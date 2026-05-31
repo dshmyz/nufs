@@ -1,0 +1,209 @@
+// Package metadata provides core data structures and interfaces for the distributed storage metadata layer.
+package metadata
+
+import (
+	"time"
+)
+
+// ========== Basic Types ==========
+
+// FileType represents the type of a filesystem entry.
+type FileType uint8
+
+const (
+	FileRegular   FileType = iota // Regular file
+	FileDirectory                 // Directory
+	FileSymlink                   // Symbolic link
+)
+
+// InodeID is a unique identifier for an inode in the namespace tree.
+type InodeID uint64
+
+// ChunkID is a unique identifier for a data chunk (Snowflake-style 64-bit).
+type ChunkID uint64
+
+// NodeID is a unique identifier for a data node in the cluster.
+type NodeID uint64
+
+// ========== Namespace & Inode ==========
+
+// InodeMeta represents metadata for a file or directory.
+// Stored at key: /inode/{inode_id}
+type InodeMeta struct {
+	ID    InodeID  `json:"id"`
+	Type  FileType `json:"type"`
+	Size  int64    `json:"size"`  // Total file size in bytes
+	NLink uint32   `json:"nlink"` // Hard link count
+	UID   uint32   `json:"uid"`
+	GID   uint32   `json:"gid"`
+	Mode  uint32   `json:"mode"`  // POSIX permission bits
+	CTime int64    `json:"ctime"` // Change time (unix nanoseconds)
+	MTime int64    `json:"mtime"` // Modification time
+	ATime int64    `json:"atime"` // Access time
+
+	// File-specific fields
+	ChunkMap []ChunkRef `json:"chunks,omitempty"`  // Ordered chunk list
+	Symlink  string     `json:"symlink,omitempty"` // Symlink target path
+
+	// Extended attributes
+	XAttrs map[string][]byte `json:"xattrs,omitempty"`
+}
+
+// DirEntry represents a directory entry (child pointer).
+// Stored at key: /ns/{parent_inode}/{name}
+type DirEntry struct {
+	InodeID InodeID  `json:"inode"`
+	Type    FileType `json:"type"`
+	Name    string   `json:"name"`
+}
+
+// BucketInfo represents S3 bucket metadata.
+type BucketInfo struct {
+	Name         string          `json:"name"`
+	RootInode    InodeID         `json:"root_inode"`
+	Policy       PlacementPolicy `json:"policy"`
+	CreationDate time.Time       `json:"creation_date"`
+}
+
+// ========== Chunk Layer ==========
+
+// ChunkRef is a reference to a chunk within a file.
+type ChunkRef struct {
+	ID      ChunkID `json:"id"`
+	Offset  int64   `json:"offset"`  // Byte offset within the file
+	Length  int32   `json:"length"`  // Actual data length in this chunk
+	Version int64   `json:"version"` // MVCC version for read-your-writes
+}
+
+// ChunkMeta represents metadata for a data chunk.
+// Stored at key: /chunk/{chunk_id}
+type ChunkMeta struct {
+	ID         ChunkID       `json:"id"`
+	Size       int32         `json:"size"` // Max 64MB per chunk
+	State      ChunkState    `json:"state"`
+	Replicas   []ReplicaInfo `json:"replicas"` // Ordered: [primary, secondary, ...]
+	ECGroup    *ECGroupInfo  `json:"ec_group,omitempty"`
+	Tier       StorageTier   `json:"tier"`       // Target storage tier for this chunk
+	CreateTime int64         `json:"create_time"`
+	Checksum   uint32        `json:"checksum"` // CRC32C of chunk data
+}
+
+// ChunkState represents the lifecycle state of a chunk.
+type ChunkState uint8
+
+const (
+	ChunkSealing  ChunkState = iota // Being written
+	ChunkSealed                     // Write complete, replicating
+	ChunkReady                      // All replicas confirmed
+	ChunkDegraded                   // Replica lost, repairing
+	ChunkOrphan                     // No inode references (GC candidate)
+)
+
+// ReplicaInfo describes a replica location.
+type ReplicaInfo struct {
+	NodeID   NodeID       `json:"node_id"`
+	Addr     string       `json:"addr"` // Data node address (host:port)
+	State    ReplicaState `json:"state"`
+	DiskPath string       `json:"disk_path"` // Local storage path on data node
+}
+
+// ReplicaState represents the sync state of a replica.
+type ReplicaState uint8
+
+const (
+	ReplicaSyncing ReplicaState = iota
+	ReplicaReady
+	ReplicaStale
+	ReplicaFailed
+)
+
+// ECGroupInfo describes erasure coding group membership.
+type ECGroupInfo struct {
+	GroupID      string `json:"group_id"`
+	DataShards   int    `json:"data_shards"`
+	ParityShards int    `json:"parity_shards"`
+	ShardIndex   int    `json:"shard_index"` // This chunk's shard index
+}
+
+// ========== Node & Cluster ==========
+
+// NodeInfo represents a data node in the cluster.
+// Registered with lease (auto-expire on heartbeat loss).
+// Stored at key: /node/{node_id}
+type NodeInfo struct {
+	ID         NodeID      `json:"id"`
+	Addr       string      `json:"addr"`
+	DataDir    string      `json:"data_dir"`
+	Rack       string      `json:"rack"`
+	Zone       string      `json:"zone"`
+	Tier       StorageTier `json:"tier"`
+	CapacityGB int64       `json:"capacity_gb"`
+	UsedGB     int64       `json:"used_gb"`
+	ChunkCount int64       `json:"chunk_count"`
+	State      NodeState   `json:"state"`
+	LastSeen   int64       `json:"last_seen"`
+}
+
+// NodeState represents the operational state of a node.
+type NodeState uint8
+
+const (
+	NodeOnline   NodeState = iota
+	NodeDraining           // Being decommissioned
+	NodeOffline
+	NodeFailed
+)
+
+// NodeReport is sent by data nodes during heartbeat.
+type NodeReport struct {
+	UsedGB      int64                    `json:"used_gb"`
+	ChunkCount  int64                    `json:"chunk_count"`
+	DiskIO      float64                  `json:"disk_io"` // 0.0 - 1.0 utilization
+	ChunkStates map[ChunkID]ReplicaState `json:"chunk_states"`
+}
+
+// RepairTask represents a pending repair operation.
+type RepairTask struct {
+	ChunkID   ChunkID   `json:"chunk_id"`
+	Reason    string    `json:"reason"`
+	Priority  int       `json:"priority"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ========== Placement Policy ==========
+
+// PlacementPolicy defines data placement rules for a bucket.
+// Stored at key: /policy/{bucket_name}
+type PlacementPolicy struct {
+	ID                string         `json:"id"`
+	ReplicationFactor int            `json:"replication_factor"` // e.g., 3
+	ECConfig          *ECConfig      `json:"ec_config,omitempty"`
+	TopologySpread    TopologySpread `json:"topology_spread"`
+	StorageTier       StorageTier    `json:"storage_tier"`
+}
+
+// ECConfig defines erasure coding parameters.
+type ECConfig struct {
+	DataShards   int `json:"data_shards"`   // e.g., 4
+	ParityShards int `json:"parity_shards"` // e.g., 2
+}
+
+// TopologySpread defines the fault domain isolation level.
+type TopologySpread uint8
+
+const (
+	SpreadNode TopologySpread = iota // Replicas on different nodes
+	SpreadRack                       // Replicas on different racks
+	SpreadZone                       // Replicas on different AZs/DCs
+)
+
+// StorageTier defines the storage performance tier.
+type StorageTier uint8
+
+const (
+	StorageTierAny StorageTier = 0 // No tier preference (used as default/unset)
+	TierHot        StorageTier = 1 // NVMe
+	TierWarm       StorageTier = 2 // SSD
+	TierCold       StorageTier = 3 // HDD
+	TierArchive    StorageTier = 4 // Tape / remote cold storage
+)

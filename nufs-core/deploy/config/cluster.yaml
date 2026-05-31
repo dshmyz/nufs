@@ -1,0 +1,61 @@
+# DFS Cluster Configuration
+# This file configures all DFS services for production deployment.
+
+cluster:
+  name: "dfs-cluster-01"
+  region: "us-east-1"
+
+# Metadata service configuration
+metadata:
+  etcd_endpoints:
+    - "etcd-0:2379"
+    - "etcd-1:2379"
+    - "etcd-2:2379"
+  badger_cache_dir: "/var/lib/dfs/metad/cache"
+  node_id: 1
+
+# Data node configuration
+datanode:
+  listen: ":9001"
+  data_dir: "/var/lib/dfs/datanode"
+  capacity_gb: 1000
+  tier: "hot"           # hot, warm, cold, archive
+  rack: "rack1"
+  zone: "zone1"
+  heartbeat_interval: "10s"
+
+# S3 Gateway configuration
+s3gw:
+  listen: ":8080"
+  etcd_endpoints:
+    - "etcd-0:2379"
+  auth:
+    enabled: false
+    access_key: ""
+    secret_key: ""
+  cors:
+    allow_origins: ["*"]
+    allow_methods: ["GET", "PUT", "POST", "DELETE", "HEAD"]
+
+# FUSE Gateway configuration
+fusegw:
+  mountpoint: "/mnt/dfs"
+  etcd_endpoints:
+    - "etcd-0:2379"
+  badger_cache_dir: "/var/lib/dfs/fusegw/cache"
+
+# Placement policy defaults
+placement:
+  replication_factor: 3
+  topology_spread: "rack"  # node, rack, zone
+  storage_tier: "hot"
+
+# Repair & maintenance
+repair:
+  scan_interval: "30s"
+  max_concurrent_repairs: 5
+
+rebalance:
+  threshold: 0.1         # 10% imbalance triggers rebalance
+  max_migrations_per_run: 100
+  scan_interval: "5m"

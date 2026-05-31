@@ -1,0 +1,89 @@
+package metadata
+
+import (
+	"errors"
+	"fmt"
+)
+
+// ============================================================
+// Error Types — Production-grade error handling
+// ============================================================
+
+// ErrorCode classifies the error for programmatic handling.
+type ErrorCode string
+
+const (
+	ErrCodeNamespace     ErrorCode = "NAMESPACE_ERROR"
+	ErrCodeBucket        ErrorCode = "BUCKET_ERROR"
+	ErrCodeChunk         ErrorCode = "CHUNK_ERROR"
+	ErrCodeNode          ErrorCode = "NODE_ERROR"
+	ErrCodeConsistency   ErrorCode = "CONSISTENCY_ERROR"
+	ErrCodeSystem        ErrorCode = "SYSTEM_ERROR"
+)
+
+// Error is a structured error with an error code for API responses.
+type Error struct {
+	Code    ErrorCode
+	Message string
+	Cause   error
+}
+
+func (e *Error) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("%s: %s: %v", e.Code, e.Message, e.Cause)
+	}
+	return fmt.Sprintf("%s: %s", e.Code, e.Message)
+}
+
+func (e *Error) Unwrap() error { return e.Cause }
+
+// NewError creates a structured error.
+func NewError(code ErrorCode, message string, cause error) *Error {
+	return &Error{Code: code, Message: message, Cause: cause}
+}
+
+// Namespace errors
+var (
+	ErrBucketExists   = errors.New("metadata: bucket already exists")
+	ErrBucketNotFound = errors.New("metadata: bucket not found")
+	ErrBucketNotEmpty = errors.New("metadata: bucket is not empty")
+	ErrEntryExists    = errors.New("metadata: directory entry already exists")
+	ErrEntryNotFound  = errors.New("metadata: directory entry not found")
+	ErrInodeNotFound  = errors.New("metadata: inode not found")
+	ErrDirNotEmpty    = errors.New("metadata: directory is not empty")
+	ErrNotDirectory   = errors.New("metadata: not a directory")
+	ErrNotFile        = errors.New("metadata: not a regular file")
+	ErrNotSymlink     = errors.New("metadata: not a symbolic link")
+	ErrNameTooLong    = errors.New("metadata: name exceeds maximum length")
+)
+
+// Chunk errors
+var (
+	ErrChunkNotFound      = errors.New("metadata: chunk not found")
+	ErrChunkNotSealed     = errors.New("metadata: chunk is not sealed")
+	ErrChunkAlreadySealed = errors.New("metadata: chunk is already sealed")
+	ErrChunkChecksum      = errors.New("metadata: chunk checksum mismatch")
+)
+
+// Node & Cluster errors
+var (
+	ErrNodeNotFound      = errors.New("metadata: node not found")
+	ErrNodeAlreadyExists = errors.New("metadata: node already registered")
+	ErrNodeOffline       = errors.New("metadata: node is offline")
+	ErrInsufficientNodes = errors.New("metadata: insufficient healthy nodes for placement")
+	ErrPlacementFailed   = errors.New("metadata: failed to satisfy placement constraints")
+	ErrNodeDraining      = errors.New("metadata: node is being decommissioned")
+)
+
+// System errors
+var (
+	ErrServiceClosed   = errors.New("metadata: service is closed")
+	ErrInvalidArgument = errors.New("metadata: invalid argument")
+	ErrInternalError   = errors.New("metadata: internal error")
+	ErrVersionConflict = errors.New("metadata: MVCC version conflict")
+	ErrLeaseExpired    = errors.New("metadata: node lease expired")
+	ErrScrubCorrupted  = errors.New("metadata: chunk data corrupted")
+	ErrNotLeader       = errors.New("metadata: not the Raft leader")
+	ErrRaftApply       = errors.New("metadata: Raft apply failed")
+	ErrTimeout         = errors.New("metadata: operation timed out")
+)

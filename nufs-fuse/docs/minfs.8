@@ -1,0 +1,42 @@
+.TH MinFS 8 "Fuse driver for Object Storage" "23 January 2021" "MinIO, Inc."
+.SH NAME
+MinFS \- fuse driver for Object Storage
+.SH SYNOPSIS
+.B minfs
+.I [flags] command [arguments...]
+.PP
+.SH DESCRIPTION
+MinFS is a fuse driver for Amazon S3 compatible object storage server.
+Use it to store photos, videos, VMs, containers, log files, or any blob
+of data as objects on your object storage server.
+
+.SH OPTIONS
+
+.SS "Miscellaneous Options"
+.PP
+.TP
+
+\fB\-h, \fB\-\-help\fR
+Show help.
+.TP
+\fB\-V, \fB\-\-version\fR
+Print the minfs version.
+
+.PP
+.SH FILES
+/etc/minfs/config.json
+.SH EXAMPLES
+mount a bucket named foo at server play.min.io:9000 on mount point /mnt/foo
+
+# minfs https://play.min.io:9000/foo /mnt/foo
+
+.SH SEE ALSO
+.nf
+\fBfusermount\fR(1), \fBmount.minfs\fR(8)
+\fR
+.fi
+.SH COPYRIGHT
+.nf
+Copyright(c) 2017 MinIO, Inc.  <https://www.min.io>
+\fR
+.fi

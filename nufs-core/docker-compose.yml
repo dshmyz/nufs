@@ -1,0 +1,147 @@
+version: "3.8"
+
+services:
+  # ==================== Metadata Service (Pebble + Raft) ====================
+  metad:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: metad
+    container_name: dfs-metad
+    command:
+      - "-data-dir=/var/lib/dfs/metadata"
+      - "-node-id=1"
+      - "-raft"
+      - "-raft-addr=0.0.0.0:7000"
+      - "-raft-dir=/var/lib/dfs/raft"
+      - "-raft-bootstrap"
+      - "-ops-addr=0.0.0.0:8091"
+    volumes:
+      - metad-data:/var/lib/dfs/metadata
+      - metad-raft:/var/lib/dfs/raft
+    ports:
+      - "8091:8091"   # Operations API
+      - "7000:7000"   # Raft consensus
+    networks:
+      - dfs-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8091/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ==================== Data Nodes ====================
+  datanode1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: datanode
+    container_name: dfs-datanode1
+    command:
+      - "-node-id=1"
+      - "-listen=0.0.0.0:9100"
+      - "-metadata=metad:8091"
+      - "-data-dir=/data"
+      - "-rack=rack1"
+      - "-zone=zone1"
+      - "-ops-addr=0.0.0.0:8092"
+    volumes:
+      - datanode1-data:/data
+    ports:
+      - "9101:9100"   # Data TCP
+      - "9091:8092"   # Ops API
+    depends_on:
+      metad:
+        condition: service_healthy
+    networks:
+      - dfs-net
+    restart: unless-stopped
+
+  datanode2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: datanode
+    container_name: dfs-datanode2
+    command:
+      - "-node-id=2"
+      - "-listen=0.0.0.0:9100"
+      - "-metadata=metad:8091"
+      - "-data-dir=/data"
+      - "-rack=rack2"
+      - "-zone=zone1"
+      - "-ops-addr=0.0.0.0:8092"
+    volumes:
+      - datanode2-data:/data
+    ports:
+      - "9102:9100"   # Data TCP
+      - "9092:8092"   # Ops API
+    depends_on:
+      metad:
+        condition: service_healthy
+    networks:
+      - dfs-net
+    restart: unless-stopped
+
+  datanode3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: datanode
+    container_name: dfs-datanode3
+    command:
+      - "-node-id=3"
+      - "-listen=0.0.0.0:9100"
+      - "-metadata=metad:8091"
+      - "-data-dir=/data"
+      - "-rack=rack3"
+      - "-zone=zone1"
+      - "-ops-addr=0.0.0.0:8092"
+    volumes:
+      - datanode3-data:/data
+    ports:
+      - "9103:9100"   # Data TCP
+      - "9093:8092"   # Ops API
+    depends_on:
+      metad:
+        condition: service_healthy
+    networks:
+      - dfs-net
+    restart: unless-stopped
+
+  # ==================== S3 Gateway ====================
+  s3gw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: s3gw
+    container_name: dfs-s3gw
+    command:
+      - "-listen=:8080"
+      - "-meta-dir=/var/lib/dfs/metadata"
+    volumes:
+      - s3gw-meta:/var/lib/dfs/metadata
+    ports:
+      - "8080:8080"
+    depends_on:
+      metad:
+        condition: service_healthy
+    networks:
+      - dfs-net
+    restart: unless-stopped
+
+# ==================== Volumes ====================
+volumes:
+  metad-data:
+  metad-raft:
+  datanode1-data:
+  datanode2-data:
+  datanode3-data:
+  s3gw-meta:
+
+# ==================== Networks ====================
+networks:
+  dfs-net:
+    driver: bridge
