@@ -1,0 +1,40 @@
+# Go build artefacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Test / coverage output
+*.out
+coverage.txt
+
+# Vendor / go workspace
+vendor/
+go.work
+go.work.sum
+
+# Coverage tooling
+cover.out
+cover.html
+
+# Build output directories
+nufs-core/bin/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local config / secrets
+.env
+.env.local
+*.local
