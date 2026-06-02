@@ -4,8 +4,12 @@
 package fuse
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
+	"os"
+	"syscall"
 	"sync"
 	"time"
 
@@ -22,6 +26,13 @@ type DFSFileSystem struct {
 	meta       metadata.MetadataService
 	chunkStore gateway.ChunkStore
 
+	// lockOwner is the per-process string used when acquiring advisory
+	// file locks (commit 0: metadata: add advisory file lock service).
+	// Each Open that returns a write handle acquires an exclusive lock
+	// under this owner; Release drops it. Empty means "no locks" (used
+	// in unit tests that have no lock manager).
+	lockOwner string
+
 	// Inode cache: metadata.InodeID -> *fs.Inode
 	mu       sync.RWMutex
 	inodeMap map[metadata.InodeID]*fs.Inode
@@ -32,6 +43,7 @@ func NewDFSFileSystem(meta metadata.MetadataService, chunkStore gateway.ChunkSto
 	return &DFSFileSystem{
 		meta:       meta,
 		chunkStore: chunkStore,
+		lockOwner:  fmt.Sprintf("fusegw-%d", os.Getpid()),
 		inodeMap:   make(map[metadata.InodeID]*fs.Inode),
 	}
 }
@@ -72,6 +84,75 @@ func (dfs *DFSFileSystem) getInode(metaID metadata.InodeID) *fs.Inode {
 	return dfs.inodeMap[metaID]
 }
 
+// ========== Root inode: bucket-as-shared-root ==========
+
+// Compile-time guards for root inode operations.
+var _ = (fs.NodeReaddirer)((*DFSFileSystem)(nil))
+var _ = (fs.NodeLookuper)((*DFSFileSystem)(nil))
+
+// Readdir on the root inode lists all bucket names as directory
+// entries. This is what makes `ls /mnt/dfs` show the bucket list
+// without requiring a separate mount per bucket (compare: s3gw
+// uses per-bucket RootInode; fusegw shares RootInodeID=1).
+func (dfs *DFSFileSystem) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	buckets, err := dfs.meta.ListBuckets(ctx)
+	if err != nil {
+		logf("root readdir: %v", err)
+		return nil, syscall.EIO
+	}
+
+	var entries []fuse.DirEntry
+	for _, b := range buckets {
+		entries = append(entries, fuse.DirEntry{
+			Name: b.Name,
+			Ino:  uint64(b.RootInode),
+			Mode: fuse.S_IFDIR,
+		})
+	}
+
+	return fs.NewListDirStream(entries), 0
+}
+
+// Lookup resolves a bucket name at the root level. "foo" returns the
+// DFSDir that wraps bucket "foo" RootInode, so all file operations
+// under /mnt/dfs/foo go through the same metadata path that s3gw
+// would use for bucket "foo".
+func (dfs *DFSFileSystem) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	bucket, err := dfs.meta.GetBucket(ctx, name)
+	if err != nil {
+		if errors.Is(err, metadata.ErrBucketNotFound) {
+			return nil, syscall.ENOENT
+		}
+		logf("root lookup %q: %v", name, err)
+		return nil, syscall.EIO
+	}
+
+	child := &DFSDir{meta: dfs.meta, inodeID: bucket.RootInode}
+	attr := fuse.Attr{
+		Ino:  uint64(bucket.RootInode),
+		Mode: fuse.S_IFDIR,
+	}
+	inode := dfs.NewInode(ctx, child, fs.StableAttr{
+		Mode: fuse.S_IFDIR,
+		Ino:  uint64(bucket.RootInode),
+	})
+
+	out.Attr = attr
+	return inode, 0
+}
+
+// Getattr on the root inode returns the attributes of the global
+// root (inode 1). The root is always a directory; its size is 0
+// (no content); timestamps are not tracked.
+func (dfs *DFSFileSystem) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	rootInode, err := dfs.meta.GetInode(ctx, metadata.RootInodeID)
+	if err != nil {
+		return syscall.EIO
+	}
+	out.Attr = inodeMetaToAttr(rootInode)
+	return 0
+}
+
 // ========== Inode type resolution ==========
 
 // newChildInode creates the appropriate InodeEmbedder based on file type.
@@ -80,11 +161,11 @@ func newChildInode(dfs *DFSFileSystem, metaInode *metadata.InodeMeta) fs.InodeEm
 	case metadata.FileDirectory:
 		return &DFSDir{meta: dfs.meta, inodeID: metaInode.ID}
 	case metadata.FileRegular:
-		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID}
+		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
 	case metadata.FileSymlink:
 		return &DFSSymlink{meta: dfs.meta, inodeID: metaInode.ID}
 	default:
-		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID}
+		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/example/dfs/metadata"
 )
@@ -69,6 +70,19 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 			return
 		}
 	}
+
+	// Acquire an exclusive advisory lock on the inode so a
+	// concurrent FUSE writer (or another S3 PUT to the same key)
+	// sees ErrLockBusy rather than a silent overwrite.  The lock
+	// owner is unique per-request so we don't hold our own lock.
+	lockOwner := fmt.Sprintf("s3gw-%s-%s-%d", bucket, key, time.Now().UnixNano())
+	if err := gw.meta.AdvisoryLock(ctx, inode.ID, lockOwner); err != nil {
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
+			"Object is locked by another writer: "+err.Error(),
+			"/"+bucket+"/"+key, requestID)
+		return
+	}
+	defer gw.meta.AdvisoryUnlock(ctx, inode.ID, lockOwner)
 
 	// Allocate a chunk for the data
 	chunk, err := gw.meta.AllocateChunk(ctx, inode.ID, 0, b.Policy)
@@ -158,6 +172,18 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 			err.Error(), "/"+bucket+"/"+key, requestID)
 		return
 	}
+
+	// Acquire a shared advisory lock so a concurrent FUSE write
+	// (or S3 PUT) blocks until we finish streaming the response.
+	// Multiple readers can coexist; only writers are exclusive.
+	lockOwner := fmt.Sprintf("s3gw-get-%s-%s-%d", bucket, key, time.Now().UnixNano())
+	if err := gw.meta.AdvisoryLockShared(ctx, inode.ID, lockOwner); err != nil {
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
+			"Object is locked: "+err.Error(),
+			"/"+bucket+"/"+key, requestID)
+		return
+	}
+	defer gw.meta.AdvisoryUnlock(ctx, inode.ID, lockOwner)
 
 	// Handle range request
 	start, end := parseRange(r.Header.Get("Range"), inode.Size)

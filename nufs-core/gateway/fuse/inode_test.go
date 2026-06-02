@@ -13,6 +13,7 @@ import (
 	"github.com/example/dfs/gateway"
 	"github.com/example/dfs/gateway/s3"
 	"github.com/example/dfs/metadata"
+	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 // ========== Test fixtures ==========
@@ -446,6 +447,191 @@ func TestDFSFile_FullCycle_WriteFlushWriteFlush(t *testing.T) {
 	got, _ := rr.Bytes(make([]byte, 64))
 	if !bytes.Equal(got, []byte("second-longer")) {
 		t.Fatalf("Read: got %q, want %q (allocator should not split single-chunk file)", got, "second-longer")
+	}
+}
+
+// ========== Root inode: bucket-as-shared-root ==========
+
+// TestDFSFileSystem_Readdir_ListsBuckets is the "ls /mnt/dfs" path.
+// The root inode (RootInodeID) must list every bucket as a directory
+// entry with its RootInode as the inode number. Pre-fix, the root
+// was a bare fs.Inode with no Readdir/Lookup, so "ls /mnt/dfs"
+// returned ENOTDIR.
+func TestDFSFileSystem_Readdir_ListsBuckets(t *testing.T) {
+	store, _ := newTestMetaStore(t)
+	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore())
+	ctx := context.Background()
+
+	// Create a second bucket so we have two entries.
+	if err := store.CreateBucket(ctx, "another", metadata.PlacementPolicy{
+		ID: "another", ReplicationFactor: 1, TopologySpread: metadata.SpreadNode,
+	}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	ds, errno := dfs.Readdir(ctx)
+	if errno != 0 {
+		t.Fatalf("Readdir: errno=%v", errno)
+	}
+	var names []string
+	for ds.HasNext() {
+		entry, _ := ds.Next()
+		names = append(names, entry.Name)
+	}
+	if len(names) != 2 {
+		t.Fatalf("Readdir: got %d entries %v, want 2", len(names), names)
+	}
+	// Entries should include both "another" and "test".
+	found := map[string]bool{}
+	for _, n := range names {
+		found[n] = true
+	}
+	if !found["test"] || !found["another"] {
+		t.Fatalf("Readdir: missing expected buckets, got %v", names)
+	}
+}
+
+// TestDFSFileSystem_Lookup_ExistingBucket resolves "test" to a
+// DFSDir with inodeID == bucket.RootInode. The returned *fs.Inode
+// must have StableAttr.Ino equal to the bucket's RootInode so the
+// kernel caches it correctly.
+func TestDFSFileSystem_Lookup_ExistingBucket(t *testing.T) {
+	store, _ := newTestMetaStore(t)
+	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore())
+	ctx := context.Background()
+
+	bucket, err := store.GetBucket(ctx, "test")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+
+	var out fuse.EntryOut
+	inode, errno := dfs.Lookup(ctx, "test", &out)
+	if errno != 0 {
+		t.Fatalf("Lookup: errno=%v", errno)
+	}
+	if inode == nil {
+		t.Fatalf("Lookup: returned nil inode for existing bucket")
+	}
+	if out.Attr.Ino != uint64(bucket.RootInode) {
+		t.Fatalf("Lookup: Ino=%d, want %d (bucket.RootInode)", out.Attr.Ino, bucket.RootInode)
+	}
+}
+
+// TestDFSFileSystem_Lookup_MissingBucket returns ENOENT for a bucket
+// that doesn't exist.
+func TestDFSFileSystem_Lookup_MissingBucket(t *testing.T) {
+	store, _ := newTestMetaStore(t)
+	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore())
+	ctx := context.Background()
+
+	var out fuse.EntryOut
+	_, errno := dfs.Lookup(ctx, "no-such-bucket", &out)
+	if errno != syscall.ENOENT {
+		t.Fatalf("Lookup missing bucket: errno=%v, want ENOENT", errno)
+	}
+}
+
+// ========== Advisory lock integration ==========
+
+// TestDFSFile_Open_AcquiresExclusiveLock verifies that opening a
+// file for writing acquires an exclusive advisory lock, and that
+// Release releases it. Between Open and Release, a second Open
+// from a different owner must fail with ErrLockBusy (returned as
+// EIO by the FUSE layer).
+func TestDFSFile_Open_AcquiresExclusiveLock(t *testing.T) {
+	store, id := newTestMetaStore(t)
+	cs := s3.NewMemoryChunkStore()
+
+	dfs := NewDFSFileSystem(store, cs)
+	f := &DFSFile{
+		meta:       store,
+		chunkStore: cs,
+		inodeID:    id,
+		lockOwner:  dfs.lockOwner,
+	}
+	ctx := context.Background()
+
+	// Open for writing → exclusive lock.
+	h, _, errno := f.Open(ctx, syscall.O_RDWR)
+	if errno != 0 {
+		t.Fatalf("Open O_RDWR: errno=%v", errno)
+	}
+	if h == nil {
+		t.Fatalf("Open O_RDWR: returned nil handle")
+	}
+	fh := h.(*DFSFileHandle)
+	if !fh.lockAcquired {
+		t.Fatalf("Open O_RDWR: lockAcquired=false, expected true")
+	}
+
+	// A concurrent open from a DIFFERENT owner must fail (exclusive
+	// lock is held).
+	f2 := &DFSFile{
+		meta:       store,
+		chunkStore: cs,
+		inodeID:    id,
+		lockOwner:  "fusegw-other-pid",
+	}
+	_, _, errno2 := f2.Open(ctx, syscall.O_RDWR)
+	if errno2 != syscall.EIO {
+		t.Fatalf("concurrent Open: errno=%v, want EIO (lock busy)", errno2)
+	}
+
+	// Release our handle → lock freed.
+	if errno := f.Release(ctx, h); errno != 0 {
+		t.Fatalf("Release: errno=%v", errno)
+	}
+
+	// Now the other owner can acquire.
+	h2, _, errno3 := f2.Open(ctx, syscall.O_RDWR)
+	if errno3 != 0 {
+		t.Fatalf("Open after unlock: errno=%v, expected success", errno3)
+	}
+	if h2 != nil {
+		f2.Release(ctx, h2)
+	}
+}
+
+// TestDFSFile_Open_AcquiresSharedLock verifies that opening a file
+// for reading acquires a shared lock. Two readers can coexist, but
+// a writer is blocked by either reader.
+func TestDFSFile_Open_AcquiresSharedLock(t *testing.T) {
+	store, id := newTestMetaStore(t)
+	cs := s3.NewMemoryChunkStore()
+
+	f1 := &DFSFile{meta: store, chunkStore: cs, inodeID: id, lockOwner: "reader-1"}
+	f2 := &DFSFile{meta: store, chunkStore: cs, inodeID: id, lockOwner: "reader-2"}
+	fw := &DFSFile{meta: store, chunkStore: cs, inodeID: id, lockOwner: "writer"}
+	ctx := context.Background()
+
+	// Two readers can coexist.
+	h1, _, errno := f1.Open(ctx, syscall.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("Open reader-1: errno=%v", errno)
+	}
+	h2, _, errno := f2.Open(ctx, syscall.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("Open reader-2: errno=%v", errno)
+	}
+
+	// A writer is blocked by either reader.
+	_, _, errno = fw.Open(ctx, syscall.O_RDWR)
+	if errno != syscall.EIO {
+		t.Fatalf("Open writer while readers: errno=%v, want EIO", errno)
+	}
+
+	// Release both readers.
+	f1.Release(ctx, h1)
+	f2.Release(ctx, h2)
+
+	// Now the writer can acquire.
+	hw, _, errno := fw.Open(ctx, syscall.O_RDWR)
+	if errno != 0 {
+		t.Fatalf("Open writer after readers gone: errno=%v", errno)
+	}
+	if hw != nil {
+		fw.Release(ctx, hw)
 	}
 }
 

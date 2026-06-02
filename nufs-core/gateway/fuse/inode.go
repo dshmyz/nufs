@@ -75,11 +75,36 @@ var _ = (fs.NodeReleaser)((*DFSFile)(nil))
 // DFSFileHandle wraps DFSFile for per-open-file state.
 type DFSFileHandle struct {
 	file *DFSFile
+	// lockAcquired is true when Open acquired an advisory lock on
+	// this file descriptor. Release must call AdvisoryUnlock exactly
+	// once per acquisition (POSIX-flock semantics).
+	lockAcquired bool
 }
 
 // Open opens the file.
 func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	return &DFSFileHandle{file: f}, 0, 0
+	h := &DFSFileHandle{file: f}
+
+	// Acquire an advisory file lock.  O_WRONLY|O_RDWR → exclusive;
+	// O_RDONLY → shared.  An empty lockOwner (unit tests that supply
+	// no lock manager) skips locking entirely.
+	if f.lockOwner != "" && f.meta != nil {
+		isWrite := (flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0)
+		if isWrite {
+			if err := f.meta.AdvisoryLock(ctx, f.inodeID, f.lockOwner); err != nil {
+				logf("open: advisory lock %d: %v", f.inodeID, err)
+				return nil, 0, syscall.EIO
+			}
+		} else {
+			if err := f.meta.AdvisoryLockShared(ctx, f.inodeID, f.lockOwner); err != nil {
+				logf("open: advisory shared lock %d: %v", f.inodeID, err)
+				return nil, 0, syscall.EIO
+			}
+		}
+		h.lockAcquired = true
+	}
+
+	return h, 0, 0
 }
 
 // Read reads data from the file.
@@ -268,7 +293,22 @@ func (f *DFSFile) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sys
 
 // Release is called when the last reference to the file handle is dropped.
 func (f *DFSFile) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
-	return f.Flush(ctx, fh)
+	// Flush first so buffered data hits the chunk store before we
+	// release the advisory lock.
+	if err := f.Flush(ctx, fh); err != 0 {
+		return err
+	}
+
+	// Release the advisory lock that Open acquired.  If no lock was
+	// acquired (unit tests / empty lockOwner) this is a no-op.
+	if h, ok := fh.(*DFSFileHandle); ok && h.lockAcquired && f.lockOwner != "" {
+		if err := f.meta.AdvisoryUnlock(ctx, f.inodeID, f.lockOwner); err != nil {
+			logf("release: advisory unlock %d: %v", f.inodeID, err)
+			// POSIX-flock: unlock failure is non-fatal; log only.
+		}
+	}
+
+	return 0
 }
 
 // Getattr returns file attributes.
