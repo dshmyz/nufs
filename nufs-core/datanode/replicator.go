@@ -18,6 +18,10 @@ type ReplicationTask struct {
 	TargetAddr string // data node to replicate to
 	Retries    int
 	CreatedAt  time.Time
+
+	// done is an optional 1-buffered channel signalled by the worker
+	// once replicate(task) returns. nil means fire-and-forget.
+	done chan error
 }
 
 // Replicator manages async chunk replication between data nodes.
@@ -79,6 +83,28 @@ func (r *Replicator) Submit(task ReplicationTask) error {
 	}
 }
 
+// SubmitWait enqueues a task and blocks until the worker reports the
+// final result (or the timeout elapses, or the replicator is stopped).
+// It is the synchronous counterpart of Submit; callers should use it
+// when they need to know the copy actually completed before they
+// update metadata or commit the chunk.
+func (r *Replicator) SubmitWait(task ReplicationTask, timeout time.Duration) error {
+	task.done = make(chan error, 1)
+	if err := r.Submit(task); err != nil {
+		return err
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-task.done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("datanode: replication task for chunk %d timed out after %v", task.ChunkID, timeout)
+	case <-r.ctx.Done():
+		return fmt.Errorf("datanode: replicator shut down while waiting for chunk %d", task.ChunkID)
+	}
+}
+
 // SubmitReplication creates replication tasks for a chunk to all target replicas.
 func (r *Replicator) SubmitReplication(chunkID metadata.ChunkID, sourceAddr string, targets []metadata.ReplicaInfo) {
 	for _, target := range targets {
@@ -104,28 +130,41 @@ func (r *Replicator) worker(id int) {
 	for task := range r.taskCh {
 		select {
 		case <-r.ctx.Done():
+			if task.done != nil {
+				task.done <- fmt.Errorf("datanode: replicator shut down")
+			}
 			return
 		default:
 		}
 
-		if err := r.replicate(task); err != nil {
+		err := r.replicate(task)
+		if err != nil {
 			log.Printf("datanode: worker %d: replication failed for chunk %d (%s -> %s): %v",
 				id, task.ChunkID, task.SourceAddr, task.TargetAddr, err)
 
-			// Retry with exponential backoff (max 3 retries)
-			if task.Retries < 3 {
+			// Retry with exponential backoff (max 3 retries). We only
+			// retry fire-and-forget tasks; synchronous ones are
+			// surfaced to the caller immediately so it can decide.
+			if task.done == nil && task.Retries < 3 {
 				task.Retries++
 				backoff := time.Duration(1<<uint(task.Retries)) * time.Second
 				time.AfterFunc(backoff, func() {
 					_ = r.Submit(task)
 				})
-			} else {
+			} else if task.done == nil {
 				log.Printf("datanode: worker %d: giving up on chunk %d after %d retries",
 					id, task.ChunkID, task.Retries)
 			}
 		} else {
 			log.Printf("datanode: worker %d: replicated chunk %d to %s",
 				id, task.ChunkID, task.TargetAddr)
+		}
+
+		// Signal any synchronous waiter exactly once. We deliver the
+		// final result of this attempt, not the eventual retry result,
+		// because the caller wants to know whether the copy landed.
+		if task.done != nil {
+			task.done <- err
 		}
 	}
 }

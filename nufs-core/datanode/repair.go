@@ -10,6 +10,13 @@ import (
 	"github.com/example/dfs/metadata"
 )
 
+// repairReplicationTimeout is the upper bound on a single cross-node
+// chunk copy triggered by the repair worker. The previous code used
+// a fixed time.Sleep(500ms), which was both a race and an outright
+// bug for large chunks. 60s is generous for any single chunk on a
+// healthy LAN but bounds a hung transfer so the scan loop can move on.
+const repairReplicationTimeout = 60 * time.Second
+
 // RepairWorker monitors chunk health and triggers repairs for degraded chunks.
 type RepairWorker struct {
 	meta     metadata.MetadataService
@@ -213,18 +220,20 @@ func (rw *RepairWorker) repairByAddingReplica(ctx context.Context, chunk *metada
 
 	// 2. Write chunk to target via TCP
 	if rw.replicator != nil {
-		// Use replicator for async copy
+		// Use replicator for an async copy and wait for the actual
+		// completion signal. This replaces the previous
+		// time.Sleep(500ms) hack, which raced for chunks larger
+		// than ~500ms of copy time and could report success before
+		// the bytes were durable on the target.
 		task := ReplicationTask{
 			ChunkID:    chunk.ID,
 			SourceAddr: sourceReplica.Addr,
 			TargetAddr: targetNode.Addr,
 			CreatedAt:  time.Now(),
 		}
-		if err := rw.replicator.Submit(task); err != nil {
-			return fmt.Errorf("repair: submit replication: %w", err)
+		if err := rw.replicator.SubmitWait(task, repairReplicationTimeout); err != nil {
+			return fmt.Errorf("repair: replication to %s: %w", targetNode.Addr, err)
 		}
-		// Wait briefly for replication to complete
-		time.Sleep(500 * time.Millisecond)
 	} else {
 		// Sync copy directly
 		tgtClient := NewClient(targetNode.Addr)

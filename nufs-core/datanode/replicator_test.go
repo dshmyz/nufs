@@ -279,3 +279,73 @@ func TestReplicator_QueueFull(t *testing.T) {
 	replicator.Start()
 	replicator.Stop()
 }
+
+func TestReplicator_SubmitWait_Success(t *testing.T) {
+	srcSrv, _, srcAddr := startTestServer(t, 1)
+	defer srcSrv.Stop()
+	tgtSrv, _, tgtAddr := startTestServer(t, 2)
+	defer tgtSrv.Stop()
+
+	srcClient := NewClient(srcAddr)
+	if err := srcClient.Connect(); err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	defer srcClient.Close()
+
+	chunkID := metadata.ChunkID(500)
+	data := []byte("synchronous replication result")
+	if resp, err := srcClient.WriteChunk(chunkID, data); err != nil || resp.Status != StatusOK {
+		t.Fatalf("write source: err=%v status=%v", err, resp.Status)
+	}
+
+	replicator := NewReplicator(srcAddr, 2)
+	replicator.Start()
+	defer replicator.Stop()
+
+	task := ReplicationTask{
+		ChunkID:    chunkID,
+		SourceAddr: srcAddr,
+		TargetAddr: tgtAddr,
+		CreatedAt:  time.Now(),
+	}
+	if err := replicator.SubmitWait(task, 5*time.Second); err != nil {
+		t.Fatalf("SubmitWait: %v", err)
+	}
+}
+
+func TestReplicator_SubmitWait_TimeoutOnUnreachableTarget(t *testing.T) {
+	srcSrv, _, srcAddr := startTestServer(t, 1)
+	defer srcSrv.Stop()
+
+	srcClient := NewClient(srcAddr)
+	if err := srcClient.Connect(); err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	defer srcClient.Close()
+
+	chunkID := metadata.ChunkID(600)
+	srcClient.WriteChunk(chunkID, []byte("timeout test data"))
+
+	// Port 1 reliably refuses connections on Linux/macOS.
+	badAddr := "127.0.0.1:1"
+
+	replicator := NewReplicator(srcAddr, 1)
+	replicator.Start()
+	defer replicator.Stop()
+
+	start := time.Now()
+	err := replicator.SubmitWait(ReplicationTask{
+		ChunkID:    chunkID,
+		SourceAddr: srcAddr,
+		TargetAddr: badAddr,
+		CreatedAt:  time.Now(),
+	}, 250*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("SubmitWait blocked too long: %v", elapsed)
+	}
+}
