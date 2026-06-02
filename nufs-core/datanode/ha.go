@@ -436,6 +436,13 @@ func (ae *AntiEntropy) repairFromPeer(ctx context.Context, chunkID metadata.Chun
 			continue
 		}
 
+		// Report local replica as ready to metadata
+		if stateErr := ae.meta.ReportChunkState(ctx, ae.localID, map[metadata.ChunkID]metadata.ReplicaState{
+			chunkID: metadata.ReplicaReady,
+		}); stateErr != nil {
+			log.Printf("anti-entropy: failed to report chunk %d state: %v", chunkID, stateErr)
+		}
+
 		log.Printf("anti-entropy: chunk %d repaired successfully from node %d", chunkID, r.NodeID)
 		return nil
 	}

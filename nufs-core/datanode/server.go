@@ -342,15 +342,21 @@ func writeResponse(w io.Writer, resp *Response) error {
 
 // Client is a data node client for inter-node chunk replication.
 type Client struct {
-	addr string
-	conn net.Conn
-	mu   sync.Mutex
-	seq  atomic.Uint64
+	addr    string
+	conn    net.Conn
+	mu      sync.Mutex
+	seq     atomic.Uint64
+	timeout time.Duration
 }
 
 // NewClient creates a new data node client.
 func NewClient(addr string) *Client {
-	return &Client{addr: addr}
+	return &Client{addr: addr, timeout: 30 * time.Second}
+}
+
+// SetTimeout sets the operation timeout for read/write operations.
+func (c *Client) SetTimeout(d time.Duration) {
+	c.timeout = d
 }
 
 // Connect establishes a TCP connection to the data node.
@@ -416,16 +422,24 @@ func (c *Client) sendRequest(header *Header, body []byte) (*Response, error) {
 		return nil, fmt.Errorf("datanode: not connected")
 	}
 
+	// Apply deadline for the full operation
+	if c.timeout > 0 {
+		if err := c.conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+			return nil, fmt.Errorf("datanode: set deadline: %w", err)
+		}
+		defer c.conn.SetDeadline(time.Time{})
+	}
+
 	// Write header
 	headerData, err := json.Marshal(header)
 	if err != nil {
 		return nil, err
 	}
 	if err := binary.Write(c.conn, binary.BigEndian, uint32(len(headerData))); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("datanode: write header length: %w", err)
 	}
 	if _, err := c.conn.Write(headerData); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("datanode: write header: %w", err)
 	}
 
 	// Write body
@@ -434,11 +448,11 @@ func (c *Client) sendRequest(header *Header, body []byte) (*Response, error) {
 		bodyLen = uint32(len(body))
 	}
 	if err := binary.Write(c.conn, binary.BigEndian, bodyLen); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("datanode: write body length: %w", err)
 	}
 	if bodyLen > 0 {
 		if _, err := c.conn.Write(body); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("datanode: write body: %w", err)
 		}
 	}
 

@@ -400,3 +400,27 @@ func TestServerClient_ConcurrentReadWrite(t *testing.T) {
 		}
 	}
 }
+
+func TestClient_DefaultTimeout(t *testing.T) {
+	client := NewClient("127.0.0.1:1")
+	if client.timeout != 30*time.Second {
+		t.Fatalf("expected default timeout 30s, got %v", client.timeout)
+	}
+}
+
+func TestClient_SetTimeout(t *testing.T) {
+	client := NewClient("127.0.0.1:1")
+	client.SetTimeout(5 * time.Second)
+	if client.timeout != 5*time.Second {
+		t.Fatalf("expected timeout 5s, got %v", client.timeout)
+	}
+}
+
+func TestClient_SendRequest_Unreachable(t *testing.T) {
+	// Client without connection should error immediately
+	client := NewClient("127.0.0.1:1")
+	_, err := client.ReadChunk(42, 0, 0)
+	if err == nil {
+		t.Fatal("expected error from unconnected client")
+	}
+}

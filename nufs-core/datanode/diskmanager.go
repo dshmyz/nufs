@@ -15,6 +15,28 @@ import (
 	"github.com/example/dfs/metadata"
 )
 
+// DiskState represents the operational health of a disk.
+type DiskState int
+
+const (
+	DiskOnline   DiskState = iota // Healthy
+	DiskDegraded                  // I/O errors detected, below threshold
+	DiskFailed                    // Too many I/O errors, read-only
+)
+
+func (s DiskState) String() string {
+	switch s {
+	case DiskOnline:
+		return "online"
+	case DiskDegraded:
+		return "degraded"
+	case DiskFailed:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
 // ============================================================
 // Disk Manager — Production disk lifecycle management
 // ============================================================
@@ -42,6 +64,14 @@ type DiskManager struct {
 
 	stopCh  chan struct{}
 	running atomic.Bool
+
+	// I/O error tracking
+	ioErrors  atomic.Int64
+	diskState atomic.Int64 // stores DiskState as int64
+	errSince  atomic.Int64 // unix nanos when current error streak started
+
+	// Callback for chunk migration when disk fails
+	onDiskFailed func(diskID string)
 }
 
 // DiskStats holds real-time disk utilization metrics.
@@ -68,17 +98,17 @@ type TierConfig struct {
 // NewDiskManager creates a disk manager with capacity enforcement.
 // The caller must provide a WAL instance (use NewWriteAheadLog to create one).
 func NewDiskManager(dataDir string, store *ChunkStore, capacityGB int64, wal *WriteAheadLog) (*DiskManager, error) {
-
 	dm := &DiskManager{
 		dataDir:    dataDir,
 		store:      store,
 		capacityGB: capacityGB,
 		tiers:      defaultTierConfig(),
 		admitCh:    make(chan struct{}, 64),
-		rejectPct:  0.90, // reject at 90%
+		rejectPct:  0.90,
 		wal:        wal,
 		stopCh:     make(chan struct{}),
 	}
+	dm.diskState.Store(int64(DiskOnline))
 	dm.stats.TotalBytes = capacityGB * 1024 * 1024 * 1024
 	dm.refreshStats()
 	return dm, nil
@@ -120,6 +150,8 @@ type DiskStatsSnapshot struct {
 	WriteIOPS   int64     `json:"write_iops"`
 	ReadBytes   int64     `json:"read_bytes"`
 	WriteBytes  int64     `json:"write_bytes"`
+	IOErrors    int64     `json:"io_errors"`
+	DiskState   string    `json:"disk_state"`
 	LastUpdated time.Time `json:"last_updated"`
 }
 
@@ -137,8 +169,89 @@ func (dm *DiskManager) Stats() DiskStatsSnapshot {
 		WriteIOPS:   dm.stats.WriteIOPS.Load(),
 		ReadBytes:   dm.stats.ReadBytes.Load(),
 		WriteBytes:  dm.stats.WriteBytes.Load(),
+		IOErrors:    dm.ioErrors.Load(),
+		DiskState:   DiskState(dm.diskState.Load()).String(),
 		LastUpdated: dm.stats.LastUpdated,
 	}
+}
+
+const (
+	// DiskIOErrorThreshold is the number of consecutive I/O errors before marking disk as failed.
+	DiskIOErrorThreshold = 5
+	// DiskRecoveryErrors is the number of consecutive successful operations needed to clear degraded state.
+	DiskRecoveryOps = 100
+)
+
+// DiskIOErrors returns the consecutive I/O error count.
+func (dm *DiskManager) DiskIOErrors() int64 {
+	return dm.ioErrors.Load()
+}
+
+// DiskState returns the current disk state.
+func (dm *DiskManager) DiskState() DiskState {
+	return DiskState(dm.diskState.Load())
+}
+
+// RecordWriteError records a disk I/O error and transitions state if threshold exceeded.
+// Returns true if the disk was just marked failed.
+func (dm *DiskManager) RecordWriteError(err error) bool {
+	n := dm.ioErrors.Add(1)
+	if n == 1 {
+		dm.errSince.Store(time.Now().UnixNano())
+	}
+	if n >= DiskIOErrorThreshold {
+		old := dm.diskState.Swap(int64(DiskFailed))
+		if old != int64(DiskFailed) {
+			log.Printf("disk: data dir %s marked FAILED after %d consecutive I/O errors", dm.dataDir, n)
+			if dm.onDiskFailed != nil {
+				go dm.onDiskFailed(dm.dataDir)
+			}
+		}
+		return true
+	}
+	old := dm.diskState.Swap(int64(DiskDegraded))
+	if old == int64(DiskOnline) {
+		log.Printf("disk: data dir %s DEGRADED (%d I/O errors)", dm.dataDir, n)
+	}
+	return false
+}
+
+// RecordIOError records any I/O error (read or write) for disk health tracking.
+func (dm *DiskManager) RecordIOError() {
+	n := dm.ioErrors.Add(1)
+	if n == 1 {
+		dm.errSince.Store(time.Now().UnixNano())
+	}
+	if n >= DiskIOErrorThreshold {
+		old := dm.diskState.Swap(int64(DiskFailed))
+		if old != int64(DiskFailed) {
+			log.Printf("disk: %s marked FAILED after %d I/O errors", dm.dataDir, n)
+			if dm.onDiskFailed != nil {
+				go dm.onDiskFailed(dm.dataDir)
+			}
+		}
+		return
+	}
+	dm.diskState.CompareAndSwap(int64(DiskOnline), int64(DiskDegraded))
+}
+
+// RecordSuccess clears error count after enough consecutive successes.
+func (dm *DiskManager) RecordSuccess() {
+	n := dm.ioErrors.Load()
+	if n == 0 {
+		return
+	}
+	dm.ioErrors.Add(-1)
+	if dm.ioErrors.Load() <= 0 {
+		dm.ioErrors.Store(0)
+		dm.diskState.Store(int64(DiskOnline))
+		log.Printf("disk: %s recovered to ONLINE state", dm.dataDir)
+	}
+}
+
+// SetOnDiskFailed registers a callback invoked when the disk transitions to failed state.
+func (dm *DiskManager) SetOnDiskFailed(fn func(diskID string)) {
+	dm.onDiskFailed = fn
 }
 
 // CanAdmitWrite checks if the disk can accept a new write.
@@ -146,11 +259,14 @@ func (dm *DiskManager) CanAdmitWrite(sizeBytes int64) error {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 
-	if dm.stats.TotalBytes == 0 {
-		return nil // No capacity limit
+	if DiskState(dm.diskState.Load()) == DiskFailed {
+		return fmt.Errorf("disk: %s is in FAILED state, writes rejected", dm.dataDir)
 	}
 
-	// Check capacity
+	if dm.stats.TotalBytes == 0 {
+		return nil
+	}
+
 	projected := float64(dm.stats.UsedBytes+sizeBytes) / float64(dm.stats.TotalBytes)
 	if projected > dm.rejectPct {
 		return fmt.Errorf("disk: capacity limit reached (%.1f%% used, limit %.0f%%)",

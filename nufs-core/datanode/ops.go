@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,28 +19,47 @@ import (
 
 // OpsServer exposes HTTP endpoints for cluster operations.
 type OpsServer struct {
-	cfg      Config
-	store    *ChunkStore
-	meta     metadata.MetadataService
-	disk     *DiskManager
-	repl     *ChainReplicator
-	ae       *AntiEntropy
-	listener *http.Server
-	running  atomic.Bool
+	cfg        Config
+	store      *ChunkStore
+	meta       metadata.MetadataService
+	disk       *DiskManager
+	repl       *ChainReplicator
+	ae         *AntiEntropy
+	repair     *RepairWorker
+	listener   *http.Server
+	running    atomic.Bool
+	shutdownWg sync.WaitGroup
 }
 
 // NewOpsServer creates the operations HTTP server.
 func NewOpsServer(cfg Config, store *ChunkStore, meta metadata.MetadataService,
 	disk *DiskManager, repl *ChainReplicator, ae *AntiEntropy) *OpsServer {
+	return NewOpsServerWithRepair(cfg, store, meta, disk, repl, ae, nil)
+}
+
+// NewOpsServerWithRepair creates an ops server with repair worker integration.
+func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta metadata.MetadataService,
+	disk *DiskManager, repl *ChainReplicator, ae *AntiEntropy, repair *RepairWorker) *OpsServer {
 	mux := http.NewServeMux()
 
 	s := &OpsServer{
-		cfg:   cfg,
-		store: store,
-		meta:  meta,
-		disk:  disk,
-		repl:  repl,
-		ae:    ae,
+		cfg:    cfg,
+		store:  store,
+		meta:   meta,
+		disk:   disk,
+		repl:   repl,
+		ae:     ae,
+		repair: repair,
+	}
+
+	// Wire disk failure callback to trigger repair for chunks on failed disk
+	if repair != nil {
+		disk.SetOnDiskFailed(func(diskID string) {
+			log.Printf("ops: disk %s failed, triggering chunk repairs", diskID)
+			if err := repair.RepairChunksForDiskFailure(context.Background(), diskID); err != nil {
+				log.Printf("ops: disk failure repair failed: %v", err)
+			}
+		})
 	}
 
 	// Cluster status

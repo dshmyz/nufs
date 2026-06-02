@@ -46,11 +46,17 @@ type Config struct {
 	// Zone is the availability zone identifier.
 	Zone string
 
+	// MachineID is the physical machine identifier for topology placement.
+	MachineID string
+
 	// Tier is the storage tier (NVMe/SSD/HDD).
 	Tier metadata.StorageTier
 
 	// CapacityGB is the total storage capacity of this node in gigabytes.
 	CapacityGB int64
+
+	// ClientTimeout is the default timeout for inter-node TCP operations.
+	ClientTimeout time.Duration
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -66,6 +72,7 @@ func DefaultConfig() Config {
 		MaxConcurrentReads:  256,
 		Tier:                metadata.TierHot,
 		CapacityGB:          1000,
+		ClientTimeout:       30 * time.Second,
 	}
 }
 
