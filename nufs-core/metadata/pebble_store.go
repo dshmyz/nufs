@@ -29,6 +29,10 @@ type PebbleStore struct {
 
 	// Raft integration: when set, all mutating operations are applied via Raft
 	raft *RaftNode
+
+	// advisoryLocks tracks the in-memory advisory file lock table.
+	// See lock.go for the model. State is dropped on Close / restart.
+	advisoryLocks *advisoryLockManager
 }
 
 // PebbleStoreConfig configures a PebbleStore instance.
@@ -81,10 +85,11 @@ func NewPebbleStore(cfg PebbleStoreConfig) (*PebbleStore, error) {
 	}
 
 	s := &PebbleStore{
-		db:        db,
-		placement: NewPlacementEngine(),
-		chunkGen:  NewChunkIDGenerator(cfg.NodeID),
-		cfg:       cfg,
+		db:            db,
+		placement:     NewPlacementEngine(),
+		chunkGen:      NewChunkIDGenerator(cfg.NodeID),
+		cfg:           cfg,
+		advisoryLocks: newAdvisoryLockManager(),
 	}
 	s.inodeSeq.Store(uint64(RootInodeID))
 
@@ -113,6 +118,59 @@ func (s *PebbleStore) Close() error {
 		return fmt.Errorf("pebble store: close errors: %v", errs)
 	}
 	return nil
+}
+
+// AdvisoryLock acquires an exclusive lock on inode for owner.
+// See lock.go for the full model.
+func (s *PebbleStore) AdvisoryLock(ctx context.Context, inode InodeID, owner string) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	// Honour context cancellation before doing any work. The lock
+	// itself is a short, in-memory operation, so cancellation can
+	// only land at the entry point — once we are inside the mutex
+	// the call completes in microseconds.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.advisoryLocks.acquire(inode, owner, LockModeExclusive)
+}
+
+// AdvisoryLockShared is the read-side equivalent. See AdvisoryLock
+// and lock.go.
+func (s *PebbleStore) AdvisoryLockShared(ctx context.Context, inode InodeID, owner string) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.advisoryLocks.acquire(inode, owner, LockModeShared)
+}
+
+// AdvisoryUnlock releases one acquisition of (inode, owner). A
+// no-op for owners that do not hold the lock, matching flock(2).
+func (s *PebbleStore) AdvisoryUnlock(ctx context.Context, inode InodeID, owner string) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.advisoryLocks.release(inode, owner)
+}
+
+// AdvisoryListLocks returns a snapshot of every holder of inode.
+// Used by `dfsctl locks <inode>` and the admin endpoint; the
+// runtime path does not call it.
+func (s *PebbleStore) AdvisoryListLocks(ctx context.Context, inode InodeID) ([]LockInfo, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.advisoryLocks.list(inode), nil
 }
 
 // ========== Internal Helpers ==========

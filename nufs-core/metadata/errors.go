@@ -87,3 +87,17 @@ var (
 	ErrRaftApply       = errors.New("metadata: Raft apply failed")
 	ErrTimeout         = errors.New("metadata: operation timed out")
 )
+
+// Advisory lock errors
+var (
+	// ErrLockBusy is returned by AdvisoryLock / AdvisoryLockShared
+	// when another holder already owns an incompatible lock on the
+	// inode. Callers should treat this as a transient condition and
+	// retry (with backoff) or surface it to the user as a permission
+	// error. The same model as POSIX EAGAIN from flock(2).
+	ErrLockBusy = errors.New("metadata: lock is held by another owner")
+	// ErrInvalidOwner is returned when the owner string is empty or
+	// malformed. An empty owner would make Unlock a no-op for
+	// everybody, so we reject it up front.
+	ErrInvalidOwner = errors.New("metadata: lock owner must be non-empty")
+)

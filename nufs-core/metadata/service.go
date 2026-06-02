@@ -68,6 +68,27 @@ type MetadataService interface {
 
 	// Lifecycle
 	Close() error
+
+	// AdvisoryLock acquires an exclusive (write) lock on the inode.
+	// Returns ErrLockBusy if the lock is held by another owner in
+	// an incompatible mode, or ErrInvalidOwner if owner is empty.
+	// The same owner may acquire the same lock multiple times; the
+	// implementation uses a refcount so each call needs a matching
+	// AdvisoryUnlock. See lock.go for the full model.
+	AdvisoryLock(ctx context.Context, inode InodeID, owner string) error
+	// AdvisoryLockShared is the read-side equivalent. Multiple
+	// owners can hold a shared lock on the same inode, but any
+	// exclusive acquirer (from any owner) blocks them. Same
+	// re-entrancy rules as AdvisoryLock.
+	AdvisoryLockShared(ctx context.Context, inode InodeID, owner string) error
+	// AdvisoryUnlock releases one acquisition of (inode, owner).
+	// Releasing a lock the caller does not hold is a no-op
+	// (POSIX-flock semantics), not an error.
+	AdvisoryUnlock(ctx context.Context, inode InodeID, owner string) error
+	// AdvisoryListLocks returns a snapshot of every holder of the
+	// lock on inode. Used for diagnostics and admin tools; the
+	// runtime path does not need it.
+	AdvisoryListLocks(ctx context.Context, inode InodeID) ([]LockInfo, error)
 }
 
 // Compile-time interface check

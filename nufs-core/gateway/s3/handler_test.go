@@ -376,6 +376,23 @@ func (m *mockMetaService) MigrateChunkReplica(_ context.Context, _ metadata.Chun
 	return nil
 }
 
+// Advisory lock stubs — s3gw does not currently take file locks in
+// tests, so these are no-ops. Production wire-up lives in the
+// PutObject / GetObject path via a future commit.
+
+func (m *mockMetaService) AdvisoryLock(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}
+func (m *mockMetaService) AdvisoryLockShared(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}
+func (m *mockMetaService) AdvisoryUnlock(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}
+func (m *mockMetaService) AdvisoryListLocks(_ context.Context, _ metadata.InodeID) ([]metadata.LockInfo, error) {
+	return nil, nil
+}
+
 // ========== Test Helpers ==========
 
 func newTestGateway(t *testing.T) (*Gateway, *httptest.Server, *mockMetaService) {

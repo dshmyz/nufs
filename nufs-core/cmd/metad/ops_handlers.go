@@ -61,6 +61,11 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/repair/trigger", s.handleTriggerRepair)
 	mux.HandleFunc("/api/v1/repair/", s.handleRepairByID)
 	mux.HandleFunc("/api/v1/rebalance/trigger", s.handleTriggerRebalance)
+
+	// Advisory file locks (proxied from HTTPClient on remote clients)
+	mux.HandleFunc("/api/v1/locks/acquire", s.handleAdvisoryAcquire)
+	mux.HandleFunc("/api/v1/locks/release", s.handleAdvisoryRelease)
+	mux.HandleFunc("/api/v1/locks", s.handleAdvisoryList)
 }
 
 // --- Health, cluster, metrics ---

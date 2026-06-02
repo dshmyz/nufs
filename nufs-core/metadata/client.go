@@ -480,3 +480,55 @@ func (c *HTTPClient) TriggerRebalance(ctx context.Context) error {
 func (c *HTTPClient) Close() error {
 	return nil
 }
+
+// Advisory lock operations — proxied to the metad HTTP API. The
+// remote server is the single source of truth for the in-memory
+// lock table, so all clients connected to the same metad see a
+// consistent view of who holds what.
+
+func (c *HTTPClient) AdvisoryLock(ctx context.Context, inode InodeID, owner string) error {
+	return c.advisoryLockCall(ctx, "/api/v1/locks/acquire", inode, owner, "exclusive")
+}
+
+func (c *HTTPClient) AdvisoryLockShared(ctx context.Context, inode InodeID, owner string) error {
+	return c.advisoryLockCall(ctx, "/api/v1/locks/acquire", inode, owner, "shared")
+}
+
+func (c *HTTPClient) AdvisoryUnlock(ctx context.Context, inode InodeID, owner string) error {
+	req := map[string]interface{}{"inode": inode, "owner": owner}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/locks/release", req)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) AdvisoryListLocks(ctx context.Context, inode InodeID) ([]LockInfo, error) {
+	path := fmt.Sprintf("/api/v1/locks?inode=%d", inode)
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var locks []LockInfo
+	if err := c.readResponse(resp, &locks); err != nil {
+		return nil, err
+	}
+	return locks, nil
+}
+
+func (c *HTTPClient) advisoryLockCall(ctx context.Context, path string, inode InodeID, owner, mode string) error {
+	req := map[string]interface{}{"inode": inode, "owner": owner, "mode": mode}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, req)
+	if err != nil {
+		return err
+	}
+	// Map HTTP 409 (Conflict) to ErrLockBusy so the caller's
+	// errors.Is checks see a typed error rather than a generic
+	// "metad: ... (status=409)" string. Other 4xx/5xx responses
+	// fall through to readResponse and surface as before.
+	if resp.StatusCode == http.StatusConflict {
+		resp.Body.Close()
+		return ErrLockBusy
+	}
+	return c.readResponse(resp, nil)
+}

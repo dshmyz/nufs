@@ -332,3 +332,19 @@ func TestRepairWorker_ProcessRepairQueue_RemovesStaleFailed(t *testing.T) {
 		t.Error("expected stale failed repair task to be removed")
 	}
 }
+
+// Advisory lock stubs — the repair worker does not take file locks,
+// so these are no-ops. They exist only to satisfy MetadataService.
+
+func (m *mockMetadataService) AdvisoryLock(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}
+func (m *mockMetadataService) AdvisoryLockShared(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}
+func (m *mockMetadataService) AdvisoryUnlock(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}
+func (m *mockMetadataService) AdvisoryListLocks(_ context.Context, _ metadata.InodeID) ([]metadata.LockInfo, error) {
+	return nil, nil
+}
