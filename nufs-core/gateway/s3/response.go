@@ -140,6 +140,9 @@ const (
 	ErrCodeInvalidPart         = "InvalidPart"
 	ErrCodeMethodNotAllowed    = "MethodNotAllowed"
 	ErrCodeNotImplemented      = "NotImplemented"
+	ErrCodeEntityTooLarge      = "EntityTooLarge"
+	ErrCodeServiceUnavailable  = "ServiceUnavailable"
+	ErrCodeSlowDown            = "SlowDown"
 )
 
 // ========== Response Helpers ==========

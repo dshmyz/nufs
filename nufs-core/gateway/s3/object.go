@@ -32,9 +32,20 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	// Read body
-	data, err := io.ReadAll(io.LimitReader(r.Body, 5*1024*1024*1024)) // 5GB limit
+	// Cap the body at MaxObjectSize + 1 so http.MaxBytesReader trips
+	// exactly when the client overshoots. ReadAll will then return
+	// *http.MaxBytesError and we can return 413 instead of buffering
+	// gigabytes into memory.
+	r.Body = http.MaxBytesReader(w, r.Body, gw.maxObjectSize)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			WriteXMLError(w, http.StatusRequestEntityTooLarge, ErrCodeEntityTooLarge,
+				fmt.Sprintf("Object size exceeds %d bytes", gw.maxObjectSize),
+				"/"+bucket+"/"+key, requestID)
+			return
+		}
 		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"Failed to read request body: "+err.Error(), "/"+bucket+"/"+key, requestID)
 		return
@@ -67,12 +78,26 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
+	// Reject the request up front if the placement policy produced no
+	// replicas. This is a clearer 503 than waiting for the chunk store
+	// to fail with "no replicas", and it stops a misconfigured cluster
+	// from accepting writes that cannot satisfy the durability contract.
+	// Only enforced when the gateway is configured to do so (production
+	// sets it; in-memory tests do not).
+	if gw.rejectEmptyReplicas && len(chunk.Replicas) == 0 {
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
+			"No datanode replicas are available for this bucket's placement policy",
+			"/"+bucket+"/"+key, requestID)
+		return
+	}
+
 	// Write data to each replica via the chunk store (TCP for prod,
 	// in-memory for tests).
 	checksum := crc32Checksum(data)
 	if err := gw.chunkStore.WriteChunk(ctx, chunk, data); err != nil {
-		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			"Failed to write data to datanodes: "+err.Error(), "/"+bucket+"/"+key, requestID)
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
+			"Failed to write data to enough datanodes: "+err.Error(),
+			"/"+bucket+"/"+key, requestID)
 		return
 	}
 

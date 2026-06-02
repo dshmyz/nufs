@@ -16,6 +16,12 @@ type Gateway struct {
 	chunkStore ChunkStore
 	dataNodes  map[metadata.NodeID]string // nodeID -> data node address
 	mux        *http.ServeMux
+
+	// Configurable limits and health check, captured at construction.
+	maxObjectSize       int64
+	rejectEmptyReplicas bool
+	health              HealthChecker
+	ready               HealthChecker
 }
 
 // GatewayConfig holds configuration for the S3 gateway.
@@ -26,7 +32,35 @@ type GatewayConfig struct {
 	// If nil, NewGateway installs a DatanodeChunkStore (the production
 	// default). Tests typically inject a MemoryChunkStore.
 	ChunkStore ChunkStore
+	// MaxObjectSize is the largest allowed PUT body, in bytes, for
+	// single-shot PutObject and UploadPart. <= 0 means 5 GiB
+	// (the S3 single-shot limit). Requests exceeding the cap get a
+	// 413 EntityTooLarge before any metadata work happens.
+	MaxObjectSize int64
+	// RejectEmptyReplicas, when true, makes PutObject return 503 if
+	// the placement policy produced an empty replica set. Production
+	// deployments should set this to true so a degraded cluster
+	// surfaces writes as ServiceUnavailable rather than accepting
+	// them and losing data. Tests with in-memory chunk stores keep
+	// the default (false) so they don't need to wire replicas.
+	RejectEmptyReplicas bool
+	// HealthCheck, if set, is invoked on GET /healthz. A nil return
+	// yields 200; a non-nil error yields 503. Defaults to a stub
+	// that always reports healthy.
+	HealthCheck HealthChecker
+	// ReadyCheck, if set, is invoked on GET /readyz. Same semantics
+	// as HealthCheck. /readyz should reflect whether the gateway
+	// is connected to the metadata service and the chunk store is
+	// usable; /healthz is the liveness probe.
+	ReadyCheck HealthChecker
 }
+
+// HealthChecker reports the state of a subsystem. Returning nil means
+// the subsystem is up; returning a non-nil error means down.
+type HealthChecker func(ctx context.Context) error
+
+// DefaultMaxObjectSize is the S3 single-shot PUT limit (5 GiB).
+const DefaultMaxObjectSize int64 = 5 * 1024 * 1024 * 1024
 
 // NewGateway creates a new S3 gateway handler.
 func NewGateway(cfg GatewayConfig) *Gateway {
@@ -44,11 +78,51 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 	if gw.chunkStore == nil {
 		gw.chunkStore = NewDatanodeChunkStore()
 	}
+	if cfg.MaxObjectSize <= 0 {
+		gw.maxObjectSize = DefaultMaxObjectSize
+	} else {
+		gw.maxObjectSize = cfg.MaxObjectSize
+	}
+	gw.rejectEmptyReplicas = cfg.RejectEmptyReplicas
+	gw.health = cfg.HealthCheck
+	if gw.health == nil {
+		gw.health = func(_ context.Context) error { return nil }
+	}
+	gw.ready = cfg.ReadyCheck
+	if gw.ready == nil {
+		gw.ready = gw.health
+	}
 
 	// Register routes — Go 1.22+ enhanced ServeMux patterns
 	gw.mux.HandleFunc("/", gw.route)
+	gw.mux.HandleFunc("/healthz", gw.handleHealthz)
+	gw.mux.HandleFunc("/readyz", gw.handleReadyz)
 
 	return gw
+}
+
+// handleHealthz is the liveness probe. It returns 200 as long as the
+// process is responsive enough to serve the request; a custom
+// HealthChecker can veto by returning an error.
+func (gw *Gateway) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if err := gw.health(r.Context()); err != nil {
+		http.Error(w, "unhealthy: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleReadyz is the readiness probe. It is the same as healthz by
+// default but the caller is expected to wire a stricter check (e.g.
+// "metadata service is reachable") via GatewayConfig.ReadyCheck.
+func (gw *Gateway) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if err := gw.ready(r.Context()); err != nil {
+		http.Error(w, "not ready: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ready"}`))
 }
 
 // Handler returns the fully wrapped HTTP handler with middleware chain.

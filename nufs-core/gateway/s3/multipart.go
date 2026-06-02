@@ -2,6 +2,7 @@ package s3
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -114,9 +115,18 @@ func (gw *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	// Read part data
-	data, err := io.ReadAll(io.LimitReader(r.Body, 5*1024*1024*1024))
+	// Read part data. The 5 GiB per-part S3 limit is also our cap; we
+	// rely on the gateway-wide MaxObjectSize to reject anything larger.
+	r.Body = http.MaxBytesReader(w, r.Body, gw.maxObjectSize)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			WriteXMLError(w, http.StatusRequestEntityTooLarge, ErrCodeEntityTooLarge,
+				fmt.Sprintf("Part exceeds %d bytes", gw.maxObjectSize),
+				"/"+bucket+"/"+key, requestID)
+			return
+		}
 		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"Failed to read part data", "/"+bucket+"/"+key, requestID)
 		return

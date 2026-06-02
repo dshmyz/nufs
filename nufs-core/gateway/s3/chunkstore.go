@@ -33,6 +33,11 @@ type ChunkStore interface {
 type DatanodeChunkStore struct {
 	mu          sync.Mutex
 	dialTimeout time.Duration
+	// MinReplicasPerWrite is the floor on the number of replicas that
+	// must acknowledge a write. <= 0 (the default) means "all replicas
+	// must succeed", which is the production durability contract. Set
+	// to 1 in tests that bring up a single-node cluster.
+	MinReplicasPerWrite int
 }
 
 // NewDatanodeChunkStore returns a ChunkStore that dials datanode daemons
@@ -42,10 +47,12 @@ func NewDatanodeChunkStore() *DatanodeChunkStore {
 	return &DatanodeChunkStore{dialTimeout: 10 * time.Second}
 }
 
-// WriteChunk writes data to every replica. A write is considered
-// successful only if at least one replica returns OK; callers that need
-// stricter durability should check the returned error and rely on
-// metadata.SealChunk before reporting success to the client.
+// WriteChunk writes data to every replica. The write is considered
+// successful only when at least s.requiredReplicas(chunk) replicas
+// return OK; for production deployments that is "all of N" (i.e. a
+// non-zero MinReplicasPerWrite means "at least this many, capped by
+// the total"). The default (MinReplicasPerWrite == 0) means the write
+// must reach every replica before it is considered durable.
 func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.ChunkMeta, data []byte) error {
 	if chunk == nil {
 		return fmt.Errorf("chunkstore: nil chunk")
@@ -54,8 +61,9 @@ func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.Chu
 		return fmt.Errorf("chunkstore: chunk %d has no replicas", chunk.ID)
 	}
 
-	var lastErr error
+	required := s.requiredReplicas(len(chunk.Replicas))
 	successes := 0
+	var lastErr error
 	for _, rep := range chunk.Replicas {
 		if rep.Addr == "" {
 			lastErr = fmt.Errorf("replica on node %d has empty addr", rep.NodeID)
@@ -88,13 +96,27 @@ func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.Chu
 		successes++
 	}
 
-	if successes == 0 {
+	if successes < required {
 		if lastErr != nil {
-			return fmt.Errorf("chunkstore: all replicas failed, last error: %w", lastErr)
+			return fmt.Errorf("chunkstore: only %d of %d required replicas wrote chunk %d, last error: %w",
+				successes, required, chunk.ID, lastErr)
 		}
-		return fmt.Errorf("chunkstore: all replicas failed")
+		return fmt.Errorf("chunkstore: only %d of %d required replicas wrote chunk %d",
+			successes, required, chunk.ID)
 	}
 	return nil
+}
+
+// requiredReplicas maps MinReplicasPerWrite to the actual floor for
+// this chunk. A non-positive value is "all replicas".
+func (s *DatanodeChunkStore) requiredReplicas(total int) int {
+	if s.MinReplicasPerWrite <= 0 {
+		return total
+	}
+	if s.MinReplicasPerWrite > total {
+		return total
+	}
+	return s.MinReplicasPerWrite
 }
 
 // ReadChunk reads chunk data from the first replica that responds OK.
@@ -153,6 +175,13 @@ type MemoryChunkStore struct {
 	WriteHook func(chunkID metadata.ChunkID, data []byte) error
 	// ReadHook, if set, is called on every ReadChunk.
 	ReadHook func(chunkID metadata.ChunkID) error
+	// MinReplicasPerWrite mirrors DatanodeChunkStore.MinReplicasPerWrite
+	// so the gateway can be tested with the same durability contract.
+	// The MemoryChunkStore only ever has one logical copy, so the
+	// meaningful values are 0 (default; "succeed" without checking,
+	// matches old test behaviour) and 1 (require the write hook to
+	// return nil).
+	MinReplicasPerWrite int
 }
 
 // NewMemoryChunkStore returns an empty in-memory ChunkStore.
@@ -162,8 +191,12 @@ func NewMemoryChunkStore() *MemoryChunkStore {
 
 // WriteChunk stores data for the chunk, recording one copy per replica
 // so a subsequent read on any replica succeeds. Hook errors are
-// propagated.
+// propagated. With MinReplicasPerWrite == 1 the hook must succeed for
+// the call to be considered durable.
 func (m *MemoryChunkStore) WriteChunk(_ context.Context, chunk *metadata.ChunkMeta, data []byte) error {
+	if m.MinReplicasPerWrite > 0 && m.WriteHook == nil {
+		return fmt.Errorf("chunkstore: MinReplicasPerWrite=1 requires a non-nil WriteHook")
+	}
 	if m.WriteHook != nil {
 		if err := m.WriteHook(chunk.ID, data); err != nil {
 			return err
