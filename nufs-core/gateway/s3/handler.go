@@ -11,29 +11,38 @@ import (
 // Gateway is the S3-compatible HTTP handler that routes requests
 // to the metadata service and data nodes.
 type Gateway struct {
-	meta      metadata.MetadataService
-	creds     *CredentialStore
-	dataNodes map[metadata.NodeID]string // nodeID -> data node address
-	mux       *http.ServeMux
+	meta       metadata.MetadataService
+	creds      *CredentialStore
+	chunkStore ChunkStore
+	dataNodes  map[metadata.NodeID]string // nodeID -> data node address
+	mux        *http.ServeMux
 }
 
 // GatewayConfig holds configuration for the S3 gateway.
 type GatewayConfig struct {
 	MetaService metadata.MetadataService
 	Creds       *CredentialStore
+	// ChunkStore is the data path used to read and write chunk payloads.
+	// If nil, NewGateway installs a DatanodeChunkStore (the production
+	// default). Tests typically inject a MemoryChunkStore.
+	ChunkStore ChunkStore
 }
 
 // NewGateway creates a new S3 gateway handler.
 func NewGateway(cfg GatewayConfig) *Gateway {
 	gw := &Gateway{
-		meta:      cfg.MetaService,
-		creds:     cfg.Creds,
-		dataNodes: make(map[metadata.NodeID]string),
-		mux:       http.NewServeMux(),
+		meta:       cfg.MetaService,
+		creds:      cfg.Creds,
+		chunkStore: cfg.ChunkStore,
+		dataNodes:  make(map[metadata.NodeID]string),
+		mux:        http.NewServeMux(),
 	}
 
 	if gw.creds == nil {
 		gw.creds = NewCredentialStore() // anonymous mode
+	}
+	if gw.chunkStore == nil {
+		gw.chunkStore = NewDatanodeChunkStore()
 	}
 
 	// Register routes — Go 1.22+ enhanced ServeMux patterns

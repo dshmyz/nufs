@@ -360,18 +360,39 @@ func (m *mockMetaService) TriggerRebalance(_ context.Context) error {
 	return nil
 }
 
+func (m *mockMetaService) RemoveRepairTask(_ context.Context, chunkID metadata.ChunkID) error {
+	return nil
+}
+
 func (m *mockMetaService) GetRepairQueue(_ context.Context) ([]metadata.RepairTask, error) {
 	return nil, nil
+}
+
+func (m *mockMetaService) ChunksByNode(_ context.Context, _ metadata.NodeID) ([]metadata.ChunkMeta, error) {
+	return nil, nil
+}
+
+func (m *mockMetaService) MigrateChunkReplica(_ context.Context, _ metadata.ChunkID, _, _ metadata.NodeID) error {
+	return nil
 }
 
 // ========== Test Helpers ==========
 
 func newTestGateway(t *testing.T) (*Gateway, *httptest.Server, *mockMetaService) {
 	t.Helper()
+	return newTestGatewayWithStore(t, NewMemoryChunkStore())
+}
+
+// newTestGatewayWithStore allows tests to inject a custom ChunkStore.
+// When store is nil a DatanodeChunkStore is used (only suitable for
+// tests that bring up a real datanode).
+func newTestGatewayWithStore(t *testing.T, store ChunkStore) (*Gateway, *httptest.Server, *mockMetaService) {
+	t.Helper()
 	meta := newMockMetaService()
 	gw := NewGateway(GatewayConfig{
 		MetaService: meta,
 		Creds:       NewCredentialStore(),
+		ChunkStore:  store,
 	})
 	ts := httptest.NewServer(gw.Handler())
 	return gw, ts, meta

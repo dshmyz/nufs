@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -66,14 +67,25 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	// In production: write data to primary replica data node via TCP,
-	// then commit chunk with checksum. For now, commit directly.
+	// Write data to each replica via the chunk store (TCP for prod,
+	// in-memory for tests).
 	checksum := crc32Checksum(data)
-	err = gw.meta.CommitChunk(ctx, chunk.ID, checksum)
-	if err != nil {
+	if err := gw.chunkStore.WriteChunk(ctx, chunk, data); err != nil {
+		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"Failed to write data to datanodes: "+err.Error(), "/"+bucket+"/"+key, requestID)
+		return
+	}
+
+	// Commit chunk with checksum
+	if err := gw.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
 		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"Failed to commit chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
 		return
+	}
+
+	// Seal chunk
+	if err := gw.meta.SealChunk(ctx, chunk.ID); err != nil {
+		log.Printf("s3gw: seal chunk %d: %v", chunk.ID, err)
 	}
 
 	// Update inode with size and chunk reference
@@ -81,9 +93,8 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 	inode.ChunkMap = []metadata.ChunkRef{
 		{ID: chunk.ID, Offset: 0, Length: int32(len(data)), Version: 1},
 	}
-	err = gw.meta.UpdateInode(ctx, inode)
-	if err != nil {
-		// Non-fatal: data is written, metadata update may lag
+	if err := gw.meta.UpdateInode(ctx, inode); err != nil {
+		log.Printf("s3gw: update inode %d: %v", inode.ID, err)
 	}
 
 	// Compute ETag from content hash
@@ -141,7 +152,47 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 		w.WriteHeader(http.StatusOK)
 	}
 
-	// TODO: In production, read chunks from data nodes and stream to client
+	// Read chunks from data nodes and stream to client
+	for _, cref := range inode.ChunkMap {
+		chunk, err := gw.meta.GetChunk(ctx, cref.ID)
+		if err != nil {
+			WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"Failed to get chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
+			return
+		}
+		if len(chunk.Replicas) == 0 {
+			continue
+		}
+
+		data, err := gw.chunkStore.ReadChunk(ctx, chunk)
+		if err != nil {
+			WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"Failed to read chunk data: "+err.Error(), "/"+bucket+"/"+key, requestID)
+			return
+		}
+
+		// Trim chunk data to requested range
+		if len(data) > 0 && (start > 0 || end < inode.Size-1) {
+			relStart := start
+			relEnd := end
+			if relStart < 0 {
+				relStart = 0
+			}
+			if relEnd >= int64(len(data)) {
+				relEnd = int64(len(data)) - 1
+			}
+			if relStart <= relEnd && relEnd < int64(len(data)) {
+				data = data[relStart : relEnd+1]
+			}
+		}
+		if _, err := w.Write(data); err != nil {
+			log.Printf("s3gw: write response: %v", err)
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
 }
 
 // handleDeleteObject handles DELETE /{bucket}/{key+}
