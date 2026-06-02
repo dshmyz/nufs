@@ -136,6 +136,7 @@ type NodeInfo struct {
 	DataDir    string      `json:"data_dir"`
 	Rack       string      `json:"rack"`
 	Zone       string      `json:"zone"`
+	MachineID  string      `json:"machine_id"`
 	Tier       StorageTier `json:"tier"`
 	CapacityGB int64       `json:"capacity_gb"`
 	UsedGB     int64       `json:"used_gb"`
@@ -192,9 +193,10 @@ type ECConfig struct {
 type TopologySpread uint8
 
 const (
-	SpreadNode TopologySpread = iota // Replicas on different nodes
-	SpreadRack                       // Replicas on different racks
-	SpreadZone                       // Replicas on different AZs/DCs
+	SpreadNode    TopologySpread = iota // Replicas on different nodes (disks)
+	SpreadMachine                       // Replicas on different machines
+	SpreadRack                          // Replicas on different racks
+	SpreadZone                          // Replicas on different AZs/DCs
 )
 
 // StorageTier defines the storage performance tier.

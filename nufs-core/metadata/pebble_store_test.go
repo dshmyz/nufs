@@ -613,6 +613,363 @@ func TestFSM_ApplyAndRestore(t *testing.T) {
 	}
 }
 
+func TestPebbleStore_RemoveRepairTask(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	// Trigger a repair task
+	err := store.TriggerRepair(ctx, 42)
+	if err != nil {
+		t.Fatalf("TriggerRepair: %v", err)
+	}
+
+	// Verify it's in the queue
+	tasks, err := store.GetRepairQueue(ctx)
+	if err != nil {
+		t.Fatalf("GetRepairQueue: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ChunkID != 42 {
+		t.Fatalf("expected 1 repair task for chunk 42, got %+v", tasks)
+	}
+
+	// Remove it
+	err = store.RemoveRepairTask(ctx, 42)
+	if err != nil {
+		t.Fatalf("RemoveRepairTask: %v", err)
+	}
+
+	// Verify queue is empty
+	tasks, err = store.GetRepairQueue(ctx)
+	if err != nil {
+		t.Fatalf("GetRepairQueue: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("expected empty repair queue, got %+v", tasks)
+	}
+}
+
+func TestPebbleStore_RemoveRepairTask_NonExistent(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	// Removing a non-existent task should not error
+	err := store.RemoveRepairTask(ctx, 999)
+	if err != nil {
+		t.Fatalf("RemoveRepairTask for non-existent task: %v", err)
+	}
+}
+
+func TestPebbleStore_ReportChunkState_Batch(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	// Create bucket with file → allocate chunk
+	err := store.CreateBucket(ctx, "batch-test", PlacementPolicy{
+		ID: "default", ReplicationFactor: 3, TopologySpread: SpreadRack,
+	})
+	if err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	bucket, err := store.GetBucket(ctx, "batch-test")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+
+	f, err := store.CreateFile(ctx, bucket.RootInode, "test.txt", 0644)
+	if err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+
+	// Register nodes first (placement policy needs healthy nodes)
+	nodeID := NodeID(1)
+	err = store.RegisterNode(ctx, &NodeInfo{
+		ID: nodeID, Addr: "host1:9100", Rack: "r1", Zone: "z1",
+		State: NodeOnline,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	// Allocate two chunks
+	chunk1, err := store.AllocateChunk(ctx, f.ID, 0, PlacementPolicy{
+		ReplicationFactor: 1, TopologySpread: SpreadNode,
+	})
+	if err != nil {
+		t.Fatalf("AllocateChunk 1: %v", err)
+	}
+
+	chunk2, err := store.AllocateChunk(ctx, f.ID, 65536, PlacementPolicy{
+		ReplicationFactor: 1, TopologySpread: SpreadNode,
+	})
+	if err != nil {
+		t.Fatalf("AllocateChunk 2: %v", err)
+	}
+
+	// Batch report state for both chunks
+	states := map[ChunkID]ReplicaState{
+		chunk1.ID: ReplicaReady,
+		chunk2.ID: ReplicaReady,
+	}
+	err = store.ReportChunkState(ctx, nodeID, states)
+	if err != nil {
+		t.Fatalf("ReportChunkState batch: %v", err)
+	}
+
+	// Verify chunk1
+	c1, err := store.GetChunk(ctx, chunk1.ID)
+	if err != nil {
+		t.Fatalf("GetChunk chunk1: %v", err)
+	}
+	found1 := false
+	for _, r := range c1.Replicas {
+		if r.NodeID == nodeID && r.State == ReplicaReady {
+			found1 = true
+			break
+		}
+	}
+	if !found1 {
+		t.Fatalf("chunk1: expected ready replica for node 1, got %+v", c1.Replicas)
+	}
+
+	// Verify chunk2
+	c2, err := store.GetChunk(ctx, chunk2.ID)
+	if err != nil {
+		t.Fatalf("GetChunk chunk2: %v", err)
+	}
+	found2 := false
+	for _, r := range c2.Replicas {
+		if r.NodeID == nodeID && r.State == ReplicaReady {
+			found2 = true
+			break
+		}
+	}
+	if !found2 {
+		t.Fatalf("chunk2: expected ready replica for node 1, got %+v", c2.Replicas)
+	}
+}
+
+func TestPebbleStore_ReportChunkState_EmptyBatch(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	// Empty batch should be a no-op
+	err := store.ReportChunkState(ctx, 1, nil)
+	if err != nil {
+		t.Fatalf("ReportChunkState nil: %v", err)
+	}
+
+	err = store.ReportChunkState(ctx, 1, map[ChunkID]ReplicaState{})
+	if err != nil {
+		t.Fatalf("ReportChunkState empty: %v", err)
+	}
+}
+
+func TestPebbleStore_ChunksByNode(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	// Register nodes
+	for i := 1; i <= 3; i++ {
+		store.RegisterNode(ctx, &NodeInfo{
+			ID: NodeID(i), Addr: fmt.Sprintf("node%d:9001", i),
+			CapacityGB: 100, Rack: fmt.Sprintf("rack%d", i), Zone: "zone1",
+			Tier: TierHot,
+		})
+	}
+
+	store.CreateBucket(ctx, "fs", PlacementPolicy{})
+	bucket, _ := store.GetBucket(ctx, "fs")
+	file, _ := store.CreateFile(ctx, bucket.RootInode, "chunks.bin", 0644)
+
+	// Allocate several chunks (they'll be auto-placed on nodes 1-3)
+	var chunkIDs []ChunkID
+	for i := 0; i < 5; i++ {
+		chunk, err := store.AllocateChunk(ctx, file.ID, int64(i)*MaxChunkSize, PlacementPolicy{
+			ReplicationFactor: 2, TopologySpread: SpreadNode,
+		})
+		if err != nil {
+			t.Fatalf("AllocateChunk %d: %v", i, err)
+		}
+		chunkIDs = append(chunkIDs, chunk.ID)
+	}
+
+	// All chunks should have at least 1 replica (they are auto-placed)
+	results, err := store.ChunksByNode(ctx, 1)
+	if err != nil {
+		t.Fatalf("ChunksByNode: %v", err)
+	}
+	if len(results) == 0 {
+		t.Error("expected at least 1 chunk for node 1")
+	}
+
+	// Verify all returned chunks have node 1 in replicas
+	for _, c := range results {
+		found := false
+		for _, r := range c.Replicas {
+			if r.NodeID == 1 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("chunk %d returned by ChunksByNode(1) but no replica on node 1", c.ID)
+		}
+	}
+}
+
+func TestPebbleStore_ChunksByNode_Empty(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	results, err := store.ChunksByNode(ctx, 1)
+	if err != nil {
+		t.Fatalf("ChunksByNode: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("expected 0 chunks, got %d", len(results))
+	}
+}
+
+func TestPebbleStore_MigrateChunkReplica(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	// Register nodes
+	for i := 1; i <= 3; i++ {
+		store.RegisterNode(ctx, &NodeInfo{
+			ID: NodeID(i), Addr: fmt.Sprintf("10.0.0.%d:9100", i),
+			CapacityGB: 100, Rack: fmt.Sprintf("rack%d", i), Zone: "zone1",
+			Tier: TierHot, State: NodeOnline,
+		})
+	}
+
+	store.CreateBucket(ctx, "test", PlacementPolicy{})
+	bucket, _ := store.GetBucket(ctx, "test")
+	file, _ := store.CreateFile(ctx, bucket.RootInode, "target.bin", 0644)
+
+	// Allocate a chunk (auto-placed on some of nodes 1-3)
+	chunk, err := store.AllocateChunk(ctx, file.ID, 0, PlacementPolicy{
+		ReplicationFactor: 2, TopologySpread: SpreadNode,
+	})
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+
+	// Find a replica to migrate
+	sourceNode := chunk.Replicas[0].NodeID
+	targetNode := NodeID(3)
+	if sourceNode == 3 {
+		targetNode = 1
+	}
+
+	// Migrate replica
+	err = store.MigrateChunkReplica(ctx, chunk.ID, sourceNode, targetNode)
+	if err != nil {
+		t.Fatalf("MigrateChunkReplica: %v", err)
+	}
+
+	// Verify migration
+	updated, err := store.GetChunk(ctx, chunk.ID)
+	if err != nil {
+		t.Fatalf("GetChunk: %v", err)
+	}
+
+	hasSource := false
+	hasTarget := false
+	for _, r := range updated.Replicas {
+		if r.NodeID == sourceNode {
+			hasSource = true
+		}
+		if r.NodeID == targetNode {
+			hasTarget = true
+		}
+	}
+	if hasSource {
+		t.Errorf("node %d should not be a replica after migration", sourceNode)
+	}
+	if !hasTarget {
+		t.Errorf("node %d should be a replica after migration", targetNode)
+	}
+}
+
+func TestPebbleStore_MigrateChunkReplica_NotFound(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	err := store.MigrateChunkReplica(ctx, 999, 1, 2)
+	if err == nil {
+		t.Error("expected error for non-existent chunk")
+	}
+}
+
+func TestPebbleStore_TriggerRebalanceWithChunks(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	// Register nodes
+	for i := 1; i <= 3; i++ {
+		store.RegisterNode(ctx, &NodeInfo{
+			ID: NodeID(i), Addr: fmt.Sprintf("10.0.0.%d:9100", i),
+			CapacityGB: 1000, Rack: fmt.Sprintf("rack%d", i), Zone: "zone1",
+			Tier: TierHot, State: NodeOnline,
+		})
+	}
+
+	store.CreateBucket(ctx, "test", PlacementPolicy{})
+	bucket, _ := store.GetBucket(ctx, "test")
+	file, _ := store.CreateFile(ctx, bucket.RootInode, "data.bin", 0644)
+
+	// Allocate several chunks
+	for i := 0; i < 5; i++ {
+		_, err := store.AllocateChunk(ctx, file.ID, int64(i)*MaxChunkSize, PlacementPolicy{
+			ReplicationFactor: 2, TopologySpread: SpreadNode,
+		})
+		if err != nil {
+			t.Fatalf("AllocateChunk %d: %v", i, err)
+		}
+	}
+
+	// Override chunk counts to create imbalance
+	nodes, _ := store.ListNodes(ctx)
+	for _, n := range nodes {
+		info, _ := store.GetNode(ctx, n.ID)
+		// Set node 1 as heavily loaded
+		if info.ID == 1 {
+			info.ChunkCount = 500
+			info.UsedGB = 500
+		} else {
+			info.ChunkCount = 10
+			info.UsedGB = 10
+		}
+		key := fmt.Sprintf("%s%d", prefixNode, info.ID)
+		store.putJSON(key, info)
+	}
+
+	// Trigger rebalance
+	err := store.TriggerRebalance(ctx)
+	if err != nil {
+		t.Fatalf("TriggerRebalance: %v", err)
+	}
+
+	// Verify repair tasks were created with real chunk IDs
+	tasks, err := store.GetRepairQueue(ctx)
+	if err != nil {
+		t.Fatalf("GetRepairQueue: %v", err)
+	}
+	if len(tasks) == 0 {
+		t.Error("expected repair tasks after trigger rebalance")
+	}
+	for _, task := range tasks {
+		if task.ChunkID == 0 {
+			t.Errorf("repair task has ChunkID=0, should have real chunk ID")
+		}
+		if task.Reason == "" {
+			t.Errorf("repair task for chunk %d has empty reason", task.ChunkID)
+		}
+	}
+}
+
 // testSnapshotSink is a minimal raft.SnapshotSink for testing.
 type testSnapshotSink struct {
 	buf *bytes.Buffer

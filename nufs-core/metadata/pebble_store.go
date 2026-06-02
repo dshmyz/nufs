@@ -759,7 +759,11 @@ func (s *PebbleStore) AllocateChunk(ctx context.Context, inodeID InodeID, offset
 
 	replicas := make([]ReplicaInfo, 0, len(nodeIDs))
 	for _, nid := range nodeIDs {
-		replicas = append(replicas, ReplicaInfo{NodeID: nid, State: ReplicaSyncing})
+		addr := ""
+		if n, err := s.GetNode(ctx, nid); err == nil {
+			addr = n.Addr
+		}
+		replicas = append(replicas, ReplicaInfo{NodeID: nid, Addr: addr, State: ReplicaSyncing})
 	}
 
 	chunk := &ChunkMeta{
@@ -898,6 +902,19 @@ func (s *PebbleStore) ReportChunkState(ctx context.Context, nodeID NodeID, state
 	if s.closed.Load() {
 		return ErrServiceClosed
 	}
+	if len(states) == 0 {
+		return nil
+	}
+	return s.batchUpdateChunkStates(nodeID, states)
+}
+
+const maxBatchOps = 1000
+
+// batchUpdateChunkStates updates replica states for multiple chunks in a single batch.
+func (s *PebbleStore) batchUpdateChunkStates(nodeID NodeID, states map[ChunkID]ReplicaState) error {
+	ops := make([]batchJSONOp, 0, len(states))
+	deletes := make([]string, 0)
+
 	for chunkID, state := range states {
 		key := fmt.Sprintf("%s%d", prefixChunk, chunkID)
 		var chunk ChunkMeta
@@ -905,13 +922,33 @@ func (s *PebbleStore) ReportChunkState(ctx context.Context, nodeID NodeID, state
 		if err != nil || !exists {
 			continue
 		}
+		updated := false
 		for i := range chunk.Replicas {
 			if chunk.Replicas[i].NodeID == nodeID {
 				chunk.Replicas[i].State = state
+				updated = true
 				break
 			}
 		}
-		s.putJSON(key, &chunk)
+		if !updated {
+			chunk.Replicas = append(chunk.Replicas, ReplicaInfo{
+				NodeID: nodeID,
+				State:  state,
+			})
+		}
+		ops = append(ops, batchJSONOp{Key: key, Value: &chunk})
+
+		// Flush in batches to avoid oversized Raft entries
+		if len(ops) >= maxBatchOps {
+			if err := s.applyBatchJSON(ops, deletes); err != nil {
+				return err
+			}
+			ops = ops[:0]
+		}
+	}
+
+	if len(ops) > 0 {
+		return s.applyBatchJSON(ops, deletes)
 	}
 	return nil
 }
@@ -1070,6 +1107,14 @@ func (s *PebbleStore) TriggerRepair(ctx context.Context, chunkID ChunkID) error 
 	return s.putJSON(key, &task)
 }
 
+func (s *PebbleStore) RemoveRepairTask(ctx context.Context, chunkID ChunkID) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	key := fmt.Sprintf("%s%d", prefixRepair, chunkID)
+	return s.deleteKey(key)
+}
+
 // ========== Raft-Aware Write Path ==========
 
 // SetRaftNode configures the PebbleStore to use Raft for consensus.
@@ -1168,17 +1213,34 @@ func (s *PebbleStore) TriggerRebalance(ctx context.Context) error {
 	}
 
 	planner := &RebalancePlanner{}
-	result := planner.PlanRebalance(nodes, 0.1)
-	if result.Balanced {
+
+	// Build node→chunks map for concrete chunk IDs
+	chunkMap := make(map[NodeID][]ChunkID)
+	s.scanPrefix(prefixChunk, func(key, val []byte) error {
+		var chunk ChunkMeta
+		if err := json.Unmarshal(val, &chunk); err != nil {
+			return nil
+		}
+		for _, r := range chunk.Replicas {
+			chunkMap[r.NodeID] = append(chunkMap[r.NodeID], chunk.ID)
+		}
+		return nil
+	})
+
+	result := planner.PlanRebalanceWithChunks(nodes, chunkMap, 0.1)
+	if result.Balanced || len(result.Plans) == 0 {
 		return nil
 	}
 
-	// Create repair tasks for each migration plan
 	for _, plan := range result.Plans {
+		if plan.ChunkID == 0 {
+			continue
+		}
 		key := fmt.Sprintf("%s%d", prefixRepair, plan.ChunkID)
 		task := RepairTask{
 			ChunkID:   plan.ChunkID,
-			Reason:    fmt.Sprintf("rebalance:%s", plan.Reason),
+			Reason:    fmt.Sprintf("rebalance: node %d → %d", plan.SourceNode, plan.TargetNode),
+			Priority:  2,
 			CreatedAt: time.Now(),
 		}
 		if err := s.putJSON(key, &task); err != nil {
@@ -1186,6 +1248,71 @@ func (s *PebbleStore) TriggerRebalance(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// ChunksByNode scans all chunks and returns those with a replica on the given node.
+func (s *PebbleStore) ChunksByNode(ctx context.Context, nodeID NodeID) ([]ChunkMeta, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	var result []ChunkMeta
+	err := s.scanPrefix(prefixChunk, func(key, val []byte) error {
+		var chunk ChunkMeta
+		if err := json.Unmarshal(val, &chunk); err != nil {
+			return nil
+		}
+		for _, r := range chunk.Replicas {
+			if r.NodeID == nodeID {
+				result = append(result, chunk)
+				break
+			}
+		}
+		return nil
+	})
+	return result, err
+}
+
+// MigrateChunkReplica removes a replica from fromNode and adds one on toNode.
+// This updates the metadata record only; actual data transfer happens via the repair queue.
+func (s *PebbleStore) MigrateChunkReplica(ctx context.Context, chunkID ChunkID, fromNode, toNode NodeID) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	chunk, err := s.GetChunk(ctx, chunkID)
+	if err != nil {
+		return err
+	}
+
+	// Get target node address
+	var toAddr string
+	nodes, _ := s.ListNodes(ctx)
+	for _, n := range nodes {
+		if n.ID == toNode {
+			toAddr = n.Addr
+			break
+		}
+	}
+	if toAddr == "" {
+		return fmt.Errorf("target node %d not found", toNode)
+	}
+
+	// Remove old replica
+	newReplicas := make([]ReplicaInfo, 0, len(chunk.Replicas))
+	for _, r := range chunk.Replicas {
+		if r.NodeID != fromNode {
+			newReplicas = append(newReplicas, r)
+		}
+	}
+
+	// Add new replica
+	newReplicas = append(newReplicas, ReplicaInfo{
+		NodeID: toNode,
+		Addr:   toAddr,
+		State:  ReplicaSyncing,
+	})
+
+	chunk.Replicas = newReplicas
+	return s.UpdateChunk(ctx, chunk)
 }
 
 // ScanAllInodes iterates over all inode metadata (used by lifecycle engine).

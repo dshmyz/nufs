@@ -357,3 +357,64 @@ func TestChunkIDGenerator_Monotonic(t *testing.T) {
 		prev = id
 	}
 }
+
+func makeTestNodeWithMachine(id NodeID, rack, zone, machineID string, capGB, usedGB int64, state NodeState) *NodeInfo {
+	n := makeTestNode(id, rack, zone, TierHot, capGB, usedGB, state)
+	n.MachineID = machineID
+	return n
+}
+
+func TestPlacementEngine_MachineSpread(t *testing.T) {
+	pe := NewPlacementEngine()
+
+	// Two nodes on machine-A, one on machine-B, one on machine-C
+	pe.UpdateNode(makeTestNodeWithMachine(1, "rack-1", "zone-1", "machine-A", 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNodeWithMachine(2, "rack-1", "zone-1", "machine-A", 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNodeWithMachine(3, "rack-2", "zone-1", "machine-B", 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNodeWithMachine(4, "rack-3", "zone-1", "machine-C", 1000, 100, NodeOnline))
+
+	policy := PlacementPolicy{
+		ReplicationFactor: 3,
+		TopologySpread:    SpreadMachine,
+	}
+
+	selected, err := pe.PlaceChunk(policy, nil)
+	if err != nil {
+		t.Fatalf("PlaceChunk: %v", err)
+	}
+	if len(selected) != 3 {
+		t.Fatalf("expected 3 replicas, got %d", len(selected))
+	}
+
+	// Verify all on different machines
+	machines := map[string]bool{}
+	for _, nid := range selected {
+		node := pe.nodes[nid]
+		if machines[node.MachineID] {
+			t.Fatalf("two replicas on same machine: %s", node.MachineID)
+		}
+		machines[node.MachineID] = true
+	}
+}
+
+func TestPlacementEngine_MachineSpreadRelaxation(t *testing.T) {
+	pe := NewPlacementEngine()
+
+	// 3 nodes but only 2 machines — SpreadMachine should relax
+	pe.UpdateNode(makeTestNodeWithMachine(1, "rack-1", "zone-1", "machine-A", 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNodeWithMachine(2, "rack-1", "zone-1", "machine-A", 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNodeWithMachine(3, "rack-1", "zone-1", "machine-B", 1000, 100, NodeOnline))
+
+	policy := PlacementPolicy{
+		ReplicationFactor: 3,
+		TopologySpread:    SpreadMachine,
+	}
+
+	selected, err := pe.PlaceChunk(policy, nil)
+	if err != nil {
+		t.Fatalf("PlaceChunk with relaxed machine spread: %v", err)
+	}
+	if len(selected) != 3 {
+		t.Fatalf("expected 3 replicas (relaxed), got %d", len(selected))
+	}
+}

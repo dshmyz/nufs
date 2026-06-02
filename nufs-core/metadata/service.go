@@ -55,9 +55,16 @@ type MetadataService interface {
 	// Repair operations
 	GetRepairQueue(ctx context.Context) ([]RepairTask, error)
 	TriggerRepair(ctx context.Context, chunkID ChunkID) error
+	RemoveRepairTask(ctx context.Context, chunkID ChunkID) error
 
 	// Rebalance operations
 	TriggerRebalance(ctx context.Context) error
+
+	// Scaling: scan all chunks for a specific node
+	ChunksByNode(ctx context.Context, nodeID NodeID) ([]ChunkMeta, error)
+
+	// Replica migration: move a chunk replica from one node to another
+	MigrateChunkReplica(ctx context.Context, chunkID ChunkID, fromNode, toNode NodeID) error
 
 	// Lifecycle
 	Close() error

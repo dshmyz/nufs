@@ -189,6 +189,8 @@ func (p *PlacementEngine) getDomain(n *NodeInfo, spread TopologySpread) string {
 		return n.Zone
 	case SpreadRack:
 		return n.Rack
+	case SpreadMachine:
+		return n.MachineID
 	default:
 		// SpreadNode: each node is its own domain
 		return fmt.Sprintf("node-%d", n.ID)
