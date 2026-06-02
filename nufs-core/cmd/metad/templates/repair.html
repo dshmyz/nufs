@@ -1,0 +1,63 @@
+{{define "repair"}}<!DOCTYPE html>
+<html>{{template "head" .}}
+<body>
+<div class="layout">
+{{template "sidebar" .}}
+<div class="main">
+{{template "topbar" .}}
+<div class="content">
+<div class="toolbar">
+  <button class="btn btn-primary" onclick="triggerRepair()">Trigger Repair</button>
+</div>
+<div class="card">
+  <div class="card-header"><h3>Repair Queue</h3><span class="badge badge-info">{{len .Tasks}} pending</span></div>
+  <div class="card-body p-0">
+    <table class="table">
+      <thead><tr><th data-sort="int">Chunk ID</th><th data-sort="string">Reason</th><th data-sort="int">Priority</th><th data-sort="string">Created</th><th>Actions</th></tr></thead>
+      <tbody>
+        {{range .Tasks}}
+        <tr>
+          <td>{{.ChunkID}}</td><td>{{.Reason}}</td>
+          <td><span class="badge badge-{{if gt .Priority 5}}danger{{else if gt .Priority 2}}warning{{else}}info{{end}}">{{.Priority}}</span></td>
+          <td>{{formatTime .CreatedAt}}</td>
+          <td><button class="btn btn-sm btn-danger" onclick="removeRepair({{.ChunkID}})">Remove</button></td>
+        </tr>
+        {{else}}<tr><td colspan="5" class="empty">No pending repairs</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+<div class="modal-overlay" id="triggerRepairModal" style="display:none" onclick="if(event.target===this)hideTriggerRepair()">
+  <div class="modal">
+    <div class="modal-header"><h3>Trigger Repair</h3><button class="modal-close" onclick="hideTriggerRepair()">&times;</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label>Chunk ID</label><input type="text" id="repairChunkID" class="input" placeholder="Enter chunk ID"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="hideTriggerRepair()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitRepair()">Trigger</button>
+    </div>
+  </div>
+</div>
+</div>
+</div>
+</div>
+{{template "scripts_base" .}}
+<script>
+function triggerRepair(){document.getElementById('triggerRepairModal').style.display='flex'}
+function hideTriggerRepair(){document.getElementById('triggerRepairModal').style.display='none'}
+function submitRepair(){
+  const id=document.getElementById('repairChunkID').value.trim();
+  if(!id){alert('Chunk ID required');return}
+  fetch('/api/v1/repair/trigger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chunk_id:parseInt(id)})})
+  .then(r=>r.json()).then(d=>{if(d.error){alert('Error: '+d.error)}else{hideTriggerRepair();location.reload()}})
+  .catch(e=>alert('Error: '+e))
+}
+function removeRepair(id){
+  if(!confirm('Remove repair task for chunk '+id+'?'))return;
+  fetch('/api/v1/repair/'+id,{method:'DELETE'}).then(r=>r.json()).then(d=>{if(d.error){alert('Error: '+d.error)}else{location.reload()}}).catch(e=>alert('Error: '+e))
+}
+</script>
+</body>
+</html>{{end}}

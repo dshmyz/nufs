@@ -1,0 +1,60 @@
+{{define "buckets"}}<!DOCTYPE html>
+<html>{{template "head" .}}
+<body>
+<div class="layout">
+{{template "sidebar" .}}
+<div class="main">
+{{template "topbar" .}}
+<div class="content">
+<div class="toolbar">
+  <button class="btn btn-primary" onclick="showCreateBucket()">+ Create Bucket</button>
+</div>
+<div class="card">
+  <div class="card-header"><h3>All Buckets</h3><span class="badge badge-info">{{len .Buckets}} total</span></div>
+  <div class="card-body p-0">
+    <table class="table">
+      <thead><tr><th data-sort="string">Name</th><th data-sort="string">Policy</th><th data-sort="int">Replicas</th><th data-sort="int">Root Inode</th><th data-sort="string">Created</th></tr></thead>
+      <tbody>
+        {{range .Buckets}}
+        <tr><td><strong>{{.Name}}</strong></td><td>{{.Policy.ID}}</td><td>{{.Policy.ReplicationFactor}}</td><td>{{.RootInode}}</td><td>{{formatTime .CreationDate}}</td></tr>
+        {{else}}<tr><td colspan="5" class="empty">No buckets</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+<div class="modal-overlay" id="createBucketModal" style="display:none" onclick="if(event.target===this)hideCreateBucket()">
+  <div class="modal">
+    <div class="modal-header"><h3>Create Bucket</h3><button class="modal-close" onclick="hideCreateBucket()">&times;</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label>Bucket Name</label><input type="text" id="bucketName" class="input" placeholder="my-bucket"></div>
+      <div class="form-group"><label>Replication Factor</label><input type="number" id="bucketReplicas" class="input" value="3" min="1" max="7"></div>
+      <div class="form-group"><label>Placement Policy</label>
+        <select id="bucketPolicy" class="input"><option value="default">Default</option><option value="ssd">SSD Only</option><option value="hdd">HDD Only</option><option value="ec">Erasure Coding</option></select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="hideCreateBucket()">Cancel</button>
+      <button class="btn btn-primary" onclick="createBucket()">Create</button>
+    </div>
+  </div>
+</div>
+</div>
+</div>
+</div>
+{{template "scripts_base" .}}
+<script>
+function showCreateBucket(){document.getElementById('createBucketModal').style.display='flex'}
+function hideCreateBucket(){document.getElementById('createBucketModal').style.display='none'}
+function createBucket(){
+  const name=document.getElementById('bucketName').value.trim();
+  const replicas=parseInt(document.getElementById('bucketReplicas').value)||3;
+  const policy=document.getElementById('bucketPolicy').value;
+  if(!name){alert('Bucket name is required');return}
+  fetch('/api/v1/buckets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,policy:{id:policy,replication_factor:replicas}})})
+  .then(r=>r.json()).then(d=>{if(d.error){alert('Error: '+d.error)}else{hideCreateBucket();location.reload()}})
+  .catch(e=>alert('Error: '+e))
+}
+</script>
+</body>
+</html>{{end}}

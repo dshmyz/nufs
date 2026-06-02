@@ -1,0 +1,124 @@
+{{define "overview"}}<!DOCTYPE html>
+<html>{{template "head" .}}
+<body>
+<div class="layout">
+{{template "sidebar" .}}
+<div class="main">
+{{template "topbar" .}}
+<div class="content">
+
+{{if .IsEmpty}}
+<div class="empty-state">
+  <div class="empty-icon">
+    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+  </div>
+  <h2>Welcome to NUFS</h2>
+  <p class="empty-desc">Your cluster is empty. Create demo data to explore the dashboard.</p>
+  <button class="btn btn-primary btn-lg" onclick="seedDemo(this)">Create Demo Data</button>
+  <p class="empty-hint">This will create 3 nodes, 2 buckets, and sample chunks.</p>
+</div>
+{{else}}
+
+<div class="stats-grid">
+  <div class="stat-card stat-blue">
+    <div class="stat-value" id="stat-nodes-total">{{len .Nodes}}</div>
+    <div class="stat-label">Total Nodes</div>
+    <div class="stat-sub" id="stat-nodes-sub">
+      <span class="stat-green">{{.OnlineNodes}} online</span>
+      {{if .DrainingNodes}}&middot; <span class="stat-yellow">{{.DrainingNodes}} draining</span>{{end}}
+      {{if .OfflineNodes}}&middot; <span class="stat-red">{{.OfflineNodes}} offline</span>{{end}}
+    </div>
+  </div>
+  <div class="stat-card stat-green">
+    <div class="stat-value" id="stat-buckets">{{len .Buckets}}</div>
+    <div class="stat-label">Buckets</div>
+  </div>
+  <div class="stat-card stat-purple">
+    <div class="stat-value" id="stat-chunks">{{.ChunkCount}}</div>
+    <div class="stat-label">Total Chunks</div>
+  </div>
+  <div class="stat-card stat-orange">
+    <div class="stat-value" id="stat-repairs">{{.RepairLen}}</div>
+    <div class="stat-label">Pending Repairs</div>
+  </div>
+  <div class="stat-card" style="background:var(--card-bg);border:1px solid var(--border-light);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px;position:relative;overflow:hidden">
+    <div class="stat-value" id="stat-ops-rate" style="color:var(--primary);font-size:1.6rem">0.0</div>
+    <div class="stat-label">Ops / sec</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3>Cluster Capacity</h3></div>
+  <div class="card-body">
+    <div class="capacity-bar">
+      <div class="capacity-fill" id="capacity-fill" style="width: {{printf "%.0f" .CapacityPct}}%"></div>
+    </div>
+    <div class="capacity-labels">
+      <span id="capacity-used">{{.UsedCapacity}} GB used</span>
+      <span id="capacity-total">{{.TotalCapacity}} GB total ({{printf "%.1f" .CapacityPct}}%)</span>
+    </div>
+  </div>
+</div>
+
+<div class="card" id="chart-card">
+  <div class="card-header"><h3>Operations Rate <span class="live-badge">LIVE</span></h3></div>
+  <div class="card-body">
+    <canvas id="ops-chart" width="1000" height="220"></canvas>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3>Nodes</h3><a href="/admin/nodes" class="btn btn-sm">View All</a></div>
+  <div class="card-body p-0">
+    <table class="table">
+      <thead><tr><th>ID</th><th>Address</th><th>State</th><th>Capacity</th><th>Used</th><th>Chunks</th></tr></thead>
+      <tbody>
+        {{range .Nodes}}
+        <tr>
+          <td><a href="/admin/nodes/{{.ID}}">{{.ID}}</a></td>
+          <td>{{.Addr}}</td>
+          <td><span class="badge badge-{{stateClass .State}}">{{stateLabel .State}}</span></td>
+          <td>{{.CapacityGB}} GB</td>
+          <td>{{.UsedGB}} GB</td>
+          <td>{{.ChunkCount}}</td>
+        </tr>
+        {{else}}<tr><td colspan="6" class="empty">No nodes registered</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3>Buckets</h3><a href="/admin/buckets" class="btn btn-sm">View All</a></div>
+  <div class="card-body p-0">
+    <table class="table">
+      <thead><tr><th>Name</th><th>Policy</th><th>Replicas</th><th>Created</th></tr></thead>
+      <tbody>
+        {{range .Buckets}}
+        <tr><td>{{.Name}}</td><td>{{.Policy.ID}}</td><td>{{.Policy.ReplicationFactor}}</td><td>{{formatTime .CreationDate}}</td></tr>
+        {{else}}<tr><td colspan="4" class="empty">No buckets</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{end}}
+</div>
+</div>
+</div>
+{{template "scripts_base" .}}
+{{if .IsEmpty}}
+<script>
+function seedDemo(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Creating...';
+  fetch('/admin/seed', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => { if (d.error) { alert('Error: ' + d.error); btn.disabled = false; btn.textContent = 'Create Demo Data'; } else { location.reload(); } })
+    .catch(e => { alert('Error: ' + e); btn.disabled = false; btn.textContent = 'Create Demo Data'; });
+}
+</script>
+{{end}}
+</body>
+</html>{{end}}

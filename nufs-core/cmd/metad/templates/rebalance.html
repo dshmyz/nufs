@@ -1,0 +1,55 @@
+{{define "rebalance"}}<!DOCTYPE html>
+<html>{{template "head" .}}
+<body>
+<div class="layout">
+{{template "sidebar" .}}
+<div class="main">
+{{template "topbar" .}}
+<div class="content">
+<div class="card">
+  <div class="card-header"><h3>Cluster Rebalance</h3></div>
+  <div class="card-body">
+    <p class="text-muted">Rebalance redistributes chunks across all available nodes to balance storage utilization.</p>
+    <button class="btn btn-primary" onclick="triggerRebalance(this)">Trigger Rebalance</button>
+  </div>
+</div>
+<div id="rebalanceResult"></div>
+<div class="card">
+  <div class="card-header"><h3>Node Utilization</h3></div>
+  <div class="card-body"><table class="table">
+    <thead><tr><th>Node ID</th><th>Address</th><th>Capacity</th><th>Used</th><th>Utilization</th><th>Chunks</th></tr></thead>
+    <tbody id="utilBody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+  </table></div>
+</div>
+</div>
+</div>
+</div>
+{{template "scripts_base" .}}
+<script>
+document.addEventListener('DOMContentLoaded',loadUtilization);
+function loadUtilization(){
+  fetch('/api/v1/nodes').then(r=>r.json()).then(nodes=>{
+    const tbody=document.getElementById('utilBody');
+    if(!nodes||!nodes.length){tbody.innerHTML='<tr><td colspan="6" class="empty">No nodes</td></tr>';return}
+    let html='';
+    nodes.sort((a,b)=>a.id-b.id).forEach(function(n){
+      const pct=n.capacity_gb>0?(n.used_gb/n.capacity_gb*100):0;
+      html+='<tr><td><a href="/admin/nodes/'+n.id+'">'+n.id+'</a></td><td>'+n.addr+'</td><td>'+n.capacity_gb+' GB</td><td>'+n.used_gb+' GB</td>';
+      html+='<td><div class="mini-bar"><div class="mini-fill '+(pct>90?'fill-danger':pct>70?'fill-warning':'fill-green')+'" style="width:'+pct.toFixed(0)+'%"></div></div> '+pct.toFixed(1)+'%</td><td>'+n.chunk_count+'</td></tr>';
+    });
+    tbody.innerHTML=html;
+  }).catch(e=>{document.getElementById('utilBody').innerHTML='<tr><td colspan="6" class="empty">Failed: '+e.message+'</td></tr>'});
+}
+function triggerRebalance(btn){
+  if(!confirm('Trigger cluster rebalance?'))return;
+  btn.disabled=true;btn.textContent='Rebalancing...';
+  const el=document.getElementById('rebalanceResult');
+  fetch('/api/v1/rebalance/trigger',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.error){el.innerHTML='<div class="card"><div class="card-body"><p style="color:var(--red)">'+d.error+'</p></div></div>'}
+    else{el.innerHTML='<div class="card"><div class="card-body"><p style="color:var(--green)">Rebalance triggered.</p></div></div>';setTimeout(loadUtilization,2000)}
+  }).catch(e=>{el.innerHTML='<div class="card"><div class="card-body"><p style="color:var(--red)">'+e.message+'</p></div></div>'})
+  .finally(()=>{btn.disabled=false;btn.textContent='Trigger Rebalance'});
+}
+</script>
+</body>
+</html>{{end}}

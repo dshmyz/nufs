@@ -1,0 +1,58 @@
+{{define "sidebar"}}
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <h1 class="sidebar-logo">NUFS</h1>
+    <span class="sidebar-subtitle">Admin Console</span>
+  </div>
+  <nav class="sidebar-nav">
+    <a href="/admin/" class="{{if eq .Title "Cluster Overview"}}active{{end}}">
+      <span class="nav-icon">&#9679;</span> Overview
+    </a>
+    <a href="/admin/nodes" class="{{if hasPrefix .Title "Node"}}active{{end}}">
+      <span class="nav-icon">&#9644;</span> Nodes
+    </a>
+    <a href="/admin/buckets" class="{{if eq .Title "Buckets"}}active{{end}}">
+      <span class="nav-icon">&#9632;</span> Buckets
+    </a>
+    <a href="/admin/chunks" class="{{if eq .Title "Chunks"}}active{{end}}">
+      <span class="nav-icon">&#9642;</span> Chunks
+    </a>
+    <a href="/admin/repair" class="{{if eq .Title "Repair Queue"}}active{{end}}">
+      <span class="nav-icon">&#9881;</span> Repair
+    </a>
+    <a href="/admin/rebalance" class="{{if eq .Title "Rebalance"}}active{{end}}">
+      <span class="nav-icon">&#8635;</span> Rebalance
+    </a>
+  </nav>
+</aside>
+{{end}}
+
+{{define "topbar"}}
+<header class="topbar">
+  <div class="topbar-left">
+    <h2>{{.Title}}</h2>
+  </div>
+  <div class="topbar-right">
+    <span class="leader-badge {{if .IsLeader}}leader-yes{{else}}leader-no{{end}}">
+      {{if .IsLeader}}&#9679; Leader{{else}}&#9675; Follower{{end}}
+    </span>
+    <span class="version-badge">v{{.Version}}</span>
+  </div>
+</header>
+{{if not .IsLeader}}
+<div class="notice notice-warning">This node is not the Raft leader. Some operations may be read-only.</div>
+{{end}}
+{{end}}
+
+{{define "head"}}
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{.Title}} - NUFS Admin</title>
+<link rel="stylesheet" href="/admin/static/css/style.css">
+</head>
+{{end}}
+
+{{define "scripts_base"}}
+<script src="/admin/static/js/app.js"></script>
+{{end}}
