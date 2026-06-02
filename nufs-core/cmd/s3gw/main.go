@@ -18,23 +18,17 @@ import (
 func main() {
 	var (
 		listenAddr = flag.String("listen", ":8080", "HTTP listen address")
-		metaDir    = flag.String("meta-dir", "/var/lib/dfs/metadata", "Pebble metadata directory")
+		metaAddr   = flag.String("meta-addr", "localhost:8091", "Metadata service address (host:port)")
 		accessKey  = flag.String("access-key", "", "Access key for auth (empty = anonymous)")
 		secretKey  = flag.String("secret-key", "", "Secret key for auth")
 	)
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
-	log.Println("s3gw: starting S3 gateway...")
+	log.Printf("s3gw: starting S3 gateway (meta=%s)", *metaAddr)
 
-	// Create metadata store (PebbleStore)
-	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
-		Dir: *metaDir,
-	})
-	if err != nil {
-		log.Fatalf("s3gw: failed to create metadata store: %v", err)
-	}
-	defer store.Close()
+	// Connect to remote metadata service
+	meta := metadata.NewHTTPClient("http://"+*metaAddr, 30*time.Second)
 
 	// Setup credentials
 	creds := gos3.NewCredentialStore()
@@ -45,9 +39,11 @@ func main() {
 		log.Println("s3gw: running in anonymous mode (no auth)")
 	}
 
+	defer meta.Close()
+
 	// Create gateway
 	gw := gos3.NewGateway(gos3.GatewayConfig{
-		MetaService: store,
+		MetaService: meta,
 		Creds:       creds,
 	})
 
