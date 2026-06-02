@@ -73,7 +73,8 @@ func (d *DFSDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*
 		return nil, syscall.EIO
 	}
 
-	child := newChildInode(d.meta, metaInode)
+	dfs := rootFromInode(&d.Inode)
+	child := newChildInode(dfs, metaInode)
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{
@@ -83,6 +84,19 @@ func (d *DFSDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*
 
 	out.Attr = attr
 	return inode, 0
+}
+
+// rootFromInode walks up to the DFSFileSystem root so newChildInode
+// can read the chunk store. go-fuse exposes the embedder tree via
+// Inode.Root().Operations(), which is the DFSFileSystem instance we
+// constructed in NewDFSFileSystem. The argument is a pointer so
+// the embedded fs.Inode (which contains a sync.Mutex) is not copied.
+func rootFromInode(inode *fs.Inode) *DFSFileSystem {
+	root := inode.Root().Operations()
+	if r, ok := root.(*DFSFileSystem); ok {
+		return r
+	}
+	return nil
 }
 
 // Mkdir creates a new directory.
@@ -140,7 +154,8 @@ func (d *DFSDir) Create(ctx context.Context, name string, flags uint32, mode uin
 		}
 	}
 
-	file := &DFSFile{meta: d.meta, inodeID: metaInode.ID}
+	dfs := rootFromInode(&d.Inode)
+	file := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, file, fs.StableAttr{
@@ -225,7 +240,8 @@ func (d *DFSDir) Link(ctx context.Context, target fs.InodeEmbedder, name string,
 		return nil, syscall.EIO
 	}
 
-	child := &DFSFile{meta: d.meta, inodeID: metaInode.ID}
+	dfs := rootFromInode(&d.Inode)
+	child := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{

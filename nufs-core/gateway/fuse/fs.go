@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/example/dfs/gateway"
 	"github.com/example/dfs/metadata"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -18,7 +19,8 @@ import (
 type DFSFileSystem struct {
 	fs.Inode
 
-	meta metadata.MetadataService
+	meta       metadata.MetadataService
+	chunkStore gateway.ChunkStore
 
 	// Inode cache: metadata.InodeID -> *fs.Inode
 	mu       sync.RWMutex
@@ -26,16 +28,17 @@ type DFSFileSystem struct {
 }
 
 // NewDFSFileSystem creates a new FUSE filesystem root.
-func NewDFSFileSystem(meta metadata.MetadataService) *DFSFileSystem {
+func NewDFSFileSystem(meta metadata.MetadataService, chunkStore gateway.ChunkStore) *DFSFileSystem {
 	return &DFSFileSystem{
-		meta:     meta,
-		inodeMap: make(map[metadata.InodeID]*fs.Inode),
+		meta:       meta,
+		chunkStore: chunkStore,
+		inodeMap:   make(map[metadata.InodeID]*fs.Inode),
 	}
 }
 
 // Mount mounts the DFS filesystem at the given mountpoint.
-func Mount(mountpoint string, meta metadata.MetadataService, opts *fuse.MountOptions) (*fuse.Server, error) {
-	root := NewDFSFileSystem(meta)
+func Mount(mountpoint string, meta metadata.MetadataService, chunkStore gateway.ChunkStore, opts *fuse.MountOptions) (*fuse.Server, error) {
+	root := NewDFSFileSystem(meta, chunkStore)
 
 	if opts == nil {
 		opts = &fuse.MountOptions{
@@ -72,16 +75,16 @@ func (dfs *DFSFileSystem) getInode(metaID metadata.InodeID) *fs.Inode {
 // ========== Inode type resolution ==========
 
 // newChildInode creates the appropriate InodeEmbedder based on file type.
-func newChildInode(meta metadata.MetadataService, metaInode *metadata.InodeMeta) fs.InodeEmbedder {
+func newChildInode(dfs *DFSFileSystem, metaInode *metadata.InodeMeta) fs.InodeEmbedder {
 	switch metaInode.Type {
 	case metadata.FileDirectory:
-		return &DFSDir{meta: meta, inodeID: metaInode.ID}
+		return &DFSDir{meta: dfs.meta, inodeID: metaInode.ID}
 	case metadata.FileRegular:
-		return &DFSFile{meta: meta, inodeID: metaInode.ID}
+		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID}
 	case metadata.FileSymlink:
-		return &DFSSymlink{meta: meta, inodeID: metaInode.ID}
+		return &DFSSymlink{meta: dfs.meta, inodeID: metaInode.ID}
 	default:
-		return &DFSFile{meta: meta, inodeID: metaInode.ID}
+		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID}
 	}
 }
 

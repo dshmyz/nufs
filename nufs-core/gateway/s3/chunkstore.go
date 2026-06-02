@@ -8,23 +8,28 @@ import (
 	"time"
 
 	"github.com/example/dfs/datanode"
+	"github.com/example/dfs/gateway"
 	"github.com/example/dfs/metadata"
 )
 
 // ChunkStore is the data path used by the S3 gateway to read and write
-// chunk payloads. Production uses DatanodeChunkStore; tests can inject
+// chunk payloads. It is a type alias for gateway.ChunkStore, defined
+// here so existing callers that reference s3.ChunkStore keep working
+// after the interface was lifted into the parent gateway package.
+//
+// Production uses DatanodeChunkStore; tests can inject
 // MemoryChunkStore to avoid requiring a real datanode.
-type ChunkStore interface {
-	// WriteChunk writes the given data to all replicas for the chunk.
-	// It returns nil only when at least minReplicas replicas have
-	// acknowledged the write.
-	WriteChunk(ctx context.Context, chunk *metadata.ChunkMeta, data []byte) error
+type ChunkStore = gateway.ChunkStore
 
-	// ReadChunk reads the chunk payload from the first healthy replica.
-	// The returned slice may be larger than the requested range; callers
-	// are responsible for trimming.
-	ReadChunk(ctx context.Context, chunk *metadata.ChunkMeta) ([]byte, error)
-}
+// Compile-time guards: the two implementations below must satisfy
+// both gateway.ChunkStore (the canonical interface) and the
+// s3.ChunkStore alias (the legacy name).
+var (
+	_ ChunkStore        = (*DatanodeChunkStore)(nil)
+	_ ChunkStore        = (*MemoryChunkStore)(nil)
+	_ gateway.ChunkStore = (*DatanodeChunkStore)(nil)
+	_ gateway.ChunkStore = (*MemoryChunkStore)(nil)
+)
 
 // DatanodeChunkStore is the production ChunkStore implementation: it
 // talks to datanode daemons over TCP. The previous in-process behaviour

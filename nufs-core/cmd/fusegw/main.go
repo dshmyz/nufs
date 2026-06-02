@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	gofuse "github.com/example/dfs/gateway/fuse"
+	"github.com/example/dfs/gateway/s3"
 	"github.com/example/dfs/metadata"
 )
 
@@ -40,8 +41,15 @@ func main() {
 	}
 	defer store.Close()
 
+	// Chunk store: commit 1.1 uses an in-process memory store so
+	// fusegw is self-contained and easy to exercise from a single
+	// VM. A later commit wires it up to a local datanode daemon
+	// (or a remote DatanodeChunkStore) the same way the S3
+	// gateway does it.
+	chunkStore := s3.NewMemoryChunkStore()
+
 	// Mount FUSE filesystem
-	server, err := gofuse.Mount(*mountpoint, store, nil)
+	server, err := gofuse.Mount(*mountpoint, store, chunkStore, nil)
 	if err != nil {
 		log.Fatalf("fusegw: failed to mount: %v", err)
 	}
