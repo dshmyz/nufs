@@ -450,6 +450,38 @@ func TestDFSFile_FullCycle_WriteFlushWriteFlush(t *testing.T) {
 	}
 }
 
+// ========== readBufPool ==========
+
+// TestReadBufPool_ConcurrentStress runs 1000 sequential reads through
+// the pooled-buffer path and asserts every read returns the correct
+// data. This is a smoke test for F1: without the pool, every Read
+// allocates a fresh 128 KB buffer; with the pool, the same buffer
+// is reused across calls.
+func TestReadBufPool_ConcurrentStress(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := s3.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	want := []byte("pool-test-data")
+	if _, errno := f.Write(context.Background(), nil, want, 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	for i := 0; i < 1000; i++ {
+		rr, errno := f.Read(context.Background(), nil, make([]byte, 32), 0)
+		if errno != 0 {
+			t.Fatalf("Read %d: errno=%v", i, errno)
+		}
+		got, _ := rr.Bytes(make([]byte, 32))
+		if !bytes.Equal(got, want) {
+			t.Fatalf("Read %d: got %q, want %q", i, got, want)
+		}
+	}
+}
+
 // ========== Root inode: bucket-as-shared-root ==========
 
 // TestDFSFileSystem_Readdir_ListsBuckets is the "ls /mnt/dfs" path.

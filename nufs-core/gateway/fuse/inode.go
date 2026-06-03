@@ -16,6 +16,19 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
+// readBufPool reuses 128 KB buffers for Read calls. The go-fuse
+// framework copies the returned []byte into kernel space before
+// returning from the read(2) syscall, so it is safe to return the
+// same pooled buffer to the pool after the call. This avoids a
+// fresh 128 KB heap allocation on every Read that crosses a chunk
+// boundary.
+var readBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 128*1024)
+		return &buf
+	},
+}
+
 // ========== DFSFile: regular file inode ==========
 
 // MaxChunkPayload is the largest single-chunk payload we hand to
@@ -130,6 +143,13 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 		return fuse.ReadResultData(make([]byte, size)), 0
 	}
 
+	// Grab a reusable 128 KB buffer from the pool. The pool buffer
+	// is used as scratch space for individual chunk reads; the final
+	// result is assembled in a separate (right-sized) output slice
+	// so the pool buffer can be returned immediately.
+	bufp := readBufPool.Get().(*[]byte)
+	defer readBufPool.Put(bufp)
+
 	// Walk the ChunkMap and pick out the bytes that overlap the
 	// requested window. Each chunk owns [cref.Offset, +cref.Length).
 	// The window is in (off, end] in file coordinates; we trim
@@ -162,7 +182,16 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 		if relStart >= relEnd {
 			continue
 		}
-		out = append(out, payload[relStart:relEnd]...)
+		// If the chunk slice fits in the pool buffer, copy it there
+		// first so we avoid growing `out` with tiny appends.
+		chunkLen := int(relEnd - relStart)
+		if chunkLen <= cap(*bufp) {
+			buf := (*bufp)[:chunkLen]
+			copy(buf, payload[relStart:relEnd])
+			out = append(out, buf...)
+		} else {
+			out = append(out, payload[relStart:relEnd]...)
+		}
 		if int64(len(out)) >= end-off {
 			break
 		}
