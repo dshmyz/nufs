@@ -1,18 +1,18 @@
 # Data Node Configuration
-# Usage: datanode --config=datanode.yaml (or pass equivalent flags)
+# Usage: datanode --config=datanode.yaml
+# CLI flags override YAML values.
 
-listen: ":9100"
+listen: "0.0.0.0:9100"
+node_id: "auto"                          # "auto" = hash machine-id, or a number
 data_dir: "/var/lib/dfs/datanode"
-metadata: "localhost:8091"          # Metadata service address
+data_dirs: ""                            # comma-separated, enables supervisor mode
+base_port: 9101
+metadata: "localhost:8091"               # Metadata service address
 machine_id: ""
 external_host: ""
 rack: "rack1"
 zone: "zone1"
 capacity_gb: 1000
-
-# Supervisor mode (optional — spawns child processes per disk)
-data_dirs: ""                       # comma-separated, enables supervisor mode
-base_port: 9101
 
 log_level: "info"
 log_json: false

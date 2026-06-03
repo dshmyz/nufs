@@ -1,25 +1,28 @@
 # NUFS FUSE Gateway Configuration
 # Usage:
+#   nufs-fuse --config=nufs-fuse.yaml <mountpoint>
 #   nufs-fuse --backend=dfs [flags] <mountpoint>
 #   nufs-fuse --backend=s3 [flags] <s3-endpoint/bucket/prefix> <mountpoint>
+#
+# CLI flags override YAML values.
 
-# === Shared ===
-backend: "dfs"                         # dfs (distributed filesystem) or s3 (external S3 bucket)
-cache_dir: ""                          # Chunk cache directory (empty=memory only)
+backend: "dfs"
+cache_dir: ""
+log_level: "info"
+log_json: false
 
-# === DFS backend (--backend=dfs) ===
-mountpoint: "/mnt/dfs"
-meta_dir: "/var/lib/dfs/metadata"      # Local mode: Pebble data directory
-meta_addr: ""                          # Remote mode: metadata HTTP address
+# DFS backend options
+meta_addr: ""                            # Remote: metadata HTTP address (e.g., "localhost:8091")
+meta_dir: "/var/lib/dfs/metadata"        # Local: Pebble data directory (mutually exclusive with meta_addr)
 
-# === S3 backend (--backend=s3) ===
-# target: "https://s3.amazonaws.com/my-bucket"
-# mountpoint: "/mnt/s3"
-# scan_ttl: "60s"
-# read_only: false
-# cache_quota: 0
-# metrics_addr: ":9900"
-# insecure: false
-# debug: false
-# uid: 0
-# gid: 0
+# S3 backend options (used when --backend=s3)
+target: ""
+mountpoint: "/mnt/nufs"
+scan_ttl: "60s"
+read_only: false
+cache_quota: 0
+metrics_addr: ":9900"
+insecure: false
+debug: false
+uid: 0
+gid: 0

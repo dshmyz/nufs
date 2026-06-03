@@ -1,11 +1,11 @@
 # Metadata Service Configuration
-# Usage: metad --config=metad.yaml (or pass equivalent flags)
+# Usage: metad --config=metad.yaml
+# CLI flags override YAML values.
 
-listen: ":8091"
-ops_addr: ":8091"
-node_id: 1
 data_dir: "/var/lib/dfs/metadata"
 cache_dir: ""
+ops_addr: "0.0.0.0:8091"
+node_id: 1
 log_level: "info"
 log_json: false
 
@@ -16,7 +16,15 @@ raft:
   data_dir: "/var/lib/dfs/raft"
   bootstrap: false
 
+# TLS (requires both cert and key)
+tls_cert: ""
+tls_key: ""
+
+# Auth token for ops API (empty = no auth)
+auth_token: ""
+
 # Background tasks
 lease_ttl: "30s"
 gc_interval: "10m"
+gc_dry_run: false
 scrub_interval: "1h"
