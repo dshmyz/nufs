@@ -5,7 +5,10 @@ import (
 	"encoding/hex"
 	"log"
 	"net/http"
+	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // Middleware chain for the S3 gateway.
@@ -82,6 +85,51 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+// RateLimitMiddleware limits requests per second per client IP using a
+// per-IP token bucket. rps <= 0 means unlimited.
+func RateLimitMiddleware(rps float64, burst int) func(http.Handler) http.Handler {
+	if rps <= 0 {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	if burst <= 0 {
+		burst = int(rps)
+	}
+	var mu sync.Mutex
+	clients := make(map[string]*rate.Limiter)
+	// Background cleanup of stale limiters every minute.
+	go func() {
+		for {
+			time.Sleep(time.Minute)
+			mu.Lock()
+			for ip, lim := range clients {
+				if lim.Tokens() >= float64(burst) {
+					delete(clients, ip)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := r.RemoteAddr
+			mu.Lock()
+			lim, ok := clients[ip]
+			if !ok {
+				lim = rate.NewLimiter(rate.Limit(rps), burst)
+				clients[ip] = lim
+			}
+			mu.Unlock()
+			if !lim.Allow() {
+				requestID := w.Header().Get("x-amz-request-id")
+				WriteXMLError(w, http.StatusTooManyRequests, ErrCodeSlowDown,
+					"Rate limit exceeded", r.URL.Path, requestID)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // Chain applies middlewares in order (outermost first).

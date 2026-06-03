@@ -22,6 +22,8 @@ type Gateway struct {
 	rejectEmptyReplicas bool
 	health              HealthChecker
 	ready               HealthChecker
+	rateLimit           float64
+	rateLimitBurst      int
 }
 
 // GatewayConfig holds configuration for the S3 gateway.
@@ -56,6 +58,12 @@ type GatewayConfig struct {
 	// Empty means parts are stored in memory (not recommended for
 	// production — restart loses in-progress uploads).
 	PartDir string
+	// RateLimit is the maximum requests/second per client IP.
+	// 0 means unlimited.
+	RateLimit float64
+	// RateLimitBurst is the maximum burst size for the rate limiter.
+	// Defaults to RateLimit if 0.
+	RateLimitBurst int
 }
 
 // HealthChecker reports the state of a subsystem. Returning nil means
@@ -99,6 +107,11 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 	if gw.ready == nil {
 		gw.ready = gw.health
 	}
+	gw.rateLimit = cfg.RateLimit
+	gw.rateLimitBurst = cfg.RateLimitBurst
+	if gw.rateLimit > 0 && gw.rateLimitBurst <= 0 {
+		gw.rateLimitBurst = int(gw.rateLimit)
+	}
 
 	// Register routes — Go 1.22+ enhanced ServeMux patterns
 	gw.mux.HandleFunc("/", gw.route)
@@ -139,6 +152,7 @@ func (gw *Gateway) Handler() http.Handler {
 		RecoveryMiddleware,
 		RequestIDMiddleware,
 		CORSMiddleware,
+		RateLimitMiddleware(gw.rateLimit, gw.rateLimitBurst),
 		LoggingMiddleware,
 	)
 }

@@ -25,6 +25,8 @@ func main() {
 		gracefulTimeout = flag.Duration("graceful-timeout", 30*time.Second, "Max time to wait for in-flight requests on shutdown")
 		tlsCert         = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
 		tlsKey          = flag.String("tls-key", "", "TLS private key file")
+		rateLimit       = flag.Float64("rate-limit", 0, "Max requests/second per client IP (0 = unlimited)")
+		rateLimitBurst  = flag.Int("rate-limit-burst", 0, "Rate limiter burst size (0 = same as rate-limit)")
 		logLevel        = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON         = flag.Bool("log-json", false, "JSON log output")
 	)
@@ -62,6 +64,8 @@ func main() {
 		RejectEmptyReplicas: true,
 		HealthCheck:         health,
 		ReadyCheck:          health,
+		RateLimit:           *rateLimit,
+		RateLimitBurst:      *rateLimitBurst,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

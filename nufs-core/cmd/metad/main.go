@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -36,6 +37,7 @@ func main() {
 		scrubInterval = flag.Duration("scrub-interval", 1*time.Hour, "Scrub interval")
 		tlsCert       = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
 		tlsKey        = flag.String("tls-key", "", "TLS private key file")
+		authToken     = flag.String("auth-token", "", "Bearer token for ops API auth (empty = no auth)")
 		logLevel      = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON       = flag.Bool("log-json", false, "JSON log output")
 	)
@@ -118,6 +120,13 @@ func main() {
 	admin := newAdminServer(store, bundle)
 	admin.RegisterRoutes(mux)
 
+	if *authToken != "" {
+		log.Info("auth token enabled for ops API")
+		wrap := mux
+		mux = http.NewServeMux()
+		mux.Handle("/", authMiddleware(*authToken, wrap))
+	}
+
 	opsServer := &http.Server{
 		Addr:         *opsAddr,
 		Handler:      mux,
@@ -162,4 +171,18 @@ func main() {
 	}
 
 	log.Info("shutdown complete")
+}
+
+// authMiddleware rejects requests that don't carry the expected Bearer token.
+func authMiddleware(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get("Authorization")
+		expected := "Bearer " + token
+		if got != expected {
+			slog.Warn("auth rejected", "remote", r.RemoteAddr, "path", r.URL.Path)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
