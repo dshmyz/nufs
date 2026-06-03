@@ -12,11 +12,13 @@ import (
 	"time"
 
 	"github.com/example/dfs/datanode"
+	"github.com/example/dfs/internal/config"
 	"github.com/example/dfs/internal/logging"
 	"github.com/example/dfs/metadata"
 )
 
 func main() {
+	// Management subcommands — skip flag.Parse entirely.
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
 		case "status", "adopt", "retire":
@@ -26,6 +28,7 @@ func main() {
 	}
 
 	var (
+		configPath   = flag.String("config", "", "Path to YAML config file")
 		nodeID       = flag.Uint64("node-id", 1, "Unique data node ID")
 		listenAddr   = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
 		dataDir      = flag.String("data-dir", "/var/lib/dfs/data", "Chunk storage root directory")
@@ -37,9 +40,13 @@ func main() {
 		rack         = flag.String("rack", "rack-1", "Rack identifier for topology placement")
 		zone         = flag.String("zone", "zone-1", "Availability zone identifier")
 		capacityGB   = flag.Int64("capacity", 1000, "Node storage capacity in GB")
+		logLevel     = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
+		logJSON      = flag.Bool("log-json", false, "JSON log output")
 	)
+	_ = configPath
+	config.Preload()
 	flag.Parse()
-	logging.Init(logging.Config{Level: "info", AddSource: true})
+	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})
 	log := logging.Named("datanode")
 
 	if *dataDirs != "" {

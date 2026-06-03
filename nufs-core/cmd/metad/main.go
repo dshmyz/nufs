@@ -13,12 +13,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/example/dfs/internal/config"
 	"github.com/example/dfs/internal/logging"
 	"github.com/example/dfs/metadata"
 )
 
 func main() {
 	var (
+		configPath    = flag.String("config", "", "Path to YAML config file")
 		dataDir       = flag.String("data-dir", "/var/lib/dfs/metadata", "Pebble data directory")
 		cacheDir      = flag.String("cache-dir", "", "Pebble read cache directory (optional)")
 		nodeID        = flag.Uint64("node-id", 1, "Metadata node ID (for chunk ID generation)")
@@ -35,6 +37,8 @@ func main() {
 		logLevel      = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON       = flag.Bool("log-json", false, "JSON log output")
 	)
+	_ = configPath
+	config.Preload()
 	flag.Parse()
 
 	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})

@@ -8,6 +8,55 @@
 //
 //	nufs-fuse --backend=dfs [flags] <mountpoint>
 //	nufs-fuse --backend=s3 [flags] <s3-endpoint/bucket/prefix> <mountpoint>
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	// DFS backend
+	gofuse "github.com/example/dfs/gateway/fuse"
+	"github.com/example/dfs/gateway/s3"
+	"github.com/example/dfs/metadata"
+
+	// S3 backend
+	"github.com/example/dfs/gateway/s3fs"
+
+	"github.com/example/dfs/internal/config"
+	"github.com/example/dfs/internal/logging"
+)
+
+func main() {
+	var (
+		configPath = flag.String("config", "", "Path to YAML config file")
+		backend    = flag.String("backend", "dfs", "Backend: dfs (distributed filesystem) or s3 (external S3 bucket)")
+
+		// DFS backend flags
+		metaDir  = flag.String("meta-dir", "/var/lib/dfs/metadata", "DFS: Pebble metadata directory (local mode)")
+		metaAddr = flag.String("meta-addr", "", "DFS: Remote metadata address (host:port)")
+
+		// S3 backend flags
+		scanTTL     = flag.Duration("scan-ttl", 60*time.Second, "S3: Directory scan cache TTL")
+		readOnly    = flag.Bool("read-only", false, "S3: Read-only mode")
+		cacheQuota  = flag.Int64("cache-quota", 0, "S3: Cache disk quota in bytes (0=unlimited)")
+		metricsAddr = flag.String("metrics-addr", ":9900", "S3: Metrics/health HTTP address")
+		insecure    = flag.Bool("insecure", false, "S3: Skip TLS verification")
+		debug       = flag.Bool("debug", false, "S3: Debug logging")
+		uid         = flag.Uint("uid", 0, "S3: File owner UID")
+		gid         = flag.Uint("gid", 0, "S3: File owner GID")
+
+		// Shared flags
+		cacheDir = flag.String("cache-dir", "", "Cache directory (empty=memory only)")
+		logLevel = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
+		logJSON  = flag.Bool("log-json", false, "JSON log output")
+	)
+	_ = configPath
+	config.Preload()
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  %s --backend=dfs [flags] <mountpoint>\n", os.Args[0])
@@ -18,8 +67,9 @@
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}
+	config.Preload()
 	flag.Parse()
-	logging.Init(logging.Config{Level: "info", AddSource: true})
+	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})
 	log := logging.Named("nufs-fuse")
 
 	switch *backend {
