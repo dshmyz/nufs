@@ -257,7 +257,10 @@ func (c *PebbleCache) GetLastScan(id uint64) time.Time {
 	if err != nil {
 		return time.Time{}
 	}
-	return time.Unix(in.Ctime, 0)
+	if in.Ctime == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, in.Ctime)
 }
 
 // SetLastScan updates the ctime field as a scan timestamp.

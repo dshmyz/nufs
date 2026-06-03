@@ -44,6 +44,7 @@ func (fs *S3FileSystem) Unlock(path string) {
 	if len(pl.waiters) > 0 {
 		next := pl.waiters[0]
 		pl.waiters = pl.waiters[1:]
+		pl.locked = false
 		close(next)
 	} else {
 		delete(fs.locks, path)
