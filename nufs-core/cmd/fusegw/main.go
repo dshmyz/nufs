@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	gofuse "github.com/example/dfs/gateway/fuse"
 	"github.com/example/dfs/gateway/s3"
@@ -18,7 +19,8 @@ import (
 func main() {
 	var (
 		mountpoint = flag.String("mount", "/mnt/dfs", "FUSE mount point")
-		metaDir    = flag.String("meta-dir", "/var/lib/dfs/metadata", "Pebble metadata directory")
+		metaDir    = flag.String("meta-dir", "/var/lib/dfs/metadata", "Pebble metadata directory (local mode)")
+		metaAddr   = flag.String("meta-addr", "", "Remote metadata address (host:port, enables remote+DatanodeChunkStore)")
 		cacheDir   = flag.String("cache-dir", "", "Chunk cache directory (empty=memory only)")
 	)
 	flag.Parse()
@@ -34,17 +36,27 @@ func main() {
 		}
 	}
 
-	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{Dir: *metaDir})
-	if err != nil {
-		log.Error("failed to create metadata store", "error", err)
-		os.Exit(1)
-	}
-	defer store.Close()
+	var meta metadata.MetadataService
 
-	chunkStore := s3.NewMemoryChunkStore()
+	if *metaAddr != "" {
+		meta = metadata.NewHTTPClient("http://"+*metaAddr, 30*time.Second)
+		log.Info("remote mode", "meta_addr", *metaAddr)
+	} else {
+		var err error
+		meta, err = metadata.NewPebbleStore(metadata.PebbleStoreConfig{Dir: *metaDir})
+		if err != nil {
+			log.Error("failed to create metadata store", "error", err)
+			os.Exit(1)
+		}
+		log.Info("local mode (development)", "dir", *metaDir)
+	}
+	defer meta.Close()
+
+	chunkStore := s3.NewDatanodeChunkStore()
 
 	var chunkCache *gofuse.ChunkCache
 	if *cacheDir != "" {
+		var err error
 		chunkCache, err = gofuse.NewChunkCache(*cacheDir)
 		if err != nil {
 			log.Error("failed to create chunk cache", "error", err)
@@ -53,7 +65,7 @@ func main() {
 		log.Info("chunk cache enabled", "dir", *cacheDir)
 	}
 
-	server, err := gofuse.Mount(*mountpoint, store, chunkStore, chunkCache, nil)
+	server, err := gofuse.Mount(*mountpoint, meta, chunkStore, chunkCache, nil)
 	if err != nil {
 		log.Error("failed to mount", "error", err)
 		os.Exit(1)
