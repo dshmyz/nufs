@@ -89,6 +89,14 @@ type MetadataService interface {
 	// lock on inode. Used for diagnostics and admin tools; the
 	// runtime path does not need it.
 	AdvisoryListLocks(ctx context.Context, inode InodeID) ([]LockInfo, error)
+
+	// Extended attributes (xattrs). The InodeMeta.XAttrs map is
+	// the backing store; these are convenience methods that atomically
+	// read/modify it via GetInode + UpdateInode.
+	GetXAttr(ctx context.Context, id InodeID, name string) ([]byte, error)
+	SetXAttr(ctx context.Context, id InodeID, name string, value []byte) error
+	ListXAttr(ctx context.Context, id InodeID) (map[string][]byte, error)
+	RemoveXAttr(ctx context.Context, id InodeID, name string) error
 }
 
 // Compile-time interface check

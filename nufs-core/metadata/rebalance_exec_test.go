@@ -62,6 +62,19 @@ func (m *mockRebalanceStore) DecommissionNode(ctx context.Context, nodeID NodeID
 	return nil
 }
 
+func (m *mockRebalanceStore) GetXAttr(_ context.Context, _ InodeID, _ string) ([]byte, error) {
+	return nil, ErrXAttrNotFound
+}
+func (m *mockRebalanceStore) SetXAttr(_ context.Context, _ InodeID, _ string, _ []byte) error {
+	return nil
+}
+func (m *mockRebalanceStore) ListXAttr(_ context.Context, _ InodeID) (map[string][]byte, error) {
+	return nil, nil
+}
+func (m *mockRebalanceStore) RemoveXAttr(_ context.Context, _ InodeID, _ string) error {
+	return nil
+}
+
 func TestRebalanceExecutor_ExecuteDecommission(t *testing.T) {
 	store := &mockRebalanceStore{
 		nodes: []NodeInfo{

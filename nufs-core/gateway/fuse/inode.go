@@ -391,6 +391,11 @@ func (f *DFSFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 	return 0
 }
 
+// OpenXAttr returns an xattr handle for this file.
+func (f *DFSFile) OpenXAttr() *DFSXAttr {
+	return &DFSXAttr{meta: f.meta, inodeID: f.inodeID}
+}
+
 // ========== DFSFileHandle methods ==========
 
 var _ = (fs.FileReader)((*DFSFileHandle)(nil))
@@ -437,4 +442,9 @@ func (s *DFSSymlink) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.At
 	}
 	out.Attr = inodeMetaToAttr(metaInode)
 	return 0
+}
+
+// OpenXAttr returns an xattr handle for this symlink.
+func (s *DFSSymlink) OpenXAttr() *DFSXAttr {
+	return &DFSXAttr{meta: s.meta, inodeID: s.inodeID}
 }

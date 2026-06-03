@@ -482,6 +482,74 @@ func TestReadBufPool_ConcurrentStress(t *testing.T) {
 	}
 }
 
+// ========== xattr ==========
+
+// TestDFSXAttr_GetSetRoundTrip writes an xattr and reads it back.
+func TestDFSXAttr_GetSetRoundTrip(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	x := &DFSXAttr{meta: meta, inodeID: id}
+	ctx := context.Background()
+
+	if errno := x.Setxattr(ctx, "user.foo", []byte("bar"), 0); errno != 0 {
+		t.Fatalf("Setxattr: errno=%v", errno)
+	}
+
+	dest := make([]byte, 256)
+	n, errno := x.Getxattr(ctx, "user.foo", dest)
+	if errno != 0 {
+		t.Fatalf("Getxattr: errno=%v", errno)
+	}
+	if string(dest[:n]) != "bar" {
+		t.Fatalf("Getxattr: got %q, want %q", dest[:n], "bar")
+	}
+}
+
+// TestDFSXAttr_ListMultiple writes two xattrs and lists them.
+func TestDFSXAttr_ListMultiple(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	x := &DFSXAttr{meta: meta, inodeID: id}
+	ctx := context.Background()
+
+	if errno := x.Setxattr(ctx, "user.a", []byte("1"), 0); errno != 0 {
+		t.Fatalf("Setxattr a: errno=%v", errno)
+	}
+	if errno := x.Setxattr(ctx, "user.b", []byte("2"), 0); errno != 0 {
+		t.Fatalf("Setxattr b: errno=%v", errno)
+	}
+
+	dest := make([]byte, 256)
+	n, errno := x.Listxattr(ctx, dest)
+	if errno != 0 {
+		t.Fatalf("Listxattr: errno=%v", errno)
+	}
+	// Parse null-separated names.
+	names := make(map[string]bool)
+	var offset int
+	for offset < int(n) {
+		end := offset
+		for end < int(n) && dest[end] != 0 {
+			end++
+		}
+		names[string(dest[offset:end])] = true
+		offset = end + 1
+	}
+	if !names["user.a"] || !names["user.b"] {
+		t.Fatalf("Listxattr: got %v, want user.a and user.b", names)
+	}
+}
+
+// TestDFSXAttr_NotFound returns ENODATA for a missing xattr.
+func TestDFSXAttr_NotFound(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	x := &DFSXAttr{meta: meta, inodeID: id}
+	ctx := context.Background()
+
+	_, errno := x.Getxattr(ctx, "user.no-such-attr", make([]byte, 256))
+	if errno != syscall.ENODATA {
+		t.Fatalf("Getxattr missing: errno=%v, want ENODATA", errno)
+	}
+}
+
 // ========== Root inode: bucket-as-shared-root ==========
 
 // TestDFSFileSystem_Readdir_ListsBuckets is the "ls /mnt/dfs" path.

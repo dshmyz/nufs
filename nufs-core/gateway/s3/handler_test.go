@@ -392,6 +392,18 @@ func (m *mockMetaService) AdvisoryUnlock(_ context.Context, _ metadata.InodeID, 
 func (m *mockMetaService) AdvisoryListLocks(_ context.Context, _ metadata.InodeID) ([]metadata.LockInfo, error) {
 	return nil, nil
 }
+func (m *mockMetaService) GetXAttr(_ context.Context, _ metadata.InodeID, _ string) ([]byte, error) {
+	return nil, metadata.ErrXAttrNotFound
+}
+func (m *mockMetaService) SetXAttr(_ context.Context, _ metadata.InodeID, _ string, _ []byte) error {
+	return nil
+}
+func (m *mockMetaService) ListXAttr(_ context.Context, _ metadata.InodeID) (map[string][]byte, error) {
+	return nil, nil
+}
+func (m *mockMetaService) RemoveXAttr(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}
 
 // ========== Test Helpers ==========
 

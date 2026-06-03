@@ -288,3 +288,8 @@ func (d *DFSDir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttr
 	out.Attr = inodeMetaToAttr(metaInode)
 	return 0
 }
+
+// OpenXAttr returns an xattr handle for this directory.
+func (d *DFSDir) OpenXAttr() *DFSXAttr {
+	return &DFSXAttr{meta: d.meta, inodeID: d.inodeID}
+}

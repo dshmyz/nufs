@@ -55,6 +55,7 @@ var (
 	ErrNotFile        = errors.New("metadata: not a regular file")
 	ErrNotSymlink     = errors.New("metadata: not a symbolic link")
 	ErrNameTooLong    = errors.New("metadata: name exceeds maximum length")
+	ErrXAttrNotFound  = errors.New("metadata: extended attribute not found")
 )
 
 // Chunk errors

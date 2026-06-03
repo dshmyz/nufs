@@ -532,3 +532,18 @@ func (c *HTTPClient) advisoryLockCall(ctx context.Context, path string, inode In
 	}
 	return c.readResponse(resp, nil)
 }
+
+// ========== Extended attributes (stubs — xattr not yet exposed via HTTP) ==========
+
+func (c *HTTPClient) GetXAttr(_ context.Context, _ InodeID, _ string) ([]byte, error) {
+	return nil, ErrXAttrNotFound
+}
+func (c *HTTPClient) SetXAttr(_ context.Context, _ InodeID, _ string, _ []byte) error {
+	return fmt.Errorf("xattr not yet supported over HTTP")
+}
+func (c *HTTPClient) ListXAttr(_ context.Context, _ InodeID) (map[string][]byte, error) {
+	return nil, nil
+}
+func (c *HTTPClient) RemoveXAttr(_ context.Context, _ InodeID, _ string) error {
+	return fmt.Errorf("xattr not yet supported over HTTP")
+}

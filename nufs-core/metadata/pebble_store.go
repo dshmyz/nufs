@@ -173,6 +173,100 @@ func (s *PebbleStore) AdvisoryListLocks(ctx context.Context, inode InodeID) ([]L
 	return s.advisoryLocks.list(inode), nil
 }
 
+// ========== Extended Attributes (xattrs) ==========
+
+// GetXAttr returns the value of the named xattr on the given inode.
+// Returns ErrXAttrNotFound if the attribute does not exist.
+func (s *PebbleStore) GetXAttr(ctx context.Context, id InodeID, name string) ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	meta, err := s.GetInode(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if meta.XAttrs == nil {
+		return nil, ErrXAttrNotFound
+	}
+	val, ok := meta.XAttrs[name]
+	if !ok {
+		return nil, ErrXAttrNotFound
+	}
+	out := make([]byte, len(val))
+	copy(out, val)
+	return out, nil
+}
+
+// SetXAttr sets the named xattr on the given inode. If the attribute
+// already exists it is overwritten. An empty value removes the key.
+func (s *PebbleStore) SetXAttr(ctx context.Context, id InodeID, name string, value []byte) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	meta, err := s.GetInode(ctx, id)
+	if err != nil {
+		return err
+	}
+	if meta.XAttrs == nil {
+		meta.XAttrs = make(map[string][]byte)
+	}
+	v := make([]byte, len(value))
+	copy(v, value)
+	meta.XAttrs[name] = v
+	return s.UpdateInode(ctx, meta)
+}
+
+// ListXAttr returns all xattrs on the given inode. The returned map
+// is a copy; callers may mutate it freely.
+func (s *PebbleStore) ListXAttr(ctx context.Context, id InodeID) (map[string][]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	meta, err := s.GetInode(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(meta.XAttrs) == 0 {
+		return nil, nil
+	}
+	out := make(map[string][]byte, len(meta.XAttrs))
+	for k, v := range meta.XAttrs {
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out, nil
+}
+
+// RemoveXAttr deletes the named xattr from the given inode. Removing
+// a non-existent attribute is a no-op (not an error).
+func (s *PebbleStore) RemoveXAttr(ctx context.Context, id InodeID, name string) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	meta, err := s.GetInode(ctx, id)
+	if err != nil {
+		return err
+	}
+	if meta.XAttrs == nil {
+		return nil
+	}
+	delete(meta.XAttrs, name)
+	return s.UpdateInode(ctx, meta)
+}
+
 // ========== Internal Helpers ==========
 
 func (s *PebbleStore) initRootInode() error {

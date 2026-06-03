@@ -348,3 +348,15 @@ func (m *mockMetadataService) AdvisoryUnlock(_ context.Context, _ metadata.Inode
 func (m *mockMetadataService) AdvisoryListLocks(_ context.Context, _ metadata.InodeID) ([]metadata.LockInfo, error) {
 	return nil, nil
 }
+func (m *mockMetadataService) GetXAttr(_ context.Context, _ metadata.InodeID, _ string) ([]byte, error) {
+	return nil, metadata.ErrXAttrNotFound
+}
+func (m *mockMetadataService) SetXAttr(_ context.Context, _ metadata.InodeID, _ string, _ []byte) error {
+	return nil
+}
+func (m *mockMetadataService) ListXAttr(_ context.Context, _ metadata.InodeID) (map[string][]byte, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) RemoveXAttr(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}

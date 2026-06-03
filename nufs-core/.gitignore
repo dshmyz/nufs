@@ -1,7 +1,2 @@
-# Local Go build binaries produced by `go build ./cmd/<name>` without `-o`.
-# Anchored to the repo root so we don't accidentally ignore source
-# directories of the same name (eufs-core/cmd/s3gw/ is a real package).
-/metad
-/s3gw
-/datanode
-/dfsctl
+# This file intentionally left nearly empty.
+# Binary ignore patterns live in the repo-root .gitignore.
