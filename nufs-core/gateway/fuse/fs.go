@@ -33,24 +33,28 @@ type DFSFileSystem struct {
 	// in unit tests that have no lock manager).
 	lockOwner string
 
+	// chunkCache caches chunk payloads to avoid datanode round-trips.
+	chunkCache *ChunkCache
+
 	// Inode cache: metadata.InodeID -> *fs.Inode
 	mu       sync.RWMutex
 	inodeMap map[metadata.InodeID]*fs.Inode
 }
 
 // NewDFSFileSystem creates a new FUSE filesystem root.
-func NewDFSFileSystem(meta metadata.MetadataService, chunkStore gateway.ChunkStore) *DFSFileSystem {
+func NewDFSFileSystem(meta metadata.MetadataService, chunkStore gateway.ChunkStore, cache *ChunkCache) *DFSFileSystem {
 	return &DFSFileSystem{
 		meta:       meta,
 		chunkStore: chunkStore,
+		chunkCache: cache,
 		lockOwner:  fmt.Sprintf("fusegw-%d", os.Getpid()),
 		inodeMap:   make(map[metadata.InodeID]*fs.Inode),
 	}
 }
 
 // Mount mounts the DFS filesystem at the given mountpoint.
-func Mount(mountpoint string, meta metadata.MetadataService, chunkStore gateway.ChunkStore, opts *fuse.MountOptions) (*fuse.Server, error) {
-	root := NewDFSFileSystem(meta, chunkStore)
+func Mount(mountpoint string, meta metadata.MetadataService, chunkStore gateway.ChunkStore, cache *ChunkCache, opts *fuse.MountOptions) (*fuse.Server, error) {
+	root := NewDFSFileSystem(meta, chunkStore, cache)
 
 	if opts == nil {
 		opts = &fuse.MountOptions{
@@ -161,11 +165,11 @@ func newChildInode(dfs *DFSFileSystem, metaInode *metadata.InodeMeta) fs.InodeEm
 	case metadata.FileDirectory:
 		return &DFSDir{meta: dfs.meta, inodeID: metaInode.ID}
 	case metadata.FileRegular:
-		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
+		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
 	case metadata.FileSymlink:
 		return &DFSSymlink{meta: dfs.meta, inodeID: metaInode.ID}
 	default:
-		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
+		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
 	}
 }
 

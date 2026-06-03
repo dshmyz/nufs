@@ -19,6 +19,7 @@ func main() {
 	var (
 		mountpoint = flag.String("mount", "/mnt/dfs", "FUSE mount point")
 		metaDir    = flag.String("meta-dir", "/var/lib/dfs/metadata", "Pebble metadata directory")
+		cacheDir   = flag.String("cache-dir", "", "Chunk cache directory (empty=memory only)")
 	)
 	flag.Parse()
 
@@ -48,8 +49,18 @@ func main() {
 	// gateway does it.
 	chunkStore := s3.NewMemoryChunkStore()
 
+	// Create chunk cache (optional)
+	var chunkCache *gofuse.ChunkCache
+	if *cacheDir != "" {
+		chunkCache, err = gofuse.NewChunkCache(*cacheDir)
+		if err != nil {
+			log.Fatalf("fusegw: failed to create chunk cache: %v", err)
+		}
+		log.Printf("fusegw: chunk cache enabled at %s", *cacheDir)
+	}
+
 	// Mount FUSE filesystem
-	server, err := gofuse.Mount(*mountpoint, store, chunkStore, nil)
+	server, err := gofuse.Mount(*mountpoint, store, chunkStore, chunkCache, nil)
 	if err != nil {
 		log.Fatalf("fusegw: failed to mount: %v", err)
 	}

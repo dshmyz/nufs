@@ -60,6 +60,7 @@ type DFSFile struct {
 
 	meta       metadata.MetadataService
 	chunkStore gateway.ChunkStore
+	cache      *ChunkCache
 	inodeID    metadata.InodeID
 
 	// lockOwner is the per-process owner string used when acquiring
@@ -162,13 +163,24 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 			// chunk entirely outside the requested window
 			continue
 		}
-		chunk, err := f.meta.GetChunk(ctx, cref.ID)
-		if err != nil {
-			return nil, syscall.EIO
+		var payload []byte
+		if f.cache != nil {
+			if p, ok := f.cache.Get(uint64(cref.ID)); ok {
+				payload = p
+			}
 		}
-		payload, err := f.chunkStore.ReadChunk(ctx, chunk)
-		if err != nil {
-			return nil, syscall.EIO
+		if payload == nil {
+			chunk, err := f.meta.GetChunk(ctx, cref.ID)
+			if err != nil {
+				return nil, syscall.EIO
+			}
+			payload, err = f.chunkStore.ReadChunk(ctx, chunk)
+			if err != nil {
+				return nil, syscall.EIO
+			}
+			if f.cache != nil {
+				f.cache.Add(uint64(cref.ID), payload)
+			}
 		}
 		// Map file-coordinates [off,end) to chunk-local coordinates.
 		relStart := off - chunkStart
