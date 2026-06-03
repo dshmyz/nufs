@@ -1,18 +1,27 @@
 # NUFS S3 Gateway Configuration
-# Usage: nufs-s3 [flags]
+# Usage: nufs-s3 --config=nufs-s3.yaml [flags]
+# CLI flags override YAML values.
 
 listen: ":8080"
-meta_addr: "localhost:8091"         # Metadata service address
-part_dir: "/var/lib/nufs-s3/parts" # Multipart upload temp directory
-max_object_size: 5368709120         # 5 GiB
+meta_addr: "localhost:8091"              # Metadata service address
+part_dir: "/var/lib/nufs-s3/parts"      # Multipart upload temp directory
+max_object_size: 5368709120              # 5 GiB
 
-# Authentication (disabled = anonymous access)
+# Credentials file (hot-reloadable, multi-tenant)
+# nufs-s3 --credentials-file=credentials/s3.yaml
+credentials_file: ""
+
+# Rate limiting (hot-reloadable via config Watch)
+rate_limit: 1000                         # requests/second per IP
+rate_limit_burst: 2000                   # burst size
+
+# Authentication (single credential, not hot-reloadable; use credentials_file instead)
 access_key: ""
 secret_key: ""
 
-# CORS
-cors_allow_origins: ["*"]
-cors_allow_methods: ["GET", "PUT", "POST", "DELETE", "HEAD"]
+# TLS (requires both cert and key)
+tls_cert: ""
+tls_key: ""
 
 log_level: "info"
 log_json: false

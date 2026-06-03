@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
@@ -20,6 +21,7 @@ func main() {
 		metaAddr        = flag.String("meta-addr", "localhost:8091", "Metadata service address (host:port)")
 		accessKey       = flag.String("access-key", "", "Access key for auth (empty = anonymous)")
 		secretKey       = flag.String("secret-key", "", "Secret key for auth")
+		credentialsFile = flag.String("credentials-file", "", "Path to YAML credentials file (hot-reloadable)")
 		partDir         = flag.String("part-dir", "/var/lib/nufs-s3/parts", "Multipart upload temp directory (empty=in-memory)")
 		maxObjectSize   = flag.Int64("max-object-size", gos3.DefaultMaxObjectSize, "Maximum single-shot PUT body size in bytes (5 GiB by default)")
 		gracefulTimeout = flag.Duration("graceful-timeout", 30*time.Second, "Max time to wait for in-flight requests on shutdown")
@@ -44,8 +46,16 @@ func main() {
 	creds := gos3.NewCredentialStore()
 	if *accessKey != "" && *secretKey != "" {
 		creds.AddCredential(*accessKey, *secretKey)
-		log.Info("auth enabled")
-	} else {
+		log.Info("auth enabled (CLI credentials)")
+	}
+	if *credentialsFile != "" {
+		if err := creds.LoadCredentials(*credentialsFile); err != nil {
+			log.Error("failed to load credentials file", "error", err)
+			os.Exit(1)
+		}
+		log.Info("auth enabled (hot-reloadable credentials)", "file", *credentialsFile)
+	}
+	if !creds.HasCredentials() {
 		log.Warn("running in anonymous mode (no auth)")
 	}
 
@@ -71,6 +81,38 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Hot-reload: rate limit via main config file.
+	if *configPath != "" {
+		go func() {
+			if err := config.Watch(ctx, *configPath, func() {
+				rl := flag.Lookup("rate-limit")
+				rb := flag.Lookup("rate-limit-burst")
+				if rl != nil && rb != nil {
+					rps, burst := parseRateLimitFlags(rl.Value.String(), rb.Value.String())
+					gw.SetRateLimit(rps, burst)
+					log.Info("rate limit updated from config", "rate", rps, "burst", burst)
+				}
+			}); err != nil && err != context.Canceled {
+				log.Error("config watch error", "error", err)
+			}
+		}()
+	}
+
+	// Hot-reload: credentials file.
+	if *credentialsFile != "" {
+		go func() {
+			if err := config.Watch(ctx, *credentialsFile, func() {
+				if err := creds.LoadCredentials(*credentialsFile); err != nil {
+					log.Error("credentials reload failed", "error", err)
+					return
+				}
+				log.Info("credentials reloaded", "file", *credentialsFile, "count", creds.Count())
+			}); err != nil && err != context.Canceled {
+				log.Error("credentials watch error", "error", err)
+			}
+		}()
+	}
+
 	if err := gw.Run(ctx, gos3.ServerConfig{
 		Addr:            *listenAddr,
 		GracefulTimeout: *gracefulTimeout,
@@ -80,4 +122,16 @@ func main() {
 		log.Error("gateway exited with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func parseRateLimitFlags(rpsStr, burstStr string) (float64, int) {
+	rps := 0.0
+	burst := 0
+	if rpsStr != "" {
+		_, _ = fmt.Sscanf(rpsStr, "%f", &rps)
+	}
+	if burstStr != "" {
+		_, _ = fmt.Sscanf(burstStr, "%d", &burst)
+	}
+	return rps, burst
 }

@@ -87,40 +87,71 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// RateLimitMiddleware limits requests per second per client IP using a
-// per-IP token bucket. rps <= 0 means unlimited.
-func RateLimitMiddleware(rps float64, burst int) func(http.Handler) http.Handler {
+// rateLimiterPool manages per-IP token bucket limiters that can be updated
+// at runtime. This enables hot-reload of rate limits without restart.
+type rateLimiterPool struct {
+	mu      sync.Mutex
+	clients map[string]*rate.Limiter
+	rps     float64
+	burst   int
+}
+
+func newRateLimiterPool(rps float64, burst int) *rateLimiterPool {
 	if rps <= 0 {
-		return func(next http.Handler) http.Handler { return next }
+		return &rateLimiterPool{} // unlimited
 	}
 	if burst <= 0 {
 		burst = int(rps)
 	}
-	var mu sync.Mutex
-	clients := make(map[string]*rate.Limiter)
-	// Background cleanup of stale limiters every minute.
-	go func() {
-		for {
-			time.Sleep(time.Minute)
-			mu.Lock()
-			for ip, lim := range clients {
-				if lim.Tokens() >= float64(burst) {
-					delete(clients, ip)
-				}
-			}
-			mu.Unlock()
-		}
-	}()
+	p := &rateLimiterPool{
+		clients: make(map[string]*rate.Limiter),
+		rps:     rps,
+		burst:   burst,
+	}
+	go p.cleanupLoop()
+	return p
+}
+
+// Update changes the rate limit for all existing and future IPs.
+// rps <= 0 disables rate limiting.
+func (p *rateLimiterPool) Update(rps float64, burst int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if rps <= 0 {
+		p.clients = nil
+		p.rps = 0
+		p.burst = 0
+		return
+	}
+	if burst <= 0 {
+		burst = int(rps)
+	}
+	p.rps = rps
+	p.burst = burst
+	if p.clients == nil {
+		p.clients = make(map[string]*rate.Limiter)
+	}
+	for _, lim := range p.clients {
+		lim.SetLimit(rate.Limit(rps))
+		lim.SetBurst(burst)
+	}
+}
+
+// Middleware returns an HTTP middleware that enforces the per-IP rate limit.
+func (p *rateLimiterPool) Middleware() func(http.Handler) http.Handler {
+	if p == nil || p.rps <= 0 {
+		return func(next http.Handler) http.Handler { return next }
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ip := r.RemoteAddr
-			mu.Lock()
-			lim, ok := clients[ip]
+			p.mu.Lock()
+			lim, ok := p.clients[ip]
 			if !ok {
-				lim = rate.NewLimiter(rate.Limit(rps), burst)
-				clients[ip] = lim
+				lim = rate.NewLimiter(rate.Limit(p.rps), p.burst)
+				p.clients[ip] = lim
 			}
-			mu.Unlock()
+			p.mu.Unlock()
 			if !lim.Allow() {
 				requestID := w.Header().Get("x-amz-request-id")
 				WriteXMLError(w, http.StatusTooManyRequests, ErrCodeSlowDown,
@@ -129,6 +160,23 @@ func RateLimitMiddleware(rps float64, burst int) func(http.Handler) http.Handler
 			}
 			next.ServeHTTP(w, r)
 		})
+	}
+}
+
+func (p *rateLimiterPool) cleanupLoop() {
+	for {
+		time.Sleep(time.Minute)
+		p.mu.Lock()
+		if p.clients == nil {
+			p.mu.Unlock()
+			return
+		}
+		for ip, lim := range p.clients {
+			if lim.Tokens() >= float64(p.burst) {
+				delete(p.clients, ip)
+			}
+		}
+		p.mu.Unlock()
 	}
 }
 

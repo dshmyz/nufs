@@ -22,8 +22,7 @@ type Gateway struct {
 	rejectEmptyReplicas bool
 	health              HealthChecker
 	ready               HealthChecker
-	rateLimit           float64
-	rateLimitBurst      int
+	ratePool            *rateLimiterPool
 }
 
 // GatewayConfig holds configuration for the S3 gateway.
@@ -107,11 +106,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 	if gw.ready == nil {
 		gw.ready = gw.health
 	}
-	gw.rateLimit = cfg.RateLimit
-	gw.rateLimitBurst = cfg.RateLimitBurst
-	if gw.rateLimit > 0 && gw.rateLimitBurst <= 0 {
-		gw.rateLimitBurst = int(gw.rateLimit)
-	}
+	gw.ratePool = newRateLimiterPool(cfg.RateLimit, cfg.RateLimitBurst)
 
 	// Register routes — Go 1.22+ enhanced ServeMux patterns
 	gw.mux.HandleFunc("/", gw.route)
@@ -152,7 +147,7 @@ func (gw *Gateway) Handler() http.Handler {
 		RecoveryMiddleware,
 		RequestIDMiddleware,
 		CORSMiddleware,
-		RateLimitMiddleware(gw.rateLimit, gw.rateLimitBurst),
+		gw.ratePool.Middleware(),
 		LoggingMiddleware,
 	)
 }
@@ -169,6 +164,13 @@ func (gw *Gateway) RefreshDataNodes(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// SetRateLimit updates the per-IP rate limiter settings at runtime.
+// rps <= 0 disables rate limiting. This is safe for concurrent use and
+// is intended to be called from a config-watch callback.
+func (gw *Gateway) SetRateLimit(rps float64, burst int) {
+	gw.ratePool.Update(rps, burst)
 }
 
 // route is the main request dispatcher.

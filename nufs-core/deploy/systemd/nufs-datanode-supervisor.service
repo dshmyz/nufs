@@ -1,0 +1,31 @@
+[Unit]
+Description=NUFS Data Node Supervisor (multi-disk)
+Documentation=https://github.com/example/dfs
+After=network.target nufs-metad.service
+
+[Service]
+Type=simple
+User=nufs
+Group=nufs
+EnvironmentFile=-/etc/default/nufs-datanode
+ExecStart=/usr/local/bin/datanode \
+    --data-dirs=${DATA_DIRS} \
+    --base-port=${BASE_PORT:-9100} \
+    --metadata=localhost:8091 \
+    --rack=${RACK:-rack1} \
+    --zone=${ZONE:-zone1} \
+    --capacity=${CAPACITY_GB:-500} \
+    --log-level=${LOG_LEVEL:-info} \
+    --log-json=${LOG_JSON:-false}
+
+Restart=always
+RestartSec=5
+LimitNOFILE=131072
+
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

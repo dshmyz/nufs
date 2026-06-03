@@ -1,0 +1,92 @@
+# NUFS Single-Machine Development Cluster
+#
+# Starts: 1x metad + 2x datanode + 1x nufs-s3
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.yml up -d
+#   curl http://localhost:8080/healthz
+#
+# Credentials (optional): set NUFUS_ACCESS_KEY / NUFUS_SECRET_KEY env vars
+# or create deploy/credentials/s3.yaml before starting.
+
+services:
+  metad:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: nufs:latest
+    entrypoint: /usr/local/bin/metad
+    command:
+      - --data-dir=/var/lib/dfs/metadata
+      - --ops-addr=0.0.0.0:8091
+      - --raft=false
+      - --log-level=info
+      - --log-json=true
+    ports:
+      - "8091:8091"
+    volumes:
+      - nufs-data:/var/lib/dfs
+
+  datanode-1:
+    image: nufs:latest
+    entrypoint: /usr/local/bin/datanode
+    command:
+      - --node-id=auto
+      - --listen=0.0.0.0:9100
+      - --data-dir=/var/lib/dfs/datanode1
+      - --metadata=metad:8091
+      - --rack=rack1
+      - --zone=zone1
+      - --capacity=500
+      - --log-level=info
+      - --log-json=true
+    depends_on:
+      - metad
+    volumes:
+      - nufs-data:/var/lib/dfs
+    restart: unless-stopped
+
+  datanode-2:
+    image: nufs:latest
+    entrypoint: /usr/local/bin/datanode
+    command:
+      - --node-id=auto
+      - --listen=0.0.0.0:9101
+      - --data-dir=/var/lib/dfs/datanode2
+      - --metadata=metad:8091
+      - --rack=rack1
+      - --zone=zone1
+      - --capacity=500
+      - --log-level=info
+      - --log-json=true
+    depends_on:
+      - metad
+    volumes:
+      - nufs-data:/var/lib/dfs
+    restart: unless-stopped
+
+  s3:
+    image: nufs:latest
+    entrypoint: /usr/local/bin/nufs-s3
+    command:
+      - --listen=0.0.0.0:8080
+      - --meta-addr=metad:8091
+      - --part-dir=/var/lib/dfs/parts
+      - --rate-limit=1000
+      - --rate-limit-burst=2000
+      - --credentials-file=/etc/nufs/credentials.yaml
+      - --log-level=info
+      - --log-json=true
+    ports:
+      - "8080:8080"
+    depends_on:
+      - metad
+      - datanode-1
+      - datanode-2
+    volumes:
+      - nufs-data:/var/lib/dfs
+      - ${NUFS_CREDENTIALS_FILE:-./credentials/s3.yaml}:/etc/nufs/credentials.yaml:ro
+    restart: unless-stopped
+
+volumes:
+  nufs-data:

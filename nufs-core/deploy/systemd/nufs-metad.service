@@ -1,0 +1,32 @@
+[Unit]
+Description=NUFS Metadata Service
+Documentation=https://github.com/example/dfs
+After=network.target
+
+[Service]
+Type=simple
+User=nufs
+Group=nufs
+ExecStart=/usr/local/bin/metad \
+    --data-dir=/var/lib/dfs/metadata \
+    --ops-addr=0.0.0.0:8091 \
+    --raft=true \
+    --raft-addr=0.0.0.0:7000 \
+    --raft-dir=/var/lib/dfs/raft \
+    --log-level=info \
+    --log-json=true \
+    --auth-token=${NUFS_METAD_TOKEN}
+
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=full
+PrivateTmp=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
