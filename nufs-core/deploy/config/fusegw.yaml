@@ -1,14 +1,25 @@
 # FUSE Gateway Configuration
-# Usage: fusegw --config=fusegw.yaml (or pass equivalent flags)
+# Usage:
+#   fusegw --backend=dfs [flags] <mountpoint>
+#   fusegw --backend=s3 [flags] <s3-endpoint/bucket/prefix> <mountpoint>
 
+# === Shared ===
+backend: "dfs"                         # dfs (distributed filesystem) or s3 (external S3 bucket)
+cache_dir: ""                          # Chunk cache directory (empty=memory only)
+
+# === DFS backend (--backend=dfs) ===
 mountpoint: "/mnt/dfs"
+meta_dir: "/var/lib/dfs/metadata"      # Local mode: Pebble data directory
+meta_addr: ""                          # Remote mode: metadata HTTP address
 
-# Metadata — local mode (-meta-dir) or remote mode (-meta-addr)
-meta_dir: "/var/lib/dfs/metadata"   # Local mode: Pebble data directory
-meta_addr: ""                        # Remote mode: metadata HTTP address
-
-# Chunk cache (empty = memory-only LRU with no disk persistence)
-cache_dir: ""
-
-log_level: "info"
-log_json: false
+# === S3 backend (--backend=s3) ===
+# target: "https://s3.amazonaws.com/my-bucket"
+# mountpoint: "/mnt/s3"
+# scan_ttl: "60s"
+# read_only: false
+# cache_quota: 0
+# metrics_addr: ":9900"
+# insecure: false
+# debug: false
+# uid: 0
+# gid: 0
