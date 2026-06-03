@@ -25,8 +25,10 @@ type ChunkStore interface {
 	// MinReplicasPerWrite replicas have acknowledged the write.
 	WriteChunk(ctx context.Context, chunk *metadata.ChunkMeta, data []byte) error
 
-	// ReadChunk reads the chunk payload from the first healthy replica.
-	// The returned slice may be larger than the requested range; callers
-	// are responsible for trimming to the bytes they need.
+	// ReadChunk reads the entire chunk payload from the first healthy replica.
 	ReadChunk(ctx context.Context, chunk *metadata.ChunkMeta) ([]byte, error)
+
+	// ReadChunkRange reads a subrange [offset, offset+length) from the chunk.
+	// If length <= 0, the entire chunk is returned.
+	ReadChunkRange(ctx context.Context, chunk *metadata.ChunkMeta, offset int64, length int32) ([]byte, error)
 }

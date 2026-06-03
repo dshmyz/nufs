@@ -28,16 +28,17 @@ func main() {
 	}
 
 	var (
-		nodeID     = flag.Uint64("node-id", 1, "Unique data node ID")
-		listenAddr = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
-		dataDir    = flag.String("data-dir", "/var/lib/dfs/data", "Chunk storage root directory")
-		dataDirs   = flag.String("data-dirs", "", "Comma-separated data directories (enables supervisor mode)")
-		basePort   = flag.Int("base-port", 9100, "Base port for supervisor mode children")
-		machineID  = flag.String("machine-id", "", "Machine identifier for topology placement")
-		metaAddr   = flag.String("metadata", "localhost:8091", "Metadata service HTTP address")
-		rack       = flag.String("rack", "rack-1", "Rack identifier for topology placement")
-		zone       = flag.String("zone", "zone-1", "Availability zone identifier")
-		capacityGB = flag.Int64("capacity", 1000, "Node storage capacity in GB")
+		nodeID       = flag.Uint64("node-id", 1, "Unique data node ID")
+		listenAddr   = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
+		dataDir      = flag.String("data-dir", "/var/lib/dfs/data", "Chunk storage root directory")
+		dataDirs     = flag.String("data-dirs", "", "Comma-separated data directories (enables supervisor mode)")
+		basePort     = flag.Int("base-port", 9100, "Base port for supervisor mode children")
+		machineID    = flag.String("machine-id", "", "Machine identifier for topology placement")
+		externalHost = flag.String("external-host", "", "External host IP for node registration (supervisor mode only, defaults to 127.0.0.1)")
+		metaAddr     = flag.String("metadata", "localhost:8091", "Metadata service HTTP address")
+		rack         = flag.String("rack", "rack-1", "Rack identifier for topology placement")
+		zone         = flag.String("zone", "zone-1", "Availability zone identifier")
+		capacityGB   = flag.Int64("capacity", 1000, "Node storage capacity in GB")
 	)
 	flag.Parse()
 
@@ -51,7 +52,7 @@ func main() {
 		if mid == "" {
 			mid = readMachineID()
 		}
-		runSupervisor(dirs, *basePort, mid, *metaAddr, *rack, *zone, *capacityGB)
+		runSupervisor(dirs, *basePort, mid, *externalHost, *metaAddr, *rack, *zone, *capacityGB)
 		return
 	}
 

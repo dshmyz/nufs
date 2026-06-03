@@ -265,7 +265,7 @@ func (m *mockMetaService) AllocateChunk(_ context.Context, inodeID metadata.Inod
 	m.nextID++
 	chunk := &metadata.ChunkMeta{
 		ID:         id,
-		State:      metadata.ChunkSealing,
+		State:      metadata.ChunkCreated,
 		CreateTime: time.Now().UnixNano(),
 	}
 	m.chunks[id] = chunk

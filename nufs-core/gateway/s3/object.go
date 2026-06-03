@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"net/http"
@@ -205,6 +206,12 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 
 	// Read chunks from data nodes and stream to client
 	for _, cref := range inode.ChunkMap {
+		chunkEnd := cref.Offset + int64(cref.Length) - 1
+		// Skip chunks outside the requested range
+		if chunkEnd < start || cref.Offset > end {
+			continue
+		}
+
 		chunk, err := gw.meta.GetChunk(ctx, cref.ID)
 		if err != nil {
 			WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -215,27 +222,24 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 			continue
 		}
 
-		data, err := gw.chunkStore.ReadChunk(ctx, chunk)
+		// Compute chunk-local read range
+		localStart := int64(0)
+		localEnd := int64(cref.Length) - 1
+		if start > cref.Offset {
+			localStart = start - cref.Offset
+		}
+		if end < chunkEnd {
+			localEnd = end - cref.Offset
+		}
+		readLen := int32(localEnd - localStart + 1)
+
+		data, err := gw.chunkStore.ReadChunkRange(ctx, chunk, localStart, readLen)
 		if err != nil {
 			WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
 				"Failed to read chunk data: "+err.Error(), "/"+bucket+"/"+key, requestID)
 			return
 		}
 
-		// Trim chunk data to requested range
-		if len(data) > 0 && (start > 0 || end < inode.Size-1) {
-			relStart := start
-			relEnd := end
-			if relStart < 0 {
-				relStart = 0
-			}
-			if relEnd >= int64(len(data)) {
-				relEnd = int64(len(data)) - 1
-			}
-			if relStart <= relEnd && relEnd < int64(len(data)) {
-				data = data[relStart : relEnd+1]
-			}
-		}
 		if _, err := w.Write(data); err != nil {
 			log.Printf("s3gw: write response: %v", err)
 			return
@@ -404,16 +408,5 @@ func parseRange(rangeHeader string, fileSize int64) (start, end int64) {
 }
 
 func crc32Checksum(data []byte) uint32 {
-	var crc uint32 = 0xFFFFFFFF
-	for _, b := range data {
-		crc ^= uint32(b)
-		for i := 0; i < 8; i++ {
-			if crc&1 != 0 {
-				crc = (crc >> 1) ^ 0xEDB88320
-			} else {
-				crc >>= 1
-			}
-		}
-	}
-	return crc ^ 0xFFFFFFFF
+	return crc32.ChecksumIEEE(data)
 }

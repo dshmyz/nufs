@@ -119,3 +119,11 @@ func writeJSONError(w http.ResponseWriter, code int, msg string) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
+
+// writeJSONErrorC is like writeJSONError but includes a machine-readable
+// "code" field so callers can match on it instead of fragile strings.
+func writeJSONErrorC(w http.ResponseWriter, code int, errCode, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg, "code": errCode})
+}

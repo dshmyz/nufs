@@ -911,17 +911,17 @@ func (s *PebbleStore) AllocateChunk(ctx context.Context, inodeID InodeID, offset
 
 	replicas := make([]ReplicaInfo, 0, len(nodeIDs))
 	for _, nid := range nodeIDs {
-		addr := ""
-		if n, err := s.GetNode(ctx, nid); err == nil {
-			addr = n.Addr
+		n, err := s.GetNode(ctx, nid)
+		if err != nil {
+			return nil, fmt.Errorf("allocate chunk: node %d not found: %w", nid, err)
 		}
-		replicas = append(replicas, ReplicaInfo{NodeID: nid, Addr: addr, State: ReplicaSyncing})
+		replicas = append(replicas, ReplicaInfo{NodeID: nid, Addr: n.Addr, State: ReplicaSyncing})
 	}
 
 	chunk := &ChunkMeta{
 		ID:         chunkID,
 		Size:       MaxChunkSize,
-		State:      ChunkSealing,
+		State:      ChunkCreated,
 		Replicas:   replicas,
 		Tier:       policy.StorageTier,
 		CreateTime: time.Now().UnixNano(),
@@ -964,7 +964,7 @@ func (s *PebbleStore) CommitChunk(ctx context.Context, chunkID ChunkID, checksum
 	if !exists {
 		return ErrChunkNotFound
 	}
-	if chunk.State != ChunkSealing {
+	if chunk.State != ChunkCreated {
 		return ErrChunkAlreadySealed
 	}
 	chunk.State = ChunkSealed
@@ -1476,7 +1476,7 @@ func (s *PebbleStore) ScanAllInodes(ctx context.Context, fn func(*InodeMeta) err
 		var inode InodeMeta
 		if err := json.Unmarshal(val, &inode); err != nil {
 			// Log and skip corrupted entries
-			log.Printf("pebble store: corrupted chunk entry at key %q: %v", key, err)
+			log.Printf("pebble store: corrupted inode entry at key %q: %v", key, err)
 			return nil
 		}
 		return fn(&inode)

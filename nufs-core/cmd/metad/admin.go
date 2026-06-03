@@ -104,7 +104,7 @@ func newAdminServer(store *metadata.PebbleStore, bundle *metadata.ServiceBundle)
 		},
 		"chunkStateClass": func(s metadata.ChunkState) string {
 			switch s {
-			case metadata.ChunkSealing:
+			case metadata.ChunkCreated:
 				return "info"
 			case metadata.ChunkSealed:
 				return "primary"
@@ -120,8 +120,8 @@ func newAdminServer(store *metadata.PebbleStore, bundle *metadata.ServiceBundle)
 		},
 		"chunkStateLabel": func(s metadata.ChunkState) string {
 			switch s {
-			case metadata.ChunkSealing:
-				return "Sealing"
+			case metadata.ChunkCreated:
+				return "Created"
 			case metadata.ChunkSealed:
 				return "Sealed"
 			case metadata.ChunkReady:

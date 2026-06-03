@@ -293,8 +293,8 @@ func TestPebbleStore_ChunkLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllocateChunk: %v", err)
 	}
-	if chunk.State != ChunkSealing {
-		t.Fatalf("expected Sealing, got %d", chunk.State)
+	if chunk.State != ChunkCreated {
+		t.Fatalf("expected ChunkCreated, got %d", chunk.State)
 	}
 
 	// Commit

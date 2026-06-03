@@ -92,9 +92,9 @@ type ChunkMeta struct {
 type ChunkState uint8
 
 const (
-	ChunkSealing  ChunkState = iota // Being written
-	ChunkSealed                     // Write complete, replicating
-	ChunkReady                      // All replicas confirmed
+	ChunkCreated ChunkState = iota // Allocated, not yet committed
+	ChunkSealed                    // Commit received, replicating
+	ChunkReady                     // All replicas confirmed
 	ChunkDegraded                   // Replica lost, repairing
 	ChunkOrphan                     // No inode references (GC candidate)
 )

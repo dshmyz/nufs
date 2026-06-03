@@ -126,6 +126,12 @@ func (s *DatanodeChunkStore) requiredReplicas(total int) int {
 
 // ReadChunk reads chunk data from the first replica that responds OK.
 func (s *DatanodeChunkStore) ReadChunk(ctx context.Context, chunk *metadata.ChunkMeta) ([]byte, error) {
+	return s.ReadChunkRange(ctx, chunk, 0, 0)
+}
+
+// ReadChunkRange reads a subrange [offset, offset+length) from the chunk
+// via the datanode TCP protocol. offset=0, length=0 reads the entire chunk.
+func (s *DatanodeChunkStore) ReadChunkRange(ctx context.Context, chunk *metadata.ChunkMeta, offset int64, length int32) ([]byte, error) {
 	if chunk == nil {
 		return nil, fmt.Errorf("chunkstore: nil chunk")
 	}
@@ -150,8 +156,8 @@ func (s *DatanodeChunkStore) ReadChunk(ctx context.Context, chunk *metadata.Chun
 			log.Printf("s3gw: connect to %s: %v", rep.Addr, err)
 			continue
 		}
-		// Read the full chunk; callers trim to the requested range.
-		resp, err := client.ReadChunk(chunk.ID, 0, 0)
+		// Read the specified range; offset=0, length=0 means full chunk.
+		resp, err := client.ReadChunk(chunk.ID, offset, length)
 		client.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("read from %s: %w", rep.Addr, err)
@@ -217,7 +223,12 @@ func (m *MemoryChunkStore) WriteChunk(_ context.Context, chunk *metadata.ChunkMe
 }
 
 // ReadChunk returns the previously written payload for chunk.ID.
-func (m *MemoryChunkStore) ReadChunk(_ context.Context, chunk *metadata.ChunkMeta) ([]byte, error) {
+func (m *MemoryChunkStore) ReadChunk(ctx context.Context, chunk *metadata.ChunkMeta) ([]byte, error) {
+	return m.ReadChunkRange(ctx, chunk, 0, 0)
+}
+
+// ReadChunkRange reads a subrange from the in-memory chunk data.
+func (m *MemoryChunkStore) ReadChunkRange(_ context.Context, chunk *metadata.ChunkMeta, offset int64, length int32) ([]byte, error) {
 	if m.ReadHook != nil {
 		if err := m.ReadHook(chunk.ID); err != nil {
 			return nil, err
@@ -229,8 +240,14 @@ func (m *MemoryChunkStore) ReadChunk(_ context.Context, chunk *metadata.ChunkMet
 	if !ok {
 		return nil, fmt.Errorf("chunkstore: chunk %d not found", chunk.ID)
 	}
-	out := make([]byte, len(data))
-	copy(out, data)
+	if length <= 0 || offset < 0 || offset+int64(length) > int64(len(data)) {
+		// Return full data
+		out := make([]byte, len(data))
+		copy(out, data)
+		return out, nil
+	}
+	out := make([]byte, length)
+	copy(out, data[offset:offset+int64(length)])
 	return out, nil
 }
 

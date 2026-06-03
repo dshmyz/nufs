@@ -40,35 +40,37 @@ type childInfo struct {
 }
 
 type supervisor struct {
-	mu          sync.Mutex
-	dataDirs    []string
-	basePort    int
-	machineID   string
-	metaAddr    string
-	rack        string
-	zone        string
-	capacityGB  int64
-	children    map[string]*childInfo // key = dataDir
-	sockPath    string
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
-	nextNodeID  metadata.NodeID
+	mu           sync.Mutex
+	dataDirs     []string
+	basePort     int
+	machineID    string
+	externalHost string
+	metaAddr     string
+	rack         string
+	zone         string
+	capacityGB   int64
+	children     map[string]*childInfo // key = dataDir
+	sockPath     string
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+	nextNodeID   metadata.NodeID
 }
 
-func runSupervisor(dataDirs []string, basePort int, machineID, metaAddr, rack, zone string, capacityGB int64) {
+func runSupervisor(dataDirs []string, basePort int, machineID, externalHost, metaAddr, rack, zone string, capacityGB int64) {
 	log.Printf("datanode: supervisor mode (%d disks, machine=%s)", len(dataDirs), machineID)
 
 	sv := &supervisor{
-		dataDirs:   dataDirs,
-		basePort:   basePort,
-		machineID:  machineID,
-		metaAddr:   metaAddr,
-		rack:       rack,
-		zone:       zone,
-		capacityGB: capacityGB,
-		children:   make(map[string]*childInfo),
-		stopCh:     make(chan struct{}),
-		nextNodeID: 1,
+		dataDirs:     dataDirs,
+		basePort:     basePort,
+		machineID:    machineID,
+		externalHost: externalHost,
+		metaAddr:     metaAddr,
+		rack:         rack,
+		zone:         zone,
+		capacityGB:   capacityGB,
+		children:     make(map[string]*childInfo),
+		stopCh:       make(chan struct{}),
+		nextNodeID:   1,
 	}
 
 	sockPath := filepath.Join(dataDirs[0], ".datanode.sock")
@@ -103,7 +105,11 @@ func (sv *supervisor) startChild(dir string, port int) {
 	sv.mu.Unlock()
 
 	nid := sv.loadOrAllocateNodeID(dir, nextID)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	host := sv.externalHost
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	addr := fmt.Sprintf("%s:%d", host, port)
 
 	args := []string{
 		"--node-id", fmt.Sprintf("%d", nid),
@@ -166,37 +172,44 @@ func (sv *supervisor) loadOrAllocateNodeID(dir string, fallback metadata.NodeID)
 			return metadata.NodeID(id)
 		}
 	}
-	os.WriteFile(path, []byte(fmt.Sprintf("%d\n", fallback)), 0644)
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d\n", fallback)), 0644); err != nil {
+		log.Printf("datanode: warning: failed to persist node ID for %s: %v", dir, err)
+	}
 	return fallback
 }
 
 func (sv *supervisor) stopAll() {
 	sv.mu.Lock()
-	defer sv.mu.Unlock()
 	for _, ci := range sv.children {
 		if ci.Cmd != nil && ci.Cmd.Process != nil {
 			log.Printf("datanode: stopping child pid=%d dir=%s", ci.Pid, ci.Dir)
 			ci.Cmd.Process.Signal(syscall.SIGTERM)
 		}
 	}
+	sv.mu.Unlock()
+
 	done := make(chan struct{}, 1)
 	go func() {
+		sv.mu.Lock()
 		for _, ci := range sv.children {
 			if ci.Cmd != nil {
 				ci.Cmd.Wait()
 			}
 			ci.State = childStopped
 		}
+		sv.mu.Unlock()
 		done <- struct{}{}
 	}()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
+		sv.mu.Lock()
 		for _, ci := range sv.children {
 			if ci.Cmd != nil && ci.Cmd.Process != nil {
 				ci.Cmd.Process.Kill()
 			}
 		}
+		sv.mu.Unlock()
 	}
 }
 
@@ -215,18 +228,18 @@ func (sv *supervisor) monitorLoop() {
 			sv.mu.Lock()
 			for _, ci := range sv.children {
 				if ci.State == childCrashed {
-					backoff := time.Duration(1<<min(restartCount[ci.Dir], 3)) * time.Second
-					if restartCount[ci.Dir] < maxRestarts {
-						log.Printf("datanode: restarting child dir=%s (attempt %d/%d, backoff %v)",
-							ci.Dir, restartCount[ci.Dir]+1, maxRestarts, backoff)
-						go func(info *childInfo) {
-							time.Sleep(backoff)
-							sv.startChild(info.Dir, info.Port)
-						}(ci)
-					} else {
+					if restartCount[ci.Dir] >= maxRestarts {
 						log.Printf("datanode: child dir=%s max restarts reached, not restarting", ci.Dir)
+						continue
 					}
+					backoff := time.Duration(1<<min(restartCount[ci.Dir], 3)) * time.Second
+					log.Printf("datanode: restarting child dir=%s (attempt %d/%d, backoff %v)",
+						ci.Dir, restartCount[ci.Dir]+1, maxRestarts, backoff)
 					restartCount[ci.Dir]++
+					go func(info *childInfo) {
+						time.Sleep(backoff)
+						sv.startChild(info.Dir, info.Port)
+					}(ci)
 				}
 			}
 			sv.mu.Unlock()
@@ -402,7 +415,7 @@ func runManagementCommand(cmd string, args []string) {
 		data, _ := json.MarshalIndent(resp.Data, "", "  ")
 		fmt.Println(string(data))
 	} else {
-		fmt.Printf("ok: %s\n", resp.Error)
+		fmt.Println("ok")
 	}
 }
 
@@ -427,11 +440,4 @@ func findSockPath(args []string) string {
 		}
 	}
 	return ""
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

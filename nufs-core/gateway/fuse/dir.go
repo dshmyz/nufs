@@ -32,6 +32,7 @@ var _ = (fs.NodeSymlinker)((*DFSDir)(nil))
 var _ = (fs.NodeLinker)((*DFSDir)(nil))
 var _ = (fs.NodeGetattrer)((*DFSDir)(nil))
 var _ = (fs.NodeSetattrer)((*DFSDir)(nil))
+var _ = (fs.NodeAccesser)((*DFSDir)(nil))
 
 // Readdir lists directory entries.
 func (d *DFSDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -286,6 +287,11 @@ func (d *DFSDir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttr
 	}
 
 	out.Attr = inodeMetaToAttr(metaInode)
+	return 0
+}
+
+// Access always returns 0 (allow-all).
+func (d *DFSDir) Access(ctx context.Context, mask uint32) syscall.Errno {
 	return 0
 }
 

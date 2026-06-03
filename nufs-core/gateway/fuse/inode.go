@@ -4,7 +4,6 @@ package fuse
 
 import (
 	"context"
-	"errors"
 	"hash/crc32"
 	"sync"
 	"syscall"
@@ -84,6 +83,7 @@ var _ = (fs.NodeSetattrer)((*DFSFile)(nil))
 var _ = (fs.NodeFsyncer)((*DFSFile)(nil))
 var _ = (fs.NodeFlusher)((*DFSFile)(nil))
 var _ = (fs.NodeReleaser)((*DFSFile)(nil))
+var _ = (fs.NodeAccesser)((*DFSFile)(nil))
 
 // DFSFileHandle wraps DFSFile for per-open-file state.
 type DFSFileHandle struct {
@@ -391,6 +391,11 @@ func (f *DFSFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 	return 0
 }
 
+// Access always returns 0 (allow-all).
+func (f *DFSFile) Access(ctx context.Context, mask uint32) syscall.Errno {
+	return 0
+}
+
 // OpenXAttr returns an xattr handle for this file.
 func (f *DFSFile) OpenXAttr() *DFSXAttr {
 	return &DFSXAttr{meta: f.meta, inodeID: f.inodeID}
@@ -409,42 +414,4 @@ func (h *DFSFileHandle) Write(ctx context.Context, data []byte, off int64) (uint
 	return h.file.Write(ctx, h, data, off)
 }
 
-// ========== DFSSymlink: symbolic link inode ==========
-
-// DFSSymlink represents a symbolic link in the DFS FUSE filesystem.
-type DFSSymlink struct {
-	fs.Inode
-
-	meta    metadata.MetadataService
-	inodeID metadata.InodeID
-}
-
-var _ = (fs.NodeReadlinker)((*DFSSymlink)(nil))
-var _ = (fs.NodeGetattrer)((*DFSSymlink)(nil))
-
-// Readlink reads the target path of the symlink.
-func (s *DFSSymlink) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
-	target, err := s.meta.Readlink(ctx, s.inodeID)
-	if err != nil {
-		if errors.Is(err, metadata.ErrNotSymlink) {
-			return nil, syscall.EINVAL
-		}
-		return nil, syscall.EIO
-	}
-	return []byte(target), 0
-}
-
-// Getattr returns symlink attributes.
-func (s *DFSSymlink) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	metaInode, err := s.meta.GetInode(ctx, s.inodeID)
-	if err != nil {
-		return syscall.EIO
-	}
-	out.Attr = inodeMetaToAttr(metaInode)
-	return 0
-}
-
-// OpenXAttr returns an xattr handle for this symlink.
-func (s *DFSSymlink) OpenXAttr() *DFSXAttr {
-	return &DFSXAttr{meta: s.meta, inodeID: s.inodeID}
-}
+// DFSSymlink is defined in symlink.go.

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
+	"net/url"
 	"time"
 )
 
@@ -68,8 +68,14 @@ func (c *HTTPClient) readResponse(resp *http.Response, v interface{}) error {
 		return fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode >= 400 {
-		if resp.StatusCode == http.StatusConflict && strings.Contains(string(data), "node already registered") {
-			return ErrNodeAlreadyExists
+		if resp.StatusCode == http.StatusConflict {
+			var errResp struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+			}
+			if json.Unmarshal(data, &errResp) == nil && errResp.Code == "node_already_registered" {
+				return ErrNodeAlreadyExists
+			}
 		}
 		return fmt.Errorf("metad: %s (status=%d)", string(data), resp.StatusCode)
 	}
@@ -188,7 +194,7 @@ func (c *HTTPClient) Unlink(ctx context.Context, parent InodeID, name string) er
 }
 
 func (c *HTTPClient) Lookup(ctx context.Context, parent InodeID, name string) (*InodeMeta, error) {
-	path := fmt.Sprintf("/api/v1/namespace/lookup?parent=%d&name=%s", parent, name)
+	path := fmt.Sprintf("/api/v1/namespace/lookup?parent=%d&name=%s", parent, url.QueryEscape(name))
 	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err

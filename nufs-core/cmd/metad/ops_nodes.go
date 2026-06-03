@@ -28,7 +28,7 @@ func (h *opsHandlers) handleNodes(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := h.store.RegisterNode(r.Context(), &info); err != nil {
 			if errors.Is(err, metadata.ErrNodeAlreadyExists) {
-				writeJSONError(w, http.StatusConflict, err.Error())
+				writeJSONErrorC(w, http.StatusConflict, "node_already_registered", err.Error())
 			} else {
 				writeJSONError(w, http.StatusInternalServerError, err.Error())
 			}
