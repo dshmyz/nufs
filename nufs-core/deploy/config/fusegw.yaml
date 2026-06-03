@@ -1,0 +1,14 @@
+# FUSE Gateway Configuration
+# Usage: fusegw --config=fusegw.yaml (or pass equivalent flags)
+
+mountpoint: "/mnt/dfs"
+
+# Metadata — local mode (-meta-dir) or remote mode (-meta-addr)
+meta_dir: "/var/lib/dfs/metadata"   # Local mode: Pebble data directory
+meta_addr: ""                        # Remote mode: metadata HTTP address
+
+# Chunk cache (empty = memory-only LRU with no disk persistence)
+cache_dir: ""
+
+log_level: "info"
+log_json: false

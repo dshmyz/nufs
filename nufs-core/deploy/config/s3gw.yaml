@@ -1,0 +1,18 @@
+# S3 Gateway Configuration
+# Usage: s3gw --config=s3gw.yaml (or pass equivalent flags)
+
+listen: ":8080"
+meta_addr: "localhost:8091"         # Metadata service address
+part_dir: "/var/lib/s3gw/parts"    # Multipart upload temp directory
+max_object_size: 5368709120         # 5 GiB
+
+# Authentication (disabled = anonymous access)
+access_key: ""
+secret_key: ""
+
+# CORS
+cors_allow_origins: ["*"]
+cors_allow_methods: ["GET", "PUT", "POST", "DELETE", "HEAD"]
+
+log_level: "info"
+log_json: false

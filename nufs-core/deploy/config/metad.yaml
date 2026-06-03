@@ -1,0 +1,22 @@
+# Metadata Service Configuration
+# Usage: metad --config=metad.yaml (or pass equivalent flags)
+
+listen: ":8091"
+ops_addr: ":8091"
+node_id: 1
+data_dir: "/var/lib/dfs/metadata"
+cache_dir: ""
+log_level: "info"
+log_json: false
+
+# Raft consensus (optional, for multi-node HA)
+raft:
+  enabled: true
+  listen: "0.0.0.0:7000"
+  data_dir: "/var/lib/dfs/raft"
+  bootstrap: false
+
+# Background tasks
+lease_ttl: "30s"
+gc_interval: "10m"
+scrub_interval: "1h"
