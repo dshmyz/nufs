@@ -43,7 +43,7 @@ nufs-core/bin/
 /metad
 /s3gw
 /datanode
-/dfsctl
 
 # binary placed at nufs-core/<name> when built from nufs-core/
 nufs-core/fusegw
+nufs-core/nufs-cli
