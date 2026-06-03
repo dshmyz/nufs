@@ -6,29 +6,46 @@ cluster:
   region: "us-east-1"
 
 # Metadata service configuration
-metadata:
-  etcd_endpoints:
-    - "etcd-0:2379"
-    - "etcd-1:2379"
-    - "etcd-2:2379"
-  badger_cache_dir: "/var/lib/dfs/metad/cache"
+metad:
+  listen: ":8091"
   node_id: 1
+  ops_addr: ":8091"
+  data_dir: "/var/lib/dfs/metadata"
+  cache_dir: "/var/lib/dfs/metad/cache"
+  raft:
+    enabled: true
+    listen: "0.0.0.0:7000"
+    data_dir: "/var/lib/dfs/raft"
+    bootstrap: false
+  lease_ttl: "30s"
+  gc_interval: "10m"
+  gc_dry_run: false
+  scrub_interval: "1h"
+  log_level: "info"
+  log_json: false
 
 # Data node configuration
 datanode:
-  listen: ":9001"
+  listen: ":9100"
+  metadata: "localhost:8091"
   data_dir: "/var/lib/dfs/datanode"
+  data_dirs: ""                       # comma-separated for supervisor mode
+  machine_id: ""
+  external_host: ""
   capacity_gb: 1000
-  tier: "hot"           # hot, warm, cold, archive
+  tier: "hot"                         # hot, warm, cold, archive
   rack: "rack1"
   zone: "zone1"
   heartbeat_interval: "10s"
+  log_level: "info"
+  log_json: false
 
 # S3 Gateway configuration
 s3gw:
   listen: ":8080"
-  etcd_endpoints:
-    - "etcd-0:2379"
+  meta_addr: "localhost:8091"
+  part_dir: "/var/lib/s3gw/parts"
+  max_object_size: 5368709120         # 5 GiB
   auth:
     enabled: false
     access_key: ""
@@ -40,14 +57,14 @@ s3gw:
 # FUSE Gateway configuration
 fusegw:
   mountpoint: "/mnt/dfs"
-  etcd_endpoints:
-    - "etcd-0:2379"
-  badger_cache_dir: "/var/lib/dfs/fusegw/cache"
+  meta_dir: "/var/lib/dfs/metadata"
+  meta_addr: "localhost:8091"
+  cache_dir: "/var/lib/dfs/fusegw/cache"
 
 # Placement policy defaults
 placement:
   replication_factor: 3
-  topology_spread: "rack"  # node, rack, zone
+  topology_spread: "rack"             # node, rack, zone
   storage_tier: "hot"
 
 # Repair & maintenance
@@ -56,6 +73,6 @@ repair:
   max_concurrent_repairs: 5
 
 rebalance:
-  threshold: 0.1         # 10% imbalance triggers rebalance
+  threshold: 0.1                      # 10% imbalance triggers rebalance
   max_migrations_per_run: 100
   scan_interval: "5m"

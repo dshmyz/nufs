@@ -4,6 +4,7 @@ package fuse
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -59,6 +60,12 @@ func StartMetricsServer(addr string) *http.Server {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		accept := r.Header.Get("Accept")
+		if accept == "application/openmetrics-text" || r.URL.Query().Get("format") == "openmetrics" {
+			w.Header().Set("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")
+			writeFUSEOpenMetrics(w)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		snap := fuseMetrics.Snapshot()
 		fmt.Fprintf(w, "# HELP fusegw_uptime_seconds Uptime.\n# TYPE fusegw_uptime_seconds gauge\nfusegw_uptime_seconds %g\n\n",
@@ -82,4 +89,41 @@ func StartMetricsServer(addr string) *http.Server {
 		_ = srv.ListenAndServe()
 	}()
 	return srv
+}
+
+func writeFUSEOpenMetrics(w io.Writer) {
+	fmt.Fprintf(w, "# TYPE fusegw_uptime_seconds gauge\n# UNIT fusegw_uptime_seconds seconds\nfusegw_uptime_seconds %g\n\n",
+		time.Since(fuseMetrics.startTime).Seconds())
+	fmt.Fprintf(w, "# TYPE fusegw_ops_total counter\n# UNIT fusegw_ops_total operations\n")
+	for _, op := range []string{"open", "read", "write", "flush", "release", "lookup", "readdir", "create", "mkdir", "remove", "rename"} {
+		var v uint64
+		switch op {
+		case "open":
+			v = atomic.LoadUint64(&fuseMetrics.OpsOpen)
+		case "read":
+			v = atomic.LoadUint64(&fuseMetrics.OpsRead)
+		case "write":
+			v = atomic.LoadUint64(&fuseMetrics.OpsWrite)
+		case "flush":
+			v = atomic.LoadUint64(&fuseMetrics.OpsFlush)
+		case "release":
+			v = atomic.LoadUint64(&fuseMetrics.OpsRelease)
+		case "lookup":
+			v = atomic.LoadUint64(&fuseMetrics.OpsLookup)
+		case "readdir":
+			v = atomic.LoadUint64(&fuseMetrics.OpsReadDir)
+		case "create":
+			v = atomic.LoadUint64(&fuseMetrics.OpsCreate)
+		case "mkdir":
+			v = atomic.LoadUint64(&fuseMetrics.OpsMkdir)
+		case "remove":
+			v = atomic.LoadUint64(&fuseMetrics.OpsRemove)
+		case "rename":
+			v = atomic.LoadUint64(&fuseMetrics.OpsRename)
+		}
+		fmt.Fprintf(w, "fusegw_ops_total{op=%q} %d\n", op, v)
+	}
+	fmt.Fprintf(w, "\n# TYPE fusegw_cache_hits_total counter\n# UNIT fusegw_cache_hits_total hits\nfusegw_cache_hits_total %d\n", atomic.LoadUint64(&fuseMetrics.CacheHits))
+	fmt.Fprintf(w, "# TYPE fusegw_cache_misses_total counter\n# UNIT fusegw_cache_misses_total misses\nfusegw_cache_misses_total %d\n", atomic.LoadUint64(&fuseMetrics.CacheMisses))
+	fmt.Fprintln(w, "# EOF")
 }

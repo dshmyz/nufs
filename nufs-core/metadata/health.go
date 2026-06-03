@@ -3,6 +3,7 @@ package metadata
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"net/http"
 	"sync"
@@ -320,9 +321,67 @@ func (hc *HealthChecker) HTTPHandler() http.Handler {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(hc.metrics.Snapshot())
+		accept := r.Header.Get("Accept")
+		if accept == "application/openmetrics-text" || r.URL.Query().Get("format") == "openmetrics" {
+			w.Header().Set("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")
+			hc.writeOpenMetrics(w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		hc.writePrometheus(w)
 	})
 
 	return mux
+}
+
+func (hc *HealthChecker) writePrometheus(w io.Writer) {
+	s := hc.metrics.Snapshot()
+
+	fmt.Fprintf(w, "# HELP metad_uptime_seconds Uptime.\n# TYPE metad_uptime_seconds gauge\nmetad_uptime_seconds %d\n\n", s.UptimeSeconds)
+	fmt.Fprintf(w, "# HELP metad_ops_total Total operations.\n# TYPE metad_ops_total counter\nmetad_ops_total %d\n", s.OpsTotal)
+	fmt.Fprintf(w, "# HELP metad_read_ops Read operations.\n# TYPE metad_read_ops counter\nmetad_read_ops %d\n", s.ReadOps)
+	fmt.Fprintf(w, "# HELP metad_write_ops Write operations.\n# TYPE metad_write_ops counter\nmetad_write_ops %d\n", s.WriteOps)
+	fmt.Fprintf(w, "# HELP metad_errors_total Total errors.\n# TYPE metad_errors_total counter\nmetad_errors_total %d\n\n", s.ErrorsTotal)
+	fmt.Fprintf(w, "# HELP metad_read_latency_us Latency percentiles.\n# TYPE metad_read_latency_us gauge\n")
+	fmt.Fprintf(w, "metad_read_latency_us{quantile=\"0.5\"} %d\nmetad_read_latency_us{quantile=\"0.99\"} %d\n\n", s.ReadP50us, s.ReadP99us)
+	fmt.Fprintf(w, "# HELP metad_write_latency_us Latency percentiles.\n# TYPE metad_write_latency_us gauge\n")
+	fmt.Fprintf(w, "metad_write_latency_us{quantile=\"0.5\"} %d\nmetad_write_latency_us{quantile=\"0.99\"} %d\n\n", s.WriteP50us, s.WriteP99us)
+	fmt.Fprintf(w, "# HELP metad_keys_total Total keys.\n# TYPE metad_keys_total gauge\nmetad_keys_total %d\n", s.KeysTotal)
+	fmt.Fprintf(w, "# HELP metad_chunks_total Total chunks.\n# TYPE metad_chunks_total gauge\nmetad_chunks_total %d\n", s.ChunksTotal)
+	fmt.Fprintf(w, "# HELP metad_nodes_online Nodes online.\n# TYPE metad_nodes_online gauge\nmetad_nodes_online %d\n", s.NodesOnline)
+	fmt.Fprintf(w, "# HELP metad_buckets_total Total buckets.\n# TYPE metad_buckets_total gauge\nmetad_buckets_total %d\n\n", s.BucketsTotal)
+	fmt.Fprintf(w, "# HELP metad_raft_info Raft metadata.\n# TYPE metad_raft_info gauge\nmetad_raft_info{state=\"%s\",term=\"%d\",log_index=\"%d\",snapshots=\"%d\"} 1\n",
+		raftStateLabel(s.RaftState), s.RaftTerm, s.RaftLogIndex, s.SnapshotsDone)
+}
+
+func (hc *HealthChecker) writeOpenMetrics(w io.Writer) {
+	s := hc.metrics.Snapshot()
+
+	fmt.Fprintf(w, "# TYPE metad_uptime_seconds gauge\n# UNIT metad_uptime_seconds seconds\nmetad_uptime_seconds %d\n\n", s.UptimeSeconds)
+	fmt.Fprintf(w, "# TYPE metad_ops_total counter\n# UNIT metad_ops_total operations\nmetad_ops_total %d\n", s.OpsTotal)
+	fmt.Fprintf(w, "# TYPE metad_read_ops counter\n# UNIT metad_read_ops operations\nmetad_read_ops %d\n", s.ReadOps)
+	fmt.Fprintf(w, "# TYPE metad_write_ops counter\n# UNIT metad_write_ops operations\nmetad_write_ops %d\n", s.WriteOps)
+	fmt.Fprintf(w, "# TYPE metad_errors_total counter\n# UNIT metad_errors_total errors\nmetad_errors_total %d\n\n", s.ErrorsTotal)
+	fmt.Fprintf(w, "# TYPE metad_read_latency_us gauge\n# UNIT metad_read_latency_us microseconds\n")
+	fmt.Fprintf(w, "metad_read_latency_us{quantile=\"0.5\"} %d\nmetad_read_latency_us{quantile=\"0.99\"} %d\n\n", s.ReadP50us, s.ReadP99us)
+	fmt.Fprintf(w, "# TYPE metad_write_latency_us gauge\n# UNIT metad_write_latency_us microseconds\n")
+	fmt.Fprintf(w, "metad_write_latency_us{quantile=\"0.5\"} %d\nmetad_write_latency_us{quantile=\"0.99\"} %d\n\n", s.WriteP50us, s.WriteP99us)
+	fmt.Fprintf(w, "# TYPE metad_keys_total gauge\nmetad_keys_total %d\n", s.KeysTotal)
+	fmt.Fprintf(w, "# TYPE metad_chunks_total gauge\nmetad_chunks_total %d\n", s.ChunksTotal)
+	fmt.Fprintf(w, "# TYPE metad_nodes_online gauge\nmetad_nodes_online %d\n", s.NodesOnline)
+	fmt.Fprintf(w, "# TYPE metad_buckets_total gauge\nmetad_buckets_total %d\n\n", s.BucketsTotal)
+	fmt.Fprintf(w, "# TYPE metad_raft_info gauge\nmetad_raft_info{state=\"%s\",term=\"%d\",log_index=\"%d\",snapshots=\"%d\"} 1\n",
+		raftStateLabel(s.RaftState), s.RaftTerm, s.RaftLogIndex, s.SnapshotsDone)
+	fmt.Fprintln(w, "# EOF")
+}
+
+func raftStateLabel(state int) string {
+	switch state {
+	case 1:
+		return "candidate"
+	case 2:
+		return "leader"
+	default:
+		return "follower"
+	}
 }
