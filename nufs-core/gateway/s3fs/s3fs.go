@@ -35,6 +35,8 @@ type S3FileSystem struct {
 	handleID uint64
 	locks    map[string]*pathLock
 
+	lockWait time.Duration // Wait timeout; 0 = defaultLockWaitTimeout
+
 	syncChan  chan interface{}
 	workersWg sync.WaitGroup
 	breaker   *circuitBreaker

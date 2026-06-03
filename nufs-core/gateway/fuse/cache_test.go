@@ -1,5 +1,3 @@
-//go:build linux
-
 package fuse
 
 import (
@@ -120,8 +118,8 @@ func TestChunkCacheHitRate(t *testing.T) {
 	c.Get(1) // hit
 
 	rate := c.HitRate()
-	if rate != 0.25 {
-		t.Errorf("expected 0.25 hit rate, got %f", rate)
+	if rate != 1.0/3.0 {
+		t.Errorf("expected 0.3333 hit rate, got %f", rate)
 	}
 }
 

@@ -140,6 +140,9 @@ func splitPath(p string) []string {
 
 // RemotePath returns the full S3 key for a given filesystem path.
 func (c *Config) RemotePath(fsPath string) string {
+	if fsPath == "" {
+		return c.BasePath + "/"
+	}
 	return path.Join(c.BasePath, fsPath)
 }
 
