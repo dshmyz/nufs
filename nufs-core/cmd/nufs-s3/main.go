@@ -1,4 +1,4 @@
-// s3gw is the S3-compatible gateway daemon for DFS.
+// nufs-s3 is the S3-compatible gateway daemon for DFS.
 package main
 
 import (
@@ -18,13 +18,13 @@ func main() {
 		metaAddr        = flag.String("meta-addr", "localhost:8091", "Metadata service address (host:port)")
 		accessKey       = flag.String("access-key", "", "Access key for auth (empty = anonymous)")
 		secretKey       = flag.String("secret-key", "", "Secret key for auth")
-		partDir         = flag.String("part-dir", "/var/lib/s3gw/parts", "Multipart upload temp directory (empty=in-memory)")
+		partDir         = flag.String("part-dir", "/var/lib/nufs-s3/parts", "Multipart upload temp directory (empty=in-memory)")
 		maxObjectSize   = flag.Int64("max-object-size", gos3.DefaultMaxObjectSize, "Maximum single-shot PUT body size in bytes (5 GiB by default)")
 		gracefulTimeout = flag.Duration("graceful-timeout", 30*time.Second, "Max time to wait for in-flight requests on shutdown")
 	)
 	flag.Parse()
 	logging.Init(logging.Config{Level: "info", AddSource: true})
-	log := logging.Named("s3gw")
+	log := logging.Named("nufs-s3")
 
 	log.Info("starting S3 gateway", "meta", *metaAddr, "listen", *listenAddr, "max_object_size", *maxObjectSize)
 

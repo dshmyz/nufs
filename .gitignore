@@ -41,9 +41,9 @@ nufs-core/bin/
 
 # Local Go build binaries produced by `go build ./cmd/<name>` without `-o`.
 /metad
-/s3gw
 /datanode
 
 # binary placed at nufs-core/<name> when built from nufs-core/
 nufs-core/fusegw
+nufs-core/nufs-s3
 nufs-core/nufs-cli

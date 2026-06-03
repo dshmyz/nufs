@@ -1,9 +1,9 @@
-# S3 Gateway Configuration
-# Usage: s3gw --config=s3gw.yaml (or pass equivalent flags)
+# NUFS S3 Gateway Configuration
+# Usage: nufs-s3 [flags]
 
 listen: ":8080"
 meta_addr: "localhost:8091"         # Metadata service address
-part_dir: "/var/lib/s3gw/parts"    # Multipart upload temp directory
+part_dir: "/var/lib/nufs-s3/parts" # Multipart upload temp directory
 max_object_size: 5368709120         # 5 GiB
 
 # Authentication (disabled = anonymous access)
