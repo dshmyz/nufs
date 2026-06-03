@@ -18,6 +18,7 @@ func main() {
 		metaAddr        = flag.String("meta-addr", "localhost:8091", "Metadata service address (host:port)")
 		accessKey       = flag.String("access-key", "", "Access key for auth (empty = anonymous)")
 		secretKey       = flag.String("secret-key", "", "Secret key for auth")
+		partDir         = flag.String("part-dir", "/var/lib/s3gw/parts", "Multipart upload temp directory (empty=in-memory)")
 		maxObjectSize   = flag.Int64("max-object-size", gos3.DefaultMaxObjectSize, "Maximum single-shot PUT body size in bytes (5 GiB by default)")
 		gracefulTimeout = flag.Duration("graceful-timeout", 30*time.Second, "Max time to wait for in-flight requests on shutdown")
 	)
@@ -48,6 +49,7 @@ func main() {
 	gw := gos3.NewGateway(gos3.GatewayConfig{
 		MetaService:         meta,
 		Creds:               creds,
+		PartDir:             *partDir,
 		MaxObjectSize:       *maxObjectSize,
 		RejectEmptyReplicas: true,
 		HealthCheck:         health,

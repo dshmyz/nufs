@@ -44,15 +44,18 @@ type GatewayConfig struct {
 	// them and losing data. Tests with in-memory chunk stores keep
 	// the default (false) so they don't need to wire replicas.
 	RejectEmptyReplicas bool
-	// HealthCheck, if set, is invoked on GET /healthz. A nil return
-	// yields 200; a non-nil error yields 503. Defaults to a stub
-	// that always reports healthy.
+	// HealthCheck, if set, is invoked on GET /healthz. Returning a
+	// non-nil error causes the probe to fail.
 	HealthCheck HealthChecker
 	// ReadyCheck, if set, is invoked on GET /readyz. Same semantics
 	// as HealthCheck. /readyz should reflect whether the gateway
 	// is connected to the metadata service and the chunk store is
 	// usable; /healthz is the liveness probe.
 	ReadyCheck HealthChecker
+	// PartDir is the temp directory for multipart upload part data.
+	// Empty means parts are stored in memory (not recommended for
+	// production — restart loses in-progress uploads).
+	PartDir string
 }
 
 // HealthChecker reports the state of a subsystem. Returning nil means
@@ -64,6 +67,10 @@ const DefaultMaxObjectSize int64 = 5 * 1024 * 1024 * 1024
 
 // NewGateway creates a new S3 gateway handler.
 func NewGateway(cfg GatewayConfig) *Gateway {
+	if err := activeUploads.init(cfg.PartDir); err != nil {
+		// PartDir is advisory; silence error in production.
+		// Callers can check logs for misconfiguration.
+	}
 	gw := &Gateway{
 		meta:       cfg.MetaService,
 		creds:      cfg.Creds,

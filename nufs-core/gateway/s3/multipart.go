@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
 )
-
-// In-memory multipart upload tracking.
-// In production, this would be persisted to the metadata store.
 
 var (
 	activeUploads = &uploadTracker{
@@ -24,6 +23,16 @@ var (
 type uploadTracker struct {
 	mu      sync.RWMutex
 	uploads map[string]*multipartUpload
+
+	partDir string // temp directory for part data on disk
+}
+
+func (t *uploadTracker) init(partDir string) error {
+	t.partDir = partDir
+	if partDir != "" {
+		return os.MkdirAll(partDir, 0700)
+	}
+	return nil
 }
 
 type multipartUpload struct {
@@ -32,6 +41,7 @@ type multipartUpload struct {
 	Key       string
 	CreatedAt time.Time
 	Parts     map[int]*uploadPart
+	partDir   string
 	mu        sync.Mutex
 }
 
@@ -39,7 +49,8 @@ type uploadPart struct {
 	PartNumber int
 	Size       int64
 	ETag       string
-	Data       []byte
+	partPath   string // empty if data is in memory
+	Data       []byte // in-memory fallback (only used when partDir is empty)
 }
 
 func (t *uploadTracker) create(bucket, key string) string {
@@ -53,6 +64,7 @@ func (t *uploadTracker) create(bucket, key string) string {
 		Key:       key,
 		CreatedAt: time.Now(),
 		Parts:     make(map[int]*uploadPart),
+		partDir:   t.partDir,
 	}
 	return uploadID
 }
@@ -81,6 +93,57 @@ func (t *uploadTracker) list(bucket string) []*multipartUpload {
 		}
 	}
 	return result
+}
+
+// cleanupPart removes the temp file for a part, if any.
+func (p *uploadPart) cleanup() {
+	if p.partPath != "" {
+		os.Remove(p.partPath)
+	}
+}
+
+// readAll returns the full part data, reading from disk if needed.
+func (p *uploadPart) readAll() ([]byte, error) {
+	if p.partPath != "" {
+		return os.ReadFile(p.partPath)
+	}
+	return p.Data, nil
+}
+
+// writePart stores part data to disk when partDir is configured, or in memory otherwise.
+func (t *uploadTracker) writePart(upload *multipartUpload, partNum int, data []byte, etag string) error {
+	p := &uploadPart{
+		PartNumber: partNum,
+		Size:       int64(len(data)),
+		ETag:       etag,
+	}
+	if t.partDir != "" {
+		partPath := path.Join(t.partDir, fmt.Sprintf("%s-%05d", upload.UploadID, partNum))
+		if err := os.WriteFile(partPath, data, 0600); err != nil {
+			return err
+		}
+		p.partPath = partPath
+	} else {
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		p.Data = buf
+	}
+
+	upload.mu.Lock()
+	// Clean up previous part data for this part number
+	if old, ok := upload.Parts[partNum]; ok {
+		old.cleanup()
+	}
+	upload.Parts[partNum] = p
+	upload.mu.Unlock()
+	return nil
+}
+
+// cleanupUpload removes all temp files for a multipart upload.
+func cleanupUpload(upload *multipartUpload) {
+	for _, p := range upload.Parts {
+		p.cleanup()
+	}
 }
 
 // handleInitiateMultipartUpload handles POST /{bucket}/{key}?uploads
@@ -134,14 +197,11 @@ func (gw *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, buck
 
 	etag := fmt.Sprintf("\"%08x\"", crc32Checksum(data))
 
-	upload.mu.Lock()
-	upload.Parts[partNum] = &uploadPart{
-		PartNumber: partNum,
-		Size:       int64(len(data)),
-		ETag:       etag,
-		Data:       data,
+	if err := activeUploads.writePart(upload, partNum, data, etag); err != nil {
+		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"Failed to store part data", "/"+bucket+"/"+key, requestID)
+		return
 	}
-	upload.mu.Unlock()
 
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
@@ -216,13 +276,14 @@ func (gw *Gateway) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.
 func (gw *Gateway) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, requestID string) {
 	uploadID := r.URL.Query().Get("uploadId")
 
-	_, ok := activeUploads.get(uploadID)
+	upload, ok := activeUploads.get(uploadID)
 	if !ok {
 		WriteXMLError(w, http.StatusNotFound, ErrCodeNoSuchUpload,
 			"The specified multipart upload does not exist", "/"+bucket+"/"+key, requestID)
 		return
 	}
 
+	cleanupUpload(upload)
 	activeUploads.remove(uploadID)
 	w.WriteHeader(http.StatusNoContent)
 }
