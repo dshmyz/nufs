@@ -34,6 +34,8 @@ func main() {
 		gcInterval    = flag.Duration("gc-interval", 10*time.Minute, "GC scan interval")
 		gcDryRun      = flag.Bool("gc-dry-run", false, "GC dry-run mode (no deletes)")
 		scrubInterval = flag.Duration("scrub-interval", 1*time.Hour, "Scrub interval")
+		tlsCert       = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
+		tlsKey        = flag.String("tls-key", "", "TLS private key file")
 		logLevel      = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON       = flag.Bool("log-json", false, "JSON log output")
 	)
@@ -125,10 +127,18 @@ func main() {
 	}
 
 	go func() {
-		log.Info("ops API listening", "addr", *opsAddr)
-		if err := opsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error("ops server error", "error", err)
-			os.Exit(1)
+		if *tlsCert != "" && *tlsKey != "" {
+			log.Info("ops API listening", "addr", *opsAddr, "tls", true)
+			if err := opsServer.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil && err != http.ErrServerClosed {
+				log.Error("ops server error", "error", err)
+				os.Exit(1)
+			}
+		} else {
+			log.Info("ops API listening", "addr", *opsAddr)
+			if err := opsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("ops server error", "error", err)
+				os.Exit(1)
+			}
 		}
 	}()
 

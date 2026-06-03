@@ -23,6 +23,8 @@ func main() {
 		partDir         = flag.String("part-dir", "/var/lib/nufs-s3/parts", "Multipart upload temp directory (empty=in-memory)")
 		maxObjectSize   = flag.Int64("max-object-size", gos3.DefaultMaxObjectSize, "Maximum single-shot PUT body size in bytes (5 GiB by default)")
 		gracefulTimeout = flag.Duration("graceful-timeout", 30*time.Second, "Max time to wait for in-flight requests on shutdown")
+		tlsCert         = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
+		tlsKey          = flag.String("tls-key", "", "TLS private key file")
 		logLevel        = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON         = flag.Bool("log-json", false, "JSON log output")
 	)
@@ -68,6 +70,8 @@ func main() {
 	if err := gw.Run(ctx, gos3.ServerConfig{
 		Addr:            *listenAddr,
 		GracefulTimeout: *gracefulTimeout,
+		TLSCertFile:     *tlsCert,
+		TLSKeyFile:      *tlsKey,
 	}); err != nil {
 		log.Error("gateway exited with error", "error", err)
 		os.Exit(1)

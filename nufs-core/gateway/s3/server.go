@@ -2,6 +2,7 @@ package s3
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -37,6 +38,9 @@ type ServerConfig struct {
 	// Handler, if non-nil, is used in place of gw.Handler(). Mostly
 	// useful for tests that want to wrap the handler in a probe.
 	Handler http.Handler
+	// TLSCertFile and TLSKeyFile enable TLS on the listener.
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
 // Run starts an HTTP server on the given address, blocks until ctx
@@ -88,9 +92,22 @@ func (gw *Gateway) Run(ctx context.Context, cfg ServerConfig) error {
 		return fmt.Errorf("s3gw: listen %s: %w", cfg.Addr, err)
 	}
 
+	// Wrap listener with TLS if certificates are configured.
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		tlsCfg, err := loadTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("s3gw: tls: %w", err)
+		}
+		ln = tls.NewListener(ln, tlsCfg)
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("s3gw: listening on %s", cfg.Addr)
+		scheme := "http"
+		if cfg.TLSCertFile != "" {
+			scheme = "https"
+		}
+		log.Printf("s3gw: listening on %s://%s", scheme, cfg.Addr)
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -124,4 +141,15 @@ func (gw *Gateway) Run(ctx context.Context, cfg ServerConfig) error {
 	}
 	log.Println("s3gw: stopped")
 	return nil
+}
+
+func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load key pair: %w", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
