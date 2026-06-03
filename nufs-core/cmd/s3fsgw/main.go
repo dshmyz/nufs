@@ -13,10 +13,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
+	"github.com/example/dfs/internal/logging"
 	"github.com/example/dfs/gateway/s3fs"
 )
 
@@ -41,6 +41,8 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	logging.Init(logging.Config{Level: "info", AddSource: true})
+	log := logging.Named("s3fsgw")
 
 	if flag.NArg() < 2 {
 		flag.Usage()
@@ -50,13 +52,12 @@ func main() {
 	target := flag.Arg(0)
 	mountpoint := flag.Arg(1)
 
-	// Parse S3 target URL.
 	u, bucket, basePath, err := s3fs.ParseTarget(target)
 	if err != nil {
-		log.Fatalf("Invalid target: %v", err)
+		log.Error("invalid target", "target", target, "error", err)
+		os.Exit(1)
 	}
 
-	// Build config.
 	cfg := &s3fs.Config{
 		Bucket:      bucket,
 		BasePath:    basePath,
@@ -72,15 +73,15 @@ func main() {
 		Debug:       *debug,
 	}
 
-	// Create filesystem.
-	log.Printf("s3fsgw: mounting %s -> %s", target, mountpoint)
+	log.Info("mounting", "target", target, "mountpoint", mountpoint)
 	fs, err := s3fs.New(cfg)
 	if err != nil {
-		log.Fatalf("Failed to create filesystem: %v", err)
+		log.Error("failed to create filesystem", "error", err)
+		os.Exit(1)
 	}
 
-	// Serve FUSE requests.
 	if err := fs.Serve(mountpoint); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+		log.Error("failed to serve", "error", err)
+		os.Exit(1)
 	}
 }

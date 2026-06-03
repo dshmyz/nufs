@@ -5,13 +5,13 @@ package main
 
 import (
 	"flag"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
 	gofuse "github.com/example/dfs/gateway/fuse"
 	"github.com/example/dfs/gateway/s3"
+	"github.com/example/dfs/internal/logging"
 	"github.com/example/dfs/metadata"
 )
 
@@ -22,60 +22,53 @@ func main() {
 		cacheDir   = flag.String("cache-dir", "", "Chunk cache directory (empty=memory only)")
 	)
 	flag.Parse()
+	logging.Init(logging.Config{Level: "info", AddSource: true})
+	log := logging.Named("fusegw")
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
-	log.Println("fusegw: starting FUSE gateway...")
+	log.Info("starting FUSE gateway")
 
-	// Validate mountpoint
 	if _, err := os.Stat(*mountpoint); os.IsNotExist(err) {
 		if err := os.MkdirAll(*mountpoint, 0755); err != nil {
-			log.Fatalf("fusegw: failed to create mountpoint %s: %v", *mountpoint, err)
+			log.Error("failed to create mountpoint", "mountpoint", *mountpoint, "error", err)
+			os.Exit(1)
 		}
 	}
 
-	// Create metadata store (PebbleStore)
-	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
-		Dir: *metaDir,
-	})
+	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{Dir: *metaDir})
 	if err != nil {
-		log.Fatalf("fusegw: failed to create metadata store: %v", err)
+		log.Error("failed to create metadata store", "error", err)
+		os.Exit(1)
 	}
 	defer store.Close()
 
-	// Chunk store: commit 1.1 uses an in-process memory store so
-	// fusegw is self-contained and easy to exercise from a single
-	// VM. A later commit wires it up to a local datanode daemon
-	// (or a remote DatanodeChunkStore) the same way the S3
-	// gateway does it.
 	chunkStore := s3.NewMemoryChunkStore()
 
-	// Create chunk cache (optional)
 	var chunkCache *gofuse.ChunkCache
 	if *cacheDir != "" {
 		chunkCache, err = gofuse.NewChunkCache(*cacheDir)
 		if err != nil {
-			log.Fatalf("fusegw: failed to create chunk cache: %v", err)
+			log.Error("failed to create chunk cache", "error", err)
+			os.Exit(1)
 		}
-		log.Printf("fusegw: chunk cache enabled at %s", *cacheDir)
+		log.Info("chunk cache enabled", "dir", *cacheDir)
 	}
 
-	// Mount FUSE filesystem
 	server, err := gofuse.Mount(*mountpoint, store, chunkStore, chunkCache, nil)
 	if err != nil {
-		log.Fatalf("fusegw: failed to mount: %v", err)
+		log.Error("failed to mount", "error", err)
+		os.Exit(1)
 	}
 	defer server.Unmount()
 
-	log.Printf("fusegw: mounted at %s", *mountpoint)
+	log.Info("mounted", "mountpoint", *mountpoint)
 
-	// Wait for interrupt
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 
-	log.Printf("fusegw: received signal %v, unmounting...", sig)
+	log.Info("received signal, unmounting", "signal", sig)
 	if err := server.Unmount(); err != nil {
-		log.Printf("fusegw: unmount error: %v", err)
+		log.Warn("unmount error", "error", err)
 	}
-	log.Println("fusegw: stopped")
+	log.Info("stopped")
 }

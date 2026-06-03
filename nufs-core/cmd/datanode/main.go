@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -13,12 +12,11 @@ import (
 	"time"
 
 	"github.com/example/dfs/datanode"
+	"github.com/example/dfs/internal/logging"
 	"github.com/example/dfs/metadata"
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
-
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
 		case "status", "adopt", "retire":
@@ -41,12 +39,14 @@ func main() {
 		capacityGB   = flag.Int64("capacity", 1000, "Node storage capacity in GB")
 	)
 	flag.Parse()
+	logging.Init(logging.Config{Level: "info", AddSource: true})
+	log := logging.Named("datanode")
 
-	// Supervisor mode
 	if *dataDirs != "" {
 		dirs := splitAndClean(*dataDirs)
 		if len(dirs) == 0 {
-			log.Fatalf("datanode: --data-dirs is empty")
+			log.Error("data-dirs is empty")
+			os.Exit(1)
 		}
 		mid := *machineID
 		if mid == "" {
@@ -56,9 +56,9 @@ func main() {
 		return
 	}
 
-	// Single-process mode (backward compatible)
 	if *dataDir == "" {
-		log.Fatalf("datanode: either --data-dir or --data-dirs must be set")
+		log.Error("either --data-dir or --data-dirs must be set")
+		os.Exit(1)
 	}
 
 	mid := *machineID
@@ -66,6 +66,7 @@ func main() {
 		mid = readMachineID()
 	}
 
+	log.Info("starting", "node_id", *nodeID, "addr", *listenAddr, "data", *dataDir, "machine", mid)
 	runDataNode(datanode.Config{
 		NodeID:              metadata.NodeID(*nodeID),
 		ListenAddr:          *listenAddr,
@@ -104,7 +105,7 @@ func readMachineID() string {
 	if err == nil {
 		return strings.TrimSpace(string(b))
 	}
-	log.Printf("datanode: WARNING could not read machine-id, using hostname")
+	logging.Named("datanode").Warn("could not read machine-id, using hostname")
 	h, err := os.Hostname()
 	if err != nil {
 		return "unknown"
@@ -113,24 +114,28 @@ func readMachineID() string {
 }
 
 func runDataNode(cfg datanode.Config) {
-	log.Printf("datanode: starting (node_id=%d, addr=%s, data=%s, machine=%s)", cfg.NodeID, cfg.ListenAddr, cfg.DataDir, cfg.MachineID)
+	log := logging.Named("datanode")
+	log.Info("starting data node", "node_id", cfg.NodeID, "addr", cfg.ListenAddr, "data", cfg.DataDir, "machine", cfg.MachineID)
 
 	wal, err := datanode.NewWriteAheadLog(filepath.Join(cfg.DataDir, "wal"))
 	if err != nil {
-		log.Fatalf("datanode: failed to init WAL: %v", err)
+		log.Error("failed to init WAL", "error", err)
+		os.Exit(1)
 	}
 	defer wal.Close()
 
 	chunkStore, err := datanode.NewChunkStore(cfg.DataDir, cfg.MaxConcurrentWrites, cfg.MaxConcurrentReads, wal)
 	if err != nil {
-		log.Fatalf("datanode: failed to init chunk store: %v", err)
+		log.Error("failed to init chunk store", "error", err)
+		os.Exit(1)
 	}
 	totalBytes, chunkCount := chunkStore.Stats()
-	log.Printf("datanode: chunk store ready (chunks=%d, bytes=%d)", chunkCount, totalBytes)
+	log.Info("chunk store ready", "chunks", chunkCount, "bytes", totalBytes)
 
 	diskManager, err := datanode.NewDiskManager(cfg.DataDir, chunkStore, cfg.CapacityGB, wal)
 	if err != nil {
-		log.Fatalf("datanode: failed to init disk manager: %v", err)
+		log.Error("failed to init disk manager", "error", err)
+		os.Exit(1)
 	}
 	diskManager.Start()
 	defer diskManager.Stop()
@@ -151,13 +156,15 @@ func runDataNode(cfg datanode.Config) {
 	})
 	cancel()
 	if err != nil && err != metadata.ErrNodeAlreadyExists {
-		log.Fatalf("datanode: failed to register node: %v", err)
+		log.Error("failed to register node", "error", err)
+		os.Exit(1)
 	}
-	log.Printf("datanode: registered with metadata service at %s", cfg.MetadataAddr)
+	log.Info("registered with metadata service", "addr", cfg.MetadataAddr)
 
 	server := datanode.NewServer(cfg, chunkStore)
 	if err := server.Start(); err != nil {
-		log.Fatalf("datanode: failed to start server: %v", err)
+		log.Error("failed to start server", "error", err)
+		os.Exit(1)
 	}
 	defer server.Stop()
 
@@ -189,11 +196,11 @@ func runDataNode(cfg datanode.Config) {
 	opsServer.Start()
 	defer opsServer.Stop()
 
-	log.Printf("datanode: all components started successfully")
+	log.Info("all components started successfully")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
-	log.Printf("datanode: received signal %v, shutting down", sig)
-	log.Printf("datanode: shutdown complete")
+	log.Info("received signal, shutting down", "signal", sig)
+	log.Info("shutdown complete")
 }

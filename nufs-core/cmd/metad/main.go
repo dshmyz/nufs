@@ -6,7 +6,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/example/dfs/internal/logging"
 	"github.com/example/dfs/metadata"
 )
 
@@ -32,14 +32,16 @@ func main() {
 		gcInterval    = flag.Duration("gc-interval", 10*time.Minute, "GC scan interval")
 		gcDryRun      = flag.Bool("gc-dry-run", false, "GC dry-run mode (no deletes)")
 		scrubInterval = flag.Duration("scrub-interval", 1*time.Hour, "Scrub interval")
+		logLevel      = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
+		logJSON       = flag.Bool("log-json", false, "JSON log output")
 	)
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
-	log.Printf("metad: starting metadata service (node_id=%d, data=%s)", *nodeID, *dataDir)
-	log.Printf("metad: Go %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})
+	log := logging.Named("metad")
+	log.Info("starting metadata service", "node_id", *nodeID, "data", *dataDir)
+	log.Info("runtime", "go", runtime.Version(), "os", runtime.GOOS, "arch", runtime.GOARCH)
 
-	// 1. Create PebbleStore (single instance)
 	pebbleCfg := metadata.PebbleStoreConfig{
 		Dir:          *dataDir,
 		CacheDir:     *cacheDir,
@@ -49,11 +51,11 @@ func main() {
 
 	store, err := metadata.NewPebbleStore(pebbleCfg)
 	if err != nil {
-		log.Fatalf("metad: failed to create PebbleStore: %v", err)
+		log.Error("failed to create PebbleStore", "error", err)
+		os.Exit(1)
 	}
-	log.Printf("metad: PebbleStore initialized (dir=%s)", *dataDir)
+	log.Info("PebbleStore initialized", "dir", *dataDir)
 
-	// 2. Configure Raft (uses the same PebbleStore)
 	var raftNode *metadata.RaftNode
 
 	if *enableRaft {
@@ -69,24 +71,23 @@ func main() {
 
 		raftNode, err = metadata.NewRaftNode(store, raftCfg)
 		if err != nil {
-			log.Fatalf("metad: failed to create Raft node: %v", err)
+			log.Error("failed to create Raft node", "error", err)
+			os.Exit(1)
 		}
 		store.SetRaftNode(raftNode)
-		log.Printf("metad: Raft node started (addr=%s, bootstrap=%v)", *raftAddr, *raftBootstrap)
+		log.Info("Raft node started", "addr", *raftAddr, "bootstrap", *raftBootstrap)
 
-		// Wait for leadership
 		for i := 0; i < 30; i++ {
 			if store.IsLeader() {
-				log.Printf("metad: this node is the Raft leader")
+				log.Info("this node is the Raft leader")
 				break
 			}
 			time.Sleep(time.Second)
 		}
 	} else {
-		log.Printf("metad: running in single-node mode (Raft disabled)")
+		log.Info("running in single-node mode (Raft disabled)")
 	}
 
-	// 3. Create production service bundle (wraps the single PebbleStore)
 	opts := []metadata.ServiceOption{
 		metadata.WithLeaseTTL(*leaseTTL),
 		metadata.WithGCInterval(*gcInterval),
@@ -96,22 +97,20 @@ func main() {
 
 	bundle, err := metadata.NewPebbleServiceBundle(store, opts...)
 	if err != nil {
-		log.Fatalf("metad: failed to create service bundle: %v", err)
+		log.Error("failed to create service bundle", "error", err)
+		os.Exit(1)
 	}
 	defer bundle.Close()
 
-	// Set Raft reference on bundle (needed for health checks)
 	bundle.Raft = raftNode
 
-	log.Printf("metad: service bundle initialized")
+	log.Info("service bundle initialized")
 
-	// 4. Start operations HTTP API + Admin dashboard
 	mux := http.NewServeMux()
 	registerOpsHandlers(mux, store, bundle)
 
 	admin := newAdminServer(store, bundle)
 	admin.RegisterRoutes(mux)
-	log.Printf("metad: admin dashboard available at http://%s/admin/", *opsAddr)
 
 	opsServer := &http.Server{
 		Addr:         *opsAddr,
@@ -122,33 +121,31 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("metad: ops API listening on %s", *opsAddr)
+		log.Info("ops API listening", "addr", *opsAddr)
 		if err := opsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("metad: ops server error: %v", err)
+			log.Error("ops server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
-	log.Printf("metad: metadata service ready")
+	log.Info("metadata service ready")
 
-	// 5. Wait for shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
-	log.Printf("metad: received signal %v, shutting down", sig)
+	log.Info("received signal, shutting down", "signal", sig)
 
-	// Trigger Raft snapshot before shutdown
 	if raftNode != nil {
 		if err := raftNode.TriggerSnapshot(); err != nil {
-			log.Printf("metad: snapshot warning: %v", err)
+			log.Warn("snapshot failed", "error", err)
 		}
 	}
 
-	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
 	if err := opsServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("metad: ops shutdown error: %v", err)
+		log.Warn("ops shutdown error", "error", err)
 	}
 
-	log.Printf("metad: shutdown complete")
+	log.Info("shutdown complete")
 }
