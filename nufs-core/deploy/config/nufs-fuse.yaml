@@ -1,7 +1,7 @@
-# FUSE Gateway Configuration
+# NUFS FUSE Gateway Configuration
 # Usage:
-#   fusegw --backend=dfs [flags] <mountpoint>
-#   fusegw --backend=s3 [flags] <s3-endpoint/bucket/prefix> <mountpoint>
+#   nufs-fuse --backend=dfs [flags] <mountpoint>
+#   nufs-fuse --backend=s3 [flags] <s3-endpoint/bucket/prefix> <mountpoint>
 
 # === Shared ===
 backend: "dfs"                         # dfs (distributed filesystem) or s3 (external S3 bucket)

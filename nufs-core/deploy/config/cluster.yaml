@@ -1,6 +1,6 @@
 # Cluster-wide Settings
 # Referenced by services that need global policy; per-service configs
-# in metad.yaml, datanode.yaml, nufs-s3.yaml, fusegw.yaml.
+# in metad.yaml, datanode.yaml, nufs-s3.yaml, nufs-fuse.yaml.
 
 cluster:
   name: "dfs-cluster-01"

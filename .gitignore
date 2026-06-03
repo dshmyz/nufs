@@ -45,5 +45,6 @@ nufs-core/bin/
 
 # binary placed at nufs-core/<name> when built from nufs-core/
 nufs-core/fusegw
+nufs-core/nufs-fuse
 nufs-core/nufs-s3
 nufs-core/nufs-cli

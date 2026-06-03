@@ -12,7 +12,7 @@ import (
 // --- Advisory lock handlers ---
 //
 // These three endpoints back the HTTPClient.Advisory* methods so
-// remote gateways (fusegw, s3gw, dfsctl) can coordinate with each
+// remote gateways (nufs-fuse, nufs-s3, nufs-cli) can coordinate with each
 // other through a single source of truth — the metad process that
 // owns the PebbleStore. The lock state itself is in-memory in
 // PebbleStore.advisoryLocks; see metadata/lock.go for the model.
