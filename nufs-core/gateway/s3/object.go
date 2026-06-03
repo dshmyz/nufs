@@ -53,18 +53,20 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	// Try to create file; if exists, unlink old and recreate
+	// Try to create file; if exists, look up the existing inode and
+	// update it in place.  This avoids the Unlink+CreateFile window
+	// where the key temporarily disappears.
+	var oldChunks []metadata.ChunkRef
 	inode, err := gw.meta.CreateFile(ctx, b.RootInode, key, 0644)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryExists) {
-			// Overwrite: unlink existing entry
-			_ = gw.meta.Unlink(ctx, b.RootInode, key)
-			inode, err = gw.meta.CreateFile(ctx, b.RootInode, key, 0644)
+			inode, err = gw.meta.Lookup(ctx, b.RootInode, key)
 			if err != nil {
 				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
 					err.Error(), "/"+bucket+"/"+key, requestID)
 				return
 			}
+			oldChunks = inode.ChunkMap
 		} else {
 			WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
 				err.Error(), "/"+bucket+"/"+key, requestID)
@@ -135,6 +137,12 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 	}
 	if err := gw.meta.UpdateInode(ctx, inode); err != nil {
 		log.Printf("s3gw: update inode %d: %v", inode.ID, err)
+	}
+
+	// Clean up old chunks (async — readers still holding in-flight
+	// references will finish before the chunk data is removed).
+	for _, cref := range oldChunks {
+		_ = gw.meta.DeleteChunk(ctx, cref.ID)
 	}
 
 	// Compute ETag from content hash
