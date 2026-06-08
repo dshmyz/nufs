@@ -179,7 +179,7 @@ func runDataNode(cfg datanode.Config) {
 	replicator.Start()
 	defer replicator.Stop()
 
-	chainRepl := datanode.NewChainReplicator(cfg.ListenAddr, cfg.NodeID, 5*time.Second)
+	chainRepl := datanode.NewParallelReplicator(cfg.ListenAddr, cfg.NodeID, 5*time.Second)
 
 	repairWorker := datanode.NewRepairWorker(datanode.RepairConfig{
 		Meta:       metaStore,
