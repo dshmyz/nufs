@@ -19,6 +19,7 @@ type pathLock struct {
 // Lock acquires a path-level lock. Blocks if already locked, queuing
 // in FIFO order. When Unlock transfers ownership, the first Lock waiter
 // receives the lock directly (no race with other goroutines).
+// Uses Lock (write lock) since it modifies the locks map.
 func (fs *S3FileSystem) Lock(path string) error {
 	fs.mu.Lock()
 	pl, ok := fs.locks[path]
@@ -42,6 +43,7 @@ func (fs *S3FileSystem) Lock(path string) error {
 // Unlock releases a path-level lock. If Lock waiters are queued the
 // lock is transferred directly to the first waiter (FIFO). All Wait
 // callers are notified (they do not take ownership).
+// Uses Lock (write lock) since it modifies the locks map.
 func (fs *S3FileSystem) Unlock(path string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -72,21 +74,22 @@ func (fs *S3FileSystem) Unlock(path string) {
 // Wait blocks until the path is no longer locked, with a configurable
 // timeout. Unlike Lock, the caller does not hold the path lock after
 // Wait returns.
+// Uses RLock (read lock) since it only checks lock status.
 func (fs *S3FileSystem) Wait(path string) error {
 	timeout := fs.lockWait
 	if timeout <= 0 {
 		timeout = defaultLockWaitTimeout
 	}
 
-	fs.mu.Lock()
+	fs.mu.RLock()
 	pl, ok := fs.locks[path]
 	if !ok || !pl.locked {
-		fs.mu.Unlock()
+		fs.mu.RUnlock()
 		return nil
 	}
 	ch := make(chan struct{})
 	pl.waitWaiters = append(pl.waitWaiters, ch)
-	fs.mu.Unlock()
+	fs.mu.RUnlock()
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -99,9 +102,10 @@ func (fs *S3FileSystem) Wait(path string) error {
 }
 
 // IsLocked returns true if the path is currently locked.
+// Uses RLock (read lock) since it only checks lock status.
 func (fs *S3FileSystem) IsLocked(path string) bool {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
 	pl, ok := fs.locks[path]
 	return ok && pl.locked
 }

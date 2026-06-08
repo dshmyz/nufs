@@ -50,8 +50,8 @@ const (
 	ChainFailed                        // Node is down/unreachable
 )
 
-// ChainReplicator manages synchronous chain replication.
-type ChainReplicator struct {
+// ParallelReplicator manages synchronous chain replication.
+type ParallelReplicator struct {
 	localAddr   string
 	localID     metadata.NodeID
 	timeout     time.Duration
@@ -67,16 +67,16 @@ type ChainReplicator struct {
 	writeLatency atomic.Int64 // microseconds
 }
 
-// NewChainReplicator creates a chain replication manager.
-func NewChainReplicator(localAddr string, localID metadata.NodeID, timeout time.Duration, opts ...func(*ChainReplicatorConfig)) *ChainReplicator {
+// NewParallelReplicator creates a chain replication manager.
+func NewParallelReplicator(localAddr string, localID metadata.NodeID, timeout time.Duration, opts ...func(*ParallelReplicatorConfig)) *ParallelReplicator {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	cfg := &ChainReplicatorConfig{}
+	cfg := &ParallelReplicatorConfig{}
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	return &ChainReplicator{
+	return &ParallelReplicator{
 		localAddr:   localAddr,
 		localID:     localID,
 		timeout:     timeout,
@@ -86,7 +86,7 @@ func NewChainReplicator(localAddr string, localID metadata.NodeID, timeout time.
 }
 
 // BuildChain creates a replication chain for a chunk.
-func (cr *ChainReplicator) BuildChain(chunkID metadata.ChunkID, replicas []metadata.ReplicaInfo) *ReplicationChain {
+func (cr *ParallelReplicator) BuildChain(chunkID metadata.ChunkID, replicas []metadata.ReplicaInfo) *ReplicationChain {
 	chain := &ReplicationChain{
 		ChunkID: chunkID,
 		Nodes:   make([]ChainNode, 0, len(replicas)),
@@ -119,7 +119,7 @@ func (cr *ChainReplicator) BuildChain(chunkID metadata.ChunkID, replicas []metad
 }
 
 // Head returns the head node of the chain (first alive).
-func (cr *ChainReplicator) Head(chunkID metadata.ChunkID) *ChainNode {
+func (cr *ParallelReplicator) Head(chunkID metadata.ChunkID) *ChainNode {
 	cr.mu.RLock()
 	defer cr.mu.RUnlock()
 
@@ -136,7 +136,7 @@ func (cr *ChainReplicator) Head(chunkID metadata.ChunkID) *ChainNode {
 }
 
 // Tail returns the tail node (last alive, most consistent).
-func (cr *ChainReplicator) Tail(chunkID metadata.ChunkID) *ChainNode {
+func (cr *ParallelReplicator) Tail(chunkID metadata.ChunkID) *ChainNode {
 	cr.mu.RLock()
 	defer cr.mu.RUnlock()
 
@@ -153,7 +153,7 @@ func (cr *ChainReplicator) Tail(chunkID metadata.ChunkID) *ChainNode {
 }
 
 // AliveReplicas returns all non-failed replicas.
-func (cr *ChainReplicator) AliveReplicas(chunkID metadata.ChunkID) []ChainNode {
+func (cr *ParallelReplicator) AliveReplicas(chunkID metadata.ChunkID) []ChainNode {
 	cr.mu.RLock()
 	defer cr.mu.RUnlock()
 
@@ -171,7 +171,7 @@ func (cr *ChainReplicator) AliveReplicas(chunkID metadata.ChunkID) []ChainNode {
 }
 
 // MarkFailed marks a node as failed in the chain.
-func (cr *ChainReplicator) MarkFailed(chunkID metadata.ChunkID, nodeID metadata.NodeID) {
+func (cr *ParallelReplicator) MarkFailed(chunkID metadata.ChunkID, nodeID metadata.NodeID) {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
@@ -189,7 +189,7 @@ func (cr *ChainReplicator) MarkFailed(chunkID metadata.ChunkID, nodeID metadata.
 }
 
 // Stats returns replication statistics.
-func (cr *ChainReplicator) Stats() (writes, errors int64, avgLatencyUs int64) {
+func (cr *ParallelReplicator) Stats() (writes, errors int64, avgLatencyUs int64) {
 	w := cr.writeCount.Load()
 	e := cr.writeErrors.Load()
 	l := cr.writeLatency.Load()
@@ -201,7 +201,7 @@ func (cr *ChainReplicator) Stats() (writes, errors int64, avgLatencyUs int64) {
 
 // WriteToChain performs a synchronous chain-replicated write.
 // Returns the response from the tail node, which is the most consistent.
-func (cr *ChainReplicator) WriteToChain(ctx context.Context, chunkID metadata.ChunkID, data []byte) (*Response, error) {
+func (cr *ParallelReplicator) WriteToChain(ctx context.Context, chunkID metadata.ChunkID, data []byte) (*Response, error) {
 	chain := cr.Head(chunkID)
 	if chain == nil {
 		return nil, fmt.Errorf("chain for chunk %d has no alive head", chunkID)
@@ -267,14 +267,14 @@ func (cr *ChainReplicator) WriteToChain(ctx context.Context, chunkID metadata.Ch
 	return lastResp, nil
 }
 
-// ChainReplicatorConfig holds configuration for chain replication.
-type ChainReplicatorConfig struct {
+// ParallelReplicatorConfig holds configuration for chain replication.
+type ParallelReplicatorConfig struct {
 	LocalWriter func(chunkID metadata.ChunkID, data []byte) error
 }
 
 // WithLocalWriter sets the local write function for chain replication.
-func WithLocalWriter(writer func(chunkID metadata.ChunkID, data []byte) error) func(*ChainReplicatorConfig) {
-	return func(cfg *ChainReplicatorConfig) {
+func WithLocalWriter(writer func(chunkID metadata.ChunkID, data []byte) error) func(*ParallelReplicatorConfig) {
+	return func(cfg *ParallelReplicatorConfig) {
 		cfg.LocalWriter = writer
 	}
 }
@@ -282,6 +282,44 @@ func WithLocalWriter(writer func(chunkID metadata.ChunkID, data []byte) error) f
 
 
 
+
+// ============================================================
+// Minimal Interfaces — Interface Segregation for Datanode
+// ============================================================
+//
+// Each component only depends on the metadata methods it actually
+// uses, reducing coupling and making testing easier.
+
+// HeartbeatMeta is the minimal metadata interface for HeartbeatReporter.
+type HeartbeatMeta interface {
+	Heartbeat(ctx context.Context, nodeID metadata.NodeID, report *metadata.NodeReport) error
+}
+
+// AntiEntropyMeta is the minimal metadata interface for AntiEntropy.
+type AntiEntropyMeta interface {
+	GetChunk(ctx context.Context, id metadata.ChunkID) (*metadata.ChunkMeta, error)
+	ReportChunkState(ctx context.Context, nodeID metadata.NodeID, states map[metadata.ChunkID]metadata.ReplicaState) error
+	TriggerRepair(ctx context.Context, chunkID metadata.ChunkID) error
+}
+
+// RepairMeta is the minimal metadata interface for RepairWorker.
+type RepairMeta interface {
+	GetChunk(ctx context.Context, id metadata.ChunkID) (*metadata.ChunkMeta, error)
+	UpdateChunk(ctx context.Context, chunk *metadata.ChunkMeta) error
+	GetRepairQueue(ctx context.Context) ([]metadata.RepairTask, error)
+	RemoveRepairTask(ctx context.Context, chunkID metadata.ChunkID) error
+	ReportChunkState(ctx context.Context, nodeID metadata.NodeID, states map[metadata.ChunkID]metadata.ReplicaState) error
+	ListNodes(ctx context.Context) ([]metadata.NodeInfo, error)
+	ChunksByNode(ctx context.Context, nodeID metadata.NodeID) ([]metadata.ChunkMeta, error)
+	TriggerRepair(ctx context.Context, chunkID metadata.ChunkID) error
+}
+
+// Compile-time interface checks: PebbleStore satisfies all minimal interfaces.
+var (
+	_ HeartbeatMeta   = (*metadata.PebbleStore)(nil)
+	_ AntiEntropyMeta = (*metadata.PebbleStore)(nil)
+	_ RepairMeta      = (*metadata.PebbleStore)(nil)
+)
 
 // ============================================================
 // Nearest-Replica Read — Read from closest alive replica
@@ -343,10 +381,11 @@ func (rs *ReadStrategy) SelectReplica(chain *ReplicationChain) *ChainNode {
 // and triggers repair when inconsistencies are detected.
 type AntiEntropy struct {
 	store   *ChunkStore
-	meta    metadata.MetadataService
+	meta    AntiEntropyMeta
 	localID metadata.NodeID
 	stopCh  chan struct{}
 	running atomic.Bool
+	wg      sync.WaitGroup // WaitGroup for graceful goroutine shutdown
 
 	// Stats
 	scanned    atomic.Int64
@@ -355,7 +394,7 @@ type AntiEntropy struct {
 }
 
 // NewAntiEntropy creates an anti-entropy repair engine.
-func NewAntiEntropy(store *ChunkStore, meta metadata.MetadataService, localID metadata.NodeID) *AntiEntropy {
+func NewAntiEntropy(store *ChunkStore, meta AntiEntropyMeta, localID metadata.NodeID) *AntiEntropy {
 	return &AntiEntropy{
 		store:   store,
 		meta:    meta,
@@ -482,7 +521,9 @@ func (ae *AntiEntropy) Start(interval time.Duration) {
 	if ae.running.Swap(true) {
 		return
 	}
+	ae.wg.Add(1)
 	go func() {
+		defer ae.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -502,11 +543,12 @@ func (ae *AntiEntropy) Start(interval time.Duration) {
 	}()
 }
 
-// Stop terminates anti-entropy.
+// Stop terminates anti-entropy and waits for the goroutine to exit.
 func (ae *AntiEntropy) Stop() {
 	if ae.running.Swap(false) {
 		close(ae.stopCh)
 	}
+	ae.wg.Wait()
 }
 
 // Stats returns cumulative anti-entropy statistics.

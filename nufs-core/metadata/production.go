@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -285,15 +285,14 @@ func (lm *LeaseManager) checkExpiredNodes() {
 			info.LastSeen = now
 			data, err := json.Marshal(&info)
 			if err != nil {
-				log.Printf("lease: marshal node %d: %v", info.ID, err)
+				slog.Error("lease: marshal node", "node_id", info.ID, "error", err)
 				return nil
 			}
 			if err := lm.store.applyViaRaft(OpSet, string(key), data); err != nil {
-				log.Printf("lease: failed to mark node %d offline via raft: %v", info.ID, err)
+				slog.Error("lease: failed to mark node offline via raft", "node_id", info.ID, "error", err)
 				return nil
 			}
-			log.Printf("lease: node %d marked offline (last seen %v ago)",
-				info.ID, time.Since(time.Unix(0, info.LastSeen)))
+			slog.Warn("lease: node marked offline", "node_id", info.ID, "offline_since", time.Since(time.Unix(0, info.LastSeen)))
 
 			// Publish event for repair worker
 			if lm.events != nil {
@@ -311,6 +310,7 @@ func (lm *LeaseManager) checkExpiredNodes() {
 		return nil
 	})
 }
+
 // ============================================================
 // Orphan Chunk GC — Reclaim Unreferenced Storage
 // ============================================================
@@ -418,10 +418,13 @@ func (gc *ChunkGC) Start(interval time.Duration) {
 			case <-ticker.C:
 				result, err := gc.Scan(context.Background())
 				if err != nil {
-					log.Printf("gc: scan error: %v", err)
+					slog.Error("gc: scan error", "error", err)
 				} else if result.OrphanChunks > 0 {
-					log.Printf("gc: found %d orphans, deleted %d, freed %d bytes in %v",
-						result.OrphanChunks, result.DeletedChunks, result.FreedBytes, result.ScanDuration)
+					slog.Info("gc: found orphans",
+						"orphans", result.OrphanChunks,
+						"deleted", result.DeletedChunks,
+						"freed_bytes", result.FreedBytes,
+						"duration", result.ScanDuration)
 				}
 			case <-gc.stopCh:
 				return
@@ -507,7 +510,7 @@ func (s *Scrubber) Scan(ctx context.Context) (*ScrubResult, error) {
 
 		if err := s.VerifyChunkChecksum(ctx, chunk); err != nil {
 			result.ChunksCorrupted++
-			log.Printf("scrub: chunk %d corrupted: %v", chunk.ID, err)
+			slog.Error("scrub: chunk corrupted", "chunk_id", chunk.ID, "error", err)
 
 			// Trigger repair
 			if s.events != nil {
@@ -549,11 +552,14 @@ func (s *Scrubber) Start(interval time.Duration) {
 			case <-ticker.C:
 				result, err := s.Scan(context.Background())
 				if err != nil {
-					log.Printf("scrub: error: %v", err)
+					slog.Error("scrub: error", "error", err)
 				} else {
-					log.Printf("scrub: scanned %d chunks, %d corrupted, %d degraded, %d repairs in %v",
-						result.ChunksScanned, result.ChunksCorrupted,
-						result.ChunksDegraded, result.RepairTriggered, result.ScanDuration)
+					slog.Info("scrub: completed",
+						"scanned", result.ChunksScanned,
+						"corrupted", result.ChunksCorrupted,
+						"degraded", result.ChunksDegraded,
+						"repairs", result.RepairTriggered,
+						"duration", result.ScanDuration)
 				}
 			case <-s.stopCh:
 				return

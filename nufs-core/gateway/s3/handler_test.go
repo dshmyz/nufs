@@ -405,6 +405,39 @@ func (m *mockMetaService) RemoveXAttr(_ context.Context, _ metadata.InodeID, _ s
 	return nil
 }
 
+func (m *mockMetaService) ComputeAllBucketUsage(_ context.Context) ([]metadata.BucketUsage, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var result []metadata.BucketUsage
+	for name, b := range m.buckets {
+		used, objs := m.mockBucketUsage(b.RootInode)
+		result = append(result, metadata.BucketUsage{
+			Name:      name,
+			UsedBytes: used,
+			Objects:   objs,
+		})
+	}
+	return result, nil
+}
+
+func (m *mockMetaService) mockBucketUsage(dirInode metadata.InodeID) (int64, int) {
+	var usedBytes int64
+	var objects int
+	ents := m.entries[m.parentKey(dirInode)]
+	for _, e := range ents {
+		if e.Type == metadata.FileDirectory {
+			ub, objs := m.mockBucketUsage(e.ID)
+			usedBytes += ub
+			objects += objs
+		} else {
+			objects++
+			usedBytes += e.Size
+		}
+	}
+	return usedBytes, objects
+}
+
 // ========== Test Helpers ==========
 
 func newTestGateway(t *testing.T) (*Gateway, *httptest.Server, *mockMetaService) {

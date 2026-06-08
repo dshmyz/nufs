@@ -14,58 +14,96 @@ import (
 type opsHandlers struct {
 	store  *metadata.PebbleStore
 	bundle *metadata.ServiceBundle
+
+	// advertiseOpsAddr is our own ops HTTP URL (e.g. "http://10.0.0.1:8091").
+	// Followers that receive mutating requests return 307 to the leader's
+	// ops address so the caller can retry on the correct node.
+	advertiseOpsAddr string
+}
+
+// requireLeader checks if this node is the Raft leader. If not, it
+// sends an HTTP 307 redirect to the leader's ops address and returns
+// false. Callers (mutating handlers) should return immediately after
+// this returns false. Read-only handlers can skip the check.
+func (h *opsHandlers) requireLeader(w http.ResponseWriter, r *http.Request) bool {
+	if h.store.IsLeader() {
+		return true
+	}
+	leaderAddr := h.store.LeaderOpsAddr()
+	if leaderAddr == "" {
+		writeJSONError(w, http.StatusServiceUnavailable, "no leader available")
+		return false
+	}
+	http.Redirect(w, r, leaderAddr+r.URL.Path, http.StatusTemporaryRedirect)
+	return false
 }
 
 // registerOpsHandlers wires every endpoint in the ops API. The list
 // is grouped by resource domain so that adding a new endpoint means
 // adding the route here and the handler in the matching ops_*.go
 // file.
-func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle *metadata.ServiceBundle) {
-	s := &opsHandlers{store: store, bundle: bundle}
+func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle *metadata.ServiceBundle, advertiseOpsAddr string) {
+	s := &opsHandlers{store: store, bundle: bundle, advertiseOpsAddr: advertiseOpsAddr}
 
-	// Health & cluster
+	// helper: wrap a handler with leader check
+	mut := func(fn http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if !s.requireLeader(w, r) {
+				return
+			}
+			fn(w, r)
+		}
+	}
+
+	// Health & cluster — always served, no leader check
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/ready", s.handleReady)
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/metrics", s.handleMetrics)
 
-	// Buckets
-	mux.HandleFunc("/api/v1/buckets", s.handleBuckets)
-	mux.HandleFunc("/api/v1/buckets/", s.handleBucketByID)
+	// Admin — read-only, no leader check
+	mux.HandleFunc("/api/v1/admin/bucket-usage", s.handleComputeAllBucketUsage)
 
-	// Nodes
-	mux.HandleFunc("/api/v1/nodes", s.handleNodes)
-	mux.HandleFunc("/api/v1/nodes/", s.handleNodesByID)
+	// Buckets (mutating: POST/PUT/DELETE; read: GET uses same handler that method-switches)
+	mux.HandleFunc("/api/v1/buckets", mut(s.handleBuckets))
+	mux.HandleFunc("/api/v1/buckets/", mut(s.handleBucketByID))
+
+	// Nodes (register/heartbeat/decommission are mutating)
+	mux.HandleFunc("/api/v1/nodes", mut(s.handleNodes))
+	mux.HandleFunc("/api/v1/nodes/", mut(s.handleNodesByID))
 
 	// Chunks
-	mux.HandleFunc("/api/v1/chunks", s.handleChunks)
-	mux.HandleFunc("/api/v1/chunks/", s.handleChunksByID)
-	mux.HandleFunc("/api/v1/chunks/migrate-replica", s.handleMigrateReplica)
-	mux.HandleFunc("/api/v1/chunks/report-state", s.handleReportChunkState)
+	mux.HandleFunc("/api/v1/chunks", mut(s.handleChunks))
+	mux.HandleFunc("/api/v1/chunks/", mut(s.handleChunksByID))
+	mux.HandleFunc("/api/v1/chunks/migrate-replica", mut(s.handleMigrateReplica))
+	mux.HandleFunc("/api/v1/chunks/report-state", mut(s.handleReportChunkState))
 
-	// Namespace + inodes
-	mux.HandleFunc("/api/v1/namespace/mkdir", s.handleMkDir)
-	mux.HandleFunc("/api/v1/namespace/rmdir", s.handleRmDir)
+	// Namespace — readdir/lookup/readlink are read-only, no leader check
+	mux.HandleFunc("/api/v1/namespace/mkdir", mut(s.handleMkDir))
+	mux.HandleFunc("/api/v1/namespace/rmdir", mut(s.handleRmDir))
 	mux.HandleFunc("/api/v1/namespace/readdir", s.handleReadDir)
-	mux.HandleFunc("/api/v1/namespace/createfile", s.handleCreateFile)
-	mux.HandleFunc("/api/v1/namespace/unlink", s.handleUnlink)
+	mux.HandleFunc("/api/v1/namespace/createfile", mut(s.handleCreateFile))
+	mux.HandleFunc("/api/v1/namespace/unlink", mut(s.handleUnlink))
 	mux.HandleFunc("/api/v1/namespace/lookup", s.handleLookup)
-	mux.HandleFunc("/api/v1/namespace/rename", s.handleRename)
-	mux.HandleFunc("/api/v1/namespace/symlink", s.handleSymlink)
+	mux.HandleFunc("/api/v1/namespace/rename", mut(s.handleRename))
+	mux.HandleFunc("/api/v1/namespace/symlink", mut(s.handleSymlink))
 	mux.HandleFunc("/api/v1/namespace/readlink", s.handleReadlink)
-	mux.HandleFunc("/api/v1/namespace/link", s.handleLink)
-	mux.HandleFunc("/api/v1/inodes/", s.handleInodesByID)
+	mux.HandleFunc("/api/v1/namespace/link", mut(s.handleLink))
+	mux.HandleFunc("/api/v1/inodes/", s.handleInodesByID) // read-only
 
-	// Repair + rebalance
-	mux.HandleFunc("/api/v1/repair/queue", s.handleRepairQueue)
-	mux.HandleFunc("/api/v1/repair/trigger", s.handleTriggerRepair)
-	mux.HandleFunc("/api/v1/repair/", s.handleRepairByID)
-	mux.HandleFunc("/api/v1/rebalance/trigger", s.handleTriggerRebalance)
+	// Repair + rebalance (all mutating)
+	mux.HandleFunc("/api/v1/repair/queue", s.handleRepairQueue) // read-only
+	mux.HandleFunc("/api/v1/repair/trigger", mut(s.handleTriggerRepair))
+	mux.HandleFunc("/api/v1/repair/", mut(s.handleRepairByID))
+	mux.HandleFunc("/api/v1/rebalance/trigger", mut(s.handleTriggerRebalance))
 
-	// Advisory file locks (proxied from HTTPClient on remote clients)
-	mux.HandleFunc("/api/v1/locks/acquire", s.handleAdvisoryAcquire)
-	mux.HandleFunc("/api/v1/locks/release", s.handleAdvisoryRelease)
+	// Advisory file locks (acquire/release are mutating, list is read-only)
+	mux.HandleFunc("/api/v1/locks/acquire", mut(s.handleAdvisoryAcquire))
+	mux.HandleFunc("/api/v1/locks/release", mut(s.handleAdvisoryRelease))
 	mux.HandleFunc("/api/v1/locks", s.handleAdvisoryList)
+
+	// Scrub — data consistency check
+	mux.HandleFunc("/api/v1/scrub", s.handleScrub)
 }
 
 // --- Health, cluster, metrics ---
@@ -103,6 +141,16 @@ func (h *opsHandlers) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	} else {
 		writeJSON(w, map[string]string{"status": "no metrics"})
 	}
+}
+
+// handleComputeAllBucketUsage computes per-bucket usage server-side.
+func (h *opsHandlers) handleComputeAllBucketUsage(w http.ResponseWriter, r *http.Request) {
+	usage, err := h.store.ComputeAllBucketUsage(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, usage)
 }
 
 // --- JSON helpers ---

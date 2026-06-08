@@ -19,13 +19,14 @@ const repairReplicationTimeout = 60 * time.Second
 
 // RepairWorker monitors chunk health and triggers repairs for degraded chunks.
 type RepairWorker struct {
-	meta     metadata.MetadataService
+	meta     RepairMeta
 	nodeID   metadata.NodeID
 
 	mu       sync.Mutex
 	running  bool
 	stopCh   chan struct{}
 	interval time.Duration
+	wg       sync.WaitGroup // Tracks background goroutine
 
 	// Stats
 	repaired  int64
@@ -38,7 +39,7 @@ type RepairWorker struct {
 
 // RepairConfig holds configuration for the repair worker.
 type RepairConfig struct {
-	Meta       metadata.MetadataService
+	Meta       RepairMeta
 	NodeID     metadata.NodeID
 	Interval   time.Duration // How often to scan for repairs
 	Replicator *Replicator   // For cross-node chunk data copy
@@ -70,7 +71,11 @@ func (rw *RepairWorker) Start(ctx context.Context) {
 	rw.running = true
 	rw.mu.Unlock()
 
-	go rw.scanLoop(ctx)
+	rw.wg.Add(1)
+	go func() {
+		defer rw.wg.Done()
+		rw.scanLoop(ctx)
+	}()
 	log.Printf("repair: worker started (interval=%v)", rw.interval)
 }
 
@@ -79,9 +84,10 @@ func (rw *RepairWorker) Stop() {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	if rw.running {
-		close(rw.stopCh)
 		rw.running = false
+		close(rw.stopCh)
 	}
+	rw.wg.Wait()
 }
 
 // Stats returns repair statistics.

@@ -112,6 +112,8 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 	gw.mux.HandleFunc("/", gw.route)
 	gw.mux.HandleFunc("/healthz", gw.handleHealthz)
 	gw.mux.HandleFunc("/readyz", gw.handleReadyz)
+	gw.mux.HandleFunc("/admin/cluster/stats", gw.handleClusterStats)
+	gw.mux.HandleFunc("/admin/buckets", gw.handleAdminBuckets)
 
 	return gw
 }

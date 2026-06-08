@@ -9,7 +9,7 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 )
 
-const defaultCacheEntries = 1000
+const defaultCacheEntries = 10_000
 
 type cacheStats struct {
 	hit  uint64
@@ -22,8 +22,14 @@ type ChunkCache struct {
 	stats   cacheStats
 }
 
-func NewChunkCache(diskDir string) (*ChunkCache, error) {
-	memory, err := lru.New(defaultCacheEntries)
+// NewChunkCache creates a chunk cache with optional disk directory.
+// If size <= 0, uses defaultCacheEntries (10,000).
+func NewChunkCache(diskDir string, size ...int) (*ChunkCache, error) {
+	n := defaultCacheEntries
+	if len(size) > 0 && size[0] > 0 {
+		n = size[0]
+	}
+	memory, err := lru.New(n)
 	if err != nil {
 		return nil, fmt.Errorf("new chunk cache: %w", err)
 	}

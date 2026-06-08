@@ -3,7 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +39,7 @@ type LifecycleEngine struct {
 	mu      sync.RWMutex
 	stopCh  chan struct{}
 	running atomic.Bool
+	wg      sync.WaitGroup // Tracks background goroutine
 
 	transitions atomic.Int64
 	deletions   atomic.Int64
@@ -72,14 +73,16 @@ func (le *LifecycleEngine) Start(interval time.Duration) {
 	if le.running.Swap(true) {
 		return
 	}
+	le.wg.Add(1)
 	go func() {
+		defer le.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				if err := le.execute(context.Background()); err != nil {
-					log.Printf("lifecycle: execution error: %v", err)
+					slog.Error("lifecycle: execution error", "error", err)
 				}
 			case <-le.stopCh:
 				return
@@ -93,6 +96,7 @@ func (le *LifecycleEngine) Stop() {
 	if le.running.Swap(false) {
 		close(le.stopCh)
 	}
+	le.wg.Wait()
 }
 
 func (le *LifecycleEngine) execute(ctx context.Context) error {
@@ -105,7 +109,7 @@ func (le *LifecycleEngine) execute(ctx context.Context) error {
 
 	for bucket, bucketRules := range rules {
 		if err := le.processBucket(ctx, bucket, bucketRules); err != nil {
-			log.Printf("lifecycle: bucket %s error: %v", bucket, err)
+			slog.Error("lifecycle: bucket error", "bucket", bucket, "error", err)
 		}
 	}
 	return nil
@@ -141,14 +145,14 @@ func (le *LifecycleEngine) walkDir(ctx context.Context, dirID InodeID, bucket, p
 			// Recurse into subdirectory
 			childPrefix := prefix + entry.Name + "/"
 			if err := le.walkDir(ctx, entry.InodeID, bucket, childPrefix, rules, now); err != nil {
-				log.Printf("lifecycle: error walking %s%s: %v", prefix, entry.Name, err)
+				slog.Error("lifecycle: error walking directory", "path", prefix+entry.Name, "error", err)
 			}
 
 		case FileRegular:
 			// Get inode metadata
 			meta, err := le.meta.GetInode(ctx, entry.InodeID)
 			if err != nil {
-				log.Printf("lifecycle: get inode %d: %v", entry.InodeID, err)
+				slog.Error("lifecycle: get inode", "inode_id", entry.InodeID, "error", err)
 				continue
 			}
 
@@ -172,7 +176,7 @@ func (le *LifecycleEngine) walkDir(ctx context.Context, dirID InodeID, bucket, p
 							if chunk.State == ChunkReady && chunk.Tier < transition.To {
 								chunk.Tier = transition.To
 								if err := le.meta.UpdateChunk(ctx, chunk); err != nil {
-									log.Printf("lifecycle: transition chunk %d: %v", chunk.ID, err)
+									slog.Error("lifecycle: transition chunk", "chunk_id", chunk.ID, "error", err)
 								} else {
 									le.transitions.Add(1)
 								}
@@ -185,10 +189,10 @@ func (le *LifecycleEngine) walkDir(ctx context.Context, dirID InodeID, bucket, p
 				if rule.Expiration != nil && fileAge > time.Duration(rule.Expiration.Days)*24*time.Hour {
 					meta.NLink = 0
 					if err := le.meta.UpdateInode(ctx, meta); err != nil {
-						log.Printf("lifecycle: expire inode %d: %v", meta.ID, err)
+						slog.Error("lifecycle: expire inode", "inode_id", meta.ID, "error", err)
 					} else {
 						le.deletions.Add(1)
-						log.Printf("lifecycle: expired %s (age=%v)", relPath, fileAge)
+						slog.Info("lifecycle: expired file", "path", relPath, "age", fileAge)
 					}
 				}
 			}

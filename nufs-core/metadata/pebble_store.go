@@ -1,10 +1,16 @@
 package metadata
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,7 +18,189 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
+	lru "github.com/hashicorp/golang-lru"
 )
+
+// ============================================================
+// Graceful Degradation — Circuit breaker & read-only fallback
+// ============================================================
+
+// DegradationState represents the current operational mode of the store.
+type DegradationState uint32
+
+const (
+	DegStateNormal      DegradationState = iota // Fully operational
+	DegStateReadOnly                            // Accept reads only, reject writes
+	DegStateDegraded                            // Partial functionality
+	DegStateUnavailable                         // Completely unavailable
+)
+
+func (s DegradationState) String() string {
+	switch s {
+	case DegStateNormal:
+		return "Normal"
+	case DegStateReadOnly:
+		return "ReadOnly"
+	case DegStateDegraded:
+		return "Degraded"
+	case DegStateUnavailable:
+		return "Unavailable"
+	default:
+		return fmt.Sprintf("Unknown(%d)", s)
+	}
+}
+
+// DegradationManager monitors system health and automatically adjusts
+// the operational mode to prevent cascading failures.
+type DegradationManager struct {
+	store     *PebbleStore
+	state     atomic.Uint32
+	raftAvail atomic.Bool
+	dbAvail   atomic.Bool
+	mu        sync.RWMutex
+
+	// Consecutive error thresholds before triggering degradation
+	maxConsecutiveWriteErrors int
+	maxConsecutiveReadErrors  int
+	maxConsecutiveRaftErrors  int
+
+	// Current error counts (reset on success)
+	writeErrors atomic.Int64
+	readErrors  atomic.Int64
+	raftErrors  atomic.Int64
+
+	// Callback for state transitions
+	onStateChange func(from, to DegradationState)
+}
+
+// NewDegradationManager creates a degradation manager.
+func NewDegradationManager(store *PebbleStore) *DegradationManager {
+	dm := &DegradationManager{
+		store:                     store,
+		maxConsecutiveWriteErrors: 10,
+		maxConsecutiveReadErrors:  20,
+		maxConsecutiveRaftErrors:  5,
+	}
+	dm.dbAvail.Store(true)
+	dm.raftAvail.Store(true)
+	dm.state.Store(uint32(DegStateNormal))
+	return dm
+}
+
+// State returns the current degradation state.
+func (dm *DegradationManager) State() DegradationState {
+	return DegradationState(dm.state.Load())
+}
+
+// IsReadOnly returns true if the store is in read-only mode.
+func (dm *DegradationManager) IsReadOnly() bool {
+	return dm.State() >= DegStateReadOnly
+}
+
+// IsAvailable returns true if the store can serve requests.
+func (dm *DegradationManager) IsAvailable() bool {
+	return dm.State() < DegStateUnavailable
+}
+
+// RecordWriteError reports a write failure. Triggers read-only if threshold exceeded.
+func (dm *DegradationManager) RecordWriteError() {
+	n := dm.writeErrors.Add(1)
+	if n >= int64(dm.maxConsecutiveWriteErrors) {
+		dm.transition(DegStateReadOnly)
+	}
+}
+
+// RecordWriteSuccess resets the write error counter.
+func (dm *DegradationManager) RecordWriteSuccess() {
+	dm.writeErrors.Store(0)
+}
+
+// RecordReadError reports a read failure.
+func (dm *DegradationManager) RecordReadError() {
+	n := dm.readErrors.Add(1)
+	if n >= int64(dm.maxConsecutiveReadErrors) {
+		dm.transition(DegStateDegraded)
+	}
+}
+
+// RecordReadSuccess resets the read error counter.
+func (dm *DegradationManager) RecordReadSuccess() {
+	dm.readErrors.Store(0)
+}
+
+// RecordRaftError reports a Raft failure.
+func (dm *DegradationManager) RecordRaftError() {
+	n := dm.raftErrors.Add(1)
+	if n >= int64(dm.maxConsecutiveRaftErrors) {
+		dm.raftAvail.Store(false)
+		dm.transition(DegStateReadOnly)
+	}
+}
+
+// RecordRaftSuccess resets the Raft error counter.
+func (dm *DegradationManager) RecordRaftSuccess() {
+	dm.raftErrors.Store(0)
+	dm.raftAvail.Store(true)
+}
+
+// SetOnStateChange registers a callback for degradation state transitions.
+func (dm *DegradationManager) SetOnStateChange(fn func(from, to DegradationState)) {
+	dm.mu.Lock()
+	dm.onStateChange = fn
+	dm.mu.Unlock()
+}
+
+// Recover forces the degradation state back to Normal.
+// Intended for administrative use after the underlying issue has been resolved.
+func (dm *DegradationManager) Recover() {
+	dm.writeErrors.Store(0)
+	dm.readErrors.Store(0)
+	dm.raftErrors.Store(0)
+	dm.transition(DegStateNormal)
+}
+
+func (dm *DegradationManager) transition(to DegradationState) {
+	from := dm.State()
+	if from == to {
+		return
+	}
+	dm.state.Store(uint32(to))
+
+	switch to {
+	case DegStateReadOnly:
+		slog.Warn("degradation: entering READ-ONLY mode", "from", from)
+	case DegStateDegraded:
+		slog.Warn("degradation: entering DEGRADED mode", "from", from)
+	case DegStateUnavailable:
+		slog.Error("degradation: UNAVAILABLE", "from", from)
+	}
+
+	dm.mu.RLock()
+	fn := dm.onStateChange
+	dm.mu.RUnlock()
+	if fn != nil {
+		fn(from, to)
+	}
+}
+
+// AttemptRecovery tries to return to normal state.
+func (dm *DegradationManager) AttemptRecovery() {
+	current := dm.State()
+	if current == DegStateUnavailable {
+		return // Requires manual intervention
+	}
+
+	dm.writeErrors.Store(0)
+	dm.readErrors.Store(0)
+	dm.raftErrors.Store(0)
+	dm.dbAvail.Store(true)
+	dm.raftAvail.Store(true)
+
+	if current != DegStateNormal {
+		dm.transition(DegStateNormal)
+		slog.Info("degradation: recovered to NORMAL mode")
+	}
+}
 
 // PebbleStore implements MetadataService using Pebble (LSM-tree) as the
 // primary storage engine. Designed for hundred-million to billion-scale metadata.
@@ -27,12 +215,126 @@ type PebbleStore struct {
 	mu        sync.RWMutex
 	cfg       PebbleStoreConfig
 
+	// Dynamic config — swapped atomically via atomic.Pointer so reads are lock-free.
+	// Use GetDynamicConfig() / SetDynamicConfig() to access.
+	dynCfg atomic.Pointer[DynamicConfig]
+
+	// Degradation manager for graceful degradation
+	degradation *DegradationManager
+
+	// Metrics collector (populated by SetMetrics)
+	metrics *Metrics
+
+	// InodeID recycling: when files/dirs are deleted, their IDs can be
+	// recycled to avoid unbounded growth of the inode counter. Recycled
+	// IDs are returned before allocating new ones.
+	inodeFreeList []InodeID
+	inodeFreeMu   sync.Mutex
+
 	// Raft integration: when set, all mutating operations are applied via Raft
 	raft *RaftNode
 
 	// advisoryLocks tracks the in-memory advisory file lock table.
 	// See lock.go for the model. State is dropped on Close / restart.
 	advisoryLocks *advisoryLockManager
+
+	// inCache is a read-through cache for GetInode hot path.
+	// Invalidated on UpdateInode and CASUpdateInode.
+	inCache inodeCache
+
+	// Optional EventBus for publishing change notifications.
+	// Set by SetEventBus() after initialization.
+	events *EventBus
+}
+
+// inodeCache is a read-through cache for GetInode.
+// Uses LRU eviction so that the hottest entries survive when the
+// cache reaches capacity (no more "clear everything" stampede).
+// Safe for concurrent use (hashicorp/golang-lru is internally locked).
+type inodeCache struct {
+	c *lru.Cache
+}
+
+const maxInodeCacheEntries = 100_000
+
+func newInodeCache() inodeCache {
+	c, _ := lru.New(maxInodeCacheEntries) // error only on size <= 0
+	return inodeCache{c: c}
+}
+
+func (c *inodeCache) get(id InodeID) *InodeMeta {
+	v, ok := c.c.Get(id)
+	if !ok {
+		return nil
+	}
+	return v.(*InodeMeta)
+}
+
+func (c *inodeCache) put(id InodeID, meta *InodeMeta) {
+	c.c.Add(id, meta) // LRU evicts the least-recently-used entry automatically
+}
+
+func (c *inodeCache) del(id InodeID) {
+	c.c.Remove(id)
+}
+
+func (c *inodeCache) clear() {
+	c.c.Purge()
+}
+
+// // DynamicConfig holds all tunable parameters that can be changed while the
+// system is running, without requiring a restart. These are typically adjusted
+// by SREs in response to load changes, performance bottlenecks, or incidents.
+type DynamicConfig struct {
+	// GC
+	GCEnabled          bool          `json:"gc_enabled"`          // Master switch for GC
+	GCInterval         time.Duration `json:"gc_interval"`         // How often to run GC scans
+	GCChunkBatchSize   int           `json:"gc_chunk_batch_size"` // Chunks per scan batch
+	GCThresholdPercent float64       `json:"gc_threshold"`        // GC if orphaned > this %
+	GCDryRun           bool          `json:"gc_dry_run"`          // Don't actually delete
+
+	// Heartbeat / Lease
+	HeartbeatTTLSeconds    int  `json:"heartbeat_ttl_seconds"`    // Node mark offline after this
+	HeartbeatCheckInterval int  `json:"heartbeat_check_interval"` // How often to check
+	AutoRepairEnabled      bool `json:"auto_repair_enabled"`      // Auto-trigger chunk repair
+
+	// Write batching
+	WriteBatchingEnabled bool          `json:"write_batching_enabled"`
+	WriteBatchMaxSize    int           `json:"write_batch_max_size"`
+	WriteBatchMaxWait    time.Duration `json:"write_batch_max_wait"`
+
+	// Read cache
+	CacheEnabled bool `json:"cache_enabled"`
+	CacheMaxSize int  `json:"cache_max_size"` // Max entries before eviction
+
+	// Raft
+	RaftPreVoteEnabled bool `json:"raft_prevote_enabled"`
+
+	// Placement
+	PlacementSpreadEnabled  bool `json:"placement_spread_enabled"`
+	PlacementWeightedChoice bool `json:"placement_weighted_choice"`
+}
+
+// DefaultDynamicConfig returns safe production defaults for all dynamic configs.
+func DefaultDynamicConfig() DynamicConfig {
+	return DynamicConfig{
+		GCEnabled:               true,
+		GCInterval:              15 * time.Minute,
+		GCChunkBatchSize:        1000,
+		GCThresholdPercent:      0.0, // GC if any orphaned chunk
+		GCDryRun:                false,
+		HeartbeatTTLSeconds:     30,
+		HeartbeatCheckInterval:  5,
+		AutoRepairEnabled:       true,
+		WriteBatchingEnabled:    true,
+		WriteBatchMaxSize:       256,
+		WriteBatchMaxWait:       50 * time.Millisecond,
+		CacheEnabled:            true,
+		CacheMaxSize:            65536,
+		RaftPreVoteEnabled:      true,
+		PlacementSpreadEnabled:  true,
+		PlacementWeightedChoice: false,
+	}
 }
 
 // PebbleStoreConfig configures a PebbleStore instance.
@@ -49,6 +351,10 @@ type PebbleStoreConfig struct {
 	MaxOpenFiles int
 	// UseInMemory uses an in-memory VFS (for testing only).
 	UseInMemory bool
+	// UseBucketStats enables per-bucket usage counters updated atomically
+	// with mutations. When false, ComputeAllBucketUsage falls back to a
+	// full namespace+inode scan. Enable after backfill (see migration docs).
+	UseBucketStats bool
 }
 
 // batchJSONOp represents a single key-value write (JSON-serialized) in an atomic batch.
@@ -90,8 +396,12 @@ func NewPebbleStore(cfg PebbleStoreConfig) (*PebbleStore, error) {
 		chunkGen:      NewChunkIDGenerator(cfg.NodeID),
 		cfg:           cfg,
 		advisoryLocks: newAdvisoryLockManager(),
+		inCache:       newInodeCache(),
 	}
 	s.inodeSeq.Store(uint64(RootInodeID))
+	s.degradation = NewDegradationManager(s)
+	dcfg := DefaultDynamicConfig()
+	s.dynCfg.Store(&dcfg)
 
 	if err := s.initRootInode(); err != nil {
 		db.Close()
@@ -118,6 +428,35 @@ func (s *PebbleStore) Close() error {
 		return fmt.Errorf("pebble store: close errors: %v", errs)
 	}
 	return nil
+}
+
+// SetEventBus sets the event bus for publishing change notifications.
+// This should be called after NewPebbleServiceBundle creates the EventBus.
+func (s *PebbleStore) SetEventBus(events *EventBus) {
+	s.events = events
+}
+
+// publishEvent publishes a change event if an EventBus is configured.
+func (s *PebbleStore) publishEvent(event Event) {
+	if s.events != nil {
+		s.events.Publish(event)
+	}
+}
+
+// publishNodeEvent publishes a node change event for PlacementEngine auto-sync.
+func (s *PebbleStore) publishNodeEvent(key string, info *NodeInfo) {
+	if s.events == nil {
+		return
+	}
+	data, err := marshalValue(info, codecMsgpack)
+	if err != nil {
+		return
+	}
+	s.events.Publish(Event{
+		Type:  EventSet,
+		Key:   key,
+		Value: data,
+	})
 }
 
 // AdvisoryLock acquires an exclusive lock on inode for owner.
@@ -294,26 +633,72 @@ func (s *PebbleStore) initRootInode() error {
 }
 
 func (s *PebbleStore) nextInodeID() InodeID {
+	// Try recycled IDs first
+	s.inodeFreeMu.Lock()
+	if len(s.inodeFreeList) > 0 {
+		id := s.inodeFreeList[len(s.inodeFreeList)-1]
+		s.inodeFreeList = s.inodeFreeList[:len(s.inodeFreeList)-1]
+		s.inodeFreeMu.Unlock()
+		return id
+	}
+	s.inodeFreeMu.Unlock()
+
 	return InodeID(s.inodeSeq.Add(1))
 }
 
-func (s *PebbleStore) putJSON(key string, v interface{}) error {
-	data, err := json.Marshal(v)
+// releaseInodeID returns an inode ID to the free list for recycling.
+// Called when a file or directory is permanently deleted.
+func (s *PebbleStore) releaseInodeID(id InodeID) {
+	if id <= RootInodeID {
+		return // Never recycle root or reserved IDs
+	}
+	s.inodeFreeMu.Lock()
+	// Cap free list to prevent unbounded memory growth
+	if len(s.inodeFreeList) < 65536 {
+		s.inodeFreeList = append(s.inodeFreeList, id)
+	}
+	s.inodeFreeMu.Unlock()
+}
+
+func (s *PebbleStore) putMsgpack(key string, v interface{}) error {
+	data, err := marshalValue(v, codecMsgpack)
 	if err != nil {
 		return fmt.Errorf("pebble store: marshal: %w", err)
 	}
 	return s.applyViaRaft(OpSet, key, data)
 }
-// putJSONBatch writes to a Pebble batch (for atomic multi-key writes).
-func putJSONBatch(batch *pebble.Batch, key string, v interface{}) error {
-	data, err := json.Marshal(v)
+
+// putJSON writes a JSON-encoded value (cold path: admin/debug operations).
+// Hot-path writes should use putMsgpack instead.
+func (s *PebbleStore) putJSON(key string, v interface{}) error {
+	data, err := marshalValue(v, codecJSON)
+	if err != nil {
+		return fmt.Errorf("pebble store: marshal: %w", err)
+	}
+	return s.applyViaRaft(OpSet, key, data)
+}
+
+// putMsgpackBatch writes a msgpack-encoded value to a Pebble batch (hot path).
+func putMsgpackBatch(batch *pebble.Batch, key string, v interface{}) error {
+	data, err := marshalValue(v, codecMsgpack)
 	if err != nil {
 		return fmt.Errorf("pebble store: marshal: %w", err)
 	}
 	return batch.Set([]byte(key), data, nil)
 }
 
-func (s *PebbleStore) getJSON(key string, v interface{}) (bool, error) {
+// putJSONBatch writes a JSON-encoded value to a Pebble batch (cold path).
+func putJSONBatch(batch *pebble.Batch, key string, v interface{}) error {
+	data, err := marshalValue(v, codecJSON)
+	if err != nil {
+		return fmt.Errorf("pebble store: marshal: %w", err)
+	}
+	return batch.Set([]byte(key), data, nil)
+}
+
+// getValue reads and auto-detects the encoding format (msgpack or JSON).
+// Replaces the old getJSON with format-agnostic decoding.
+func (s *PebbleStore) getValue(key string, v interface{}) (bool, error) {
 	val, closer, err := s.db.Get([]byte(key))
 	if err == pebble.ErrNotFound {
 		return false, nil
@@ -327,10 +712,16 @@ func (s *PebbleStore) getJSON(key string, v interface{}) (bool, error) {
 	data := make([]byte, len(val))
 	copy(data, val)
 
-	if err := json.Unmarshal(data, v); err != nil {
+	if err := unmarshalValue(data, v); err != nil {
 		return false, fmt.Errorf("pebble store: unmarshal %q: %w", key, err)
 	}
 	return true, nil
+}
+
+// getJSON is kept for backward compatibility; delegates to getValue.
+// Deprecated: use getValue instead.
+func (s *PebbleStore) getJSON(key string, v interface{}) (bool, error) {
+	return s.getValue(key, v)
 }
 
 func (s *PebbleStore) deleteKey(key string) error {
@@ -388,6 +779,93 @@ func (s *PebbleStore) scanPrefixWithLimit(prefix string, limit int) (keys [][]by
 	return keys, vals, nil
 }
 
+// ScanPageResult holds the results of a paginated scan.
+type ScanPageResult struct {
+	Keys    [][]byte
+	Values  [][]byte
+	NextKey []byte // nil if no more pages
+	HasMore bool
+}
+
+// scanPrefixPaged returns a page of entries matching prefix, starting after
+// the given cursor key. This avoids loading all matching entries into memory
+// at once, which is critical for large datasets (millions of inodes/chunks).
+//
+// Usage:
+//
+//	cursor := []byte(nil) // start from beginning
+//	for {
+//	    page, err := store.scanPrefixPaged(prefix, cursor, pageSize)
+//	    // process page.Keys, page.Values
+//	    if !page.HasMore { break }
+//	    cursor = page.NextKey
+//	}
+func (s *PebbleStore) scanPrefixPaged(prefix string, cursor []byte, pageSize int) (*ScanPageResult, error) {
+	if pageSize <= 0 {
+		pageSize = 1000
+	}
+
+	opts := &pebble.IterOptions{
+		LowerBound: []byte(prefix),
+		UpperBound: prefixUpperBound(prefix),
+	}
+
+	// If cursor is provided, start after that key
+	if cursor != nil {
+		opts.LowerBound = cursor
+	}
+
+	iter, err := s.db.NewIter(opts)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	result := &ScanPageResult{}
+	count := 0
+
+	// Position iterator
+	if cursor != nil {
+		// Seek to cursor and skip past it
+		iter.SeekGE(cursor)
+		if iter.Valid() && bytes.Equal(iter.Key(), cursor) {
+			iter.Next()
+		}
+	} else {
+		iter.First()
+	}
+
+	for ; iter.Valid(); iter.Next() {
+		// Check if we've exceeded the page size (fetch one extra to detect HasMore)
+		if count >= pageSize+1 {
+			break
+		}
+
+		k := make([]byte, len(iter.Key()))
+		copy(k, iter.Key())
+		v, err := iter.ValueAndErr()
+		if err != nil {
+			return nil, err
+		}
+		vc := make([]byte, len(v))
+		copy(vc, v)
+
+		result.Keys = append(result.Keys, k)
+		result.Values = append(result.Values, vc)
+		count++
+	}
+
+	// If we got more than pageSize, there are more pages
+	if len(result.Keys) > pageSize {
+		result.NextKey = result.Keys[pageSize]
+		result.Keys = result.Keys[:pageSize]
+		result.Values = result.Values[:pageSize]
+		result.HasMore = true
+	}
+
+	return result, nil
+}
+
 // prefixUpperBound returns the lexicographic upper bound for a prefix scan.
 // e.g., "/ns/5/" → "/ns/50" (increment last byte)
 func prefixUpperBound(prefix string) []byte {
@@ -429,13 +907,14 @@ func (s *PebbleStore) CreateBucket(ctx context.Context, name string, policy Plac
 	rootID := s.nextInodeID()
 	now := time.Now().UnixNano()
 	root := &InodeMeta{
-		ID:    rootID,
-		Type:  FileDirectory,
-		Mode:  0755,
-		NLink: 2,
-		CTime: now,
-		MTime: now,
-		ATime: now,
+		ID:         rootID,
+		Type:       FileDirectory,
+		Mode:       0755,
+		NLink:      2,
+		BucketRoot: rootID,
+		CTime:      now,
+		MTime:      now,
+		ATime:      now,
 	}
 	info := &BucketInfo{
 		Name:         name,
@@ -447,6 +926,12 @@ func (s *PebbleStore) CreateBucket(ctx context.Context, name string, policy Plac
 		{Key: fmt.Sprintf("%s%d", prefixInode, rootID), Value: root},
 		{Key: bucketKey, Value: info},
 		{Key: fmt.Sprintf("%s%s", prefixPolicy, name), Value: &policy},
+	}
+	if s.cfg.UseBucketStats {
+		ops = append(ops, batchJSONOp{
+			Key:   s.bucketStatsKey(rootID),
+			Value: &BucketUsage{Name: name},
+		})
 	}
 	return s.applyBatchJSON(ops, nil)
 }
@@ -476,7 +961,14 @@ func (s *PebbleStore) DeleteBucket(ctx context.Context, name string) error {
 		return ErrBucketNotEmpty
 	}
 
-	deletes := []string{bucketKey, fmt.Sprintf("%s%d", prefixInode, info.RootInode), fmt.Sprintf("%s%s", prefixPolicy, name)}
+	deletes := []string{
+		bucketKey,
+		fmt.Sprintf("%s%d", prefixInode, info.RootInode),
+		fmt.Sprintf("%s%s", prefixPolicy, name),
+	}
+	if s.cfg.UseBucketStats {
+		deletes = append(deletes, s.bucketStatsKey(info.RootInode))
+	}
 	return s.applyBatchJSON(nil, deletes)
 }
 
@@ -488,7 +980,7 @@ func (s *PebbleStore) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 	var buckets []BucketInfo
 	err := s.scanPrefix(prefixBucket, func(key, val []byte) error {
 		var b BucketInfo
-		if err := json.Unmarshal(val, &b); err == nil {
+		if err := unmarshalValue(val, &b); err == nil {
 			buckets = append(buckets, b)
 		}
 		return nil
@@ -543,18 +1035,22 @@ func (s *PebbleStore) MkDir(ctx context.Context, parent InodeID, name string, mo
 		ATime: now,
 	}
 	entry := &DirEntry{InodeID: inodeID, Type: FileDirectory, Name: name}
-	ops := []batchJSONOp{
-		{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
-		{Key: nsKey, Value: entry},
-	}
 
-	// Update parent
+	// Update parent + inherit BucketRoot
 	var parentMeta InodeMeta
 	parentKey := fmt.Sprintf("%s%d", prefixInode, parent)
 	pExists, _ := s.getJSON(parentKey, &parentMeta)
 	if pExists {
+		meta.BucketRoot = parentMeta.BucketRoot
 		parentMeta.NLink++
 		parentMeta.MTime = now
+	}
+
+	ops := []batchJSONOp{
+		{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
+		{Key: nsKey, Value: entry},
+	}
+	if pExists {
 		ops = append(ops, batchJSONOp{Key: parentKey, Value: &parentMeta})
 	}
 
@@ -609,14 +1105,22 @@ func (s *PebbleStore) RmDir(ctx context.Context, parent InodeID, name string) er
 		ops := []batchJSONOp{
 			{Key: parentKey, Value: &parentMeta},
 		}
+		s.releaseInodeID(entry.InodeID)
 		return s.applyBatchJSON(ops, deletes)
 	}
+	s.releaseInodeID(entry.InodeID)
 	return s.applyBatchJSON(nil, deletes)
 }
 
 func (s *PebbleStore) ReadDir(ctx context.Context, parent InodeID, offset int, limit int) ([]DirEntry, error) {
 	if s.closed.Load() {
 		return nil, ErrServiceClosed
+	}
+
+	// Cap limit to prevent OOM on large directories.
+	const maxReadDirEntries = 10_000
+	if limit <= 0 || limit > maxReadDirEntries {
+		limit = maxReadDirEntries
 	}
 
 	prefix := fmt.Sprintf("%s%d/", prefixNS, parent)
@@ -627,7 +1131,7 @@ func (s *PebbleStore) ReadDir(ctx context.Context, parent InodeID, offset int, l
 			return nil
 		}
 		var entry DirEntry
-		if err := json.Unmarshal(val, &entry); err != nil {
+		if err := unmarshalValue(val, &entry); err != nil {
 			return nil
 		}
 		entry.Name = name
@@ -668,15 +1172,18 @@ func (s *PebbleStore) CreateFile(ctx context.Context, parent InodeID, name strin
 
 	inodeID := s.nextInodeID()
 	now := time.Now().UnixNano()
+	bucketRoot := s.getBucketRoot(parent)
 	meta := &InodeMeta{
 		ID: inodeID, Type: FileRegular, Mode: mode, NLink: 1,
-		CTime: now, MTime: now, ATime: now,
+		BucketRoot: bucketRoot,
+		CTime:      now, MTime: now, ATime: now,
 	}
 	entry := &DirEntry{InodeID: inodeID, Type: FileRegular, Name: name}
 	ops := []batchJSONOp{
 		{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
 		{Key: nsKey, Value: entry},
 	}
+	s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
 	if err := s.applyBatchJSON(ops, nil); err != nil {
 		return nil, err
 	}
@@ -711,7 +1218,9 @@ func (s *PebbleStore) Unlink(ctx context.Context, parent InodeID, name string) e
 		meta.NLink--
 		meta.MTime = time.Now().UnixNano()
 		if meta.NLink <= 0 {
+			s.addBucketStatsOp(meta.BucketRoot, -meta.Size, -1, &ops)
 			deletes = append(deletes, inodeKey)
+			s.releaseInodeID(meta.ID)
 		} else {
 			ops = append(ops, batchJSONOp{Key: inodeKey, Value: &meta})
 		}
@@ -723,24 +1232,40 @@ func (s *PebbleStore) Lookup(ctx context.Context, parent InodeID, name string) (
 	if s.closed.Load() {
 		return nil, ErrServiceClosed
 	}
+	start := time.Now()
 
 	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
 	var entry DirEntry
 	exists, err := s.getJSON(nsKey, &entry)
 	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordError()
+		}
 		return nil, err
 	}
 	if !exists {
+		if s.metrics != nil {
+			s.metrics.RecordRead(time.Since(start))
+		}
 		return nil, ErrEntryNotFound
 	}
 
 	var meta InodeMeta
 	exists, err = s.getJSON(fmt.Sprintf("%s%d", prefixInode, entry.InodeID), &meta)
 	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordError()
+		}
 		return nil, err
 	}
 	if !exists {
+		if s.metrics != nil {
+			s.metrics.RecordRead(time.Since(start))
+		}
 		return nil, ErrInodeNotFound
+	}
+	if s.metrics != nil {
+		s.metrics.RecordRead(time.Since(start))
 	}
 	return &meta, nil
 }
@@ -749,13 +1274,36 @@ func (s *PebbleStore) GetInode(ctx context.Context, id InodeID) (*InodeMeta, err
 	if s.closed.Load() {
 		return nil, ErrServiceClosed
 	}
+	start := time.Now()
+
+	if cached := s.inCache.get(id); cached != nil {
+		if s.metrics != nil {
+			s.metrics.RecordCacheHit()
+			s.metrics.RecordRead(time.Since(start))
+		}
+		meta := *cached
+		return &meta, nil
+	}
+	if s.metrics != nil {
+		s.metrics.RecordCacheMiss()
+	}
 	var meta InodeMeta
 	exists, err := s.getJSON(fmt.Sprintf("%s%d", prefixInode, id), &meta)
 	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordError()
+		}
 		return nil, err
 	}
 	if !exists {
+		if s.metrics != nil {
+			s.metrics.RecordRead(time.Since(start))
+		}
 		return nil, ErrInodeNotFound
+	}
+	s.inCache.put(id, &meta)
+	if s.metrics != nil {
+		s.metrics.RecordRead(time.Since(start))
 	}
 	return &meta, nil
 }
@@ -767,8 +1315,21 @@ func (s *PebbleStore) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 	if meta == nil {
 		return ErrInvalidArgument
 	}
+	// Invalidate cache — next GetInode fetches fresh data
+	s.inCache.del(meta.ID)
+
+	// Read old inode to compute size delta for bucket stats
+	var oldMeta InodeMeta
+	oldExists, _ := s.getJSON(fmt.Sprintf("%s%d", prefixInode, meta.ID), &oldMeta)
+
 	meta.CTime = time.Now().UnixNano()
-	return s.putJSON(fmt.Sprintf("%s%d", prefixInode, meta.ID), meta)
+	ops := []batchJSONOp{
+		{Key: fmt.Sprintf("%s%d", prefixInode, meta.ID), Value: meta},
+	}
+	if oldExists {
+		s.addBucketStatsOp(oldMeta.BucketRoot, meta.Size-oldMeta.Size, 0, &ops)
+	}
+	return s.applyBatchJSON(ops, nil)
 }
 
 func (s *PebbleStore) Rename(ctx context.Context, oldParent InodeID, oldName string, newParent InodeID, newName string) error {
@@ -799,6 +1360,15 @@ func (s *PebbleStore) Rename(ctx context.Context, oldParent InodeID, oldName str
 		}
 	}
 
+	// Cross-bucket rename check
+	if s.cfg.UseBucketStats {
+		oldRoot := s.getBucketRoot(oldParent)
+		newRoot := s.getBucketRoot(newParent)
+		if oldRoot != newRoot {
+			return ErrCrossBucketRename
+		}
+	}
+
 	entry.Name = newName
 	ops := []batchJSONOp{
 		{Key: newNSKey, Value: &entry},
@@ -824,15 +1394,18 @@ func (s *PebbleStore) Symlink(ctx context.Context, parent InodeID, name string, 
 
 	inodeID := s.nextInodeID()
 	now := time.Now().UnixNano()
+	bucketRoot := s.getBucketRoot(parent)
 	meta := &InodeMeta{
 		ID: inodeID, Type: FileSymlink, Mode: 0777, NLink: 1, Symlink: target,
-		CTime: now, MTime: now, ATime: now,
+		BucketRoot: bucketRoot,
+		CTime:      now, MTime: now, ATime: now,
 	}
 	entry := &DirEntry{InodeID: inodeID, Type: FileSymlink, Name: name}
 	ops := []batchJSONOp{
 		{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
 		{Key: nsKey, Value: entry},
 	}
+	s.addBucketStatsOp(bucketRoot, int64(len(target)), 1, &ops)
 	if err := s.applyBatchJSON(ops, nil); err != nil {
 		return nil, err
 	}
@@ -896,6 +1469,7 @@ func (s *PebbleStore) Link(ctx context.Context, parent InodeID, name string, tar
 	}
 	return &meta, nil
 }
+
 // ========== ChunkService Implementation ==========
 
 func (s *PebbleStore) AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error) {
@@ -969,7 +1543,7 @@ func (s *PebbleStore) CommitChunk(ctx context.Context, chunkID ChunkID, checksum
 	}
 	chunk.State = ChunkSealed
 	chunk.Checksum = checksum
-	return s.putJSON(key, &chunk)
+	return s.putMsgpack(key, &chunk)
 }
 
 func (s *PebbleStore) GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error) {
@@ -1002,7 +1576,7 @@ func (s *PebbleStore) UpdateChunk(ctx context.Context, chunk *ChunkMeta) error {
 	if !exists {
 		return ErrChunkNotFound
 	}
-	return s.putJSON(key, chunk)
+	return s.putMsgpack(key, chunk)
 }
 
 func (s *PebbleStore) SealChunk(ctx context.Context, chunkID ChunkID) error {
@@ -1025,7 +1599,7 @@ func (s *PebbleStore) SealChunk(ctx context.Context, chunkID ChunkID) error {
 		return ErrChunkNotSealed
 	}
 	chunk.State = ChunkReady
-	return s.putJSON(key, &chunk)
+	return s.putMsgpack(key, &chunk)
 }
 
 func (s *PebbleStore) ListChunks(ctx context.Context, inodeID InodeID) ([]ChunkRef, error) {
@@ -1122,10 +1696,11 @@ func (s *PebbleStore) RegisterNode(ctx context.Context, info *NodeInfo) error {
 	}
 	info.State = NodeOnline
 	info.LastSeen = time.Now().UnixNano()
-	if err := s.putJSON(key, info); err != nil {
+	if err := s.putMsgpack(key, info); err != nil {
 		return err
 	}
 	s.placement.UpdateNode(info)
+	s.publishNodeEvent(key, info)
 	return nil
 }
 
@@ -1149,10 +1724,11 @@ func (s *PebbleStore) Heartbeat(ctx context.Context, nodeID NodeID, report *Node
 		info.ChunkCount = report.ChunkCount
 		s.placement.UpdateLoad(nodeID, report.DiskIO)
 	}
-	if err := s.putJSON(key, &info); err != nil {
+	if err := s.putMsgpack(key, &info); err != nil {
 		return err
 	}
 	s.placement.UpdateNode(&info)
+	s.publishNodeEvent(key, &info)
 	if report != nil && len(report.ChunkStates) > 0 {
 		return s.ReportChunkState(ctx, nodeID, report.ChunkStates)
 	}
@@ -1173,7 +1749,7 @@ func (s *PebbleStore) DecommissionNode(ctx context.Context, nodeID NodeID) error
 		return ErrNodeNotFound
 	}
 	info.State = NodeDraining
-	return s.putJSON(key, &info)
+	return s.putMsgpack(key, &info)
 }
 
 func (s *PebbleStore) ListNodes(ctx context.Context) ([]NodeInfo, error) {
@@ -1183,7 +1759,7 @@ func (s *PebbleStore) ListNodes(ctx context.Context) ([]NodeInfo, error) {
 	var nodes []NodeInfo
 	err := s.scanPrefix(prefixNode, func(key, val []byte) error {
 		var n NodeInfo
-		if err := json.Unmarshal(val, &n); err == nil {
+		if err := unmarshalValue(val, &n); err == nil {
 			nodes = append(nodes, n)
 		}
 		return nil
@@ -1206,6 +1782,200 @@ func (s *PebbleStore) GetNode(ctx context.Context, nodeID NodeID) (*NodeInfo, er
 	return &info, nil
 }
 
+// GetDynamicConfig returns the current dynamic config atomically.
+func (s *PebbleStore) GetDynamicConfig() *DynamicConfig {
+	return s.dynCfg.Load()
+}
+
+// SetDynamicConfig atomically replaces the dynamic config.
+func (s *PebbleStore) SetDynamicConfig(cfg *DynamicConfig) {
+	s.dynCfg.Store(cfg)
+}
+
+// GetDegradationManager returns the degradation manager for this store.
+func (s *PebbleStore) GetDegradationManager() *DegradationManager {
+	return s.degradation
+}
+
+// SetMetrics attaches a metrics collector to this store.
+func (s *PebbleStore) SetMetrics(m *Metrics) {
+	s.metrics = m
+}
+
+// DynamicConfigHandler returns an HTTP handler for viewing and updating
+// dynamic configuration at runtime. GET /config returns the current config;
+// PUT /config accepts JSON to update it.
+// A shared secret (admin_token) is required for write operations to prevent
+// unauthorized configuration changes in production.
+func (s *PebbleStore) DynamicConfigHandler(adminToken string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(s.GetDynamicConfig())
+		case http.MethodPut, http.MethodPost:
+			// Require authentication for writes
+			token := r.Header.Get("X-Admin-Token")
+			if token == "" {
+				token = r.URL.Query().Get("token")
+			}
+			if adminToken != "" && token != adminToken {
+				http.Error(w, "unauthorized: invalid or missing admin token", http.StatusUnauthorized)
+				return
+			}
+			var cfg DynamicConfig
+			if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+				http.Error(w, fmt.Sprintf("invalid config: %v", err), http.StatusBadRequest)
+				return
+			}
+			s.SetDynamicConfig(&cfg)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+			slog.Info("dynamic config updated", "config", fmt.Sprintf("%+v", cfg))
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	return mux
+}
+
+// ============================================================
+// Backup & Restore
+// ============================================================
+
+// CreateBackup creates a snapshot backup of the Pebble database to the given
+// directory. The backup is a full checkpoint that can be restored later.
+// Uses Pebble's native Checkpoint API for crash-consistent snapshots.
+func (s *PebbleStore) CreateBackup(ctx context.Context, backupDir string) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return fmt.Errorf("backup: create dir %s: %w", backupDir, err)
+	}
+
+	// Pebble Checkpoint creates a crash-consistent snapshot without blocking writes
+	if err := s.db.Checkpoint(backupDir); err != nil {
+		return fmt.Errorf("backup: checkpoint to %s: %w", backupDir, err)
+	}
+
+	slog.Info("backup: created checkpoint", "path", backupDir)
+	return nil
+}
+
+// RestoreBackup restores the database from a previously created backup directory.
+// The current database is closed and replaced. The caller must re-initialize
+// any dependent services (PlacementEngine, Raft, etc.) after restore.
+func (s *PebbleStore) RestoreBackup(ctx context.Context, backupDir string) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+
+	// Verify backup exists and looks valid
+	info, err := os.Stat(backupDir)
+	if err != nil {
+		return fmt.Errorf("restore: backup dir %s: %w", backupDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("restore: %s is not a directory", backupDir)
+	}
+
+	// Generate a timestamped backup of the current data before replacing
+	currentBackup := filepath.Join(filepath.Dir(s.cfg.Dir), "pre-restore-"+fmt.Sprintf("%d", time.Now().Unix()))
+	slog.Info("restore: backing up current data before restore", "path", currentBackup)
+	if err := s.db.Checkpoint(currentBackup); err != nil {
+		slog.Warn("restore: pre-restore backup failed", "error", err)
+	}
+
+	// Close current database
+	if err := s.db.Close(); err != nil {
+		return fmt.Errorf("restore: close current db: %w", err)
+	}
+
+	// Replace data directory with backup
+	dataDir := s.cfg.Dir
+	tmpDir := dataDir + ".restore-tmp"
+
+	// Move current data to temp
+	if err := os.Rename(dataDir, tmpDir); err != nil {
+		return fmt.Errorf("restore: rename current data: %w", err)
+	}
+
+	// Copy backup to data dir
+	if err := copyDir(backupDir, dataDir); err != nil {
+		// Try to revert
+		os.Rename(tmpDir, dataDir)
+		return fmt.Errorf("restore: copy backup to data dir: %w", err)
+	}
+
+	// Remove temp dir
+	os.RemoveAll(tmpDir)
+
+	// Re-open database
+	pebbleOpts := &pebble.Options{
+		MemTableSize:                256 << 20,
+		MemTableStopWritesThreshold: 8,
+		MaxOpenFiles:                16384,
+		FormatMajorVersion:          pebble.FormatNewest,
+	}
+	if s.cfg.MemTableSize > 0 {
+		pebbleOpts.MemTableSize = s.cfg.MemTableSize
+	}
+	if s.cfg.MaxOpenFiles > 0 {
+		pebbleOpts.MaxOpenFiles = s.cfg.MaxOpenFiles
+	}
+
+	newDB, err := pebble.Open(dataDir, pebbleOpts)
+	if err != nil {
+		return fmt.Errorf("restore: re-open db: %w", err)
+	}
+	s.db = newDB
+
+	slog.Info("restore: successfully restored", "path", backupDir)
+	return nil
+}
+
+// copyDir recursively copies a directory.
+func copyDir(src, dst string) error {
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		return err
+	}
+
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			srcFile, err := os.Open(srcPath)
+			if err != nil {
+				return err
+			}
+			dstFile, err := os.Create(dstPath)
+			if err != nil {
+				srcFile.Close()
+				return err
+			}
+			_, err = io.Copy(dstFile, srcFile)
+			srcFile.Close()
+			dstFile.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // ========== Additional PebbleStore Methods ==========
 
 // ScanAllChunks iterates over all chunk metadata (used by repair/rebalance).
@@ -1215,9 +1985,9 @@ func (s *PebbleStore) ScanAllChunks(ctx context.Context, fn func(*ChunkMeta) err
 	}
 	return s.scanPrefix(prefixChunk, func(key, val []byte) error {
 		var chunk ChunkMeta
-		if err := json.Unmarshal(val, &chunk); err != nil {
+		if err := unmarshalValue(val, &chunk); err != nil {
 			// Log and skip corrupted entries
-			log.Printf("pebble store: corrupted chunk entry at key %q: %v", key, err)
+			slog.Warn("pebble store: corrupted chunk entry", "key", string(key), "error", err)
 			return nil
 		}
 		return fn(&chunk)
@@ -1238,7 +2008,7 @@ func (s *PebbleStore) GetRepairQueue(ctx context.Context) ([]RepairTask, error) 
 	var tasks []RepairTask
 	err := s.scanPrefix(prefixRepair, func(key, val []byte) error {
 		var task RepairTask
-		if err := json.Unmarshal(val, &task); err == nil {
+		if err := unmarshalValue(val, &task); err == nil {
 			tasks = append(tasks, task)
 		}
 		return nil
@@ -1291,7 +2061,14 @@ func (s *PebbleStore) LeaderAddr() string {
 	return s.raft.LeaderAddr()
 }
 
-
+// LeaderOpsAddr returns the HTTP ops URL of the current Raft leader,
+// so followers can redirect mutating requests. Empty if no leader.
+func (s *PebbleStore) LeaderOpsAddr() string {
+	if s.raft == nil {
+		return ""
+	}
+	return s.raft.LeaderOpsAddr()
+}
 
 // applyBatchJSON commits multiple JSON-encoded key-value pairs atomically via Raft or directly.
 func (s *PebbleStore) applyBatchJSON(ops []batchJSONOp, deletes []string) error {
@@ -1312,11 +2089,26 @@ func (s *PebbleStore) applyBatchJSON(ops []batchJSONOp, deletes []string) error 
 // applyViaRaft proposes a write operation through the Raft log.
 // If Raft is not configured, the write is applied directly.
 func (s *PebbleStore) applyViaRaft(op RaftLogOp, key string, value []byte) error {
+	// Check degradation state before all mutating writes
+	if s.degradation.IsReadOnly() {
+		return ErrServiceClosed
+	}
+
+	start := time.Now()
+
 	if s.raft == nil {
 		if op == OpDelete {
-			return s.db.Delete([]byte(key), pebble.Sync)
+			err := s.db.Delete([]byte(key), pebble.Sync)
+			if err == nil && s.metrics != nil {
+				s.metrics.RecordWrite(time.Since(start))
+			}
+			return err
 		}
-		return s.db.Set([]byte(key), value, pebble.Sync)
+		err := s.db.Set([]byte(key), value, pebble.Sync)
+		if err == nil && s.metrics != nil {
+			s.metrics.RecordWrite(time.Since(start))
+		}
+		return err
 	}
 
 	entry := &RaftLogEntry{
@@ -1324,7 +2116,11 @@ func (s *PebbleStore) applyViaRaft(op RaftLogOp, key string, value []byte) error
 		Key:   []byte(key),
 		Value: value,
 	}
-	return s.raft.Apply(entry, 10*time.Second)
+	err := s.raft.Apply(entry, 10*time.Second)
+	if err == nil && s.metrics != nil {
+		s.metrics.RecordWrite(time.Since(start))
+	}
+	return err
 }
 
 // applyBatchViaRaft proposes a batch of operations through the Raft log.
@@ -1333,6 +2129,13 @@ func (s *PebbleStore) applyBatchViaRaft(ops []BatchOp) error {
 	if len(ops) == 0 {
 		return nil
 	}
+
+	// Check degradation state before writes
+	if s.degradation.IsReadOnly() {
+		return ErrServiceClosed
+	}
+
+	start := time.Now()
 
 	if s.raft == nil {
 		batch := s.db.NewBatch()
@@ -1344,15 +2147,24 @@ func (s *PebbleStore) applyBatchViaRaft(ops []BatchOp) error {
 				batch.Set(op.Key, op.Value, nil)
 			}
 		}
-		return batch.Commit(pebble.Sync)
+		err := batch.Commit(pebble.Sync)
+		if err == nil && s.metrics != nil {
+			s.metrics.RecordWrite(time.Since(start))
+		}
+		return err
 	}
 
 	entry := &RaftLogEntry{
 		Op:    OpBatch,
 		Batch: ops,
 	}
-	return s.raft.Apply(entry, 10*time.Second)
+	err := s.raft.Apply(entry, 10*time.Second)
+	if err == nil && s.metrics != nil {
+		s.metrics.RecordWrite(time.Since(start))
+	}
+	return err
 }
+
 // ========== RebalanceService Implementation ==========
 
 func (s *PebbleStore) TriggerRebalance(ctx context.Context) error {
@@ -1370,7 +2182,7 @@ func (s *PebbleStore) TriggerRebalance(ctx context.Context) error {
 	chunkMap := make(map[NodeID][]ChunkID)
 	s.scanPrefix(prefixChunk, func(key, val []byte) error {
 		var chunk ChunkMeta
-		if err := json.Unmarshal(val, &chunk); err != nil {
+		if err := unmarshalValue(val, &chunk); err != nil {
 			return nil
 		}
 		for _, r := range chunk.Replicas {
@@ -1410,7 +2222,7 @@ func (s *PebbleStore) ChunksByNode(ctx context.Context, nodeID NodeID) ([]ChunkM
 	var result []ChunkMeta
 	err := s.scanPrefix(prefixChunk, func(key, val []byte) error {
 		var chunk ChunkMeta
-		if err := json.Unmarshal(val, &chunk); err != nil {
+		if err := unmarshalValue(val, &chunk); err != nil {
 			return nil
 		}
 		for _, r := range chunk.Replicas {
@@ -1474,11 +2286,202 @@ func (s *PebbleStore) ScanAllInodes(ctx context.Context, fn func(*InodeMeta) err
 	}
 	return s.scanPrefix(prefixInode, func(key, val []byte) error {
 		var inode InodeMeta
-		if err := json.Unmarshal(val, &inode); err != nil {
+		if err := unmarshalValue(val, &inode); err != nil {
 			// Log and skip corrupted entries
-			log.Printf("pebble store: corrupted inode entry at key %q: %v", key, err)
+			slog.Warn("pebble store: corrupted inode entry", "key", string(key), "error", err)
 			return nil
 		}
 		return fn(&inode)
 	})
+}
+
+// ============================================================
+// Bucket Usage (Admin)
+// ============================================================
+
+// BucketUsage holds aggregate usage for a single bucket.
+type BucketUsage struct {
+	Name      string `json:"name"`
+	UsedBytes int64  `json:"used_bytes"`
+	Objects   int    `json:"objects"`
+}
+
+func (s *PebbleStore) bucketStatsKey(rootInode InodeID) string {
+	return fmt.Sprintf("%s%d", prefixBucketStats, rootInode)
+}
+
+// readBucketStats reads the current counter for a bucket. Returns zeros
+// if the key does not exist (e.g., pre-migration).
+func (s *PebbleStore) readBucketStats(rootInode InodeID) BucketUsage {
+	var stats BucketUsage
+	s.getJSON(s.bucketStatsKey(rootInode), &stats)
+	return stats
+}
+
+// addBucketStatsOp adds a counter update to the pending batch ops.
+// No-op when UseBucketStats is disabled. The delta values are applied
+// to the current counter read at call time. Race-safe for admin-level
+// precision (S3 usage metrics are eventually consistent).
+func (s *PebbleStore) addBucketStatsOp(rootInode InodeID, deltaBytes int64, deltaObjects int, ops *[]batchJSONOp) {
+	if !s.cfg.UseBucketStats || rootInode == 0 {
+		return
+	}
+	stats := s.readBucketStats(rootInode)
+	stats.UsedBytes += deltaBytes
+	stats.Objects += deltaObjects
+	*ops = append(*ops, batchJSONOp{Key: s.bucketStatsKey(rootInode), Value: &stats})
+}
+
+// getBucketRoot reads the parent inode and returns its BucketRoot.
+// Used when creating new inodes to inherit the containing bucket.
+func (s *PebbleStore) getBucketRoot(parent InodeID) InodeID {
+	var parentMeta InodeMeta
+	ok, _ := s.getJSON(fmt.Sprintf("%s%d", prefixInode, parent), &parentMeta)
+	if !ok {
+		return 0
+	}
+	return parentMeta.BucketRoot
+}
+
+// ComputeAllBucketUsage returns per-bucket usage. When UseBucketStats
+// is enabled, reads counters directly. Otherwise falls back to a
+// full namespace+inode prefix scan.
+func (s *PebbleStore) ComputeAllBucketUsage(ctx context.Context) ([]BucketUsage, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+
+	buckets, err := s.ListBuckets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(buckets) == 0 {
+		return nil, nil
+	}
+
+	if s.cfg.UseBucketStats {
+		// Fast path: read per-bucket counters directly
+		result := make([]BucketUsage, 0, len(buckets))
+		for _, b := range buckets {
+			stats := s.readBucketStats(b.RootInode)
+			stats.Name = b.Name
+			result = append(result, stats)
+		}
+		return result, nil
+	}
+
+	// Slow path: scan namespace + inodes (pre-migration fallback)
+	children := make(map[InodeID][]DirEntry, len(buckets)*2)
+	if err := s.scanPrefix(prefixNS, func(key, val []byte) error {
+		parentStr, name := splitNSPath(string(key))
+		if name == "" {
+			return nil
+		}
+		parent, err := strconv.ParseUint(parentStr, 10, 64)
+		if err != nil {
+			return nil
+		}
+		var entry DirEntry
+		if err := unmarshalValue(val, &entry); err != nil {
+			return nil
+		}
+		entry.Name = name
+		children[InodeID(parent)] = append(children[InodeID(parent)], entry)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	needed := make(map[InodeID]struct{})
+	for _, b := range buckets {
+		collectFileInodes(children, b.RootInode, needed)
+	}
+
+	sizes := make(map[InodeID]int64, len(needed))
+	if err := s.scanPrefix(prefixInode, func(key, val []byte) error {
+		idStr := strings.TrimPrefix(string(key), prefixInode)
+		id, err := strconv.ParseUint(idStr, 10, 64)
+		if err != nil {
+			return nil
+		}
+		if _, ok := needed[InodeID(id)]; ok {
+			var meta InodeMeta
+			if err := unmarshalValue(val, &meta); err == nil {
+				sizes[InodeID(id)] = meta.Size
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	result := make([]BucketUsage, 0, len(buckets))
+	for _, b := range buckets {
+		used, objs := walkUsageTree(children, sizes, b.RootInode)
+		result = append(result, BucketUsage{
+			Name:      b.Name,
+			UsedBytes: used,
+			Objects:   objs,
+		})
+	}
+	return result, nil
+}
+
+func collectFileInodes(children map[InodeID][]DirEntry, parent InodeID, needed map[InodeID]struct{}) {
+	for _, e := range children[parent] {
+		if e.Type == FileDirectory {
+			collectFileInodes(children, e.InodeID, needed)
+		} else {
+			needed[e.InodeID] = struct{}{}
+		}
+	}
+}
+
+func walkUsageTree(children map[InodeID][]DirEntry, sizes map[InodeID]int64, dir InodeID) (usedBytes int64, objects int) {
+	for _, e := range children[dir] {
+		if e.Type == FileDirectory {
+			ub, objs := walkUsageTree(children, sizes, e.InodeID)
+			usedBytes += ub
+			objects += objs
+		} else {
+			objects++
+			usedBytes += sizes[e.InodeID]
+		}
+	}
+	return
+}
+
+// ScrubAllChunks iterates all chunks and calls the callback with
+// replica health information. Used by nufs-cli scrub command.
+func (s *PebbleStore) ScrubAllChunks(fn func(chunkID ChunkID, replicaCount, healthyCount int)) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+
+	prefix := prefixChunk
+	return s.scanPrefix(prefix, func(key, val []byte) error {
+		var chunk ChunkMeta
+		if err := unmarshalValue(val, &chunk); err != nil {
+			return nil
+		}
+		healthy := 0
+		for _, replica := range chunk.Replicas {
+			if replica.State == ReplicaReady {
+				healthy++
+			}
+		}
+		fn(chunk.ID, len(chunk.Replicas), healthy)
+		return nil
+	})
+}
+
+// splitNSPath splits "/ns/{parent}/{name}" into parent ID and name.
+// Trailing slash on directory names is preserved.
+func splitNSPath(key string) (parent, name string) {
+	s := strings.TrimPrefix(key, prefixNS)
+	slash := strings.IndexByte(s, '/')
+	if slash < 0 {
+		return s, ""
+	}
+	return s[:slash], s[slash+1:]
 }

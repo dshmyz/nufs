@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,8 +31,12 @@ func main() {
 		raftAddr      = flag.String("raft-addr", "0.0.0.0:7000", "Raft bind address")
 		raftDir       = flag.String("raft-dir", "/var/lib/dfs/raft", "Raft data directory")
 		raftBootstrap = flag.Bool("raft-bootstrap", false, "Bootstrap a new Raft cluster")
-		opsAddr       = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
-		leaseTTL      = flag.Duration("lease-ttl", 30*time.Second, "Node lease TTL")
+		opsAddr        = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
+		advertiseOps   = flag.String("advertise-ops-addr", "", "Advertised ops URL for other metad nodes (default: http://<hostname>:8091)")
+		raftHbTimeout  = flag.Duration("raft-heartbeat", 0, "Raft heartbeat timeout (default: 1s)")
+		raftElection   = flag.Duration("raft-election", 0, "Raft election timeout (default: 1s)")
+		raftLease      = flag.Duration("raft-lease", 0, "Raft leader lease timeout (default: 500ms)")
+		leaseTTL       = flag.Duration("lease-ttl", 30*time.Second, "Node lease TTL")
 		gcInterval    = flag.Duration("gc-interval", 10*time.Minute, "GC scan interval")
 		gcDryRun      = flag.Bool("gc-dry-run", false, "GC dry-run mode (no deletes)")
 		scrubInterval = flag.Duration("scrub-interval", 1*time.Hour, "Scrub interval")
@@ -66,15 +71,37 @@ func main() {
 
 	var raftNode *metadata.RaftNode
 
+	// Compute advertised ops URL once, used for both RaftNode config
+	// and ops handler redirect. Defaults to http://<hostname>:<port>.
+	advertiseOpsURL := *advertiseOps
+	if advertiseOpsURL == "" {
+		host, _, _ := net.SplitHostPort(*opsAddr)
+		if host == "" || host == "0.0.0.0" {
+			hostname, _ := os.Hostname()
+			host = hostname
+		}
+		_, port, _ := net.SplitHostPort(*opsAddr)
+		advertiseOpsURL = fmt.Sprintf("http://%s:%s", host, port)
+	}
+
 	if *enableRaft {
+		peerOps := map[string]string{
+			fmt.Sprintf("meta-%d", *nodeID): advertiseOpsURL,
+		}
+
 		raftCfg := metadata.RaftNodeConfig{
 			NodeID:            fmt.Sprintf("meta-%d", *nodeID),
 			BindAddr:          *raftAddr,
 			RaftDir:           *raftDir,
 			Bootstrap:         *raftBootstrap,
+			HeartbeatTimeout:  *raftHbTimeout,
+			ElectionTimeout:   *raftElection,
+			LeaderLeaseTimeout: *raftLease,
 			SnapshotThreshold: 8192,
 			SnapshotInterval:  2 * time.Minute,
 			TrailingLogs:      10240,
+			AdvertiseOpsAddr:  advertiseOpsURL,
+			PeerOpsURLs:       peerOps,
 		}
 
 		raftNode, err = metadata.NewRaftNode(store, raftCfg)
@@ -92,6 +119,19 @@ func main() {
 			}
 			time.Sleep(time.Second)
 		}
+
+		// Register ops URL in FSM so peers can find the leader for auto-forwarding.
+		// Runs async because the cluster may not have a leader yet on first join.
+		go func() {
+			for i := 0; i < 30; i++ {
+				if err := raftNode.StoreOpsURL(10 * time.Second); err == nil {
+					log.Info("registered ops URL in FSM", "url", advertiseOpsURL)
+					return
+				}
+				time.Sleep(time.Second)
+			}
+			log.Warn("failed to register ops URL in FSM after 30s", "url", advertiseOpsURL)
+		}()
 	} else {
 		log.Info("running in single-node mode (Raft disabled)")
 	}
@@ -115,10 +155,15 @@ func main() {
 	log.Info("service bundle initialized")
 
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle)
+	registerOpsHandlers(mux, store, bundle, advertiseOpsURL)
 
 	admin := newAdminServer(store, bundle)
 	admin.RegisterRoutes(mux)
+
+	// Prometheus metrics endpoint
+	mux.Handle("/metrics", metadata.PrometheusHandler(bundle.Metrics))
+	// Health check endpoint
+	mux.Handle("/healthz", metadata.HealthHandler(bundle.Health))
 
 	if *authToken != "" {
 		log.Info("auth token enabled for ops API")
@@ -127,9 +172,14 @@ func main() {
 		mux.Handle("/", authMiddleware(*authToken, wrap))
 	}
 
+	// Rate limiting middleware: 100 req/s, burst 200
+	rateLimiter := metadata.NewRateLimiter(100, 200)
+	limitedMux := http.NewServeMux()
+	limitedMux.Handle("/", rateLimitMiddleware(rateLimiter, mux))
+
 	opsServer := &http.Server{
 		Addr:         *opsAddr,
-		Handler:      mux,
+		Handler:      limitedMux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -151,12 +201,21 @@ func main() {
 		}
 	}()
 
-	log.Info("metadata service ready")
+	// Initialize graceful shutdown drain
+	drain := metadata.NewShutdownDrain(15 * time.Second)
+
+	// Initialize backup manager (if backup-dir is configured)
+	_ = metadata.BackupConfig{} // placeholder: configure via config file or env
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 	log.Info("received signal, shutting down", "signal", sig)
+
+	// Drain in-flight operations
+	if err := drain.Shutdown(); err != nil {
+		log.Warn("drain timeout", "error", err)
+	}
 
 	if raftNode != nil {
 		if err := raftNode.TriggerSnapshot(); err != nil {
@@ -181,6 +240,18 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 		if got != expected {
 			slog.Warn("auth rejected", "remote", r.RemoteAddr, "path", r.URL.Path)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// rateLimitMiddleware applies per-IP rate limiting using a token bucket.
+func rateLimitMiddleware(rl *metadata.RateLimiter, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.RemoteAddr
+		if !rl.Allow(key) {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 		next.ServeHTTP(w, r)

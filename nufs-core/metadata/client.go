@@ -12,10 +12,16 @@ import (
 )
 
 // HTTPClient implements MetadataService over HTTP to a remote metad server.
+// It supports automatic retries with exponential backoff and leader redirect
+// following for Raft-based deployments.
 type HTTPClient struct {
 	baseURL    string
 	httpClient *http.Client
 	timeout    time.Duration
+
+	// Retry configuration
+	maxRetries    int           // Maximum number of retries (default: 3)
+	retryBaseWait time.Duration // Base wait between retries (default: 100ms)
 }
 
 // NewHTTPClient creates a metadata HTTP client connecting to a metad server.
@@ -29,13 +35,102 @@ func NewHTTPClient(baseURL string, timeout time.Duration) *HTTPClient {
 		httpClient: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
-				MaxIdleConns:        64,
-				MaxIdleConnsPerHost: 16,
+				MaxIdleConns:        256,
+				MaxIdleConnsPerHost: 128,
+				MaxConnsPerHost:     256,
 				IdleConnTimeout:     90 * time.Second,
 			},
+			// Don't auto-follow redirects — we handle them ourselves
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
-		timeout: timeout,
+		timeout:       timeout,
+		maxRetries:    3,
+		retryBaseWait: 100 * time.Millisecond,
 	}
+}
+
+// SetRetryConfig configures the retry behavior.
+func (c *HTTPClient) SetRetryConfig(maxRetries int, baseWait time.Duration) {
+	if maxRetries >= 0 {
+		c.maxRetries = maxRetries
+	}
+	if baseWait > 0 {
+		c.retryBaseWait = baseWait
+	}
+}
+
+// doRequestWithRetry executes an HTTP request with exponential backoff retry
+// and automatic leader redirect following.
+func (c *HTTPClient) doRequestWithRetry(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 100ms, 200ms, 400ms, ...
+			wait := c.retryBaseWait * time.Duration(1<<uint(attempt-1))
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		resp, err := c.doRequest(ctx, method, path, body)
+		if err != nil {
+			lastErr = err
+			continue // Retry on network errors
+		}
+
+		// Handle leader redirect (HTTP 301/307 from follower nodes)
+		if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect {
+			location := resp.Header.Get("Location")
+			resp.Body.Close()
+			if location != "" {
+				redirectURL, err := url.Parse(location)
+				if err == nil && redirectURL.Host != "" {
+					// Follow redirect: construct a temporary URL instead of mutating c.baseURL
+					redirectBase := redirectURL.Scheme + "://" + redirectURL.Host
+					redirectReqURL := redirectBase + path
+					var reqBody io.Reader
+					if body != nil {
+						data, err := json.Marshal(body)
+						if err != nil {
+							lastErr = fmt.Errorf("marshal redirect body: %w", err)
+							continue
+						}
+						reqBody = bytes.NewReader(data)
+					}
+					req, reqErr := http.NewRequestWithContext(ctx, method, redirectReqURL, reqBody)
+					if reqErr != nil {
+						lastErr = reqErr
+						continue
+					}
+					req.Header.Set("Content-Type", "application/json")
+					resp, err = c.httpClient.Do(req)
+					if err != nil {
+						lastErr = err
+						continue
+					}
+					return resp, nil
+				}
+			}
+			lastErr = fmt.Errorf("metad: redirect without location")
+			continue
+		}
+
+		// Retry on server errors (5xx) and connection-level issues
+		if resp.StatusCode >= 500 {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("metad: server error (status=%d)", resp.StatusCode)
+			continue
+		}
+
+		return resp, nil
+	}
+
+	return nil, fmt.Errorf("metad: %w (after %d retries)", lastErr, c.maxRetries)
 }
 
 func (c *HTTPClient) doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
@@ -94,7 +189,7 @@ func (c *HTTPClient) CreateBucket(ctx context.Context, name string, policy Place
 		"name":   name,
 		"policy": policy,
 	}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/buckets", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/buckets", req)
 	if err != nil {
 		return err
 	}
@@ -102,7 +197,7 @@ func (c *HTTPClient) CreateBucket(ctx context.Context, name string, policy Place
 }
 
 func (c *HTTPClient) DeleteBucket(ctx context.Context, name string) error {
-	resp, err := c.doRequest(ctx, http.MethodDelete, "/api/v1/buckets/"+name, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, "/api/v1/buckets/"+name, nil)
 	if err != nil {
 		return err
 	}
@@ -110,7 +205,7 @@ func (c *HTTPClient) DeleteBucket(ctx context.Context, name string) error {
 }
 
 func (c *HTTPClient) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, "/api/v1/buckets", nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/buckets", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +217,7 @@ func (c *HTTPClient) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 }
 
 func (c *HTTPClient) GetBucket(ctx context.Context, name string) (*BucketInfo, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, "/api/v1/buckets/"+name, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/buckets/"+name, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +233,7 @@ func (c *HTTPClient) GetBucket(ctx context.Context, name string) (*BucketInfo, e
 
 func (c *HTTPClient) MkDir(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error) {
 	req := map[string]interface{}{"parent": parent, "name": name, "mode": mode}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/namespace/mkdir", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/namespace/mkdir", req)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +246,7 @@ func (c *HTTPClient) MkDir(ctx context.Context, parent InodeID, name string, mod
 
 func (c *HTTPClient) RmDir(ctx context.Context, parent InodeID, name string) error {
 	req := map[string]interface{}{"parent": parent, "name": name}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/namespace/rmdir", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/namespace/rmdir", req)
 	if err != nil {
 		return err
 	}
@@ -160,7 +255,7 @@ func (c *HTTPClient) RmDir(ctx context.Context, parent InodeID, name string) err
 
 func (c *HTTPClient) ReadDir(ctx context.Context, parent InodeID, offset int, limit int) ([]DirEntry, error) {
 	path := fmt.Sprintf("/api/v1/namespace/readdir?parent=%d&offset=%d&limit=%d", parent, offset, limit)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +268,7 @@ func (c *HTTPClient) ReadDir(ctx context.Context, parent InodeID, offset int, li
 
 func (c *HTTPClient) CreateFile(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error) {
 	req := map[string]interface{}{"parent": parent, "name": name, "mode": mode}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/namespace/createfile", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/namespace/createfile", req)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +281,7 @@ func (c *HTTPClient) CreateFile(ctx context.Context, parent InodeID, name string
 
 func (c *HTTPClient) Unlink(ctx context.Context, parent InodeID, name string) error {
 	req := map[string]interface{}{"parent": parent, "name": name}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/namespace/unlink", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/namespace/unlink", req)
 	if err != nil {
 		return err
 	}
@@ -195,7 +290,7 @@ func (c *HTTPClient) Unlink(ctx context.Context, parent InodeID, name string) er
 
 func (c *HTTPClient) Lookup(ctx context.Context, parent InodeID, name string) (*InodeMeta, error) {
 	path := fmt.Sprintf("/api/v1/namespace/lookup?parent=%d&name=%s", parent, url.QueryEscape(name))
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +303,7 @@ func (c *HTTPClient) Lookup(ctx context.Context, parent InodeID, name string) (*
 
 func (c *HTTPClient) Rename(ctx context.Context, oldParent InodeID, oldName string, newParent InodeID, newName string) error {
 	req := map[string]interface{}{"old_parent": oldParent, "old_name": oldName, "new_parent": newParent, "new_name": newName}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/namespace/rename", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/namespace/rename", req)
 	if err != nil {
 		return err
 	}
@@ -217,7 +312,7 @@ func (c *HTTPClient) Rename(ctx context.Context, oldParent InodeID, oldName stri
 
 func (c *HTTPClient) Symlink(ctx context.Context, parent InodeID, name string, target string) (*InodeMeta, error) {
 	req := map[string]interface{}{"parent": parent, "name": name, "target": target}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/namespace/symlink", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/namespace/symlink", req)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +325,7 @@ func (c *HTTPClient) Symlink(ctx context.Context, parent InodeID, name string, t
 
 func (c *HTTPClient) Readlink(ctx context.Context, id InodeID) (string, error) {
 	path := fmt.Sprintf("/api/v1/namespace/readlink?id=%d", id)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return "", err
 	}
@@ -245,7 +340,7 @@ func (c *HTTPClient) Readlink(ctx context.Context, id InodeID) (string, error) {
 
 func (c *HTTPClient) Link(ctx context.Context, parent InodeID, name string, target InodeID) (*InodeMeta, error) {
 	req := map[string]interface{}{"parent": parent, "name": name, "target": target}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/namespace/link", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/namespace/link", req)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +355,7 @@ func (c *HTTPClient) Link(ctx context.Context, parent InodeID, name string, targ
 
 func (c *HTTPClient) GetInode(ctx context.Context, id InodeID) (*InodeMeta, error) {
 	path := fmt.Sprintf("/api/v1/inodes/%d", id)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +367,7 @@ func (c *HTTPClient) GetInode(ctx context.Context, id InodeID) (*InodeMeta, erro
 }
 
 func (c *HTTPClient) UpdateInode(ctx context.Context, meta *InodeMeta) error {
-	resp, err := c.doRequest(ctx, http.MethodPut, fmt.Sprintf("/api/v1/inodes/%d", meta.ID), meta)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, fmt.Sprintf("/api/v1/inodes/%d", meta.ID), meta)
 	if err != nil {
 		return err
 	}
@@ -283,7 +378,7 @@ func (c *HTTPClient) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 
 func (c *HTTPClient) AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error) {
 	req := map[string]interface{}{"inode_id": inodeID, "offset": offset, "policy": policy}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/chunks", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/chunks", req)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +391,7 @@ func (c *HTTPClient) AllocateChunk(ctx context.Context, inodeID InodeID, offset 
 
 func (c *HTTPClient) CommitChunk(ctx context.Context, chunkID ChunkID, checksum uint32) error {
 	req := map[string]interface{}{"checksum": checksum}
-	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/v1/chunks/%d/commit", chunkID), req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, fmt.Sprintf("/api/v1/chunks/%d/commit", chunkID), req)
 	if err != nil {
 		return err
 	}
@@ -305,7 +400,7 @@ func (c *HTTPClient) CommitChunk(ctx context.Context, chunkID ChunkID, checksum 
 
 func (c *HTTPClient) GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error) {
 	path := fmt.Sprintf("/api/v1/chunks/%d", chunkID)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +412,7 @@ func (c *HTTPClient) GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta,
 }
 
 func (c *HTTPClient) UpdateChunk(ctx context.Context, chunk *ChunkMeta) error {
-	resp, err := c.doRequest(ctx, http.MethodPut, fmt.Sprintf("/api/v1/chunks/%d", chunk.ID), chunk)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, fmt.Sprintf("/api/v1/chunks/%d", chunk.ID), chunk)
 	if err != nil {
 		return err
 	}
@@ -325,7 +420,7 @@ func (c *HTTPClient) UpdateChunk(ctx context.Context, chunk *ChunkMeta) error {
 }
 
 func (c *HTTPClient) SealChunk(ctx context.Context, chunkID ChunkID) error {
-	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/v1/chunks/%d/seal", chunkID), nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, fmt.Sprintf("/api/v1/chunks/%d/seal", chunkID), nil)
 	if err != nil {
 		return err
 	}
@@ -334,7 +429,7 @@ func (c *HTTPClient) SealChunk(ctx context.Context, chunkID ChunkID) error {
 
 func (c *HTTPClient) ListChunks(ctx context.Context, inodeID InodeID) ([]ChunkRef, error) {
 	path := fmt.Sprintf("/api/v1/chunks?inode_id=%d", inodeID)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +441,7 @@ func (c *HTTPClient) ListChunks(ctx context.Context, inodeID InodeID) ([]ChunkRe
 }
 
 func (c *HTTPClient) DeleteChunk(ctx context.Context, chunkID ChunkID) error {
-	resp, err := c.doRequest(ctx, http.MethodDelete, fmt.Sprintf("/api/v1/chunks/%d", chunkID), nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, fmt.Sprintf("/api/v1/chunks/%d", chunkID), nil)
 	if err != nil {
 		return err
 	}
@@ -355,7 +450,7 @@ func (c *HTTPClient) DeleteChunk(ctx context.Context, chunkID ChunkID) error {
 
 func (c *HTTPClient) ReportChunkState(ctx context.Context, nodeID NodeID, states map[ChunkID]ReplicaState) error {
 	req := map[string]interface{}{"node_id": nodeID, "states": states}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/chunks/report-state", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/chunks/report-state", req)
 	if err != nil {
 		return err
 	}
@@ -365,7 +460,7 @@ func (c *HTTPClient) ReportChunkState(ctx context.Context, nodeID NodeID, states
 // Cluster operations
 
 func (c *HTTPClient) RegisterNode(ctx context.Context, info *NodeInfo) error {
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/nodes", info)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/nodes", info)
 	if err != nil {
 		return err
 	}
@@ -374,7 +469,7 @@ func (c *HTTPClient) RegisterNode(ctx context.Context, info *NodeInfo) error {
 
 func (c *HTTPClient) Heartbeat(ctx context.Context, nodeID NodeID, report *NodeReport) error {
 	path := fmt.Sprintf("/api/v1/nodes/%d/heartbeat", nodeID)
-	resp, err := c.doRequest(ctx, http.MethodPost, path, report)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, path, report)
 	if err != nil {
 		return err
 	}
@@ -382,7 +477,7 @@ func (c *HTTPClient) Heartbeat(ctx context.Context, nodeID NodeID, report *NodeR
 }
 
 func (c *HTTPClient) DecommissionNode(ctx context.Context, nodeID NodeID) error {
-	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/v1/nodes/%d/decommission", nodeID), nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, fmt.Sprintf("/api/v1/nodes/%d/decommission", nodeID), nil)
 	if err != nil {
 		return err
 	}
@@ -390,7 +485,7 @@ func (c *HTTPClient) DecommissionNode(ctx context.Context, nodeID NodeID) error 
 }
 
 func (c *HTTPClient) ListNodes(ctx context.Context) ([]NodeInfo, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, "/api/v1/nodes", nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/nodes", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -403,7 +498,7 @@ func (c *HTTPClient) ListNodes(ctx context.Context) ([]NodeInfo, error) {
 
 func (c *HTTPClient) GetNode(ctx context.Context, nodeID NodeID) (*NodeInfo, error) {
 	path := fmt.Sprintf("/api/v1/nodes/%d", nodeID)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +512,7 @@ func (c *HTTPClient) GetNode(ctx context.Context, nodeID NodeID) (*NodeInfo, err
 // Repair operations
 
 func (c *HTTPClient) GetRepairQueue(ctx context.Context) ([]RepairTask, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, "/api/v1/repair/queue", nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/repair/queue", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +525,7 @@ func (c *HTTPClient) GetRepairQueue(ctx context.Context) ([]RepairTask, error) {
 
 func (c *HTTPClient) TriggerRepair(ctx context.Context, chunkID ChunkID) error {
 	req := map[string]interface{}{"chunk_id": chunkID}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/repair/trigger", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/repair/trigger", req)
 	if err != nil {
 		return err
 	}
@@ -438,7 +533,7 @@ func (c *HTTPClient) TriggerRepair(ctx context.Context, chunkID ChunkID) error {
 }
 
 func (c *HTTPClient) RemoveRepairTask(ctx context.Context, chunkID ChunkID) error {
-	resp, err := c.doRequest(ctx, http.MethodDelete, fmt.Sprintf("/api/v1/repair/%d", chunkID), nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, fmt.Sprintf("/api/v1/repair/%d", chunkID), nil)
 	if err != nil {
 		return err
 	}
@@ -449,7 +544,7 @@ func (c *HTTPClient) RemoveRepairTask(ctx context.Context, chunkID ChunkID) erro
 
 func (c *HTTPClient) ChunksByNode(ctx context.Context, nodeID NodeID) ([]ChunkMeta, error) {
 	path := fmt.Sprintf("/api/v1/nodes/%d/chunks", nodeID)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -466,7 +561,7 @@ func (c *HTTPClient) MigrateChunkReplica(ctx context.Context, chunkID ChunkID, f
 		"from_node":  fromNode,
 		"to_node":    toNode,
 	}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/chunks/migrate-replica", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/chunks/migrate-replica", req)
 	if err != nil {
 		return err
 	}
@@ -476,7 +571,7 @@ func (c *HTTPClient) MigrateChunkReplica(ctx context.Context, chunkID ChunkID, f
 // Rebalance operations
 
 func (c *HTTPClient) TriggerRebalance(ctx context.Context) error {
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/rebalance/trigger", nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/rebalance/trigger", nil)
 	if err != nil {
 		return err
 	}
@@ -502,7 +597,7 @@ func (c *HTTPClient) AdvisoryLockShared(ctx context.Context, inode InodeID, owne
 
 func (c *HTTPClient) AdvisoryUnlock(ctx context.Context, inode InodeID, owner string) error {
 	req := map[string]interface{}{"inode": inode, "owner": owner}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/locks/release", req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/locks/release", req)
 	if err != nil {
 		return err
 	}
@@ -511,7 +606,7 @@ func (c *HTTPClient) AdvisoryUnlock(ctx context.Context, inode InodeID, owner st
 
 func (c *HTTPClient) AdvisoryListLocks(ctx context.Context, inode InodeID) ([]LockInfo, error) {
 	path := fmt.Sprintf("/api/v1/locks?inode=%d", inode)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -524,7 +619,7 @@ func (c *HTTPClient) AdvisoryListLocks(ctx context.Context, inode InodeID) ([]Lo
 
 func (c *HTTPClient) advisoryLockCall(ctx context.Context, path string, inode InodeID, owner, mode string) error {
 	req := map[string]interface{}{"inode": inode, "owner": owner, "mode": mode}
-	resp, err := c.doRequest(ctx, http.MethodPost, path, req)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, path, req)
 	if err != nil {
 		return err
 	}
@@ -540,6 +635,20 @@ func (c *HTTPClient) advisoryLockCall(ctx context.Context, path string, inode In
 }
 
 // ========== Extended attributes (stubs — xattr not yet exposed via HTTP) ==========
+
+func (c *HTTPClient) ComputeAllBucketUsage(ctx context.Context) ([]BucketUsage, error) {
+	path := "/api/v1/admin/bucket-usage"
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var usage []BucketUsage
+	if err := c.readResponse(resp, &usage); err != nil {
+		return nil, err
+	}
+	return usage, nil
+}
 
 func (c *HTTPClient) GetXAttr(_ context.Context, _ InodeID, _ string) ([]byte, error) {
 	return nil, ErrXAttrNotFound

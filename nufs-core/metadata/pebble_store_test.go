@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -613,6 +614,88 @@ func TestFSM_ApplyAndRestore(t *testing.T) {
 	}
 }
 
+func TestFSM_ApplyAndRestore_Checkpoint(t *testing.T) {
+	// Use real (non-in-memory) Pebble to test PBL3 checkpoint format
+	cfg := PebbleStoreConfig{
+		Dir:    fmt.Sprintf("test-checkpoint-%d", time.Now().UnixNano()),
+		NodeID: 1,
+	}
+	store, err := NewPebbleStore(cfg)
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	defer os.RemoveAll(cfg.Dir)
+	defer store.Close()
+
+	fsm := &PebbleFSM{store: store}
+
+	for i := 0; i < 100; i++ {
+		entry := &RaftLogEntry{
+			Op:    OpSet,
+			Key:   []byte(fmt.Sprintf("key-%d", i)),
+			Value: []byte(fmt.Sprintf("value-%d", i)),
+		}
+		result := fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: entry.Encode()})
+		if result != nil {
+			t.Fatalf("apply error: %v", result)
+		}
+	}
+
+	snap, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	var buf bytes.Buffer
+	sink := &testSnapshotSink{buf: &buf}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	// Verify magic is PBL3
+	if string(buf.Bytes()[:4]) != "PBL3" {
+		t.Fatalf("expected PBL3 magic, got %q", buf.Bytes()[:4])
+	}
+
+	// Restore into a new store
+	cfg2 := PebbleStoreConfig{
+		Dir:    fmt.Sprintf("test-checkpoint-restore-%d", time.Now().UnixNano()),
+		NodeID: 1,
+	}
+	store2, err := NewPebbleStore(cfg2)
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	defer os.RemoveAll(cfg2.Dir)
+	defer store2.Close()
+
+	fsm2 := &PebbleFSM{store: store2}
+	rc := io.NopCloser(bytes.NewReader(buf.Bytes()))
+	if err := fsm2.Restore(rc); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	// Verify restored data
+	val, closer, err := store2.db.Get([]byte("key-50"))
+	if err != nil {
+		t.Fatalf("get after restore: %v", err)
+	}
+	if string(val) != "value-50" {
+		t.Fatalf("restored value mismatch: %s", val)
+	}
+	closer.Close()
+
+	count := 0
+	iter, _ := store2.db.NewIter(nil)
+	for iter.First(); iter.Valid(); iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 101 {
+		t.Fatalf("expected 101 keys after checkpoint restore, got %d", count)
+	}
+}
+
 func TestPebbleStore_RemoveRepairTask(t *testing.T) {
 	store := newTestPebbleStore(t)
 	ctx := context.Background()
@@ -979,3 +1062,225 @@ func (s *testSnapshotSink) Write(p []byte) (int, error) { return s.buf.Write(p) 
 func (s *testSnapshotSink) Close() error                { return nil }
 func (s *testSnapshotSink) ID() string                  { return "test" }
 func (s *testSnapshotSink) Cancel() error               { return nil }
+
+// ========== applyViaRaft / applyBatchViaRaft Tests ==========
+
+func TestApplyViaRaft_SetDelete(t *testing.T) {
+	store := newTestPebbleStore(t)
+
+	// Set via applyViaRaft (non-Raft mode: direct Pebble write)
+	err := store.applyViaRaft(OpSet, "test-key", []byte("test-value"))
+	if err != nil {
+		t.Fatalf("applyViaRaft set: %v", err)
+	}
+
+	// Verify in Pebble
+	val, closer, err := store.db.Get([]byte("test-key"))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(val) != "test-value" {
+		t.Fatalf("expected test-value, got %s", val)
+	}
+	closer.Close()
+
+	// Delete via applyViaRaft
+	err = store.applyViaRaft(OpDelete, "test-key", nil)
+	if err != nil {
+		t.Fatalf("applyViaRaft delete: %v", err)
+	}
+
+	_, closer2, err := store.db.Get([]byte("test-key"))
+	if err == nil {
+		closer2.Close()
+		t.Fatal("key should be deleted")
+	}
+}
+
+func TestApplyViaRaft_ReadOnlyRejects(t *testing.T) {
+	store := newTestPebbleStore(t)
+
+	// Force read-only state
+	store.degradation.transition(DegStateReadOnly)
+
+	err := store.applyViaRaft(OpSet, "key", []byte("val"))
+	if err != ErrServiceClosed {
+		t.Fatalf("expected ErrServiceClosed in read-only mode, got: %v", err)
+	}
+
+	err = store.applyBatchViaRaft([]BatchOp{{Key: []byte("k"), Value: []byte("v")}})
+	if err != ErrServiceClosed {
+		t.Fatalf("expected ErrServiceClosed in read-only mode, got: %v", err)
+	}
+}
+
+func TestApplyViaRaft_MetricsRecorded(t *testing.T) {
+	store := newTestPebbleStore(t)
+	store.metrics = NewMetrics()
+
+	initialWrites := store.metrics.WriteOps.Load()
+
+	_ = store.applyViaRaft(OpSet, "mkey", []byte("mval"))
+
+	if store.metrics.WriteOps.Load() != initialWrites+1 {
+		t.Fatalf("expected WriteOps=%d, got %d", initialWrites+1, store.metrics.WriteOps.Load())
+	}
+}
+
+func TestApplyBatchViaRaft_AtomicBatch(t *testing.T) {
+	store := newTestPebbleStore(t)
+
+	ops := []BatchOp{
+		{Key: []byte("bk1"), Value: []byte("bv1")},
+		{Key: []byte("bk2"), Value: []byte("bv2")},
+		{Delete: true, Key: []byte("nonexistent")}, // delete missing key is fine
+	}
+
+	err := store.applyBatchViaRaft(ops)
+	if err != nil {
+		t.Fatalf("applyBatchViaRaft: %v", err)
+	}
+
+	// Verify both keys written
+	v1, c1, err := store.db.Get([]byte("bk1"))
+	if err != nil {
+		t.Fatalf("get bk1: %v", err)
+	}
+	if string(v1) != "bv1" {
+		t.Fatalf("bk1 = %s, want bv1", v1)
+	}
+	c1.Close()
+
+	v2, c2, err := store.db.Get([]byte("bk2"))
+	if err != nil {
+		t.Fatalf("get bk2: %v", err)
+	}
+	if string(v2) != "bv2" {
+		t.Fatalf("bk2 = %s, want bv2", v2)
+	}
+	c2.Close()
+}
+
+func TestApplyBatchViaRaft_EmptyIsNoop(t *testing.T) {
+	store := newTestPebbleStore(t)
+	err := store.applyBatchViaRaft(nil)
+	if err != nil {
+		t.Fatalf("nil batch: %v", err)
+	}
+	err = store.applyBatchViaRaft([]BatchOp{})
+	if err != nil {
+		t.Fatalf("empty batch: %v", err)
+	}
+}
+
+// ========== DegradationManager Tests ==========
+
+func TestDegradationManager_WriteErrorThreshold(t *testing.T) {
+	store := newTestPebbleStore(t)
+
+	if store.degradation.State() != DegStateNormal {
+		t.Fatalf("initial state should be Normal")
+	}
+
+	// Record 9 errors — still normal
+	for i := 0; i < 9; i++ {
+		store.degradation.RecordWriteError()
+	}
+	if store.degradation.State() != DegStateNormal {
+		t.Fatalf("expected Normal after 9 errors, got %s", store.degradation.State())
+	}
+
+	// 10th error triggers read-only
+	store.degradation.RecordWriteError()
+	if store.degradation.State() != DegStateReadOnly {
+		t.Fatalf("expected ReadOnly after 10 errors, got %s", store.degradation.State())
+	}
+	if !store.degradation.IsReadOnly() {
+		t.Fatal("IsReadOnly should be true")
+	}
+}
+
+func TestDegradationManager_SuccessResetsCounter(t *testing.T) {
+	store := newTestPebbleStore(t)
+
+	for i := 0; i < 9; i++ {
+		store.degradation.RecordWriteError()
+	}
+	store.degradation.RecordWriteSuccess()
+
+	// Counter reset, 10 more errors needed to trigger
+	for i := 0; i < 9; i++ {
+		store.degradation.RecordWriteError()
+	}
+	if store.degradation.State() != DegStateNormal {
+		t.Fatalf("expected Normal after reset, got %s", store.degradation.State())
+	}
+}
+
+func TestDegradationManager_ReadErrorThreshold(t *testing.T) {
+	store := newTestPebbleStore(t)
+
+	for i := 0; i < 20; i++ {
+		store.degradation.RecordReadError()
+	}
+	if store.degradation.State() != DegStateDegraded {
+		t.Fatalf("expected Degraded after 20 read errors, got %s", store.degradation.State())
+	}
+}
+
+func TestDegradationManager_StateString(t *testing.T) {
+	if DegStateNormal.String() != "Normal" {
+		t.Fatalf("Normal.String() = %q", DegStateNormal.String())
+	}
+	if DegStateReadOnly.String() != "ReadOnly" {
+		t.Fatalf("ReadOnly.String() = %q", DegStateReadOnly.String())
+	}
+	if DegStateDegraded.String() != "Degraded" {
+		t.Fatalf("Degraded.String() = %q", DegStateDegraded.String())
+	}
+	if DegStateUnavailable.String() != "Unavailable" {
+		t.Fatalf("Unavailable.String() = %q", DegStateUnavailable.String())
+	}
+}
+
+func TestDegradationManager_Recovery(t *testing.T) {
+	store := newTestPebbleStore(t)
+
+	// Trigger read-only
+	for i := 0; i < 10; i++ {
+		store.degradation.RecordWriteError()
+	}
+	if store.degradation.State() != DegStateReadOnly {
+		t.Fatal("expected ReadOnly")
+	}
+
+	// Recovery: enough successes should recover to normal
+	store.degradation.Recover()
+	if store.degradation.State() != DegStateNormal {
+		t.Fatalf("expected Normal after recovery, got %s", store.degradation.State())
+	}
+}
+
+func TestRaftLogEntry_CASRoundTrip(t *testing.T) {
+	payload := make([]byte, 8+len("new-data"))
+	copy(payload[8:], "new-data")
+	entry := &RaftLogEntry{
+		Op:    OpCAS,
+		Key:   []byte("/inode/123"),
+		Value: payload,
+	}
+	data := entry.Encode()
+	decoded, err := DecodeRaftLogEntry(data)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.Op != OpCAS {
+		t.Fatalf("op mismatch: %v", decoded.Op)
+	}
+	if string(decoded.Key) != "/inode/123" {
+		t.Fatalf("key mismatch: %s", decoded.Key)
+	}
+	if string(decoded.Value[8:]) != "new-data" {
+		t.Fatalf("value mismatch: %s", decoded.Value[8:])
+	}
+}

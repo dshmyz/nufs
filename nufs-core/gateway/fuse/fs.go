@@ -93,6 +93,7 @@ func (dfs *DFSFileSystem) getInode(metaID metadata.InodeID) *fs.Inode {
 // Compile-time guards for root inode operations.
 var _ = (fs.NodeReaddirer)((*DFSFileSystem)(nil))
 var _ = (fs.NodeLookuper)((*DFSFileSystem)(nil))
+var _ = (fs.NodeStatfser)((*DFSFileSystem)(nil))
 
 // Readdir on the root inode lists all bucket names as directory
 // entries. This is what makes `ls /mnt/dfs` show the bucket list
@@ -154,6 +155,41 @@ func (dfs *DFSFileSystem) Getattr(ctx context.Context, fh fs.FileHandle, out *fu
 		return syscall.EIO
 	}
 	out.Attr = inodeMetaToAttr(rootInode)
+	return 0
+}
+
+// Statfs returns filesystem statistics from cluster-wide node capacity.
+func (dfs *DFSFileSystem) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	nodes, err := dfs.meta.ListNodes(ctx)
+	if err != nil {
+		logf("statfs: %v", err)
+		return 0
+	}
+
+	var totalCap, usedCap int64
+	for _, n := range nodes {
+		totalCap += n.CapacityGB
+		usedCap += n.UsedGB
+	}
+
+	totalBytes := uint64(totalCap) * 1024 * 1024 * 1024
+	usedBytes := uint64(usedCap) * 1024 * 1024 * 1024
+
+	const blockSize = uint32(4096)
+	out.Bsize = blockSize
+	out.Frsize = blockSize
+	out.NameLen = 255
+
+	out.Blocks = totalBytes / uint64(blockSize)
+	out.Bfree = (totalBytes - usedBytes) / uint64(blockSize)
+	out.Bavail = out.Bfree
+
+	// Estimate inodes: 1 per 64 KB of capacity.
+	totalInodes := totalBytes / 65536
+	usedInodes := usedBytes / 65536
+	out.Files = totalInodes
+	out.Ffree = totalInodes - usedInodes
+
 	return 0
 }
 

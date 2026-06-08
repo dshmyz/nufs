@@ -6,7 +6,6 @@ import (
 	"io"
 	"sort"
 	"net/http"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -27,11 +26,48 @@ type Metrics struct {
 	ReadLatency  *LatencyHistogram
 	WriteLatency *LatencyHistogram
 
+	// Per-operation-type latency histograms for granular observability
+	CreateFileLatency *LatencyHistogram
+	MkDirLatency      *LatencyHistogram
+	LookupLatency     *LatencyHistogram
+	ReadDirLatency    *LatencyHistogram
+	GetInodeLatency   *LatencyHistogram
+	AllocateChunkLat  *LatencyHistogram
+
+	// Cache
+	CacheHits   atomic.Int64
+	CacheMisses atomic.Int64
+	CacheSize   atomic.Int64
+
 	// Storage
 	KeysTotal    atomic.Int64
 	ChunksTotal  atomic.Int64
 	NodesOnline  atomic.Int64
+	NodesTotal   atomic.Int64
 	BucketsTotal atomic.Int64
+
+	// Disk I/O (datanode side)
+	DiskReadBytes  atomic.Int64
+	DiskWriteBytes atomic.Int64
+	DiskReadOps    atomic.Int64
+	DiskWriteOps   atomic.Int64
+
+	// WAL
+	WALBytesWritten atomic.Int64
+	WALFsyncCount   atomic.Int64
+	WALLatency      *LatencyHistogram
+
+	// GC
+	GCScannedChunks  atomic.Int64
+	GCDeletedChunks  atomic.Int64
+	GCScannedBytes   atomic.Int64
+	GCFreedBytes     atomic.Int64
+	GCLastDurationMs atomic.Int64
+
+	// Repair / Rebalance
+	RepairTasksQueued   atomic.Int64
+	RepairTasksCompleted atomic.Int64
+	RebalanceBytesMoved atomic.Int64
 
 	// Raft (populated when Raft is active)
 	RaftState     atomic.Int32 // 0=follower, 1=candidate, 2=leader
@@ -46,9 +82,16 @@ type Metrics struct {
 // NewMetrics creates a new metrics collector.
 func NewMetrics() *Metrics {
 	return &Metrics{
-		ReadLatency:  NewLatencyHistogram(),
-		WriteLatency: NewLatencyHistogram(),
-		startTime:    time.Now(),
+		ReadLatency:       NewLatencyHistogram(),
+		WriteLatency:      NewLatencyHistogram(),
+		CreateFileLatency: NewLatencyHistogram(),
+		MkDirLatency:      NewLatencyHistogram(),
+		LookupLatency:     NewLatencyHistogram(),
+		ReadDirLatency:    NewLatencyHistogram(),
+		GetInodeLatency:   NewLatencyHistogram(),
+		AllocateChunkLat:  NewLatencyHistogram(),
+		WALLatency:        NewLatencyHistogram(),
+		startTime:         time.Now(),
 	}
 }
 
@@ -57,6 +100,16 @@ func (m *Metrics) RecordRead(latency time.Duration) {
 	m.OpsTotal.Add(1)
 	m.ReadOps.Add(1)
 	m.ReadLatency.Observe(latency)
+}
+
+// RecordCacheHit increments the cache hit counter.
+func (m *Metrics) RecordCacheHit() {
+	m.CacheHits.Add(1)
+}
+
+// RecordCacheMiss increments the cache miss counter.
+func (m *Metrics) RecordCacheMiss() {
+	m.CacheMisses.Add(1)
 }
 
 // RecordWrite records a write operation.
@@ -87,7 +140,25 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		KeysTotal:     m.KeysTotal.Load(),
 		ChunksTotal:   m.ChunksTotal.Load(),
 		NodesOnline:   m.NodesOnline.Load(),
+		NodesTotal:    m.NodesTotal.Load(),
 		BucketsTotal:  m.BucketsTotal.Load(),
+		CacheHits:     m.CacheHits.Load(),
+		CacheMisses:   m.CacheMisses.Load(),
+		CacheSize:     m.CacheSize.Load(),
+		DiskReadBytes:  m.DiskReadBytes.Load(),
+		DiskWriteBytes: m.DiskWriteBytes.Load(),
+		DiskReadOps:    m.DiskReadOps.Load(),
+		DiskWriteOps:   m.DiskWriteOps.Load(),
+		WALBytesWritten: m.WALBytesWritten.Load(),
+		WALFsyncCount:   m.WALFsyncCount.Load(),
+		GCScannedChunks:  m.GCScannedChunks.Load(),
+		GCDeletedChunks:  m.GCDeletedChunks.Load(),
+		GCScannedBytes:   m.GCScannedBytes.Load(),
+		GCFreedBytes:     m.GCFreedBytes.Load(),
+		GCLastDurationMs: m.GCLastDurationMs.Load(),
+		RepairTasksQueued:    m.RepairTasksQueued.Load(),
+		RepairTasksCompleted: m.RepairTasksCompleted.Load(),
+		RebalanceBytesMoved:  m.RebalanceBytesMoved.Load(),
 		RaftState:     int(m.RaftState.Load()),
 		RaftTerm:      m.RaftTerm.Load(),
 		RaftLogIndex:  m.RaftLogIndex.Load(),
@@ -110,79 +181,104 @@ type MetricsSnapshot struct {
 	KeysTotal     int64  `json:"keys_total"`
 	ChunksTotal   int64  `json:"chunks_total"`
 	NodesOnline   int64  `json:"nodes_online"`
+	NodesTotal    int64  `json:"nodes_total"`
 	BucketsTotal  int64  `json:"buckets_total"`
-	RaftState     int    `json:"raft_state"` // 0=follower, 1=candidate, 2=leader
-	RaftTerm      int64  `json:"raft_term"`
-	RaftLogIndex  int64  `json:"raft_log_index"`
-	SnapshotsDone int64  `json:"snapshots_done"`
+
+	// Cache
+	CacheHits   int64 `json:"cache_hits"`
+	CacheMisses int64 `json:"cache_misses"`
+	CacheSize   int64 `json:"cache_size"`
+
+	// Disk I/O
+	DiskReadBytes  int64 `json:"disk_read_bytes"`
+	DiskWriteBytes int64 `json:"disk_write_bytes"`
+	DiskReadOps    int64 `json:"disk_read_ops"`
+	DiskWriteOps   int64 `json:"disk_write_ops"`
+
+	// WAL
+	WALBytesWritten int64 `json:"wal_bytes_written"`
+	WALFsyncCount   int64 `json:"wal_fsync_count"`
+
+	// GC
+	GCScannedChunks  int64 `json:"gc_scanned_chunks"`
+	GCDeletedChunks  int64 `json:"gc_deleted_chunks"`
+	GCScannedBytes   int64 `json:"gc_scanned_bytes"`
+	GCFreedBytes     int64 `json:"gc_freed_bytes"`
+	GCLastDurationMs int64 `json:"gc_last_duration_ms"`
+
+	// Repair / Rebalance
+	RepairTasksQueued    int64 `json:"repair_tasks_queued"`
+	RepairTasksCompleted int64 `json:"repair_tasks_completed"`
+	RebalanceBytesMoved  int64 `json:"rebalance_bytes_moved"`
+
+	RaftState     int   `json:"raft_state"` // 0=follower, 1=candidate, 2=leader
+	RaftTerm      int64 `json:"raft_term"`
+	RaftLogIndex  int64 `json:"raft_log_index"`
+	SnapshotsDone int64 `json:"snapshots_done"`
 }
 
 // ============================================================
 // LatencyHistogram — Lock-free latency tracking
 // ============================================================
 
-// LatencyHistogram tracks latency percentiles using a fixed-size ring buffer.
-// Suitable for millions of observations with O(1) write and O(N log N) percentile.
+// LatencyHistogram tracks latency percentiles using a lock-free
+// ring buffer backed by atomic operations.  O(1) Observe with no
+// mutex; O(N log N) Percentile on a snapshot copy.
 type LatencyHistogram struct {
-	mu      sync.Mutex
-	values  []int64 // microseconds
-	count   int
-	maxSize int
+	// ring is the fixed-size circular buffer.  Written by Observe
+	// via atomic.Store; read by Percentile via atomic.Load.
+	ring []atomic.Int64
+
+	// head is the next slot index, advanced by atomic.Add.
+	head atomic.Uint64
+
+	// count records the total number of observations (never wraps).
+	count atomic.Uint64
+
+	// cap is the ring size (constant after construction).
+	cap int
 }
 
-// NewLatencyHistogram creates a histogram with a 10K sample ring buffer.
+// NewLatencyHistogram creates a histogram with a 10K-sample lock-free ring buffer.
 func NewLatencyHistogram() *LatencyHistogram {
-	return &LatencyHistogram{
-		values:  make([]int64, 0, 10000),
-		maxSize: 10000,
+	const size = 10_000
+	h := &LatencyHistogram{
+		ring: make([]atomic.Int64, size),
+		cap:  size,
 	}
+	return h
 }
 
-// Observe records a latency measurement.
+// Observe records a latency measurement. Lock-free.
 func (h *LatencyHistogram) Observe(d time.Duration) {
 	us := d.Microseconds()
-	h.mu.Lock()
-	if len(h.values) < h.maxSize {
-		h.values = append(h.values, us)
-	} else {
-		h.values[h.count%h.maxSize] = us
-	}
-	h.count++
-	h.mu.Unlock()
+	idx := h.head.Add(1) - 1 // unique slot per goroutine
+	h.ring[idx%uint64(h.cap)].Store(us)
+	h.count.Add(1)
 }
 
 // Percentile returns the p-th percentile (0-100) in microseconds.
 func (h *LatencyHistogram) Percentile(p int) int64 {
-	h.mu.Lock()
-	n := len(h.values)
+	n := h.count.Load()
 	if n == 0 {
-		h.mu.Unlock()
 		return 0
 	}
-	// Copy to avoid holding lock during sort
-	cp := make([]int64, n)
-	copy(cp, h.values)
-	h.mu.Unlock()
+	// Only sample up to cap entries (ring wraps).
+	sampleSize := int(n)
+	if sampleSize > h.cap {
+		sampleSize = h.cap
+	}
+	cp := make([]int64, sampleSize)
+	for i := 0; i < sampleSize; i++ {
+		cp[i] = h.ring[i].Load()
+	}
 
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
-	idx := (p * n) / 100
-	if idx >= n {
-		idx = n - 1
+	idx := (p * sampleSize) / 100
+	if idx >= sampleSize {
+		idx = sampleSize - 1
 	}
 	return cp[idx]
-}
-
-// sortInt64s is a simple insertion sort (fine for 10K elements).
-func sortInt64s(a []int64) {
-	for i := 1; i < len(a); i++ {
-		key := a[i]
-		j := i - 1
-		for j >= 0 && a[j] > key {
-			a[j+1] = a[j]
-			j--
-		}
-		a[j+1] = key
-	}
 }
 
 // ============================================================
@@ -349,7 +445,36 @@ func (hc *HealthChecker) writePrometheus(w io.Writer) {
 	fmt.Fprintf(w, "# HELP metad_keys_total Total keys.\n# TYPE metad_keys_total gauge\nmetad_keys_total %d\n", s.KeysTotal)
 	fmt.Fprintf(w, "# HELP metad_chunks_total Total chunks.\n# TYPE metad_chunks_total gauge\nmetad_chunks_total %d\n", s.ChunksTotal)
 	fmt.Fprintf(w, "# HELP metad_nodes_online Nodes online.\n# TYPE metad_nodes_online gauge\nmetad_nodes_online %d\n", s.NodesOnline)
+	fmt.Fprintf(w, "# HELP metad_nodes_total Total registered nodes.\n# TYPE metad_nodes_total gauge\nmetad_nodes_total %d\n", s.NodesTotal)
 	fmt.Fprintf(w, "# HELP metad_buckets_total Total buckets.\n# TYPE metad_buckets_total gauge\nmetad_buckets_total %d\n\n", s.BucketsTotal)
+
+	// Cache
+	fmt.Fprintf(w, "# HELP metad_cache_hits Cache hit count.\n# TYPE metad_cache_hits counter\nmetad_cache_hits %d\n", s.CacheHits)
+	fmt.Fprintf(w, "# HELP metad_cache_misses Cache miss count.\n# TYPE metad_cache_misses counter\nmetad_cache_misses %d\n", s.CacheMisses)
+	fmt.Fprintf(w, "# HELP metad_cache_size Current cache entry count.\n# TYPE metad_cache_size gauge\nmetad_cache_size %d\n\n", s.CacheSize)
+
+	// Disk I/O
+	fmt.Fprintf(w, "# HELP metad_disk_read_bytes Total bytes read from disk.\n# TYPE metad_disk_read_bytes counter\nmetad_disk_read_bytes %d\n", s.DiskReadBytes)
+	fmt.Fprintf(w, "# HELP metad_disk_write_bytes Total bytes written to disk.\n# TYPE metad_disk_write_bytes counter\nmetad_disk_write_bytes %d\n", s.DiskWriteBytes)
+	fmt.Fprintf(w, "# HELP metad_disk_read_ops Total disk read operations.\n# TYPE metad_disk_read_ops counter\nmetad_disk_read_ops %d\n", s.DiskReadOps)
+	fmt.Fprintf(w, "# HELP metad_disk_write_ops Total disk write operations.\n# TYPE metad_disk_write_ops counter\nmetad_disk_write_ops %d\n\n", s.DiskWriteOps)
+
+	// WAL
+	fmt.Fprintf(w, "# HELP metad_wal_bytes_written Total bytes written to WAL.\n# TYPE metad_wal_bytes_written counter\nmetad_wal_bytes_written %d\n", s.WALBytesWritten)
+	fmt.Fprintf(w, "# HELP metad_wal_fsync_count Total WAL fsync calls.\n# TYPE metad_wal_fsync_count counter\nmetad_wal_fsync_count %d\n\n", s.WALFsyncCount)
+
+	// GC
+	fmt.Fprintf(w, "# HELP metad_gc_scanned_chunks Chunks scanned by GC.\n# TYPE metad_gc_scanned_chunks counter\nmetad_gc_scanned_chunks %d\n", s.GCScannedChunks)
+	fmt.Fprintf(w, "# HELP metad_gc_deleted_chunks Chunks deleted by GC.\n# TYPE metad_gc_deleted_chunks counter\nmetad_gc_deleted_chunks %d\n", s.GCDeletedChunks)
+	fmt.Fprintf(w, "# HELP metad_gc_scanned_bytes Bytes scanned by GC.\n# TYPE metad_gc_scanned_bytes counter\nmetad_gc_scanned_bytes %d\n", s.GCScannedBytes)
+	fmt.Fprintf(w, "# HELP metad_gc_freed_bytes Bytes freed by GC.\n# TYPE metad_gc_freed_bytes counter\nmetad_gc_freed_bytes %d\n", s.GCFreedBytes)
+	fmt.Fprintf(w, "# HELP metad_gc_last_duration_ms Last GC duration.\n# TYPE metad_gc_last_duration_ms gauge\nmetad_gc_last_duration_ms %d\n\n", s.GCLastDurationMs)
+
+	// Repair
+	fmt.Fprintf(w, "# HELP metad_repair_tasks_queued Repair tasks queued.\n# TYPE metad_repair_tasks_queued gauge\nmetad_repair_tasks_queued %d\n", s.RepairTasksQueued)
+	fmt.Fprintf(w, "# HELP metad_repair_tasks_completed Repair tasks completed.\n# TYPE metad_repair_tasks_completed counter\nmetad_repair_tasks_completed %d\n", s.RepairTasksCompleted)
+	fmt.Fprintf(w, "# HELP metad_rebalance_bytes_moved Bytes moved by rebalance.\n# TYPE metad_rebalance_bytes_moved counter\nmetad_rebalance_bytes_moved %d\n\n", s.RebalanceBytesMoved)
+
 	fmt.Fprintf(w, "# HELP metad_raft_info Raft metadata.\n# TYPE metad_raft_info gauge\nmetad_raft_info{state=\"%s\",term=\"%d\",log_index=\"%d\",snapshots=\"%d\"} 1\n",
 		raftStateLabel(s.RaftState), s.RaftTerm, s.RaftLogIndex, s.SnapshotsDone)
 }
@@ -369,7 +494,36 @@ func (hc *HealthChecker) writeOpenMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE metad_keys_total gauge\nmetad_keys_total %d\n", s.KeysTotal)
 	fmt.Fprintf(w, "# TYPE metad_chunks_total gauge\nmetad_chunks_total %d\n", s.ChunksTotal)
 	fmt.Fprintf(w, "# TYPE metad_nodes_online gauge\nmetad_nodes_online %d\n", s.NodesOnline)
+	fmt.Fprintf(w, "# TYPE metad_nodes_total gauge\nmetad_nodes_total %d\n", s.NodesTotal)
 	fmt.Fprintf(w, "# TYPE metad_buckets_total gauge\nmetad_buckets_total %d\n\n", s.BucketsTotal)
+
+	// Cache
+	fmt.Fprintf(w, "# TYPE metad_cache_hits counter\nmetad_cache_hits %d\n", s.CacheHits)
+	fmt.Fprintf(w, "# TYPE metad_cache_misses counter\nmetad_cache_misses %d\n", s.CacheMisses)
+	fmt.Fprintf(w, "# TYPE metad_cache_size gauge\nmetad_cache_size %d\n\n", s.CacheSize)
+
+	// Disk I/O
+	fmt.Fprintf(w, "# TYPE metad_disk_read_bytes counter\n# UNIT metad_disk_read_bytes bytes\nmetad_disk_read_bytes %d\n", s.DiskReadBytes)
+	fmt.Fprintf(w, "# TYPE metad_disk_write_bytes counter\n# UNIT metad_disk_write_bytes bytes\nmetad_disk_write_bytes %d\n", s.DiskWriteBytes)
+	fmt.Fprintf(w, "# TYPE metad_disk_read_ops counter\nmetad_disk_read_ops %d\n", s.DiskReadOps)
+	fmt.Fprintf(w, "# TYPE metad_disk_write_ops counter\nmetad_disk_write_ops %d\n\n", s.DiskWriteOps)
+
+	// WAL
+	fmt.Fprintf(w, "# TYPE metad_wal_bytes_written counter\n# UNIT metad_wal_bytes_written bytes\nmetad_wal_bytes_written %d\n", s.WALBytesWritten)
+	fmt.Fprintf(w, "# TYPE metad_wal_fsync_count counter\nmetad_wal_fsync_count %d\n\n", s.WALFsyncCount)
+
+	// GC
+	fmt.Fprintf(w, "# TYPE metad_gc_scanned_chunks counter\nmetad_gc_scanned_chunks %d\n", s.GCScannedChunks)
+	fmt.Fprintf(w, "# TYPE metad_gc_deleted_chunks counter\nmetad_gc_deleted_chunks %d\n", s.GCDeletedChunks)
+	fmt.Fprintf(w, "# TYPE metad_gc_scanned_bytes counter\n# UNIT metad_gc_scanned_bytes bytes\nmetad_gc_scanned_bytes %d\n", s.GCScannedBytes)
+	fmt.Fprintf(w, "# TYPE metad_gc_freed_bytes counter\n# UNIT metad_gc_freed_bytes bytes\nmetad_gc_freed_bytes %d\n", s.GCFreedBytes)
+	fmt.Fprintf(w, "# TYPE metad_gc_last_duration_ms gauge\n# UNIT metad_gc_last_duration_ms milliseconds\nmetad_gc_last_duration_ms %d\n\n", s.GCLastDurationMs)
+
+	// Repair
+	fmt.Fprintf(w, "# TYPE metad_repair_tasks_queued gauge\nmetad_repair_tasks_queued %d\n", s.RepairTasksQueued)
+	fmt.Fprintf(w, "# TYPE metad_repair_tasks_completed counter\nmetad_repair_tasks_completed %d\n", s.RepairTasksCompleted)
+	fmt.Fprintf(w, "# TYPE metad_rebalance_bytes_moved counter\n# UNIT metad_rebalance_bytes_moved bytes\nmetad_rebalance_bytes_moved %d\n\n", s.RebalanceBytesMoved)
+
 	fmt.Fprintf(w, "# TYPE metad_raft_info gauge\nmetad_raft_info{state=\"%s\",term=\"%d\",log_index=\"%d\",snapshots=\"%d\"} 1\n",
 		raftStateLabel(s.RaftState), s.RaftTerm, s.RaftLogIndex, s.SnapshotsDone)
 	fmt.Fprintln(w, "# EOF")

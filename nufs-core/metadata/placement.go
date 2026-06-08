@@ -26,11 +26,17 @@ type scoredNode struct {
 }
 
 // PlacementEngine selects optimal nodes for chunk placement based on policy.
+// It can subscribe to an EventBus to automatically sync node state changes,
+// eliminating the need for external callers to manually call UpdateNode/RemoveNode.
 type PlacementEngine struct {
 	mu        sync.RWMutex
 	nodes     map[NodeID]*NodeInfo
 	loadIndex map[NodeID]float64 // 0.0 - 1.0, disk/IO load
 	rng       *rand.Rand
+
+	// Optional: auto-sync via EventBus
+	events  *EventBus
+	watcher *Watcher
 }
 
 // NewPlacementEngine creates a new placement engine instance.
@@ -138,44 +144,57 @@ func (p *PlacementEngine) PlaceChunk(
 }
 
 // spreadSelect picks nodes respecting topology spread constraints.
+// It implements a best-effort cross-domain placement strategy:
+//  1. First pass: pick one node per domain (strict isolation)
+//  2. Second pass: if not enough domains, allow same-domain nodes
+//     but prefer domains with fewer selected nodes
+//
+// This ensures that replicas are spread across failure domains (racks/zones)
+// to survive rack/zone-level failures.
 func (p *PlacementEngine) spreadSelect(
 	scored []scoredNode,
 	count int,
 	spread TopologySpread,
 ) []NodeID {
-	result := make([]NodeID, 0, count)
-	usedDomains := make(map[string]bool)
+	if len(scored) == 0 {
+		return nil
+	}
 
+	result := make([]NodeID, 0, count)
+	domainCount := make(map[string]int) // domain → number of selected nodes in it
+	selected := make(map[NodeID]bool)
+
+	// Pass 1: Strict isolation — pick at most one node per domain
 	for _, s := range scored {
 		if len(result) >= count {
 			break
 		}
-
-		domain := p.getDomain(s.node, spread)
-		if usedDomains[domain] {
+		if selected[s.node.ID] {
 			continue
 		}
-
+		domain := p.getDomain(s.node, spread)
+		if domainCount[domain] > 0 {
+			continue // skip — already have a node in this domain
+		}
 		result = append(result, s.node.ID)
-		usedDomains[domain] = true
+		selected[s.node.ID] = true
+		domainCount[domain]++
 	}
 
-	// If topology constraint cannot be fully satisfied, relax and fill remaining
+	// Pass 2: Relaxed — fill remaining slots, preferring domains with fewer nodes
 	if len(result) < count {
 		for _, s := range scored {
 			if len(result) >= count {
 				break
 			}
-			already := false
-			for _, r := range result {
-				if r == s.node.ID {
-					already = true
-					break
-				}
+			if selected[s.node.ID] {
+				continue
 			}
-			if !already {
-				result = append(result, s.node.ID)
-			}
+			domain := p.getDomain(s.node, spread)
+			// Allow but track domain usage
+			result = append(result, s.node.ID)
+			selected[s.node.ID] = true
+			domainCount[domain]++
 		}
 	}
 
@@ -233,4 +252,60 @@ func (g *ChunkIDGenerator) Next() ChunkID {
 		(g.sequence & 0x1FFF)
 
 	return ChunkID(id)
+}
+
+// SubscribeEvents registers the placement engine to automatically receive
+// node state changes from the EventBus. When a node is updated or goes
+// offline, the placement engine syncs its internal state without requiring
+// external callers to call UpdateNode/RemoveNode.
+//
+// Call this after the EventBus is initialized. The caller must call
+// UnsubscribeEvents before shutdown to release the watcher.
+func (p *PlacementEngine) SubscribeEvents(events *EventBus) {
+	p.events = events
+	p.watcher = events.Watch(prefixNode)
+	go p.drainEvents()
+}
+
+// UnsubscribeEvents stops receiving EventBus notifications.
+func (p *PlacementEngine) UnsubscribeEvents() {
+	if p.watcher != nil {
+		p.watcher.Close()
+		p.watcher = nil
+	}
+}
+
+// drainEvents processes incoming node events from the EventBus.
+func (p *PlacementEngine) drainEvents() {
+	if p.watcher == nil {
+		return
+	}
+	for event := range p.watcher.Events() {
+		p.handleEvent(event)
+	}
+}
+
+// handleEvent processes a single node change event.
+func (p *PlacementEngine) handleEvent(event Event) {
+	switch event.Type {
+	case EventSet:
+		// Node updated — decode and sync
+		var info NodeInfo
+		if err := unmarshalValue(event.Value, &info); err != nil {
+			return
+		}
+		p.mu.Lock()
+		p.nodes[info.ID] = &info
+		p.mu.Unlock()
+
+	case EventDelete:
+		// Node removed — extract node ID from key and remove
+		key := string(event.Key)
+		if len(key) > len(prefixNode) {
+			var id NodeID
+			if _, err := fmt.Sscanf(key[len(prefixNode):], "%d", &id); err == nil {
+				p.RemoveNode(id)
+			}
+		}
+	}
 }

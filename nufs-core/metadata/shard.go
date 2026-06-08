@@ -1,10 +1,14 @@
 package metadata
 
 import (
+	"context"
 	"fmt"
 	"hash/crc32"
+	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // ============================================================
@@ -246,16 +250,194 @@ func (ss *ShardedStore) AllShards() map[ShardID]*PebbleStore {
 	return result
 }
 
-// ScanAllShards iterates over all shards' chunk metadata.
-func (ss *ShardedStore) ScanAllShards(fn func(*ChunkMeta) error) error {
-	ss.mu.RLock()
-	defer ss.mu.RUnlock()
-	for _, store := range ss.shards {
-		if err := store.ScanAllChunks(nil, fn); err != nil {
-			return err
+// ============================================================
+// ShardManager — Automatic Shard Split & Merge
+// ============================================================
+
+// ShardManagerConfig configures auto-split/merge behavior.
+type ShardManagerConfig struct {
+	CheckInterval  time.Duration // How often to evaluate (default: 5min)
+	SplitThreshold int64         // Min keys per shard to trigger split (default: 10M)
+	MergeThreshold int64         // Max keys per shard to allow merge (default: 1M)
+	MinShards      int           // Minimum shard count (default: 1)
+	MaxShards      int           // Maximum shard count (default: 1024)
+	Enabled        bool          // Master switch for auto-sharding
+}
+
+// ShardManager monitors shard sizes and triggers splits or merges.
+type ShardManager struct {
+	store   *ShardedStore
+	ring    *HashRing
+	cfg     ShardManagerConfig
+	stopCh  chan struct{}
+	running atomic.Bool
+	wg      sync.WaitGroup
+
+	// callbacks: set by the orchestrator to actually create/destroy shards
+	OnSplit func(parent ShardID, childStore *PebbleStore) (ShardID, error)
+	OnMerge func(left, right ShardID) error
+}
+
+// NewShardManager creates a shard manager with sensible defaults.
+func NewShardManager(store *ShardedStore, ring *HashRing, cfg ShardManagerConfig) *ShardManager {
+	if cfg.CheckInterval <= 0 {
+		cfg.CheckInterval = 5 * time.Minute
+	}
+	if cfg.SplitThreshold <= 0 {
+		cfg.SplitThreshold = 10_000_000 // 10M keys
+	}
+	if cfg.MergeThreshold <= 0 {
+		cfg.MergeThreshold = 1_000_000 // 1M keys
+	}
+	if cfg.MinShards <= 0 {
+		cfg.MinShards = 1
+	}
+	if cfg.MaxShards <= 0 {
+		cfg.MaxShards = 1024
+	}
+	return &ShardManager{
+		store:  store,
+		ring:   ring,
+		cfg:    cfg,
+		stopCh: make(chan struct{}),
+	}
+}
+
+// Start begins the auto-sharding loop.
+func (sm *ShardManager) Start() {
+	if sm.running.Swap(true) {
+		return
+	}
+	sm.wg.Add(1)
+	go sm.loop()
+	slog.Info("shardmanager: started",
+		"interval", sm.cfg.CheckInterval,
+		"split_threshold", sm.cfg.SplitThreshold,
+		"merge_threshold", sm.cfg.MergeThreshold)
+}
+
+// Stop gracefully stops auto-sharding.
+func (sm *ShardManager) Stop() {
+	if !sm.running.Swap(false) {
+		return
+	}
+	close(sm.stopCh)
+	sm.wg.Wait()
+	slog.Info("shardmanager: stopped")
+}
+
+func (sm *ShardManager) loop() {
+	defer sm.wg.Done()
+	ticker := time.NewTicker(sm.cfg.CheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.stopCh:
+			return
+		case <-ticker.C:
+			if sm.cfg.Enabled {
+				sm.evaluate()
+			}
 		}
 	}
-	return nil
+}
+
+func (sm *ShardManager) evaluate() {
+	shards := sm.store.AllShards()
+	currentCount := len(shards)
+
+	// Check each shard for split
+	for id, store := range shards {
+		if currentCount >= sm.cfg.MaxShards {
+			break
+		}
+		if store.closed.Load() {
+			continue
+		}
+
+		approxKeys := getApproxKeyCount(store)
+		if approxKeys >= sm.cfg.SplitThreshold && sm.OnSplit != nil {
+			slog.Info("shardmanager: shard exceeds split threshold",
+				"shard_id", id,
+				"keys", approxKeys,
+				"threshold", sm.cfg.SplitThreshold)
+			newID, err := sm.OnSplit(id, store)
+			if err != nil {
+				slog.Error("shardmanager: split failed", "shard_id", id, "error", err)
+				continue
+			}
+			currentCount++
+			slog.Info("shardmanager: shard split completed", "old_shard", id, "new_shard", newID)
+		}
+	}
+
+	// Check adjacent shards for merge
+	if currentCount > sm.cfg.MinShards {
+		mergePairs := sm.findMergeCandidates(shards)
+		for _, pair := range mergePairs {
+			if currentCount <= sm.cfg.MinShards {
+				break
+			}
+			if sm.OnMerge != nil {
+				slog.Info("shardmanager: merging shards below threshold", "shard1", pair[0], "shard2", pair[1])
+				if err := sm.OnMerge(pair[0], pair[1]); err != nil {
+					slog.Error("shardmanager: merge failed", "shard1", pair[0], "shard2", pair[1], "error", err)
+					continue
+				}
+				currentCount--
+			}
+		}
+	}
+}
+
+// findMergeCandidates finds pairs of adjacent shards both below merge threshold.
+func (sm *ShardManager) findMergeCandidates(shards map[ShardID]*PebbleStore) [][2]ShardID {
+	var candidates [][2]ShardID
+	sortedIDs := make([]ShardID, 0, len(shards))
+	for id := range shards {
+		sortedIDs = append(sortedIDs, id)
+	}
+	sort.Slice(sortedIDs, func(i, j int) bool { return sortedIDs[i] < sortedIDs[j] })
+
+	for i := 0; i < len(sortedIDs)-1; i++ {
+		left := sortedIDs[i]
+		right := sortedIDs[i+1]
+
+		leftStore := shards[left]
+		rightStore := shards[right]
+		if leftStore == nil || rightStore == nil {
+			continue
+		}
+
+		leftKeys := getApproxKeyCount(leftStore)
+		rightKeys := getApproxKeyCount(rightStore)
+		if leftKeys < sm.cfg.MergeThreshold && rightKeys < sm.cfg.MergeThreshold {
+			candidates = append(candidates, [2]ShardID{left, right})
+		}
+	}
+	return candidates
+}
+
+// getApproxKeyCount returns an approximate key count for a PebbleStore.
+// Uses a limited scan with early exit — good enough for split/merge decisions
+// where exact counts are not required.
+func getApproxKeyCount(s *PebbleStore) int64 {
+	iter, err := s.db.NewIter(nil)
+	if err != nil {
+		return 0
+	}
+	defer iter.Close()
+
+	const sampleLimit = 10000
+	var count int64
+	for iter.First(); iter.Valid(); iter.Next() {
+		count++
+		if count >= sampleLimit {
+			break
+		}
+	}
+	return count
 }
 
 // ShardStats returns per-shard statistics.
@@ -296,3 +478,477 @@ func (ss *ShardedStore) Close() error {
 	}
 	return nil
 }
+
+// ============================================================
+// ShardedStore implements MetadataService
+// ============================================================
+//
+// ShardedStore routes each operation to the correct shard based on
+// the key's hash. For operations that span all shards (e.g., ListBuckets),
+// it aggregates results from every shard.
+//
+// Bucket and Node operations are broadcast to all shards since they
+// need to be available on every shard for placement decisions.
+// Namespace and Chunk operations are routed by inode/chunk ID.
+
+// shardKeyForBucket returns the routing key for bucket operations.
+// Buckets are broadcast to all shards for consistency.
+func shardKeyForBucket(name string) string {
+	return "bucket:" + name
+}
+
+// shardKeyForInode returns the routing key for inode operations.
+func shardKeyForInode(id InodeID) string {
+	return fmt.Sprintf("inode:%d", id)
+}
+
+// shardKeyForChunk returns the routing key for chunk operations.
+func shardKeyForChunk(id ChunkID) string {
+	return fmt.Sprintf("chunk:%d", id)
+}
+
+// shardKeyForNode returns the routing key for node operations.
+func shardKeyForNode(id NodeID) string {
+	return fmt.Sprintf("node:%d", id)
+}
+
+// routeToShard returns the shard store for the given routing key.
+func (ss *ShardedStore) routeToShard(key string) (*PebbleStore, error) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	sid := ss.ring.Route(key)
+	store, ok := ss.shards[sid]
+	if !ok {
+		return nil, fmt.Errorf("sharded store: shard %d not available", sid)
+	}
+	return store, nil
+}
+
+// forEachShard calls fn on every shard. Stops on first error.
+func (ss *ShardedStore) forEachShard(fn func(*PebbleStore) error) error {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	for _, store := range ss.shards {
+		if err := fn(store); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- BucketService ---
+
+func (ss *ShardedStore) CreateBucket(ctx context.Context, name string, policy PlacementPolicy) error {
+	// Broadcast: create on all shards so placement decisions work locally
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.CreateBucket(ctx, name, policy)
+	})
+}
+
+func (ss *ShardedStore) DeleteBucket(ctx context.Context, name string) error {
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.DeleteBucket(ctx, name)
+	})
+}
+
+func (ss *ShardedStore) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
+	// Read from first available shard (all shards have the same bucket list)
+	ss.mu.RLock()
+	for _, store := range ss.shards {
+		ss.mu.RUnlock()
+		return store.ListBuckets(ctx)
+	}
+	ss.mu.RUnlock()
+	return nil, fmt.Errorf("sharded store: no shards available")
+}
+
+func (ss *ShardedStore) GetBucket(ctx context.Context, name string) (*BucketInfo, error) {
+	ss.mu.RLock()
+	for _, store := range ss.shards {
+		ss.mu.RUnlock()
+		return store.GetBucket(ctx, name)
+	}
+	ss.mu.RUnlock()
+	return nil, fmt.Errorf("sharded store: no shards available")
+}
+
+// --- NamespaceService ---
+
+func (ss *ShardedStore) MkDir(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error) {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return nil, err
+	}
+	return store.MkDir(ctx, parent, name, mode)
+}
+
+func (ss *ShardedStore) RmDir(ctx context.Context, parent InodeID, name string) error {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return err
+	}
+	return store.RmDir(ctx, parent, name)
+}
+
+func (ss *ShardedStore) ReadDir(ctx context.Context, parent InodeID, offset int, limit int) ([]DirEntry, error) {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return nil, err
+	}
+	return store.ReadDir(ctx, parent, offset, limit)
+}
+
+func (ss *ShardedStore) CreateFile(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error) {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return nil, err
+	}
+	return store.CreateFile(ctx, parent, name, mode)
+}
+
+func (ss *ShardedStore) Unlink(ctx context.Context, parent InodeID, name string) error {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return err
+	}
+	return store.Unlink(ctx, parent, name)
+}
+
+func (ss *ShardedStore) Lookup(ctx context.Context, parent InodeID, name string) (*InodeMeta, error) {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return nil, err
+	}
+	return store.Lookup(ctx, parent, name)
+}
+
+func (ss *ShardedStore) Rename(ctx context.Context, oldParent InodeID, oldName string, newParent InodeID, newName string) error {
+	// If old and new parent are on different shards, this is a cross-shard rename.
+	// For simplicity, route to the old parent's shard and let it handle the operation.
+	// A full implementation would need a two-phase commit for cross-shard renames.
+	store, err := ss.routeToShard(shardKeyForInode(oldParent))
+	if err != nil {
+		return err
+	}
+	return store.Rename(ctx, oldParent, oldName, newParent, newName)
+}
+
+func (ss *ShardedStore) Symlink(ctx context.Context, parent InodeID, name string, target string) (*InodeMeta, error) {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return nil, err
+	}
+	return store.Symlink(ctx, parent, name, target)
+}
+
+func (ss *ShardedStore) Readlink(ctx context.Context, id InodeID) (string, error) {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return "", err
+	}
+	return store.Readlink(ctx, id)
+}
+
+func (ss *ShardedStore) Link(ctx context.Context, parent InodeID, name string, target InodeID) (*InodeMeta, error) {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return nil, err
+	}
+	return store.Link(ctx, parent, name, target)
+}
+
+// --- InodeService ---
+
+func (ss *ShardedStore) GetInode(ctx context.Context, id InodeID) (*InodeMeta, error) {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return nil, err
+	}
+	return store.GetInode(ctx, id)
+}
+
+func (ss *ShardedStore) UpdateInode(ctx context.Context, meta *InodeMeta) error {
+	store, err := ss.routeToShard(shardKeyForInode(meta.ID))
+	if err != nil {
+		return err
+	}
+	return store.UpdateInode(ctx, meta)
+}
+
+// --- ChunkService ---
+
+func (ss *ShardedStore) AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error) {
+	store, err := ss.routeToShard(shardKeyForInode(inodeID))
+	if err != nil {
+		return nil, err
+	}
+	return store.AllocateChunk(ctx, inodeID, offset, policy)
+}
+
+func (ss *ShardedStore) CommitChunk(ctx context.Context, chunkID ChunkID, checksum uint32) error {
+	store, err := ss.routeToShard(shardKeyForChunk(chunkID))
+	if err != nil {
+		return err
+	}
+	return store.CommitChunk(ctx, chunkID, checksum)
+}
+
+func (ss *ShardedStore) GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error) {
+	store, err := ss.routeToShard(shardKeyForChunk(chunkID))
+	if err != nil {
+		return nil, err
+	}
+	return store.GetChunk(ctx, chunkID)
+}
+
+func (ss *ShardedStore) UpdateChunk(ctx context.Context, chunk *ChunkMeta) error {
+	store, err := ss.routeToShard(shardKeyForChunk(chunk.ID))
+	if err != nil {
+		return err
+	}
+	return store.UpdateChunk(ctx, chunk)
+}
+
+func (ss *ShardedStore) SealChunk(ctx context.Context, chunkID ChunkID) error {
+	store, err := ss.routeToShard(shardKeyForChunk(chunkID))
+	if err != nil {
+		return err
+	}
+	return store.SealChunk(ctx, chunkID)
+}
+
+func (ss *ShardedStore) ListChunks(ctx context.Context, inodeID InodeID) ([]ChunkRef, error) {
+	store, err := ss.routeToShard(shardKeyForInode(inodeID))
+	if err != nil {
+		return nil, err
+	}
+	return store.ListChunks(ctx, inodeID)
+}
+
+func (ss *ShardedStore) DeleteChunk(ctx context.Context, chunkID ChunkID) error {
+	store, err := ss.routeToShard(shardKeyForChunk(chunkID))
+	if err != nil {
+		return err
+	}
+	return store.DeleteChunk(ctx, chunkID)
+}
+
+func (ss *ShardedStore) ReportChunkState(ctx context.Context, nodeID NodeID, states map[ChunkID]ReplicaState) error {
+	// Route each chunk to its shard
+	for chunkID, state := range states {
+		store, err := ss.routeToShard(shardKeyForChunk(chunkID))
+		if err != nil {
+			return err
+		}
+		singleState := map[ChunkID]ReplicaState{chunkID: state}
+		if err := store.ReportChunkState(ctx, nodeID, singleState); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- NodeService ---
+
+func (ss *ShardedStore) RegisterNode(ctx context.Context, info *NodeInfo) error {
+	// Broadcast: nodes must be visible on all shards for placement
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.RegisterNode(ctx, info)
+	})
+}
+
+func (ss *ShardedStore) Heartbeat(ctx context.Context, nodeID NodeID, report *NodeReport) error {
+	// Broadcast to all shards
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.Heartbeat(ctx, nodeID, report)
+	})
+}
+
+func (ss *ShardedStore) DecommissionNode(ctx context.Context, nodeID NodeID) error {
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.DecommissionNode(ctx, nodeID)
+	})
+}
+
+func (ss *ShardedStore) ListNodes(ctx context.Context) ([]NodeInfo, error) {
+	ss.mu.RLock()
+	for _, store := range ss.shards {
+		ss.mu.RUnlock()
+		return store.ListNodes(ctx)
+	}
+	ss.mu.RUnlock()
+	return nil, fmt.Errorf("sharded store: no shards available")
+}
+
+func (ss *ShardedStore) GetNode(ctx context.Context, nodeID NodeID) (*NodeInfo, error) {
+	ss.mu.RLock()
+	for _, store := range ss.shards {
+		ss.mu.RUnlock()
+		return store.GetNode(ctx, nodeID)
+	}
+	ss.mu.RUnlock()
+	return nil, fmt.Errorf("sharded store: no shards available")
+}
+
+// --- RepairService ---
+
+func (ss *ShardedStore) GetRepairQueue(ctx context.Context) ([]RepairTask, error) {
+	var allTasks []RepairTask
+	err := ss.forEachShard(func(s *PebbleStore) error {
+		tasks, err := s.GetRepairQueue(ctx)
+		if err != nil {
+			return err
+		}
+		allTasks = append(allTasks, tasks...)
+		return nil
+	})
+	return allTasks, err
+}
+
+func (ss *ShardedStore) TriggerRepair(ctx context.Context, chunkID ChunkID) error {
+	store, err := ss.routeToShard(shardKeyForChunk(chunkID))
+	if err != nil {
+		return err
+	}
+	return store.TriggerRepair(ctx, chunkID)
+}
+
+func (ss *ShardedStore) RemoveRepairTask(ctx context.Context, chunkID ChunkID) error {
+	store, err := ss.routeToShard(shardKeyForChunk(chunkID))
+	if err != nil {
+		return err
+	}
+	return store.RemoveRepairTask(ctx, chunkID)
+}
+
+func (ss *ShardedStore) TriggerRebalance(ctx context.Context) error {
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.TriggerRebalance(ctx)
+	})
+}
+
+func (ss *ShardedStore) ChunksByNode(ctx context.Context, nodeID NodeID) ([]ChunkMeta, error) {
+	var allChunks []ChunkMeta
+	err := ss.forEachShard(func(s *PebbleStore) error {
+		chunks, err := s.ChunksByNode(ctx, nodeID)
+		if err != nil {
+			return err
+		}
+		allChunks = append(allChunks, chunks...)
+		return nil
+	})
+	return allChunks, err
+}
+
+func (ss *ShardedStore) MigrateChunkReplica(ctx context.Context, chunkID ChunkID, fromNode, toNode NodeID) error {
+	store, err := ss.routeToShard(shardKeyForChunk(chunkID))
+	if err != nil {
+		return err
+	}
+	return store.MigrateChunkReplica(ctx, chunkID, fromNode, toNode)
+}
+
+// --- LockService ---
+
+func (ss *ShardedStore) AdvisoryLock(ctx context.Context, inode InodeID, owner string) error {
+	store, err := ss.routeToShard(shardKeyForInode(inode))
+	if err != nil {
+		return err
+	}
+	return store.AdvisoryLock(ctx, inode, owner)
+}
+
+func (ss *ShardedStore) AdvisoryLockShared(ctx context.Context, inode InodeID, owner string) error {
+	store, err := ss.routeToShard(shardKeyForInode(inode))
+	if err != nil {
+		return err
+	}
+	return store.AdvisoryLockShared(ctx, inode, owner)
+}
+
+func (ss *ShardedStore) AdvisoryUnlock(ctx context.Context, inode InodeID, owner string) error {
+	store, err := ss.routeToShard(shardKeyForInode(inode))
+	if err != nil {
+		return err
+	}
+	return store.AdvisoryUnlock(ctx, inode, owner)
+}
+
+func (ss *ShardedStore) AdvisoryListLocks(ctx context.Context, inode InodeID) ([]LockInfo, error) {
+	store, err := ss.routeToShard(shardKeyForInode(inode))
+	if err != nil {
+		return nil, err
+	}
+	return store.AdvisoryListLocks(ctx, inode)
+}
+
+// --- XAttrService ---
+
+func (ss *ShardedStore) GetXAttr(ctx context.Context, id InodeID, name string) ([]byte, error) {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return nil, err
+	}
+	return store.GetXAttr(ctx, id, name)
+}
+
+func (ss *ShardedStore) SetXAttr(ctx context.Context, id InodeID, name string, value []byte) error {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return err
+	}
+	return store.SetXAttr(ctx, id, name, value)
+}
+
+func (ss *ShardedStore) ListXAttr(ctx context.Context, id InodeID) (map[string][]byte, error) {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return nil, err
+	}
+	return store.ListXAttr(ctx, id)
+}
+
+func (ss *ShardedStore) RemoveXAttr(ctx context.Context, id InodeID, name string) error {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return err
+	}
+	return store.RemoveXAttr(ctx, id, name)
+}
+
+// --- Admin ---
+
+func (ss *ShardedStore) ComputeAllBucketUsage(ctx context.Context) ([]BucketUsage, error) {
+	// Aggregate usage from all shards
+	usageByName := make(map[string]*BucketUsage)
+	err := ss.forEachShard(func(s *PebbleStore) error {
+		usages, err := s.ComputeAllBucketUsage(ctx)
+		if err != nil {
+			return err
+		}
+		for _, u := range usages {
+			if existing, ok := usageByName[u.Name]; ok {
+				existing.UsedBytes += u.UsedBytes
+				existing.Objects += u.Objects
+			} else {
+				usageByName[u.Name] = &BucketUsage{
+					Name:      u.Name,
+					UsedBytes: u.UsedBytes,
+					Objects:   u.Objects,
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]BucketUsage, 0, len(usageByName))
+	for _, u := range usageByName {
+		result = append(result, *u)
+	}
+	return result, nil
+}
+
+// Compile-time interface check
+var _ MetadataService = (*ShardedStore)(nil)

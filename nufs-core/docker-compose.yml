@@ -112,12 +112,12 @@ services:
     restart: unless-stopped
 
   # ==================== S3 Gateway ====================
-  s3gw:
+  nufs-s3:
     build:
       context: .
       dockerfile: Dockerfile
-      target: s3gw
-    container_name: dfs-s3gw
+      target: nufs-s3
+    container_name: dfs-nufs-s3
     command:
       - "-listen=:8080"
       - "-meta-dir=/var/lib/dfs/metadata"

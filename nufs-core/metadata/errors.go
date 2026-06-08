@@ -54,8 +54,10 @@ var (
 	ErrNotDirectory   = errors.New("metadata: not a directory")
 	ErrNotFile        = errors.New("metadata: not a regular file")
 	ErrNotSymlink     = errors.New("metadata: not a symbolic link")
-	ErrNameTooLong    = errors.New("metadata: name exceeds maximum length")
-	ErrXAttrNotFound  = errors.New("metadata: extended attribute not found")
+	ErrNameTooLong      = errors.New("metadata: name exceeds maximum length")
+	ErrCrossBucketRename = errors.New("metadata: rename across buckets is not allowed")
+	ErrXAttrNotFound     = errors.New("metadata: extended attribute not found")
+	ErrDirTooLarge       = errors.New("metadata: directory exceeds maximum entries limit")
 )
 
 // Chunk errors

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -23,7 +24,7 @@ type OpsServer struct {
 	store      *ChunkStore
 	meta       metadata.MetadataService
 	disk       *DiskManager
-	repl       *ChainReplicator
+	repl       *ParallelReplicator
 	ae         *AntiEntropy
 	repair     *RepairWorker
 	listener   *http.Server
@@ -33,13 +34,13 @@ type OpsServer struct {
 
 // NewOpsServer creates the operations HTTP server.
 func NewOpsServer(cfg Config, store *ChunkStore, meta metadata.MetadataService,
-	disk *DiskManager, repl *ChainReplicator, ae *AntiEntropy) *OpsServer {
+	disk *DiskManager, repl *ParallelReplicator, ae *AntiEntropy) *OpsServer {
 	return NewOpsServerWithRepair(cfg, store, meta, disk, repl, ae, nil)
 }
 
 // NewOpsServerWithRepair creates an ops server with repair worker integration.
 func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta metadata.MetadataService,
-	disk *DiskManager, repl *ChainReplicator, ae *AntiEntropy, repair *RepairWorker) *OpsServer {
+	disk *DiskManager, repl *ParallelReplicator, ae *AntiEntropy, repair *RepairWorker) *OpsServer {
 	mux := http.NewServeMux()
 
 	s := &OpsServer{
@@ -91,14 +92,31 @@ func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta metadata.Metadat
 }
 
 // Start begins listening for operations requests.
+// It blocks until the HTTP listener is ready to accept connections,
+// eliminating the race between Start() returning and the server being
+// available for requests.
 func (s *OpsServer) Start() error {
 	if !s.running.Swap(true) {
-		log.Printf("ops: starting management API on %s", s.cfg.OpsListenAddr)
+		// Use a channel to wait for the listener to be ready
+		ready := make(chan struct{})
+
 		go func() {
-			if err := s.listener.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			// Create a net.Listener first, then signal readiness
+			ln, err := net.Listen("tcp", s.cfg.OpsListenAddr)
+			if err != nil {
+				log.Printf("ops: failed to listen on %s: %v", s.cfg.OpsListenAddr, err)
+				close(ready)
+				return
+			}
+			close(ready) // Signal that the listener is ready
+
+			if err := s.listener.Serve(ln); err != nil && err != http.ErrServerClosed {
 				log.Printf("ops: HTTP server error: %v", err)
 			}
 		}()
+
+		<-ready // Wait for listener to be ready
+		log.Printf("ops: management API ready on %s", s.cfg.OpsListenAddr)
 	}
 	return nil
 }

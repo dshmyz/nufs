@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	toml "github.com/pelletier/go-toml/v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -39,8 +40,12 @@ func Load(path string) error {
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return fmt.Errorf("parse json: %w", err)
 		}
+	case ".toml":
+		if err := toml.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("parse toml: %w", err)
+		}
 	default:
-		return fmt.Errorf("unsupported config format: %s", ext)
+		return fmt.Errorf("unsupported config format: %s (use .yaml, .json, or .toml)", ext)
 	}
 
 	return applyFlags(raw, "")

@@ -30,16 +30,17 @@ type NodeID uint64
 // InodeMeta represents metadata for a file or directory.
 // Stored at key: /inode/{inode_id}
 type InodeMeta struct {
-	ID    InodeID  `json:"id"`
-	Type  FileType `json:"type"`
-	Size  int64    `json:"size"`  // Total file size in bytes
-	NLink uint32   `json:"nlink"` // Hard link count
-	UID   uint32   `json:"uid"`
-	GID   uint32   `json:"gid"`
-	Mode  uint32   `json:"mode"`  // POSIX permission bits
-	CTime int64    `json:"ctime"` // Change time (unix nanoseconds)
-	MTime int64    `json:"mtime"` // Modification time
-	ATime int64    `json:"atime"` // Access time
+	ID         InodeID  `json:"id"`
+	Type       FileType `json:"type"`
+	Size       int64    `json:"size"`  // Total file size in bytes
+	NLink      uint32   `json:"nlink"` // Hard link count
+	BucketRoot InodeID  `json:"bucket_root,omitempty"` // Root inode of containing bucket
+	UID        uint32   `json:"uid"`
+	GID        uint32   `json:"gid"`
+	Mode       uint32   `json:"mode"`  // POSIX permission bits
+	CTime      int64    `json:"ctime"` // Change time (unix nanoseconds)
+	MTime      int64    `json:"mtime"` // Modification time
+	ATime      int64    `json:"atime"` // Access time
 
 	// File-specific fields
 	ChunkMap []ChunkRef `json:"chunks,omitempty"`  // Ordered chunk list

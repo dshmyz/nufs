@@ -53,6 +53,7 @@ Commands (remote only):
   metrics                  Show node metrics
   health                   Check node health
   rebalance                Show rebalance plan
+  scrub                    Check chunk replica consistency
 `)
 	}
 	flag.Parse()
@@ -112,6 +113,8 @@ func runLocal(args []string, metaDir string) {
 		cmdLeader(store)
 	case "rebalance":
 		cmdRebalancePlan(ctx, store)
+	case "scrub":
+		cmdScrub(ctx, store)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command (local mode): %s\n", cmd)
 		os.Exit(1)
@@ -272,6 +275,35 @@ func cmdRebalancePlan(ctx context.Context, store *metadata.PebbleStore) {
 	}
 }
 
+func cmdScrub(ctx context.Context, store *metadata.PebbleStore) {
+	fmt.Println("Scrubbing all chunks for consistency...")
+	start := time.Now()
+
+	// Scan all chunk keys and check replica health
+	var scanned, healthy, unhealthy int
+	err := store.ScrubAllChunks(func(chunkID metadata.ChunkID, replicaCount, healthyCount int) {
+		scanned++
+		if healthyCount == 0 {
+			unhealthy++
+			fmt.Printf("  UNHEALTHY: chunk %d has %d replicas, 0 healthy\n", chunkID, replicaCount)
+		} else {
+			healthy++
+		}
+	})
+	if err != nil {
+		log.Fatalf("scrub: %v", err)
+	}
+
+	fmt.Printf("\nScrub completed in %s\n", time.Since(start).Round(time.Millisecond))
+	fmt.Printf("  Scanned:   %d\n", scanned)
+	fmt.Printf("  Healthy:   %d\n", healthy)
+	fmt.Printf("  Unhealthy: %d\n", unhealthy)
+	if unhealthy > 0 {
+		fmt.Println("\nRun 'nufs-cli repair-queue' to see pending repairs.")
+		os.Exit(1)
+	}
+}
+
 // ============================================================
 // Remote mode — metad HTTP API
 // ============================================================
@@ -310,6 +342,8 @@ func runRemote(args []string, metaAddr string) {
 		api.cmdHealth()
 	case "info":
 		api.cmdClusterInfo()
+	case "scrub":
+		api.cmdScrub()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command (remote mode): %s\n", cmd)
 		os.Exit(1)
@@ -428,5 +462,11 @@ func (a *remoteAPI) cmdMetrics() {
 
 func (a *remoteAPI) cmdHealth() {
 	resp := a.get("/api/v1/health")
+	a.prettyJSON(resp)
+}
+
+func (a *remoteAPI) cmdScrub() {
+	fmt.Println("Scrubbing all chunks (remote)...")
+	resp := a.get("/api/v1/scrub")
 	a.prettyJSON(resp)
 }

@@ -3,7 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -29,13 +29,13 @@ func NewRebalanceExecutor(store MetadataService) *RebalanceExecutor {
 //   3. Push repair tasks for each chunk migration
 //   4. After each chunk is repaired, update its replica set
 func (e *RebalanceExecutor) ExecuteDecommission(ctx context.Context, nodeID NodeID) error {
-	log.Printf("rebalance: starting decommission of node %d", nodeID)
+	slog.Info("rebalance: starting decommission", "node_id", nodeID)
 
 	chunks, err := e.store.ChunksByNode(ctx, nodeID)
 	if err != nil {
 		return fmt.Errorf("list chunks for node %d: %w", nodeID, err)
 	}
-	log.Printf("rebalance: found %d chunks on node %d", len(chunks), nodeID)
+	slog.Info("rebalance: found chunks on node", "count", len(chunks), "node_id", nodeID)
 
 	nodes, err := e.store.ListNodes(ctx)
 	if err != nil {
@@ -49,7 +49,7 @@ func (e *RebalanceExecutor) ExecuteDecommission(ctx context.Context, nodeID Node
 	}
 
 	if len(plans) == 0 {
-		log.Printf("rebalance: node %d has no chunks to migrate", nodeID)
+		slog.Info("rebalance: node has no chunks to migrate", "node_id", nodeID)
 		return nil
 	}
 
@@ -67,21 +67,21 @@ func (e *RebalanceExecutor) ExecuteDecommission(ctx context.Context, nodeID Node
 
 		// Push repair task so data nodes pick it up
 		if err := e.store.TriggerRepair(ctx, plan.ChunkID); err != nil {
-			log.Printf("rebalance: trigger repair for chunk %d: %v", plan.ChunkID, err)
+			slog.Error("rebalance: trigger repair", "chunk_id", plan.ChunkID, "error", err)
 			continue
 		}
 
 		// Update metadata: remove source replica, add target
 		if err := e.store.MigrateChunkReplica(ctx, plan.ChunkID, plan.SourceNode, plan.TargetNode); err != nil {
-			log.Printf("rebalance: migrate replica for chunk %d: %v", plan.ChunkID, err)
+			slog.Error("rebalance: migrate replica", "chunk_id", plan.ChunkID, "error", err)
 			continue
 		}
 
 		migrated++
-		log.Printf("rebalance: migrated chunk %d (%s)", plan.ChunkID, plan.Reason)
+		slog.Info("rebalance: migrated chunk", "chunk_id", plan.ChunkID, "reason", plan.Reason)
 	}
 
-	log.Printf("rebalance: decommissioned node %d: %d/%d chunks migrated", nodeID, migrated, len(plans))
+	slog.Info("rebalance: decommissioned node", "node_id", nodeID, "migrated", migrated, "total", len(plans))
 	return nil
 }
 
@@ -96,20 +96,20 @@ func (e *RebalanceExecutor) ExecutePlans(ctx context.Context, plans []MigrationP
 
 		// Push to repair queue
 		if err := e.store.TriggerRepair(ctx, plan.ChunkID); err != nil {
-			log.Printf("rebalance: trigger repair for chunk %d: %v", plan.ChunkID, err)
+			slog.Error("rebalance: trigger repair", "chunk_id", plan.ChunkID, "error", err)
 			continue
 		}
 
 		// Update chunk metadata atomically
 		if err := e.store.MigrateChunkReplica(ctx, plan.ChunkID, plan.SourceNode, plan.TargetNode); err != nil {
-			log.Printf("rebalance: migrate replica for chunk %d: %v", plan.ChunkID, err)
+			slog.Error("rebalance: migrate replica", "chunk_id", plan.ChunkID, "error", err)
 			continue
 		}
 
 		executed++
 	}
 
-	log.Printf("rebalance: executed %d/%d migration plans", executed, len(plans))
+	slog.Info("rebalance: executed migration plans", "executed", executed, "total", len(plans))
 	return nil
 }
 

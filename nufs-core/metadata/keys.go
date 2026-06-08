@@ -7,11 +7,12 @@ package metadata
 const (
 	// Key prefixes for PebbleStore KV layout.
 	// Each prefix defines a separate namespace in the key-value store.
-	prefixBucket = "/bucket/"
-	prefixNS     = "/ns/"
-	prefixInode  = "/inode/"
-	prefixChunk  = "/chunk/"
-	prefixNode   = "/node/"
-	prefixPolicy = "/policy/"
-	prefixRepair = "/repair/"
+	prefixBucket      = "/bucket/"
+	prefixBucketStats = "/bucket-stats/"
+	prefixNS          = "/ns/"
+	prefixInode       = "/inode/"
+	prefixChunk       = "/chunk/"
+	prefixNode        = "/node/"
+	prefixPolicy      = "/policy/"
+	prefixRepair      = "/repair/"
 )

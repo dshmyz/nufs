@@ -9,17 +9,16 @@ import (
 // MetadataService — Unified interface for all backends
 // ============================================================
 
-// MetadataService defines the full metadata operations interface.
-// PebbleStore implements this interface as the sole storage backend,
-// with optional Raft consensus for distributed deployments.
-type MetadataService interface {
-	// Bucket operations
+// BucketService defines bucket lifecycle operations.
+type BucketService interface {
 	CreateBucket(ctx context.Context, name string, policy PlacementPolicy) error
 	DeleteBucket(ctx context.Context, name string) error
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
 	GetBucket(ctx context.Context, name string) (*BucketInfo, error)
+}
 
-	// Namespace operations
+// NamespaceService defines directory and file namespace operations.
+type NamespaceService interface {
 	MkDir(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error)
 	RmDir(ctx context.Context, parent InodeID, name string) error
 	ReadDir(ctx context.Context, parent InodeID, offset int, limit int) ([]DirEntry, error)
@@ -30,12 +29,16 @@ type MetadataService interface {
 	Symlink(ctx context.Context, parent InodeID, name string, target string) (*InodeMeta, error)
 	Readlink(ctx context.Context, id InodeID) (string, error)
 	Link(ctx context.Context, parent InodeID, name string, target InodeID) (*InodeMeta, error)
+}
 
-	// Inode operations
+// InodeService defines inode read/write operations.
+type InodeService interface {
 	GetInode(ctx context.Context, id InodeID) (*InodeMeta, error)
 	UpdateInode(ctx context.Context, meta *InodeMeta) error
+}
 
-	// Chunk operations
+// ChunkService defines chunk lifecycle operations.
+type ChunkService interface {
 	AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error)
 	CommitChunk(ctx context.Context, chunkID ChunkID, checksum uint32) error
 	GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error)
@@ -44,59 +47,65 @@ type MetadataService interface {
 	ListChunks(ctx context.Context, inodeID InodeID) ([]ChunkRef, error)
 	DeleteChunk(ctx context.Context, chunkID ChunkID) error
 	ReportChunkState(ctx context.Context, nodeID NodeID, states map[ChunkID]ReplicaState) error
+}
 
-	// Cluster operations
+// NodeService defines cluster node management operations.
+type NodeService interface {
 	RegisterNode(ctx context.Context, info *NodeInfo) error
 	Heartbeat(ctx context.Context, nodeID NodeID, report *NodeReport) error
 	DecommissionNode(ctx context.Context, nodeID NodeID) error
 	ListNodes(ctx context.Context) ([]NodeInfo, error)
 	GetNode(ctx context.Context, nodeID NodeID) (*NodeInfo, error)
+}
 
-	// Repair operations
+// RepairService defines repair and rebalance operations.
+type RepairService interface {
 	GetRepairQueue(ctx context.Context) ([]RepairTask, error)
 	TriggerRepair(ctx context.Context, chunkID ChunkID) error
 	RemoveRepairTask(ctx context.Context, chunkID ChunkID) error
-
-	// Rebalance operations
 	TriggerRebalance(ctx context.Context) error
-
-	// Scaling: scan all chunks for a specific node
 	ChunksByNode(ctx context.Context, nodeID NodeID) ([]ChunkMeta, error)
-
-	// Replica migration: move a chunk replica from one node to another
 	MigrateChunkReplica(ctx context.Context, chunkID ChunkID, fromNode, toNode NodeID) error
+}
 
-	// Lifecycle
-	Close() error
-
-	// AdvisoryLock acquires an exclusive (write) lock on the inode.
-	// Returns ErrLockBusy if the lock is held by another owner in
-	// an incompatible mode, or ErrInvalidOwner if owner is empty.
-	// The same owner may acquire the same lock multiple times; the
-	// implementation uses a refcount so each call needs a matching
-	// AdvisoryUnlock. See lock.go for the full model.
+// LockService defines advisory lock operations.
+type LockService interface {
 	AdvisoryLock(ctx context.Context, inode InodeID, owner string) error
-	// AdvisoryLockShared is the read-side equivalent. Multiple
-	// owners can hold a shared lock on the same inode, but any
-	// exclusive acquirer (from any owner) blocks them. Same
-	// re-entrancy rules as AdvisoryLock.
 	AdvisoryLockShared(ctx context.Context, inode InodeID, owner string) error
-	// AdvisoryUnlock releases one acquisition of (inode, owner).
-	// Releasing a lock the caller does not hold is a no-op
-	// (POSIX-flock semantics), not an error.
 	AdvisoryUnlock(ctx context.Context, inode InodeID, owner string) error
-	// AdvisoryListLocks returns a snapshot of every holder of the
-	// lock on inode. Used for diagnostics and admin tools; the
-	// runtime path does not need it.
 	AdvisoryListLocks(ctx context.Context, inode InodeID) ([]LockInfo, error)
+}
 
-	// Extended attributes (xattrs). The InodeMeta.XAttrs map is
-	// the backing store; these are convenience methods that atomically
-	// read/modify it via GetInode + UpdateInode.
+// XAttrService defines extended attribute operations.
+type XAttrService interface {
 	GetXAttr(ctx context.Context, id InodeID, name string) ([]byte, error)
 	SetXAttr(ctx context.Context, id InodeID, name string, value []byte) error
 	ListXAttr(ctx context.Context, id InodeID) (map[string][]byte, error)
 	RemoveXAttr(ctx context.Context, id InodeID, name string) error
+}
+
+// MetadataService is the composition of all sub-service interfaces.
+// PebbleStore implements this interface as the sole storage backend,
+// with optional Raft consensus for distributed deployments.
+//
+// Consumers should depend on the smallest sub-interface they need
+// (e.g., ChunkService instead of MetadataService) to improve
+// testability and reduce coupling.
+type MetadataService interface {
+	BucketService
+	NamespaceService
+	InodeService
+	ChunkService
+	NodeService
+	RepairService
+	LockService
+	XAttrService
+
+	// Admin
+	ComputeAllBucketUsage(ctx context.Context) ([]BucketUsage, error)
+
+	// Lifecycle
+	Close() error
 }
 
 // Compile-time interface check
@@ -210,6 +219,10 @@ func NewPebbleServiceBundle(store *PebbleStore, opts ...ServiceOption) (*Service
 		}
 		bundle.Lifecycle.Start(1 * time.Hour)
 	}
+
+	// Auto-sync PlacementEngine with node state changes via EventBus
+	store.SetEventBus(bundle.Events)
+	store.placement.SubscribeEvents(bundle.Events)
 
 	// Signal ready
 	close(bundle.Ready)

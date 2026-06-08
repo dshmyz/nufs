@@ -17,19 +17,19 @@ var (
 
 // CacheInode is the on-disk inode structure for the local metadata cache.
 type CacheInode struct {
-	ID       uint64            `json:"id"`
-	IsDir    bool              `json:"is_dir"`
-	Name     string            `json:"name"`
-	Size     uint64            `json:"size"`
-	Mode     uint32            `json:"mode"`
-	UID      uint32            `json:"uid"`
-	GID      uint32            `json:"gid"`
-	Mtime    int64             `json:"mtime"`
-	Ctime    int64             `json:"ctime"`
-	Atime    int64             `json:"atime"`
-	ETag     string            `json:"etag,omitempty"`
-	Children map[string]uint64 `json:"children,omitempty"` // name → child inode ID
-	SymlinkTarget string       `json:"symlink_target,omitempty"`
+	ID            uint64            `json:"id"`
+	IsDir         bool              `json:"is_dir"`
+	Name          string            `json:"name"`
+	Size          uint64            `json:"size"`
+	Mode          uint32            `json:"mode"`
+	UID           uint32            `json:"uid"`
+	GID           uint32            `json:"gid"`
+	Mtime         int64             `json:"mtime"`
+	Ctime         int64             `json:"ctime"`
+	Atime         int64             `json:"atime"`
+	ETag          string            `json:"etag,omitempty"`
+	Children      map[string]uint64 `json:"children,omitempty"` // name → child inode ID
+	SymlinkTarget string            `json:"symlink_target,omitempty"`
 }
 
 // PendingUpload tracks a cache file that needs to be uploaded to S3.
@@ -42,8 +42,8 @@ type PendingUpload struct {
 // PebbleCache is a local metadata cache backed by Pebble.
 type PebbleCache struct {
 	db   *pebble.DB
-	mu   sync.Mutex
-	next uint64 // monotonic inode ID generator
+	rwmu sync.RWMutex // 使用 RWMutex 替代 Mutex，读多写少场景性能更好
+	next uint64       // monotonic inode ID generator
 }
 
 // OpenCache opens or creates a Pebble cache at the given directory.
@@ -74,11 +74,12 @@ func OpenCache(dir string) (*PebbleCache, error) {
 }
 
 // NextID returns a new unique inode ID.
+// Uses Lock (write lock) since it modifies next.
 func (c *PebbleCache) NextID() uint64 {
-	c.mu.Lock()
+	c.rwmu.Lock()
 	id := c.next
 	c.next++
-	c.mu.Unlock()
+	c.rwmu.Unlock()
 	return id
 }
 
@@ -95,9 +96,10 @@ func pendingKey(basename string) []byte {
 }
 
 // PutInode stores an inode in the cache.
+// Uses Lock (write lock) since it modifies the database.
 func (c *PebbleCache) PutInode(in *CacheInode) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.Lock()
+	defer c.rwmu.Unlock()
 	data, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -106,9 +108,10 @@ func (c *PebbleCache) PutInode(in *CacheInode) error {
 }
 
 // GetInode retrieves an inode by ID.
+// Uses RLock (read lock) since it only reads from the database.
 func (c *PebbleCache) GetInode(id uint64) (*CacheInode, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.RLock()
+	defer c.rwmu.RUnlock()
 	data, closer, err := c.db.Get(inodeKey(id))
 	if errors.Is(err, pebble.ErrNotFound) {
 		return nil, errCacheNotFound
@@ -126,15 +129,15 @@ func (c *PebbleCache) GetInode(id uint64) (*CacheInode, error) {
 
 // DeleteInode removes an inode from the cache.
 func (c *PebbleCache) DeleteInode(id uint64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.Lock()
+	defer c.rwmu.Unlock()
 	return c.db.Delete(inodeKey(id), nil)
 }
 
 // PutDirEntry stores a directory entry mapping (parent, name) → childID.
 func (c *PebbleCache) PutDirEntry(parentID uint64, name string, childID uint64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.Lock()
+	defer c.rwmu.Unlock()
 	buf := make([]byte, 8)
 	buf[0] = byte(childID)
 	buf[1] = byte(childID >> 8)
@@ -148,9 +151,10 @@ func (c *PebbleCache) PutDirEntry(parentID uint64, name string, childID uint64) 
 }
 
 // GetDirEntry looks up a child inode ID by parent and name.
+// Uses RLock (read lock) since it only reads from the database.
 func (c *PebbleCache) GetDirEntry(parentID uint64, name string) (uint64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.RLock()
+	defer c.rwmu.RUnlock()
 	data, closer, err := c.db.Get(dirEntryKey(parentID, name))
 	if errors.Is(err, pebble.ErrNotFound) {
 		return 0, errCacheNotFound
@@ -169,15 +173,16 @@ func (c *PebbleCache) GetDirEntry(parentID uint64, name string) (uint64, error) 
 
 // DeleteDirEntry removes a directory entry.
 func (c *PebbleCache) DeleteDirEntry(parentID uint64, name string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.Lock()
+	defer c.rwmu.Unlock()
 	return c.db.Delete(dirEntryKey(parentID, name), nil)
 }
 
 // ListDirEntries returns all child entries for a directory.
+// Uses RLock (read lock) since it only reads from the database.
 func (c *PebbleCache) ListDirEntries(parentID uint64) (map[string]uint64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.RLock()
+	defer c.rwmu.RUnlock()
 	prefix := []byte(fmt.Sprintf("dir:%016x:", parentID))
 	iter, err := c.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -209,8 +214,8 @@ func (c *PebbleCache) ListDirEntries(parentID uint64) (map[string]uint64, error)
 
 // RecordPending stores a pending upload entry for crash recovery.
 func (c *PebbleCache) RecordPending(pu *PendingUpload) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.Lock()
+	defer c.rwmu.Unlock()
 	data, err := json.Marshal(pu)
 	if err != nil {
 		return err
@@ -220,15 +225,16 @@ func (c *PebbleCache) RecordPending(pu *PendingUpload) error {
 
 // ClearPending removes a pending upload entry.
 func (c *PebbleCache) ClearPending(cachePath string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.Lock()
+	defer c.rwmu.Unlock()
 	return c.db.Delete(pendingKey(cachePath), nil)
 }
 
 // ListPending returns all pending uploads.
+// Uses RLock (read lock) since it only reads from the database.
 func (c *PebbleCache) ListPending() ([]*PendingUpload, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.RLock()
+	defer c.rwmu.RUnlock()
 	prefix := []byte("pending:")
 	iter, err := c.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -248,11 +254,12 @@ func (c *PebbleCache) ListPending() ([]*PendingUpload, error) {
 	return result, nil
 }
 
-// Scan returns a snapshot time for the given directory inode.
+// GetLastScan returns a snapshot time for the given directory inode.
 // Returns zero time if never scanned.
+// Uses RLock (read lock) since it only reads from the database.
 func (c *PebbleCache) GetLastScan(id uint64) time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.RLock()
+	defer c.rwmu.RUnlock()
 	in, err := c.getInodeUnlocked(id)
 	if err != nil {
 		return time.Time{}
@@ -265,8 +272,8 @@ func (c *PebbleCache) GetLastScan(id uint64) time.Time {
 
 // SetLastScan updates the ctime field as a scan timestamp.
 func (c *PebbleCache) SetLastScan(id uint64, t time.Time) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.Lock()
+	defer c.rwmu.Unlock()
 	in, err := c.getInodeUnlocked(id)
 	if err != nil {
 		return err
@@ -301,8 +308,8 @@ func (c *PebbleCache) putInodeUnlocked(in *CacheInode) error {
 
 // Close closes the underlying Pebble database.
 func (c *PebbleCache) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rwmu.Lock()
+	defer c.rwmu.Unlock()
 	if c.db != nil {
 		return c.db.Close()
 	}

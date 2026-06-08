@@ -30,7 +30,7 @@ type S3FileSystem struct {
 	api    *minio.Client
 	cache  *PebbleCache
 
-	mu       sync.Mutex
+	mu       sync.RWMutex // 使用 RWMutex 优化读多写少场景
 	handles  map[uint64]*S3FileHandle
 	handleID uint64
 	locks    map[string]*pathLock

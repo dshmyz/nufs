@@ -13,9 +13,9 @@ COPY . .
 # Build all binaries
 RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/metad    ./cmd/metad
 RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/datanode ./cmd/datanode
-RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/s3gw     ./cmd/s3gw
-RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/fusegw   ./cmd/fusegw
-RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/ctl      ./cmd/ctl
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/nufs-s3   ./cmd/nufs-s3
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/nufs-fuse ./cmd/nufs-fuse
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/nufs-cli  ./cmd/nufs-cli
 
 # ========== Metadata Service ==========
 FROM gcr.io/distroless/static-debian12 AS metad
@@ -31,19 +31,19 @@ EXPOSE 9001
 ENTRYPOINT ["/usr/local/bin/datanode"]
 
 # ========== S3 Gateway ==========
-FROM gcr.io/distroless/static-debian12 AS s3gw
-COPY --from=builder /bin/s3gw /usr/local/bin/s3gw
+FROM gcr.io/distroless/static-debian12 AS nufs-s3
+COPY --from=builder /bin/nufs-s3 /usr/local/bin/nufs-s3
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/s3gw"]
+ENTRYPOINT ["/usr/local/bin/nufs-s3"]
 
 # ========== FUSE Gateway (requires FUSE libraries) ==========
-FROM debian:bookworm-slim AS fusegw
+FROM debian:bookworm-slim AS nufs-fuse
 RUN apt-get update && apt-get install -y --no-install-recommends fuse ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /bin/fusegw /usr/local/bin/fusegw
+COPY --from=builder /bin/nufs-fuse /usr/local/bin/nufs-fuse
 VOLUME ["/mnt/dfs"]
-ENTRYPOINT ["/usr/local/bin/fusegw"]
+ENTRYPOINT ["/usr/local/bin/nufs-fuse"]
 
 # ========== Admin CLI ==========
-FROM gcr.io/distroless/static-debian12 AS ctl
-COPY --from=builder /bin/ctl /usr/local/bin/ctl
-ENTRYPOINT ["/usr/local/bin/ctl"]
+FROM gcr.io/distroless/static-debian12 AS nufs-cli
+COPY --from=builder /bin/nufs-cli /usr/local/bin/nufs-cli
+ENTRYPOINT ["/usr/local/bin/nufs-cli"]

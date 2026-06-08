@@ -64,6 +64,7 @@ type DiskManager struct {
 
 	stopCh  chan struct{}
 	running atomic.Bool
+	wg      sync.WaitGroup // Tracks background goroutine
 
 	// I/O error tracking
 	ioErrors  atomic.Int64
@@ -128,7 +129,11 @@ func (dm *DiskManager) Start() {
 	if dm.running.Swap(true) {
 		return
 	}
-	go dm.monitorLoop()
+	dm.wg.Add(1)
+	go func() {
+		defer dm.wg.Done()
+		dm.monitorLoop()
+	}()
 }
 
 // Stop terminates the disk manager.
@@ -136,6 +141,7 @@ func (dm *DiskManager) Stop() {
 	if dm.running.Swap(false) {
 		close(dm.stopCh)
 	}
+	dm.wg.Wait()
 	dm.wal.Close()
 }
 
@@ -336,13 +342,31 @@ const (
 )
 
 // WriteAheadLog provides crash recovery for chunk writes.
+// It uses group commit to batch fsync calls: entries are buffered and
+// flushed together at a fixed interval (or immediately when the buffer
+// is full), reducing I/O overhead from one fsync per entry to one fsync
+// per batch.
 type WriteAheadLog struct {
 	dir  string
 	file *os.File
 	mu   sync.Mutex
+
+	// Group commit state
+	pending   []func() error  // buffered entry writers
+	flushCh   chan struct{}   // signals flush goroutine
+	flushDone chan chan error // flush goroutine reports result
+	closeCh   chan struct{}
+	wg        sync.WaitGroup
 }
 
-// NewWriteAheadLog creates or opens a WAL.
+// walGroupCommitBatchSize is the maximum number of entries buffered
+// before triggering an immediate flush.
+const walGroupCommitBatchSize = 64
+
+// walGroupCommitInterval is the maximum time between flushes.
+const walGroupCommitInterval = 5 * time.Millisecond
+
+// NewWriteAheadLog creates or opens a WAL with group commit enabled.
 func NewWriteAheadLog(dir string) (*WriteAheadLog, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
@@ -352,45 +376,143 @@ func NewWriteAheadLog(dir string) (*WriteAheadLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &WriteAheadLog{dir: dir, file: f}, nil
+	w := &WriteAheadLog{
+		dir:       dir,
+		file:      f,
+		pending:   make([]func() error, 0, walGroupCommitBatchSize),
+		flushCh:   make(chan struct{}, 1),
+		flushDone: make(chan chan error, 1),
+		closeCh:   make(chan struct{}),
+	}
+	w.wg.Add(1)
+	go w.flushLoop()
+	return w, nil
 }
 
-// LogWrite records a pending chunk write.
+// flushLoop runs in a background goroutine and batches pending entries
+// into a single fsync, reducing I/O from N fsyncs to 1 per batch.
+func (w *WriteAheadLog) flushLoop() {
+	defer w.wg.Done()
+	ticker := time.NewTicker(walGroupCommitInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.closeCh:
+			// Final flush before shutdown
+			w.doFlush()
+			return
+		case <-ticker.C:
+			w.doFlush()
+		case <-w.flushCh:
+			w.doFlush()
+		}
+	}
+}
+
+// doFlush writes all buffered entries to the WAL file and performs a
+// single fsync. It then notifies the waiting callers of the result.
+func (w *WriteAheadLog) doFlush() {
+	w.mu.Lock()
+	if len(w.pending) == 0 {
+		w.mu.Unlock()
+		return
+	}
+
+	// Swap pending buffer
+	batch := w.pending
+	w.pending = make([]func() error, 0, walGroupCommitBatchSize)
+	w.mu.Unlock()
+
+	// Write all entries
+	var firstErr error
+	for _, writeEntry := range batch {
+		if err := writeEntry(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// Single fsync for the entire batch
+	if firstErr == nil {
+		if err := w.file.Sync(); err != nil {
+			firstErr = err
+		}
+	}
+
+	// Notify callers if someone is waiting
+	select {
+	case resultCh := <-w.flushDone:
+		resultCh <- firstErr
+	default:
+		// No one waiting (ticker-triggered flush)
+	}
+}
+
+// submitEntry adds an entry to the pending buffer and triggers a flush
+// when the batch is full. It waits for the flush to complete.
+func (w *WriteAheadLog) submitEntry(writeFn func() error) error {
+	w.mu.Lock()
+	w.pending = append(w.pending, writeFn)
+	shouldFlush := len(w.pending) >= walGroupCommitBatchSize
+	w.mu.Unlock()
+
+	if shouldFlush {
+		// Trigger immediate flush
+		select {
+		case w.flushCh <- struct{}{}:
+		default:
+		}
+	}
+
+	// Wait for the next flush to complete
+	resultCh := make(chan error, 1)
+	w.mu.Lock()
+	select {
+	case w.flushDone <- resultCh:
+	default:
+		// A flush result channel is already pending; create a new one
+		resultCh = make(chan error, 1)
+		w.flushDone <- resultCh
+	}
+	w.mu.Unlock()
+
+	// Trigger flush if not already triggered
+	select {
+	case w.flushCh <- struct{}{}:
+	default:
+	}
+
+	return <-resultCh
+}
+
+// LogWrite records a pending chunk write via group commit.
 func (w *WriteAheadLog) LogWrite(chunkID metadata.ChunkID, dataLen int) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	header := make([]byte, 21) // 4+4+8+1+4
-	copy(header[0:4], walMagic)
-	binary.BigEndian.PutUint32(header[4:8], uint32(dataLen))
-	binary.BigEndian.PutUint64(header[8:16], uint64(chunkID))
-	header[16] = walOpWrite
-	crc := crc32.ChecksumIEEE(header[:17])
-	binary.BigEndian.PutUint32(header[17:21], crc)
-
-	if _, err := w.file.Write(header); err != nil {
+	return w.submitEntry(func() error {
+		header := make([]byte, 21) // 4+4+8+1+4
+		copy(header[0:4], walMagic)
+		binary.BigEndian.PutUint32(header[4:8], uint32(dataLen))
+		binary.BigEndian.PutUint64(header[8:16], uint64(chunkID))
+		header[16] = walOpWrite
+		crc := crc32.ChecksumIEEE(header[:17])
+		binary.BigEndian.PutUint32(header[17:21], crc)
+		_, err := w.file.Write(header)
 		return err
-	}
-	return w.file.Sync()
+	})
 }
 
-// LogCommit records that a chunk write completed successfully.
+// LogCommit records that a chunk write completed successfully via group commit.
 func (w *WriteAheadLog) LogCommit(chunkID metadata.ChunkID) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	header := make([]byte, 21)
-	copy(header[0:4], walMagic)
-	binary.BigEndian.PutUint32(header[4:8], 0) // no data
-	binary.BigEndian.PutUint64(header[8:16], uint64(chunkID))
-	header[16] = walOpCommit
-	crc := crc32.ChecksumIEEE(header[:17])
-	binary.BigEndian.PutUint32(header[17:21], crc)
-
-	if _, err := w.file.Write(header); err != nil {
+	return w.submitEntry(func() error {
+		header := make([]byte, 21)
+		copy(header[0:4], walMagic)
+		binary.BigEndian.PutUint32(header[4:8], 0) // no data
+		binary.BigEndian.PutUint64(header[8:16], uint64(chunkID))
+		header[16] = walOpCommit
+		crc := crc32.ChecksumIEEE(header[:17])
+		binary.BigEndian.PutUint32(header[17:21], crc)
+		_, err := w.file.Write(header)
 		return err
-	}
-	return w.file.Sync()
+	})
 }
 
 // Recover returns chunk IDs that were written but not committed (need cleanup).
@@ -449,7 +571,31 @@ func (w *WriteAheadLog) Recover() ([]metadata.ChunkID, error) {
 			orphans = append(orphans, id)
 		}
 	}
+
+	// Auto-cleanup: remove orphaned chunk data files left by crashes
+	// that occurred between Write and LogCommit.
+	if len(orphans) > 0 {
+		cleaned := 0
+		for _, id := range orphans {
+			chunkPath := w.chunkPath(id)
+			if err := os.Remove(chunkPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("wal: failed to clean orphan chunk %d: %v", id, err)
+			} else if err == nil {
+				cleaned++
+			}
+		}
+		if cleaned > 0 {
+			log.Printf("wal: cleaned %d orphan chunk files from uncommitted writes", cleaned)
+		}
+	}
+
 	return orphans, nil
+}
+
+// chunkPath returns the filesystem path for a chunk data file.
+// This is used during recovery to clean up orphaned chunks.
+func (w *WriteAheadLog) chunkPath(id metadata.ChunkID) string {
+	return filepath.Join(w.dir, fmt.Sprintf("chunk_%d.dat", id))
 }
 
 // Truncate clears the WAL (call after successful recovery).
@@ -459,10 +605,11 @@ func (w *WriteAheadLog) Truncate() error {
 	return w.file.Truncate(0)
 }
 
-// Close closes the WAL file.
+// Close gracefully shuts down the WAL: flushes pending entries and waits
+// for the group commit goroutine to exit.
 func (w *WriteAheadLog) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	close(w.closeCh)
+	w.wg.Wait()
 	return w.file.Close()
 }
 

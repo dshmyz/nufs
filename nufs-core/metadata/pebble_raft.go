@@ -2,19 +2,23 @@ package metadata
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/klauspost/compress/zstd"
 )
 
 // ============================================================
@@ -42,6 +46,7 @@ const (
 	OpSet    RaftLogOp = 0x01 // Set key-value
 	OpDelete RaftLogOp = 0x02 // Delete key
 	OpBatch  RaftLogOp = 0x03 // Atomic batch of Set/Delete operations
+	OpCAS    RaftLogOp = 0x04 // Compare-and-swap inode update
 )
 
 // RaftLogEntry is the binary-encoded format of a Raft log entry.
@@ -83,6 +88,10 @@ func (e *RaftLogEntry) Encode() []byte {
 				writeBytes(&buf, op.Value)
 			}
 		}
+	case OpCAS:
+		// Key = Pebble key; Value = [8-byte expected version][new data]
+		writeBytes(&buf, e.Key)
+		writeBytes(&buf, e.Value)
 	}
 	return buf.Bytes()
 }
@@ -109,6 +118,16 @@ func DecodeRaftLogEntry(data []byte) (*RaftLogEntry, error) {
 	case OpDelete:
 		var err error
 		e.Key, err = readBytes(r)
+		if err != nil {
+			return nil, err
+		}
+	case OpCAS:
+		var err error
+		e.Key, err = readBytes(r)
+		if err != nil {
+			return nil, err
+		}
+		e.Value, err = readBytes(r)
 		if err != nil {
 			return nil, err
 		}
@@ -178,7 +197,7 @@ func (f *PebbleFSM) Apply(l *raft.Log) interface{} {
 
 	entry, err := DecodeRaftLogEntry(l.Data)
 	if err != nil {
-		log.Printf("fsm: decode error at index %d: %v", l.Index, err)
+		slog.Error("fsm: decode error", "index", l.Index, "error", err)
 		return err
 	}
 
@@ -200,10 +219,43 @@ func (f *PebbleFSM) Apply(l *raft.Log) interface{} {
 		}
 		err = batch.Commit(pebble.Sync)
 		batch.Close()
+
+	case OpCAS:
+		// CAS: compare-and-swap inode update.
+		// entry.Value = [8-byte expected version][new inode data]
+		if len(entry.Value) < 8 {
+			err = fmt.Errorf("fsm: opcas: value too short (%d bytes)", len(entry.Value))
+			break
+		}
+		expectedVer := MVCCVersion(binary.BigEndian.Uint64(entry.Value[:8]))
+		newData := entry.Value[8:]
+
+		// Read current value
+		currentVal, closer, getErr := f.store.db.Get(entry.Key)
+		if getErr != nil {
+			err = getErr
+			break
+		}
+		currentCopy := make([]byte, len(currentVal))
+		copy(currentCopy, currentVal)
+		closer.Close()
+
+		var current InodeWithVersion
+		if err = unmarshalValue(currentCopy, &current); err != nil {
+			break
+		}
+
+		if current.Version != expectedVer {
+			err = ErrVersionConflict
+			break
+		}
+
+		// Apply update
+		err = f.store.db.Set(entry.Key, newData, pebble.Sync)
 	}
 
 	if err != nil {
-		log.Printf("fsm: apply error at index %d: %v", l.Index, err)
+		slog.Error("fsm: apply error", "index", l.Index, "error", err)
 	}
 	return err
 }
@@ -235,77 +287,15 @@ func (f *PebbleFSM) Apply(l *raft.Log) interface{} {
 //       │   └── state.bin        # Serialized KV data
 //       └── 0001-12346-67891/
 
-// Snapshot format:
-//   [magic: 4 bytes "PBL1"]
-//   [key_count: 8 bytes BE]
-//   For each KV:
-//     [key_len: 4 bytes BE] [key] [val_len: 4 bytes BE] [val]
-
-const snapshotMagic = "PBL1"
-
 // Snapshot returns an FSM snapshot.
 func (f *PebbleFSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &PebbleSnapshot{store: f.store}, nil
 }
 
 // Restore restores the FSM from a snapshot stream.
+// Supports both PBL3 (checkpoint) and PBL1 (legacy KV stream) formats.
 func (f *PebbleFSM) Restore(rc io.ReadCloser) error {
-	defer rc.Close()
-
-	// Read magic
-	magic := make([]byte, 4)
-	if _, err := io.ReadFull(rc, magic); err != nil {
-		return fmt.Errorf("read magic: %w", err)
-	}
-	if string(magic) != snapshotMagic {
-		return fmt.Errorf("invalid snapshot magic: %q", magic)
-	}
-
-	// Read key count
-	var count uint64
-	if err := binary.Read(rc, binary.BigEndian, &count); err != nil {
-		return fmt.Errorf("read count: %w", err)
-	}
-
-	// Clear existing data (ingest into empty DB)
-	// In production: use Pebble ingest for SST-level restore
-	batch := f.store.db.NewBatch()
-	batchCount := 0
-
-	for i := uint64(0); i < count; i++ {
-		key, err := readBytesStream(rc)
-		if err != nil {
-			batch.Close()
-			return fmt.Errorf("read key %d: %w", i, err)
-		}
-		val, err := readBytesStream(rc)
-		if err != nil {
-			batch.Close()
-			return fmt.Errorf("read value %d: %w", i, err)
-		}
-		batch.Set(key, val, nil)
-		batchCount++
-
-		// Commit in batches of 10K to avoid OOM
-		if batchCount >= 10000 {
-			if err := batch.Commit(pebble.Sync); err != nil {
-				batch.Close()
-				return fmt.Errorf("batch commit at %d: %w", i, err)
-			}
-			batch.Close()
-			batch = f.store.db.NewBatch()
-			batchCount = 0
-		}
-	}
-
-	if err := batch.Commit(pebble.Sync); err != nil {
-		batch.Close()
-		return err
-	}
-	batch.Close()
-
-	log.Printf("fsm: restored %d keys from snapshot", count)
-	return nil
+	return checkpointRestore(f, rc)
 }
 
 func readBytesStream(r io.Reader) ([]byte, error) {
@@ -321,62 +311,125 @@ func readBytesStream(r io.Reader) ([]byte, error) {
 	return data, nil
 }
 
+func writeBytesStream(w io.Writer, data []byte) error {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
+	if _, err := w.Write(lenBuf[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(data)
+	return err
+}
+
 // PebbleSnapshot implements raft.FSMSnapshot.
 type PebbleSnapshot struct {
 	store *PebbleStore
 }
 
-// Persist streams the full Pebble state to the Raft snapshot sink.
+// Persist creates a checkpoint snapshot (PBL3) or falls back to
+// KV-stream (PBL1) for in-memory stores.
 func (s *PebbleSnapshot) Persist(sink raft.SnapshotSink) error {
-	// Iterate all keys in Pebble and stream them
-	iter, err := s.store.db.NewIter(nil)
-	if err != nil {
+	if s.store.cfg.UseInMemory {
+		return persistKVStream(s.store, sink)
+	}
+
+	cpDir := filepath.Join(filepath.Dir(s.store.cfg.Dir), fmt.Sprintf("raft-checkpoint-%d", time.Now().UnixNano()))
+	defer os.RemoveAll(cpDir)
+
+	if err := s.store.db.Checkpoint(cpDir); err != nil {
 		sink.Cancel()
-		return fmt.Errorf("pebble iter: %w", err)
-	}
-	defer iter.Close()
-
-	// First pass: count keys
-	var count uint64
-	for iter.First(); iter.Valid(); iter.Next() {
-		count++
+		return fmt.Errorf("pebble checkpoint: %w", err)
 	}
 
-	// Write header
-	header := make([]byte, 12)
-	copy(header[:4], snapshotMagic)
-	binary.BigEndian.PutUint64(header[4:], count)
-	if _, err := sink.Write(header); err != nil {
+	if err := checkpointWriteDir(cpDir, sink); err != nil {
 		sink.Cancel()
-		return err
-	}
-
-	// Second pass: stream KV pairs
-	for iter.First(); iter.Valid(); iter.Next() {
-		val, err := iter.ValueAndErr()
-		if err != nil {
-			sink.Cancel()
-			return err
-		}
-
-		k := iter.Key()
-		// Write key
-		var lenBuf [4]byte
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(k)))
-		sink.Write(lenBuf[:])
-		sink.Write(k)
-
-		// Write value
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(val)))
-		sink.Write(lenBuf[:])
-		sink.Write(val)
+		return fmt.Errorf("checkpoint persist: %w", err)
 	}
 
 	return sink.Close()
 }
 
+// persistKVStream writes the legacy PBL1 KV-stream format.
+func persistKVStream(store *PebbleStore, sink raft.SnapshotSink) error {
+	if _, err := sink.Write([]byte("PBL1")); err != nil {
+		sink.Cancel()
+		return fmt.Errorf("write magic: %w", err)
+	}
+
+	zw, err := zstd.NewWriter(sink)
+	if err != nil {
+		sink.Cancel()
+		return fmt.Errorf("zstd new: %w", err)
+	}
+
+	iter, err := store.db.NewIter(nil)
+	if err != nil {
+		zw.Close()
+		sink.Cancel()
+		return fmt.Errorf("pebble iter: %w", err)
+	}
+
+	var count uint64
+	var iterErr error
+	for iter.First(); iter.Valid(); iter.Next() {
+		val, err := iter.ValueAndErr()
+		if err != nil {
+			iterErr = fmt.Errorf("value at %q: %w", iter.Key(), err)
+			break
+		}
+		if err := writeBytesStream(zw, iter.Key()); err != nil {
+			iterErr = fmt.Errorf("write key: %w", err)
+			break
+		}
+		if err := writeBytesStream(zw, val); err != nil {
+			iterErr = fmt.Errorf("write val: %w", err)
+			break
+		}
+		count++
+	}
+	iter.Close()
+
+	if iterErr != nil {
+		zw.Close()
+		sink.Cancel()
+		return iterErr
+	}
+
+	var termBuf [4]byte
+	for i := range termBuf {
+		termBuf[i] = 0xFF
+	}
+	if _, err := zw.Write(termBuf[:]); err != nil {
+		zw.Close()
+		sink.Cancel()
+		return fmt.Errorf("write term: %w", err)
+	}
+	var countBuf [8]byte
+	binary.BigEndian.PutUint64(countBuf[:], count)
+	if _, err := zw.Write(countBuf[:]); err != nil {
+		zw.Close()
+		sink.Cancel()
+		return fmt.Errorf("write count: %w", err)
+	}
+
+	if err := zw.Close(); err != nil {
+		sink.Cancel()
+		return fmt.Errorf("zstd close: %w", err)
+	}
+	return sink.Close()
+}
+
 // Release cleans up snapshot resources.
 func (s *PebbleSnapshot) Release() {}
+
+// metaNodeOpsPrefix is the key prefix for storing each metad node's
+// ops HTTP URL in the FSM, keyed by Raft server ID. Used by followers
+// to look up the leader's ops address for auto-forwarding.
+const metaNodeOpsPrefix = "/_raft/nodes/"
+
+func metaNodeOpsKey(serverID string) string {
+	return metaNodeOpsPrefix + serverID
+}
 
 // ============================================================
 // RaftNode — Full Raft lifecycle management
@@ -384,11 +437,17 @@ func (s *PebbleSnapshot) Release() {}
 
 // RaftNode wraps a hashicorp/raft instance backed by Pebble as the FSM.
 type RaftNode struct {
-	raft     *raft.Raft
-	fsm      *PebbleFSM
-	raftDir  string
-	nodeID   string
-	bindAddr string
+	raft         *raft.Raft
+	fsm          *PebbleFSM
+	raftDir      string
+	nodeID       string
+	bindAddr     string
+	advertiseOps string            // Our own ops HTTP address
+	peerOps      map[string]string // Raft node ID → ops HTTP address
+
+	// BatchApply coalesces multiple write entries into a single Raft Apply,
+	// reducing consensus overhead for metadata-intensive workloads.
+	batch *raftBatchWriter
 }
 
 // RaftNodeConfig configures a RaftNode.
@@ -400,10 +459,38 @@ type RaftNodeConfig struct {
 	JoinAddr  string
 	Peers     []string
 
-	// Snapshot policy
+	// AdvertiseOpsAddr is the HTTP ops URL (e.g. "http://10.0.0.1:8091")
+	// that other metad nodes should use to reach this node's ops API.
+	// Used by followers to redirect mutating write requests to the leader.
+	AdvertiseOpsAddr string
+
+	// PeerOpsURLs maps Raft node ID → ops HTTP URL for auto-forwarding.
+	// Populated from config when each node's ops address is known.
+	PeerOpsURLs map[string]string
+
+	// Raft timing (zero value = use hashicorp/raft defaults: 1s, 1s, 500ms)
+	HeartbeatTimeout   time.Duration
+	ElectionTimeout    time.Duration
+	LeaderLeaseTimeout time.Duration
+
+	// Snapshot policy (zero value = sensible defaults)
 	SnapshotThreshold uint64        // Logs before triggering snapshot (default: 8192)
 	SnapshotInterval  time.Duration // Min time between snapshots (default: 2min)
 	TrailingLogs      uint64        // Logs to retain after snapshot (default: 10240)
+
+	// PreVote enables the Pre-Vote protocol extension (default: true).
+	// When enabled, a partitioned node will not disrupt the current leader
+	// by starting an election unless it can communicate with a majority.
+	// This prevents election storms in network partitions.
+	// Use a pointer so we can distinguish "not set" (nil → default true)
+	// from "explicitly disabled" (false).
+	PreVote *bool
+
+	// ElectionPriority is a hint for leader election preference (0-255).
+	// Higher values indicate a more preferred leader. This is used as a
+	// tiebreaker: higher-priority nodes use shorter election timeouts,
+	// making them more likely to win elections. Set to 0 (default) for no preference.
+	ElectionPriority uint8
 }
 
 // NewRaftNode creates and starts a new Raft node.
@@ -411,6 +498,17 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 	raftConfig := raft.DefaultConfig()
 	raftConfig.LocalID = raft.ServerID(cfg.NodeID)
 	raftConfig.LogOutput = io.Discard
+
+	// Apply Raft timing configuration
+	if cfg.HeartbeatTimeout > 0 {
+		raftConfig.HeartbeatTimeout = cfg.HeartbeatTimeout
+	}
+	if cfg.ElectionTimeout > 0 {
+		raftConfig.ElectionTimeout = cfg.ElectionTimeout
+	}
+	if cfg.LeaderLeaseTimeout > 0 {
+		raftConfig.LeaderLeaseTimeout = cfg.LeaderLeaseTimeout
+	}
 
 	// Apply snapshot/log retention policy
 	if cfg.SnapshotThreshold > 0 {
@@ -422,6 +520,30 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 	if cfg.TrailingLogs > 0 {
 		raftConfig.TrailingLogs = cfg.TrailingLogs
 	}
+
+	// PreVote: enabled by default to prevent election storms in partitions.
+	// A partitioned node will not disrupt the leader unless it can communicate
+	// with a majority, avoiding unnecessary leader changes.
+	// In hashicorp/raft v1.x, PreVote is enabled via ProtocolVersion >= 3.
+	enablePreVote := true
+	if cfg.PreVote != nil {
+		enablePreVote = *cfg.PreVote
+	}
+	if enablePreVote {
+		raftConfig.ProtocolVersion = 3
+	}
+
+	// Election priority: HashiCorp Raft does not natively support priority-based
+	// leader election. We implement a practical workaround: higher-priority nodes
+	// use shorter ElectionTimeout, making them more likely to initiate elections
+	// first when the leader fails. This is a soft preference, not a guarantee.
+	if cfg.ElectionPriority > 0 && cfg.ElectionTimeout == 0 {
+		// Scale election timeout inversely with priority (0-255).
+		// Priority 255 → ~50% of default timeout, Priority 1 → ~95% of default.
+		factor := 0.5 + 0.5*float64(255-cfg.ElectionPriority)/255.0
+		raftConfig.ElectionTimeout = time.Duration(float64(raftConfig.ElectionTimeout) * factor)
+	}
+	_ = cfg.ElectionPriority
 
 	// Directories
 	logDir := filepath.Join(cfg.RaftDir, "log")
@@ -474,13 +596,19 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 		}
 		f := r.BootstrapCluster(raft.Configuration{Servers: servers})
 		if err := f.Error(); err != nil && err != raft.ErrCantBootstrap {
-			log.Printf("raft bootstrap warning: %v", err)
+			slog.Warn("raft bootstrap warning", "error", err)
 		}
 	}
 
+	peerOps := cfg.PeerOpsURLs
+	if peerOps == nil {
+		peerOps = make(map[string]string)
+	}
 	return &RaftNode{
 		raft: r, fsm: fsm, raftDir: cfg.RaftDir,
 		nodeID: cfg.NodeID, bindAddr: cfg.BindAddr,
+		advertiseOps: cfg.AdvertiseOpsAddr,
+		peerOps:      peerOps,
 	}, nil
 }
 
@@ -495,13 +623,149 @@ func (n *RaftNode) LeaderAddr() string {
 	return string(addr)
 }
 
+// LeaderOpsAddr returns the HTTP ops URL of the current leader,
+// or empty string if this is a single-node deployment (Raft disabled).
+func (n *RaftNode) LeaderOpsAddr() string {
+	addr, id := n.raft.LeaderWithID()
+	if addr == "" {
+		return ""
+	}
+	// If we are the leader, use our own ops address
+	if n.IsLeader() {
+		return n.advertiseOps
+	}
+	// Look up the leader's ops address from the peer map
+	if ops, ok := n.peerOps[string(id)]; ok {
+		return ops
+	}
+	// FSM lookup: each metad node stores its ops URL in the FSM on startup
+	if n.fsm.store.db != nil {
+		key := []byte(metaNodeOpsKey(string(id)))
+		val, closer, err := n.fsm.store.db.Get(key)
+		if err == nil {
+			defer closer.Close()
+			data := make([]byte, len(val))
+			copy(data, val)
+			return string(data)
+		}
+	}
+	// Last-resort fallback: just use the Raft address with http:// prefix
+	return "http://" + string(addr)
+}
+
+// StoreOpsURL submits this node's ops HTTP URL to the FSM via Raft,
+// making it discoverable by other nodes for auto-forwarding.
+// Must be called after Raft is initialized (may retry on transient errors).
+func (n *RaftNode) StoreOpsURL(timeout time.Duration) error {
+	if n.advertiseOps == "" {
+		return nil
+	}
+	entry := &RaftLogEntry{
+		Op:    OpSet,
+		Key:   []byte(metaNodeOpsKey(n.nodeID)),
+		Value: []byte(n.advertiseOps),
+	}
+	// Use the underlying raft.Raft.Apply (auto-forwards to leader)
+	f := n.raft.Apply(entry.Encode(), timeout)
+	return f.Error()
+}
+
 // Apply sends a write through Raft consensus.
+// Returns an error if this node is not the leader.
 func (n *RaftNode) Apply(entry *RaftLogEntry, timeout time.Duration) error {
 	if !n.IsLeader() {
 		return fmt.Errorf("not leader (leader at %s)", n.LeaderAddr())
 	}
 	f := n.raft.Apply(entry.Encode(), timeout)
 	return f.Error()
+}
+
+// ApplyAutoForward sends a write through Raft consensus, automatically
+// forwarding to the leader if this node is a follower. This eliminates
+// the need for clients to implement redirect/retry logic.
+//
+// If the leader's ops HTTP address is known, the entry is forwarded via
+// an HTTP POST to the leader's /api/v1/raft/apply endpoint. Otherwise,
+// it falls back to the standard Apply error ("not leader").
+func (n *RaftNode) ApplyAutoForward(entry *RaftLogEntry, timeout time.Duration) error {
+	// Fast path: we are the leader
+	if n.IsLeader() {
+		f := n.raft.Apply(entry.Encode(), timeout)
+		return f.Error()
+	}
+
+	// Forward to leader via HTTP
+	leaderOps := n.LeaderOpsAddr()
+	if leaderOps == "" {
+		return fmt.Errorf("not leader and leader address unknown")
+	}
+
+	return n.forwardToLeader(entry, leaderOps, timeout)
+}
+
+// ReadIndex performs a consistent read on a follower by verifying the
+// node's log is caught up to the leader's commit index. This allows
+// followers to serve read requests without forwarding to the leader,
+// reducing leader load and cross-AZ latency.
+//
+// Returns an error if this node has been removed from the cluster or
+// the verification times out.
+func (n *RaftNode) ReadIndex(timeout time.Duration) error {
+	future := n.raft.VerifyLeader()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- future.Error()
+	}()
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("read index: verify leader timeout after %v", timeout)
+	}
+}
+
+// FollowerRead executes a read function with follower read consistency.
+// It first verifies that this node's log is consistent with the leader,
+// then executes the read function locally. If this node is the leader,
+// the read proceeds immediately without verification.
+func (n *RaftNode) FollowerRead(timeout time.Duration, fn func() error) error {
+	if n.IsLeader() {
+		return fn()
+	}
+	if err := n.ReadIndex(timeout); err != nil {
+		return fmt.Errorf("follower read: %w", err)
+	}
+	return fn()
+}
+
+// forwardToLeader sends a Raft log entry to the leader's ops HTTP endpoint.
+func (n *RaftNode) forwardToLeader(entry *RaftLogEntry, leaderOps string, timeout time.Duration) error {
+	encoded := entry.Encode()
+
+	// Use the internal raft apply endpoint on the leader node
+	url := leaderOps + "/api/v1/raft/apply"
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(encoded))
+	if err != nil {
+		return fmt.Errorf("forward: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Forwarded-By", n.nodeID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("forward to %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("forward to %s: status %d: %s", url, resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 // ApplySet is a convenience method for a single key-value set.
@@ -559,4 +823,113 @@ func EncodeSetJSON(key string, v interface{}) (*RaftLogEntry, error) {
 		return nil, err
 	}
 	return &RaftLogEntry{Op: OpSet, Key: []byte(key), Value: data}, nil
+}
+
+// ============================================================
+// Raft Batch Writer — coalesces multiple writes into one Apply
+// ============================================================
+
+// raftBatchWriter collects write entries and flushes them as a single
+// Raft Apply (OpBatch). This reduces consensus round-trips for
+// metadata-intensive workloads like bulk file creation.
+type raftBatchWriter struct {
+	node    *RaftNode
+	mu      sync.Mutex
+	pending []BatchOp
+	waiters []chan error
+	timer   *time.Timer
+	maxOps  int           // Flush when this many ops are collected
+	maxWait time.Duration // Flush after this duration regardless
+}
+
+// newRaftBatchWriter creates a batch writer attached to the given RaftNode.
+func newRaftBatchWriter(node *RaftNode, maxOps int, maxWait time.Duration) *raftBatchWriter {
+	if maxOps <= 0 {
+		maxOps = 64
+	}
+	if maxWait <= 0 {
+		maxWait = 5 * time.Millisecond
+	}
+	return &raftBatchWriter{
+		node:    node,
+		maxOps:  maxOps,
+		maxWait: maxWait,
+	}
+}
+
+// ApplyBatched adds a write operation to the current batch. When the batch
+// is full (maxOps) or the timer expires (maxWait), all pending ops are
+// submitted as a single Raft Apply. The caller blocks until the batch
+// containing their op is committed.
+func (bw *raftBatchWriter) ApplyBatched(op BatchOp, timeout time.Duration) error {
+	bw.mu.Lock()
+
+	bw.pending = append(bw.pending, op)
+	ch := make(chan error, 1)
+	bw.waiters = append(bw.waiters, ch)
+
+	// Start timer on first op in batch
+	if len(bw.pending) == 1 {
+		bw.timer = time.AfterFunc(bw.maxWait, func() { bw.flush() })
+	}
+
+	// Flush immediately if batch is full
+	if len(bw.pending) >= bw.maxOps {
+		if bw.timer != nil {
+			bw.timer.Stop()
+		}
+		bw.mu.Unlock()
+		bw.flush()
+	} else {
+		bw.mu.Unlock()
+	}
+
+	// Wait for result
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("batch apply timeout after %v", timeout)
+	}
+}
+
+// flush sends all pending ops as a single Raft Apply and notifies waiters.
+func (bw *raftBatchWriter) flush() {
+	bw.mu.Lock()
+	ops := bw.pending
+	waiters := bw.waiters
+	bw.pending = nil
+	bw.waiters = nil
+	bw.mu.Unlock()
+
+	if len(ops) == 0 {
+		return
+	}
+
+	entry := &RaftLogEntry{Op: OpBatch, Batch: ops}
+	err := bw.node.Apply(entry, 10*time.Second)
+
+	for _, ch := range waiters {
+		ch <- err
+	}
+}
+
+// StartBatchedApply enables batched write mode on the RaftNode.
+// After calling this, use ApplyBatched for write operations to benefit
+// from automatic coalescing.
+func (n *RaftNode) StartBatchedApply(maxOps int, maxWait time.Duration) {
+	n.batch = newRaftBatchWriter(n, maxOps, maxWait)
+}
+
+// ApplyBatched submits a single write operation through the batch writer.
+// If batch mode is not enabled, falls back to a regular Apply.
+func (n *RaftNode) ApplyBatched(op BatchOp, timeout time.Duration) error {
+	if n.batch == nil {
+		opType := OpSet
+		if op.Delete {
+			opType = OpDelete
+		}
+		return n.Apply(&RaftLogEntry{Op: opType, Key: op.Key, Value: op.Value}, timeout)
+	}
+	return n.batch.ApplyBatched(op, timeout)
 }

@@ -32,6 +32,14 @@ type ChunkStore struct {
 
 	// WAL for crash recovery — logs before write, commits after fsync
 	wal *WriteAheadLog
+
+	// File descriptor cache for hot chunks — maps ChunkID to its open file.
+	// Uses LRU eviction to bound the number of open file descriptors.
+	// Replaces the previous sync.Pool which could return wrong chunk fds.
+	fdMu    sync.RWMutex
+	fdCache map[metadata.ChunkID]*os.File
+	fdList  *fdLRU // LRU eviction tracker
+	fdMax   int    // Maximum cached file descriptors
 }
 
 // NewChunkStore creates a new chunk store at the given data directory.
@@ -54,6 +62,9 @@ func NewChunkStore(dataDir string, maxWrites, maxReads int, wal *WriteAheadLog) 
 		writeSem:  make(chan struct{}, maxWrites),
 		readSem:   make(chan struct{}, maxReads),
 		wal:       wal,
+		fdCache:   make(map[metadata.ChunkID]*os.File),
+		fdList:    newFdLRU(256), // cache up to 256 file descriptors
+		fdMax:     256,
 	}
 
 	// Scan existing chunks on startup
@@ -191,23 +202,24 @@ func (cs *ChunkStore) WriteAt(chunkID metadata.ChunkID, offset int64, data []byt
 
 // Read retrieves chunk data from local disk.
 // If offset and length are 0, reads the entire chunk.
+// Uses the LRU file descriptor cache for hot chunks to avoid repeated open/close.
 func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32) ([]byte, uint32, error) {
 	cs.readSem <- struct{}{}
 	defer func() { <-cs.readSem }()
 
 	path := cs.chunkPath(chunkID)
 
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, 0, fmt.Errorf("datanode: %w: chunk %d", metadata.ErrChunkNotFound, chunkID)
-		}
-		return nil, 0, fmt.Errorf("datanode: open chunk file: %w", err)
+	// Get file descriptor from LRU cache (correct chunk ID mapping)
+	f := cs.getFd(chunkID, path)
+	if f == nil {
+		return nil, 0, fmt.Errorf("datanode: %w: chunk %d", metadata.ErrChunkNotFound, chunkID)
 	}
-	defer f.Close()
 
 	// Read and verify header
 	header := make([]byte, ChunkFileHeaderSize)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, 0, fmt.Errorf("datanode: seek header: %w", err)
+	}
 	if _, err := io.ReadFull(f, header); err != nil {
 		return nil, 0, fmt.Errorf("datanode: read header: %w", err)
 	}
@@ -249,50 +261,33 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 	return data, storedChecksum, nil
 }
 
-// Seal finalizes a chunk: computes checksum over the full data and updates the header.
+// Seal finalizes a chunk: updates the state to sealed.
+// Since Write already computes the CRC32 checksum via rolling hash and
+// stores it in the header, Seal no longer needs to re-read the entire
+// chunk data. It only updates the in-memory state and metadata sidecar.
 func (cs *ChunkStore) Seal(chunkID metadata.ChunkID) (uint32, error) {
 	cs.writeSem <- struct{}{}
 	defer func() { <-cs.writeSem }()
 
-	path := cs.chunkPath(chunkID)
-	f, err := os.OpenFile(path, os.O_RDWR, 0644)
-	if err != nil {
-		return 0, fmt.Errorf("datanode: open chunk for seal: %w", err)
-	}
-	defer f.Close()
-
-	// Read header
-	header := make([]byte, ChunkFileHeaderSize)
-	if _, err := io.ReadFull(f, header); err != nil {
-		return 0, fmt.Errorf("datanode: read header for seal: %w", err)
-	}
-
-	dataLen := binary.BigEndian.Uint32(header[12:16])
-
-	// Read all data for checksum
-	data := make([]byte, dataLen)
-	if _, err := f.ReadAt(data, int64(ChunkFileHeaderSize)); err != nil {
-		return 0, fmt.Errorf("datanode: read data for seal: %w", err)
-	}
-
-	checksum := crc32.ChecksumIEEE(data)
-
-	// Update header with checksum
-	binary.BigEndian.PutUint32(header[16:20], checksum)
-	if _, err := f.WriteAt(header, 0); err != nil {
-		return 0, fmt.Errorf("datanode: write sealed header: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		return 0, fmt.Errorf("datanode: fsync seal: %w", err)
-	}
-
-	// Update in-memory state
 	cs.mu.Lock()
-	if info, ok := cs.chunks[chunkID]; ok {
-		info.State = LocalSealed
-		info.Checksum = checksum
+	info, ok := cs.chunks[chunkID]
+	if !ok {
+		cs.mu.Unlock()
+		return 0, fmt.Errorf("datanode: seal: chunk %d not found", chunkID)
 	}
+	if info.State == LocalSealed {
+		checksum := info.Checksum
+		cs.mu.Unlock()
+		return checksum, nil
+	}
+
+	// Checksum was already computed during Write — just update state
+	info.State = LocalSealed
+	checksum := info.Checksum
 	cs.mu.Unlock()
+
+	// Update metadata sidecar with sealed state
+	cs.writeMetaSidecar(chunkID, info)
 
 	return checksum, nil
 }
@@ -414,4 +409,132 @@ func (cs *ChunkStore) writeMetaSidecar(chunkID metadata.ChunkID, info *LocalChun
 	}
 	path := cs.metaPath(chunkID)
 	_ = os.WriteFile(path, data, 0644)
+}
+
+// ============================================================
+// LRU File Descriptor Cache
+// ============================================================
+
+// fdLRU implements a simple LRU tracker for file descriptor eviction.
+// It tracks access order without storing the actual values (those live in fdCache).
+type fdLRU struct {
+	mu       sync.Mutex
+	capacity int
+	order    []metadata.ChunkID // front = oldest, back = newest
+	set      map[metadata.ChunkID]struct{}
+}
+
+func newFdLRU(capacity int) *fdLRU {
+	return &fdLRU{
+		capacity: capacity,
+		order:    make([]metadata.ChunkID, 0, capacity),
+		set:      make(map[metadata.ChunkID]struct{}),
+	}
+}
+
+// touch marks a chunk ID as recently used, moving it to the back.
+func (l *fdLRU) touch(id metadata.ChunkID) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.set[id]; ok {
+		// Remove from current position
+		for i, v := range l.order {
+			if v == id {
+				l.order = append(l.order[:i], l.order[i+1:]...)
+				break
+			}
+		}
+	}
+	l.order = append(l.order, id)
+	l.set[id] = struct{}{}
+}
+
+// evictOne returns the least recently used chunk ID for eviction, or 0 if empty.
+func (l *fdLRU) evictOne() metadata.ChunkID {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.order) == 0 {
+		return 0
+	}
+	id := l.order[0]
+	l.order = l.order[1:]
+	delete(l.set, id)
+	return id
+}
+
+// remove removes a chunk ID from the LRU tracker.
+func (l *fdLRU) remove(id metadata.ChunkID) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.set[id]; ok {
+		for i, v := range l.order {
+			if v == id {
+				l.order = append(l.order[:i], l.order[i+1:]...)
+				break
+			}
+		}
+		delete(l.set, id)
+	}
+}
+
+// len returns the number of tracked items.
+func (l *fdLRU) len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.order)
+}
+
+// getFd retrieves or opens a file descriptor for the given chunk.
+// It uses the LRU cache to avoid repeated open/close syscalls and ensures
+// the correct file descriptor is returned for each chunk ID.
+func (cs *ChunkStore) getFd(chunkID metadata.ChunkID, path string) *os.File {
+	cs.fdMu.RLock()
+	f, ok := cs.fdCache[chunkID]
+	cs.fdMu.RUnlock()
+
+	if ok {
+		cs.fdList.touch(chunkID)
+		return f
+	}
+
+	// Open the file
+	newF, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+
+	cs.fdMu.Lock()
+	defer cs.fdMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if f, ok := cs.fdCache[chunkID]; ok {
+		newF.Close()
+		cs.fdList.touch(chunkID)
+		return f
+	}
+
+	// Evict if at capacity
+	for cs.fdList.len() >= cs.fdMax {
+		evictID := cs.fdList.evictOne()
+		if evictID != 0 {
+			if oldF, ok := cs.fdCache[evictID]; ok {
+				oldF.Close()
+				delete(cs.fdCache, evictID)
+			}
+		}
+	}
+
+	cs.fdCache[chunkID] = newF
+	cs.fdList.touch(chunkID)
+	return newF
+}
+
+// closeFdCache closes all cached file descriptors.
+func (cs *ChunkStore) closeFdCache() {
+	cs.fdMu.Lock()
+	defer cs.fdMu.Unlock()
+	for id, f := range cs.fdCache {
+		f.Close()
+		delete(cs.fdCache, id)
+	}
 }

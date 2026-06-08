@@ -8,7 +8,7 @@ GOFLAGS := -trimpath
 LDFLAGS := -s -w
 
 # All service binaries
-BINS := metad datanode s3gw fusegw ctl
+BINS := metad datanode nufs-s3 nufs-fuse nufs-cli
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -54,9 +54,9 @@ lint: ## Run golangci-lint
 docker: ## Build Docker images
 	docker build --target metad    -t dfs-metad    .
 	docker build --target datanode -t dfs-datanode .
-	docker build --target s3gw     -t dfs-s3gw     .
-	docker build --target fusegw   -t dfs-fusegw   .
-	docker build --target ctl      -t dfs-ctl      .
+	docker build --target nufs-s3  -t dfs-nufs-s3  .
+	docker build --target nufs-fuse -t dfs-nufs-fuse .
+	docker build --target nufs-cli -t dfs-nufs-cli .
 
 docker-up: ## Start DFS cluster with docker-compose
 	docker-compose up -d --build

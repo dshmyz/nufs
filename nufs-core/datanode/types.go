@@ -57,6 +57,15 @@ type Config struct {
 
 	// ClientTimeout is the default timeout for inter-node TCP operations.
 	ClientTimeout time.Duration
+
+	// MaxConnections limits the number of concurrent TCP connections.
+	// Default: 256. Set to 0 for unlimited.
+	MaxConnections int
+
+	// RequestTimeout is the per-request timeout for TCP operations.
+	// Slow clients that exceed this timeout will be disconnected.
+	// Default: 30s.
+	RequestTimeout time.Duration
 }
 
 // DefaultConfig returns a Config with sensible defaults.

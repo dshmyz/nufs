@@ -141,43 +141,27 @@ func TestECEncoder_InsufficientShards(t *testing.T) {
 }
 
 func TestECEncoder_InvalidShardCounts(t *testing.T) {
-	ec := NewECEncoder(0, 2)
-	_, err := ec.Encode([]byte("test"))
-	if err == nil {
-		t.Error("expected error for k=0")
-	}
+	// NewECEncoder panics on k=0 (klauspost/reedsolomon requires at least 1 data shard).
+	// m=0 is valid (no parity).
 
-	ec2 := NewECEncoder(4, 0)
-	_, err = ec2.Encode([]byte("test"))
-	if err == nil {
-		t.Error("expected error for m=0")
-	}
-}
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("expected panic for k=0")
+			}
+		}()
+		NewECEncoder(0, 2)
+	}()
 
-func TestGFMul(t *testing.T) {
-	// Test basic GF(256) multiplication
-	if gfMul(0, 5) != 0 {
-		t.Error("0 * 5 should be 0")
+	// m=0 should work (no parity shards)
+	ec := NewECEncoder(4, 0)
+	data := []byte("test data here!!")
+	result, err := ec.Encode(data)
+	if err != nil {
+		t.Fatalf("m=0 should work: %v", err)
 	}
-	if gfMul(5, 0) != 0 {
-		t.Error("5 * 0 should be 0")
-	}
-	if gfMul(1, 5) != 5 {
-		t.Errorf("1 * 5 should be 5, got %d", gfMul(1, 5))
-	}
-	if gfMul(5, 1) != 5 {
-		t.Errorf("5 * 1 should be 5, got %d", gfMul(5, 1))
-	}
-}
-
-func TestGFInv(t *testing.T) {
-	// a * inv(a) = 1 for all non-zero a
-	for a := 1; a < 256; a++ {
-		inv := gfInv(byte(a))
-		product := gfMul(byte(a), inv)
-		if product != 1 {
-			t.Errorf("gfMul(%d, gfInv(%d)) = %d, want 1", a, a, product)
-		}
+	if len(result.ParityShards) != 0 {
+		t.Errorf("expected 0 parity shards, got %d", len(result.ParityShards))
 	}
 }
 

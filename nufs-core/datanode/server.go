@@ -18,6 +18,8 @@ import (
 )
 
 // Server is the data node TCP server that handles chunk read/write/replicate requests.
+// It supports connection limiting, request-level timeouts, and backpressure
+// to protect against connection storms and slow clients.
 type Server struct {
 	cfg        Config
 	store      *ChunkStore
@@ -25,13 +27,28 @@ type Server struct {
 	wg         sync.WaitGroup
 	running    atomic.Bool
 	requestSeq atomic.Uint64
+
+	// Connection management
+	connSem    chan struct{}   // Semaphore limiting concurrent connections
+	activeConn atomic.Int64   // Current active connection count
+	reqTimeout time.Duration  // Per-request timeout (0 = no timeout)
 }
 
 // NewServer creates a new data node server.
 func NewServer(cfg Config, store *ChunkStore) *Server {
+	maxConns := cfg.MaxConnections
+	if maxConns <= 0 {
+		maxConns = 256 // Default: 256 concurrent connections
+	}
+	reqTimeout := cfg.RequestTimeout
+	if reqTimeout <= 0 {
+		reqTimeout = 30 * time.Second
+	}
 	return &Server{
-		cfg:   cfg,
-		store: store,
+		cfg:        cfg,
+		store:      store,
+		connSem:    make(chan struct{}, maxConns),
+		reqTimeout: reqTimeout,
 	}
 }
 
@@ -75,6 +92,19 @@ func (s *Server) acceptLoop() {
 			}
 			continue
 		}
+
+		// Connection limiting: reject if at capacity
+		select {
+		case s.connSem <- struct{}{}:
+			// Got a slot
+		default:
+			log.Printf("datanode: rejecting connection from %s: max connections reached (%d)",
+				conn.RemoteAddr(), cap(s.connSem))
+			conn.Close()
+			continue
+		}
+
+		s.activeConn.Add(1)
 		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
@@ -83,6 +113,15 @@ func (s *Server) acceptLoop() {
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
+	defer func() {
+		<-s.connSem // Release connection slot
+		s.activeConn.Add(-1)
+	}()
+
+	// Set initial deadline for the first request
+	if s.reqTimeout > 0 {
+		conn.SetDeadline(time.Now().Add(s.reqTimeout))
+	}
 
 	for s.running.Load() {
 		header, body, err := readMessage(conn)
@@ -91,6 +130,11 @@ func (s *Server) handleConn(conn net.Conn) {
 				log.Printf("datanode: read message: %v", err)
 			}
 			return
+		}
+
+		// Reset deadline for each request (backpressure: slow clients get disconnected)
+		if s.reqTimeout > 0 {
+			conn.SetDeadline(time.Now().Add(s.reqTimeout))
 		}
 
 		resp := s.dispatch(header, body)

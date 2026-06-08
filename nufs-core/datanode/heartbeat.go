@@ -13,7 +13,7 @@ import (
 // to the metadata service.
 type HeartbeatReporter struct {
 	cfg        Config
-	meta       metadata.MetadataService
+	meta       HeartbeatMeta
 	chunkSt    *ChunkStore
 	interval   time.Duration
 	ctx        context.Context
@@ -23,7 +23,7 @@ type HeartbeatReporter struct {
 }
 
 // NewHeartbeatReporter creates a new heartbeat reporter.
-func NewHeartbeatReporter(cfg Config, metaStore metadata.MetadataService, chunkStore *ChunkStore) *HeartbeatReporter {
+func NewHeartbeatReporter(cfg Config, metaStore HeartbeatMeta, chunkStore *ChunkStore) *HeartbeatReporter {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &HeartbeatReporter{
 		cfg:      cfg,
