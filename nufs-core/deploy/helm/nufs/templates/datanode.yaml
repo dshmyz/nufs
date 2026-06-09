@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-datanode
+  labels:
+    {{- include "nufs.datanode.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ .Release.Name }}-datanode
+  replicas: {{ .Values.datanode.replicaCount }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.upgradeStrategy.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "nufs.datanode.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nufs.datanode.labels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.datanode.service.opsPort }}"
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: datanode
+          image: "{{ .Values.global.imageRegistry }}{{ .Values.datanode.image.repository }}:{{ .Values.datanode.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.datanode.image.pullPolicy }}
+          ports:
+            - name: data
+              containerPort: {{ .Values.datanode.service.dataPort }}
+            - name: ops
+              containerPort: {{ .Values.datanode.service.opsPort }}
+          args:
+            - "--node-id=auto"
+            - "--listen=0.0.0.0:{{ .Values.datanode.service.dataPort }}"
+            - "--ops-addr=0.0.0.0:{{ .Values.datanode.service.opsPort }}"
+            - "--data-dir=/data"
+            - "--metadata={{ .Release.Name }}-metad:{{ .Values.metad.service.port }}"
+            - "--capacity={{ .Values.datanode.config.capacityGB }}"
+            - "--rack={{ .Values.datanode.config.rack }}"
+            - "--zone={{ .Values.datanode.config.zone }}"
+            - "--log-json=true"
+            {{- if .Values.observability.tracing.enabled }}
+            - "--trace-enabled=true"
+            - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
+            - "--trace-insecure={{ .Values.observability.tracing.insecure }}"
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{- if .Values.datanode.config.tls.enabled }}
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.datanode.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: ops
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: ops
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        {{- if .Values.datanode.config.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.datanode.config.tls.certSecret }}
+        {{- end }}
+      {{- with .Values.datanode.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.datanode.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.datanode.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.global.storageClass }}
+        storageClassName: {{ .Values.global.storageClass }}
+        {{- else if .Values.datanode.persistence.storageClass }}
+        storageClassName: {{ .Values.datanode.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.datanode.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-datanode
+  labels:
+    {{- include "nufs.datanode.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.datanode.service.type }}
+  ports:
+    - name: data
+      port: {{ .Values.datanode.service.dataPort }}
+      targetPort: data
+    - name: ops
+      port: {{ .Values.datanode.service.opsPort }}
+      targetPort: ops
+  selector:
+    {{- include "nufs.datanode.labels" . | nindent 4 }}

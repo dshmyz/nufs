@@ -1,0 +1,236 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "NUFS distributed storage system overview dashboard",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Cluster Overview",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "title": "Online Nodes",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "targets": [{ "expr": "nufs_nodes_online", "legendFormat": "Online" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] },
+          "mappings": []
+        }
+      }
+    },
+    {
+      "title": "Total Nodes",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "targets": [{ "expr": "nufs_nodes_total", "legendFormat": "Total" }]
+    },
+    {
+      "title": "Buckets",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "targets": [{ "expr": "nufs_buckets_total", "legendFormat": "Buckets" }]
+    },
+    {
+      "title": "Total Chunks",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "targets": [{ "expr": "nufs_chunks_total", "legendFormat": "Chunks" }]
+    },
+    {
+      "title": "Metadata Keys",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "targets": [{ "expr": "nufs_keys_total", "legendFormat": "Keys" }]
+    },
+    {
+      "title": "Cache Hit Rate",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "targets": [{
+        "expr": "rate(nufs_cache_hits_total[5m]) / (rate(nufs_cache_hits_total[5m]) + rate(nufs_cache_misses_total[5m])) * 100",
+        "legendFormat": "Hit Rate %"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 50 }, { "color": "green", "value": 80 }] },
+          "min": 0, "max": 100
+        }
+      }
+    },
+    {
+      "title": "Operations",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
+    },
+    {
+      "title": "Operations Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "rate(nufs_ops_total[5m])", "legendFormat": "Total ops/s" },
+        { "expr": "rate(nufs_read_ops_total[5m])", "legendFormat": "Read ops/s" },
+        { "expr": "rate(nufs_write_ops_total[5m])", "legendFormat": "Write ops/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "title": "Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "expr": "rate(nufs_errors_total[5m])", "legendFormat": "Errors/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "color": { "mode": "fixed", "fixedColor": "red" } }
+      }
+    },
+    {
+      "title": "Latency",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }
+    },
+    {
+      "title": "Read Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        { "expr": "nufs_read_latency_us{quantile=\"0.5\"}", "legendFormat": "p50" },
+        { "expr": "nufs_read_latency_us{quantile=\"0.99\"}", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "\u00b5s" }
+      }
+    },
+    {
+      "title": "Write Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        { "expr": "nufs_write_latency_us{quantile=\"0.5\"}", "legendFormat": "p50" },
+        { "expr": "nufs_write_latency_us{quantile=\"0.99\"}", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "\u00b5s" }
+      }
+    },
+    {
+      "title": "Disk I/O",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }
+    },
+    {
+      "title": "Disk Throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        { "expr": "rate(nufs_disk_read_bytes_total[5m])", "legendFormat": "Read B/s" },
+        { "expr": "rate(nufs_disk_write_bytes_total[5m])", "legendFormat": "Write B/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" }
+      }
+    },
+    {
+      "title": "Disk Usage",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 24 },
+      "targets": [{
+        "expr": "nufs_disk_used_bytes / nufs_disk_capacity_bytes * 100",
+        "legendFormat": "Usage %"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 90 }] },
+          "min": 0, "max": 100
+        }
+      }
+    },
+    {
+      "title": "Disk State",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 24 },
+      "targets": [
+        { "expr": "nufs_disk_state{state=\"healthy\"}", "legendFormat": "Healthy" },
+        { "expr": "nufs_disk_state{state=\"degraded\"}", "legendFormat": "Degraded" },
+        { "expr": "nufs_disk_state{state=\"failed\"}", "legendFormat": "Failed" }
+      ]
+    },
+    {
+      "title": "Raft Consensus",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 }
+    },
+    {
+      "title": "Raft State",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 33 },
+      "targets": [{ "expr": "nufs_raft_state", "legendFormat": "State" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "Follower", "color": "blue" }, "1": { "text": "Candidate", "color": "yellow" }, "2": { "text": "Leader", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Raft Term",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 33 },
+      "targets": [{ "expr": "nufs_raft_term", "legendFormat": "Term" }]
+    },
+    {
+      "title": "Raft Log Index",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 33 },
+      "targets": [{ "expr": "nufs_raft_log_index", "legendFormat": "Log Index" }]
+    },
+    {
+      "title": "WAL & GC",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 37 }
+    },
+    {
+      "title": "WAL Fsync Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 38 },
+      "targets": [
+        { "expr": "rate(nufs_wal_fsync_total[5m])", "legendFormat": "Fsync/s" },
+        { "expr": "rate(nufs_wal_bytes_written_total[5m])", "legendFormat": "Bytes/s" }
+      ]
+    },
+    {
+      "title": "GC Activity",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 38 },
+      "targets": [
+        { "expr": "rate(nufs_gc_scanned_chunks[5m])", "legendFormat": "Scanned/s" },
+        { "expr": "rate(nufs_gc_deleted_chunks[5m])", "legendFormat": "Deleted/s" }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["nufs", "storage"],
+  "templating": {
+    "list": []
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "NUFS Storage Overview",
+  "uid": "nufs-overview",
+  "version": 1
+}

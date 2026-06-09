@@ -1,0 +1,31 @@
+{{- if .Values.observability.prometheus.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}-metad
+  labels:
+    {{- include "nufs.metad.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "nufs.metad.labels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      interval: {{ .Values.observability.prometheus.serviceMonitor.interval }}
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}-datanode
+  labels:
+    {{- include "nufs.datanode.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "nufs.datanode.labels" . | nindent 6 }}
+  endpoints:
+    - port: ops
+      interval: {{ .Values.observability.prometheus.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}

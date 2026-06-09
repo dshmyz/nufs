@@ -1,0 +1,131 @@
+# NUFS Prometheus Alerting Rules
+# These rules intentionally reference metrics emitted by the current metad and
+# datanode exporters. Run `promtool check rules alerting-rules.yaml` after edits.
+
+groups:
+  - name: nufs.critical
+    rules:
+      - alert: NUFSClusterQuorumAtRisk
+        expr: nufs_nodes_total > 0 and nufs_nodes_online / nufs_nodes_total < 0.66
+        for: 2m
+        labels:
+          severity: critical
+          team: storage
+          component: metad
+        annotations:
+          summary: "Cluster quorum is at risk: less than 2/3 nodes are online"
+          runbook: "https://docs.nufs.io/runbook/quorum-at-risk"
+
+      - alert: NUFSDiskUsageCritical
+        expr: nufs_disk_capacity_bytes > 0 and nufs_disk_used_bytes / nufs_disk_capacity_bytes > 0.95
+        for: 5m
+        labels:
+          severity: critical
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Disk usage exceeds 95% — writes may fail soon"
+          runbook: "https://docs.nufs.io/runbook/disk-usage-critical"
+
+      - alert: NUFSDiskFailed
+        expr: nufs_disk_state{state="failed"} > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: storage
+          component: datanode
+        annotations:
+          summary: "A datanode disk is marked failed"
+          runbook: "https://docs.nufs.io/runbook/disk-failed"
+
+  - name: nufs.warning
+    rules:
+      - alert: NUFSDiskUsageHigh
+        expr: nufs_disk_capacity_bytes > 0 and nufs_disk_used_bytes / nufs_disk_capacity_bytes > 0.85
+        for: 30m
+        labels:
+          severity: warning
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Disk usage exceeds 85% — rebalance capacity limited"
+          runbook: "https://docs.nufs.io/runbook/disk-usage-high"
+
+      - alert: NUFSNodeOffline
+        expr: nufs_nodes_total > 0 and nufs_nodes_online < nufs_nodes_total * 0.8
+        for: 5m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "More than 20% of registered nodes are offline"
+          runbook: "https://docs.nufs.io/runbook/node-offline"
+
+      - alert: NUFSErrorRateHigh
+        expr: rate(nufs_errors_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Metadata service is reporting errors"
+          runbook: "https://docs.nufs.io/runbook/metad-errors"
+
+      - alert: NUFSMetadReadLatencyHigh
+        expr: nufs_read_latency_us{quantile="0.99"} > 10000
+        for: 10m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Metadata read p99 latency exceeds 10ms SLO"
+          runbook: "https://docs.nufs.io/runbook/metad-read-latency"
+
+      - alert: NUFSMetadWriteLatencyHigh
+        expr: nufs_write_latency_us{quantile="0.99"} > 50000
+        for: 10m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Metadata write p99 latency exceeds 50ms SLO"
+          runbook: "https://docs.nufs.io/runbook/metad-write-latency"
+
+      - alert: NUFSDatanodeReplicationErrors
+        expr: rate(nufs_datanode_replication_errors_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Datanode replication errors observed"
+          runbook: "https://docs.nufs.io/runbook/replication-errors"
+
+      - alert: NUFSAntiEntropyMismatches
+        expr: rate(nufs_datanode_antientropy_mismatches_total[30m]) > 0
+        for: 30m
+        labels:
+          severity: warning
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Anti-entropy found chunk mismatches"
+          runbook: "https://docs.nufs.io/runbook/antientropy-mismatches"
+
+  - name: nufs.info
+    rules:
+      - alert: NUFSDiskDegraded
+        expr: nufs_disk_state{state="degraded"} > 0
+        for: 5m
+        labels:
+          severity: info
+          team: storage
+          component: datanode
+        annotations:
+          summary: "A disk is in degraded state — monitoring for recovery"
+          runbook: "https://docs.nufs.io/runbook/disk-degraded"

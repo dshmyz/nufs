@@ -1,0 +1,13 @@
+apiVersion: v2
+name: nufs
+description: NUFS distributed storage system Helm chart
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - storage
+  - distributed
+  - s3
+home: https://github.com/example/dfs
+maintainers:
+  - name: nufs-team

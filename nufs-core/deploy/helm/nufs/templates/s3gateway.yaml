@@ -1,0 +1,113 @@
+{{- if .Values.s3gateway.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-s3gateway
+  labels:
+    {{- include "nufs.s3gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.s3gateway.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "nufs.s3gateway.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nufs.s3gateway.labels" . | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: s3gateway
+          image: "{{ .Values.global.imageRegistry }}{{ .Values.s3gateway.image.repository }}:{{ .Values.s3gateway.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.s3gateway.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.s3gateway.service.port }}
+          env:
+            - name: NUFS_METAD_ADDR
+              value: "{{ .Release.Name }}-metad:{{ .Values.metad.service.port }}"
+            {{- if .Values.s3gateway.config.rbac.enabled }}
+            - name: NUFS_RBAC_ENABLED
+              value: "true"
+            {{- end }}
+          resources:
+            {{- toYaml .Values.s3gateway.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      {{- with .Values.s3gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.s3gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.s3gateway.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-s3gateway
+  labels:
+    {{- include "nufs.s3gateway.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.s3gateway.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.s3gateway.service.port }}
+      targetPort: http
+  selector:
+    {{- include "nufs.s3gateway.labels" . | nindent 4 }}
+{{- if .Values.s3gateway.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-s3gateway
+  labels:
+    {{- include "nufs.s3gateway.labels" . | nindent 4 }}
+  {{- with .Values.s3gateway.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.s3gateway.ingress.className }}
+  ingressClassName: {{ .Values.s3gateway.ingress.className }}
+  {{- end }}
+  rules:
+    {{- range .Values.s3gateway.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ $.Release.Name }}-s3gateway
+                port:
+                  number: {{ $.Values.s3gateway.service.port }}
+          {{- end }}
+    {{- end }}
+  {{- with .Values.s3gateway.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alerting-rules.yaml"
+
+scrape_configs:
+  - job_name: "metad"
+    static_configs:
+      - targets: ["metad:8091"]
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  - job_name: "datanode-1"
+    static_configs:
+      - targets: ["datanode-1:9100"]
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  - job_name: "datanode-2"
+    static_configs:
+      - targets: ["datanode-2:9101"]
+    metrics_path: /metrics
+    scrape_interval: 10s

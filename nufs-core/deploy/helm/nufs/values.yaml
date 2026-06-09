@@ -1,0 +1,154 @@
+# NUFS Helm Chart Values
+
+# Global settings
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+  storageClass: ""
+
+# metad service configuration
+metad:
+  replicaCount: 3
+  image:
+    repository: nufs/metad
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  service:
+    type: ClusterIP
+    port: 8091
+    raftPort: 7000
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+  config:
+    shardCount: 4
+    raftEnabled: true
+    tls:
+      enabled: false
+      certSecret: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/component
+                  operator: In
+                  values:
+                    - metad
+            topologyKey: kubernetes.io/hostname
+
+# datanode configuration
+datanode:
+  replicaCount: 3
+  image:
+    repository: nufs/datanode
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "4"
+      memory: 4Gi
+  service:
+    type: ClusterIP
+    dataPort: 9100
+    opsPort: 8091
+  persistence:
+    enabled: true
+    size: 100Gi
+    storageClass: ""
+  config:
+    capacityGB: 100
+    rack: rack1
+    zone: zone1
+    writeConcurrency: 64
+    repairWorkers: 4
+    tls:
+      enabled: false
+      certSecret: ""
+    diskManager:
+      warnPct: 0.75
+      criticalPct: 0.85
+      rejectPct: 0.90
+  nodeSelector: {}
+  tolerations: []
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/component
+                  operator: In
+                  values:
+                    - datanode
+            topologyKey: kubernetes.io/hostname
+
+# S3 gateway configuration
+s3gateway:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: nufs/nufs-s3
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  service:
+    type: ClusterIP
+    port: 8080
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    tls: []
+  config:
+    rbac:
+      enabled: false
+      credentialsSecret: ""
+    tls:
+      enabled: false
+      certSecret: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Observability
+observability:
+  tracing:
+    enabled: false
+    endpoint: "otel-collector:4317"
+    insecure: true
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: false
+      interval: 15s
+  pprof:
+    enabled: false
+
+# Rolling upgrade strategy
+upgradeStrategy:
+  maxUnavailable: 1
+  autoRebalance: true

@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-metad
+  labels:
+    {{- include "nufs.metad.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ .Release.Name }}-metad
+  replicas: {{ .Values.metad.replicaCount }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.upgradeStrategy.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "nufs.metad.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nufs.metad.labels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.metad.service.port }}"
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: metad
+          image: "{{ .Values.global.imageRegistry }}{{ .Values.metad.image.repository }}:{{ .Values.metad.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.metad.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.metad.service.port }}
+            - name: raft
+              containerPort: {{ .Values.metad.service.raftPort }}
+          args:
+            - "--data-dir=/data/metadata"
+            - "--ops-addr=0.0.0.0:{{ .Values.metad.service.port }}"
+            - "--node-id=1"
+            - "--raft={{ .Values.metad.config.raftEnabled }}"
+            - "--raft-addr=0.0.0.0:{{ .Values.metad.service.raftPort }}"
+            - "--raft-dir=/data/raft"
+            - "--log-json=true"
+            {{- if .Values.observability.tracing.enabled }}
+            - "--trace-enabled=true"
+            - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
+            - "--trace-insecure={{ .Values.observability.tracing.insecure }}"
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{- if .Values.metad.config.tls.enabled }}
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.metad.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        {{- if .Values.metad.config.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.metad.config.tls.certSecret }}
+        {{- end }}
+      {{- with .Values.metad.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.metad.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.metad.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.global.storageClass }}
+        storageClassName: {{ .Values.global.storageClass }}
+        {{- else if .Values.metad.persistence.storageClass }}
+        storageClassName: {{ .Values.metad.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.metad.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-metad
+  labels:
+    {{- include "nufs.metad.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.metad.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.metad.service.port }}
+      targetPort: http
+    - name: raft
+      port: {{ .Values.metad.service.raftPort }}
+      targetPort: raft
+  selector:
+    {{- include "nufs.metad.labels" . | nindent 4 }}
