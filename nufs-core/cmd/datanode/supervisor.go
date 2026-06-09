@@ -104,7 +104,7 @@ func (sv *supervisor) startChild(dir string, port int) {
 	sv.nextNodeID++
 	sv.mu.Unlock()
 
-	nid := sv.loadOrAllocateNodeID(dir, nextID)
+	nid := loadOrAllocateNodeID(dir, nextID)
 	host := sv.externalHost
 	if host == "" {
 		host = "127.0.0.1"
@@ -163,7 +163,7 @@ func (sv *supervisor) startChild(dir string, port int) {
 	}()
 }
 
-func (sv *supervisor) loadOrAllocateNodeID(dir string, fallback metadata.NodeID) metadata.NodeID {
+func loadOrAllocateNodeID(dir string, fallback metadata.NodeID) metadata.NodeID {
 	path := filepath.Join(dir, nodeIDFile)
 	b, err := os.ReadFile(path)
 	if err == nil {
@@ -171,6 +171,10 @@ func (sv *supervisor) loadOrAllocateNodeID(dir string, fallback metadata.NodeID)
 		if err == nil && id > 0 {
 			return metadata.NodeID(id)
 		}
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("datanode: warning: failed to create data dir for node ID %s: %v", dir, err)
+		return fallback
 	}
 	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d\n", fallback)), 0644); err != nil {
 		log.Printf("datanode: warning: failed to persist node ID for %s: %v", dir, err)
@@ -248,8 +252,8 @@ func (sv *supervisor) monitorLoop() {
 }
 
 type sockMsg struct {
-	Cmd   string `json:"cmd"`
-	Path  string `json:"path,omitempty"`
+	Cmd  string `json:"cmd"`
+	Path string `json:"path,omitempty"`
 }
 
 type sockResp struct {
@@ -293,12 +297,12 @@ func (sv *supervisor) handleSocketConn(conn net.Conn) {
 	case "status":
 		sv.mu.Lock()
 		type childStatus struct {
-			Dir      string     `json:"dir"`
-			Port     int        `json:"port"`
-			NodeID   uint64     `json:"node_id"`
-			Pid      int        `json:"pid"`
-			State    childState `json:"state"`
-			Uptime   string     `json:"uptime"`
+			Dir    string     `json:"dir"`
+			Port   int        `json:"port"`
+			NodeID uint64     `json:"node_id"`
+			Pid    int        `json:"pid"`
+			State  childState `json:"state"`
+			Uptime string     `json:"uptime"`
 		}
 		var statuses []childStatus
 		for _, ci := range sv.children {

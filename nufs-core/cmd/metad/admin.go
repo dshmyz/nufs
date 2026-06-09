@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/example/dfs/internal/version"
 	"github.com/example/dfs/metadata"
 )
 
@@ -174,7 +175,7 @@ func (a *adminServer) baseData(title string) pageData {
 		Title:      title,
 		IsLeader:   a.store.IsLeader(),
 		LeaderAddr: a.store.LeaderAddr(),
-		Version:    "0.2.0",
+		Version:    version.Version,
 	}
 }
 
@@ -198,17 +199,17 @@ func (a *adminServer) render(w http.ResponseWriter, page string, data interface{
 
 type overviewData struct {
 	pageData
-	Nodes          []metadata.NodeInfo
-	Buckets        []metadata.BucketInfo
-	RepairLen      int
-	ChunkCount     int
-	OnlineNodes    int
-	OfflineNodes   int
-	DrainingNodes  int
-	TotalCapacity  int64
-	UsedCapacity   int64
-	CapacityPct    float64
-	IsEmpty        bool
+	Nodes         []metadata.NodeInfo
+	Buckets       []metadata.BucketInfo
+	RepairLen     int
+	ChunkCount    int
+	OnlineNodes   int
+	OfflineNodes  int
+	DrainingNodes int
+	TotalCapacity int64
+	UsedCapacity  int64
+	CapacityPct   float64
+	IsEmpty       bool
 }
 
 func (a *adminServer) handleOverview(w http.ResponseWriter, r *http.Request) {
@@ -242,18 +243,18 @@ func (a *adminServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.render(w, "overview", overviewData{
-		pageData:       a.baseData("Cluster Overview"),
-		Nodes:          nodes,
-		Buckets:        buckets,
-		RepairLen:      len(tasks),
-		ChunkCount:     int(chunkCount),
-		OnlineNodes:    online,
-		OfflineNodes:   offline,
-		DrainingNodes:  draining,
-		TotalCapacity:  totalCap,
-		UsedCapacity:   usedCap,
-		CapacityPct:    capPct,
-		IsEmpty:        len(nodes) == 0 && len(buckets) == 0,
+		pageData:      a.baseData("Cluster Overview"),
+		Nodes:         nodes,
+		Buckets:       buckets,
+		RepairLen:     len(tasks),
+		ChunkCount:    int(chunkCount),
+		OnlineNodes:   online,
+		OfflineNodes:  offline,
+		DrainingNodes: draining,
+		TotalCapacity: totalCap,
+		UsedCapacity:  usedCap,
+		CapacityPct:   capPct,
+		IsEmpty:       len(nodes) == 0 && len(buckets) == 0,
 	})
 }
 

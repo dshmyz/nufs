@@ -8,6 +8,7 @@ data_dir: "/var/lib/dfs/datanode"
 data_dirs: ""                            # comma-separated, enables supervisor mode
 base_port: 9101
 metadata: "localhost:8091"               # Metadata service address
+ops_addr: "0.0.0.0:8091"                  # Operations HTTP API address
 machine_id: ""
 external_host: ""
 rack: "rack1"
@@ -16,3 +17,8 @@ capacity_gb: 1000
 
 log_level: "info"
 log_json: false
+
+# OpenTelemetry tracing
+trace_enabled: false
+trace_endpoint: ""
+trace_insecure: true

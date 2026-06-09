@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -19,11 +20,10 @@ import (
 )
 
 // Load reads a config file and sets the corresponding flag values.
-// Supported formats: .yaml, .yml, .json.
-// Only top-level keys that match registered flag names are applied.
-// CLI flags already set via the command line are NOT overridden
-// (flag handles this — flag.Set is a no-op when the flag was already
-// set by the user).
+// Supported formats: .yaml, .yml, .json, .toml.
+// Keys are matched against registered flag names after normalizing common
+// YAML spellings (snake_case to kebab-case, plus selected nested aliases).
+// Call this before flag.Parse so later CLI values override file defaults.
 func Load(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -66,19 +66,47 @@ func applyFlags(m map[string]interface{}, prefix string) error {
 				return err
 			}
 		case []interface{}:
-			// Skip slices — flags don't support them
+			// Skip slices — flags don't support them.
 			continue
 		default:
-			f := flag.Lookup(name)
+			flagName := resolveFlagName(name)
+			f := flag.Lookup(flagName)
 			if f == nil {
-				continue // unknown flag, skip
+				slog.Debug("config: ignoring unknown key", "key", name, "flag", flagName)
+				continue
 			}
 			if err := f.Value.Set(fmt.Sprintf("%v", v)); err != nil {
-				return fmt.Errorf("set flag %s: %w", name, err)
+				return fmt.Errorf("set flag %s: %w", flagName, err)
 			}
 		}
 	}
 	return nil
+}
+
+var flagAliases = map[string]string{
+	"raft.enabled":   "raft",
+	"raft.listen":    "raft-addr",
+	"raft.data-dir":  "raft-dir",
+	"raft.data_dir":  "raft-dir",
+	"raft.dir":       "raft-dir",
+	"raft.bootstrap": "raft-bootstrap",
+
+	"capacity-gb": "capacity",
+
+	"tls.cert": "tls-cert",
+	"tls.key":  "tls-key",
+	"tls.ca":   "tls-ca",
+}
+
+func resolveFlagName(name string) string {
+	if alias, ok := flagAliases[name]; ok {
+		return alias
+	}
+	normalized := strings.ReplaceAll(name, "_", "-")
+	if alias, ok := flagAliases[normalized]; ok {
+		return alias
+	}
+	return normalized
 }
 
 // Watch monitors a config file for changes and calls onReload when a

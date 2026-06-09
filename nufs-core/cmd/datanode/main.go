@@ -4,16 +4,21 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/example/dfs/datanode"
 	"github.com/example/dfs/internal/config"
+	"github.com/example/dfs/internal/crypto"
 	"github.com/example/dfs/internal/logging"
+	"github.com/example/dfs/internal/tlsutil"
+	"github.com/example/dfs/internal/tracing"
 	"github.com/example/dfs/metadata"
 )
 
@@ -28,20 +33,34 @@ func main() {
 	}
 
 	var (
-		configPath   = flag.String("config", "", "Path to YAML config file")
-		nodeID       = flag.Uint64("node-id", 1, "Unique data node ID")
-		listenAddr   = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
-		dataDir      = flag.String("data-dir", "/var/lib/dfs/data", "Chunk storage root directory")
-		dataDirs     = flag.String("data-dirs", "", "Comma-separated data directories (enables supervisor mode)")
-		basePort     = flag.Int("base-port", 9100, "Base port for supervisor mode children")
-		machineID    = flag.String("machine-id", "", "Machine identifier for topology placement")
-		externalHost = flag.String("external-host", "", "External host IP for node registration (supervisor mode only, defaults to 127.0.0.1)")
-		metaAddr     = flag.String("metadata", "localhost:8091", "Metadata service HTTP address")
-		rack         = flag.String("rack", "rack-1", "Rack identifier for topology placement")
-		zone         = flag.String("zone", "zone-1", "Availability zone identifier")
-		capacityGB   = flag.Int64("capacity", 1000, "Node storage capacity in GB")
-		logLevel     = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
-		logJSON      = flag.Bool("log-json", false, "JSON log output")
+		configPath           = flag.String("config", "", "Path to YAML config file")
+		nodeID               = flag.String("node-id", "auto", "Unique data node ID or 'auto'")
+		listenAddr           = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
+		opsAddr              = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
+		dataDir              = flag.String("data-dir", "/var/lib/dfs/data", "Chunk storage root directory")
+		dataDirs             = flag.String("data-dirs", "", "Comma-separated data directories (enables supervisor mode)")
+		basePort             = flag.Int("base-port", 9100, "Base port for supervisor mode children")
+		machineID            = flag.String("machine-id", "", "Machine identifier for topology placement")
+		externalHost         = flag.String("external-host", "", "External host IP for node registration (supervisor mode only, defaults to 127.0.0.1)")
+		metaAddr             = flag.String("metadata", "localhost:8091", "Metadata service HTTP address")
+		rack                 = flag.String("rack", "rack-1", "Rack identifier for topology placement")
+		zone                 = flag.String("zone", "zone-1", "Availability zone identifier")
+		capacityGB           = flag.Int64("capacity", 1000, "Node storage capacity in GB")
+		tlsCert              = flag.String("tls-cert", "", "TLS certificate file (enables TLS for chunk TCP + ops HTTP)")
+		tlsKey               = flag.String("tls-key", "", "TLS private key file")
+		tlsCA                = flag.String("tls-ca", "", "TLS CA certificate for mutual TLS (client verification)")
+		tlsRequireClientCert = flag.Bool("tls-require-client-cert", false, "Require clients to present a certificate signed by tls-ca")
+		tlsSkipVerify        = flag.Bool("tls-skip-verify", false, "Skip TLS server certificate verification (dev only)")
+		metadataAuthToken    = flag.String("metadata-auth-token", "", "Bearer token for metadata service")
+		opsAuthToken         = flag.String("ops-auth-token", "", "Bearer token for datanode ops API")
+		enablePprof          = flag.Bool("pprof", false, "Expose /debug/pprof on ops API")
+		traceEnabled         = flag.Bool("trace-enabled", false, "Enable OpenTelemetry tracing")
+		traceEndpoint        = flag.String("trace-endpoint", "", "OTLP gRPC endpoint")
+		traceInsecure        = flag.Bool("trace-insecure", true, "Use insecure OTLP connection")
+		encryptAtRest        = flag.Bool("encrypt-at-rest", false, "Enable at-rest data encryption (AES-256-GCM)")
+		allowLocalKMS        = flag.Bool("allow-local-kms", false, "Allow in-memory development KMS; not production safe")
+		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
+		logJSON              = flag.Bool("log-json", false, "JSON log output")
 	)
 	_ = configPath
 	config.Preload()
@@ -74,9 +93,15 @@ func main() {
 	}
 
 	log.Info("starting", "node_id", *nodeID, "addr", *listenAddr, "data", *dataDir, "machine", mid)
+	nid, err := resolveNodeID(*nodeID, *dataDir, mid)
+	if err != nil {
+		log.Error("invalid node-id", "node_id", *nodeID, "error", err)
+		os.Exit(1)
+	}
 	runDataNode(datanode.Config{
-		NodeID:              metadata.NodeID(*nodeID),
+		NodeID:              nid,
 		ListenAddr:          *listenAddr,
+		OpsListenAddr:       *opsAddr,
 		DataDir:             *dataDir,
 		MetadataAddr:        *metaAddr,
 		MetadataCacheDir:    "",
@@ -88,7 +113,51 @@ func main() {
 		MachineID:           mid,
 		Tier:                metadata.TierHot,
 		CapacityGB:          *capacityGB,
+		TLS: tlsutil.Config{
+			CertFile:          *tlsCert,
+			KeyFile:           *tlsKey,
+			CAFile:            *tlsCA,
+			SkipVerify:        *tlsSkipVerify,
+			RequireClientCert: *tlsRequireClientCert,
+		},
+		MetadataAuthToken: *metadataAuthToken,
+		OpsAuthToken:      *opsAuthToken,
+		EnablePprof:       *enablePprof,
+		TraceEnabled:      *traceEnabled,
+		TraceEndpoint:     *traceEndpoint,
+		TraceInsecure:     *traceInsecure,
+		EncryptAtRest:     *encryptAtRest,
+		AllowLocalKMS:     *allowLocalKMS,
+		LogLevel:          *logLevel,
 	})
+}
+
+func resolveNodeID(raw, dataDir, machineID string) (metadata.NodeID, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "auto") {
+		fallback := stableAutoNodeID(machineID, dataDir)
+		return loadOrAllocateNodeID(dataDir, fallback), nil
+	}
+	id, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || id == 0 {
+		if err == nil {
+			err = fmt.Errorf("must be greater than zero")
+		}
+		return 0, err
+	}
+	return metadata.NodeID(id), nil
+}
+
+func stableAutoNodeID(machineID, dataDir string) metadata.NodeID {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(machineID))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(filepath.Clean(dataDir)))
+	id := h.Sum64()
+	if id == 0 {
+		id = 1
+	}
+	return metadata.NodeID(id)
 }
 
 func splitAndClean(s string) []string {
@@ -124,18 +193,45 @@ func runDataNode(cfg datanode.Config) {
 	log := logging.Named("datanode")
 	log.Info("starting data node", "node_id", cfg.NodeID, "addr", cfg.ListenAddr, "data", cfg.DataDir, "machine", cfg.MachineID)
 
+	_, traceShutdown, err := tracing.Init(tracing.Config{
+		Enabled:  cfg.TraceEnabled,
+		Endpoint: cfg.TraceEndpoint,
+		Service:  "datanode",
+		Insecure: cfg.TraceInsecure,
+	})
+	if err != nil {
+		log.Error("failed to initialize tracing", "error", err)
+		os.Exit(1)
+	}
+
 	wal, err := datanode.NewWriteAheadLog(filepath.Join(cfg.DataDir, "wal"))
 	if err != nil {
 		log.Error("failed to init WAL", "error", err)
 		os.Exit(1)
 	}
-	defer wal.Close()
 
 	chunkStore, err := datanode.NewChunkStore(cfg.DataDir, cfg.MaxConcurrentWrites, cfg.MaxConcurrentReads, wal)
 	if err != nil {
 		log.Error("failed to init chunk store", "error", err)
 		os.Exit(1)
 	}
+
+	// Configure at-rest encryption if enabled. LocalKMS is intentionally
+	// fail-closed unless the operator explicitly opts into dev-only keys.
+	if cfg.EncryptAtRest {
+		if !cfg.AllowLocalKMS {
+			log.Error("at-rest encryption requires a production KMS; LocalKMS is in-memory/dev-only and loses keys on restart", "hint", "set --allow-local-kms only for development")
+			os.Exit(1)
+		}
+		kms, err := crypto.NewLocalKMS()
+		if err != nil {
+			log.Error("failed to init encryption KMS", "error", err)
+			os.Exit(1)
+		}
+		chunkStore.SetEncryptor(crypto.NewEncryptor(kms))
+		log.Warn("at-rest encryption enabled with LocalKMS; keys are in-memory and not production safe")
+	}
+
 	totalBytes, chunkCount := chunkStore.Stats()
 	log.Info("chunk store ready", "chunks", chunkCount, "bytes", totalBytes)
 
@@ -145,10 +241,31 @@ func runDataNode(cfg datanode.Config) {
 		os.Exit(1)
 	}
 	diskManager.Start()
-	defer diskManager.Stop()
 
-	metaSvcAddr := fmt.Sprintf("http://%s", cfg.MetadataAddr)
+	// Wire disk health into chunk store so writes are rejected on disk failure
+	chunkStore.SetDiskManager(diskManager)
+
+	// Determine scheme for metadata service based on our TLS config.
+	// If the cluster uses TLS, metad should also be accessed over HTTPS.
+	metaScheme := "http"
+	if cfg.TLS.Enabled() {
+		metaScheme = "https"
+	}
+	if cfg.TLS.CAFile != "" && !cfg.TLS.RequireClientCert {
+		log.Warn("tls CA configured but client certificates are optional; set --tls-require-client-cert for strict mTLS")
+	}
+	metaSvcAddr := fmt.Sprintf("%s://%s", metaScheme, cfg.MetadataAddr)
 	metaStore := metadata.NewHTTPClient(metaSvcAddr, 30*time.Second)
+	metaStore.SetAuthToken(cfg.MetadataAuthToken)
+
+	// When connecting to a TLS-enabled metad, configure the HTTP
+	// client transport to use our TLS client config.
+	if cfg.TLS.Enabled() {
+		if err := metaStore.EnableTLS(cfg.TLS); err != nil {
+			log.Error("failed to configure TLS for metadata client", "error", err)
+			os.Exit(1)
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	err = metaStore.RegisterNode(ctx, &metadata.NodeInfo{
@@ -173,13 +290,13 @@ func runDataNode(cfg datanode.Config) {
 		log.Error("failed to start server", "error", err)
 		os.Exit(1)
 	}
-	defer server.Stop()
 
 	replicator := datanode.NewReplicator(cfg.ListenAddr, 4)
+	replicator.SetTLS(cfg.TLS)
 	replicator.Start()
-	defer replicator.Stop()
 
 	chainRepl := datanode.NewParallelReplicator(cfg.ListenAddr, cfg.NodeID, 5*time.Second)
+	chainRepl.SetTLS(cfg.TLS)
 
 	repairWorker := datanode.NewRepairWorker(datanode.RepairConfig{
 		Meta:       metaStore,
@@ -189,25 +306,92 @@ func runDataNode(cfg datanode.Config) {
 		LocalAddr:  cfg.ListenAddr,
 	})
 	repairWorker.Start(context.Background())
-	defer repairWorker.Stop()
 
 	antiEntropy := datanode.NewAntiEntropy(chunkStore, metaStore, cfg.NodeID)
+	antiEntropy.SetTLS(cfg.TLS)
 	antiEntropy.Start(30 * time.Minute)
-	defer antiEntropy.Stop()
 
 	heartbeat := datanode.NewHeartbeatReporter(cfg, metaStore, chunkStore)
 	heartbeat.Start()
-	defer heartbeat.Stop()
 
 	opsServer := datanode.NewOpsServerWithRepair(cfg, chunkStore, metaStore, diskManager, chainRepl, antiEntropy, repairWorker)
-	opsServer.Start()
-	defer opsServer.Stop()
+	if err := opsServer.Start(); err != nil {
+		log.Error("failed to start ops server", "error", err)
+		os.Exit(1)
+	}
 
 	log.Info("all components started successfully")
+
+	// SIGHUP handler for config hot-reload (log level changes)
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go func() {
+		for range hupCh {
+			log.Info("received SIGHUP, reloading log level")
+			logging.SetLevel(cfg.LogLevel)
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 	log.Info("received signal, shutting down", "signal", sig)
+
+	// Phase 1: Stop accepting new client and ops connections.
+	log.Info("shutdown phase 1: stopping ops and data servers")
+	opsServer.Stop()
+	server.Stop()
+
+	// Phase 2: Stop background workers that generate writes.
+	log.Info("shutdown phase 2: stopping background workers")
+	repairWorker.Stop()
+	antiEntropy.Stop()
+	heartbeat.Stop()
+	replicator.Stop()
+
+	// Phase 3: Wait for in-flight writes to complete.
+	log.Info("shutdown phase 3: draining in-flight writes")
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	releaseDrain, err := chunkStore.DrainWrites(drainCtx)
+	if err != nil {
+		log.Warn("drain timeout, some writes may be in-flight", "error", err)
+	} else {
+		log.Info("all in-flight writes drained")
+	}
+	if releaseDrain != nil {
+		releaseDrain()
+	}
+	drainCancel()
+
+	// Phase 4: Stop disk manager and close chunk-store resources.
+	log.Info("shutdown phase 4: stopping disk manager and closing chunk store")
+	diskManager.Stop()
+	if err := chunkStore.Close(); err != nil {
+		log.Warn("chunk store close error", "error", err)
+	}
+
+	// Phase 5: Flush and close WAL — ensures all committed writes are durable.
+	log.Info("shutdown phase 5: flushing WAL")
+	if err := wal.Close(); err != nil {
+		log.Warn("WAL close error", "error", err)
+	}
+
+	// Phase 6: Deregister from metadata service.
+	log.Info("shutdown phase 6: deregistering from metadata service")
+	deregCtx, deregCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := metaStore.RegisterNode(deregCtx, &metadata.NodeInfo{
+		ID:    cfg.NodeID,
+		State: metadata.NodeOffline,
+	}); err != nil {
+		log.Warn("failed to mark node offline", "error", err)
+	}
+	deregCancel()
+
+	traceCtx, traceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := traceShutdown(traceCtx); err != nil {
+		log.Warn("tracing shutdown error", "error", err)
+	}
+	traceCancel()
+
 	log.Info("shutdown complete")
 }

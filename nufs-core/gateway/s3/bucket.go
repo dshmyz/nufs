@@ -56,6 +56,27 @@ func (gw *Gateway) handleCreateBucket(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
+	// Set default bucket policy: creator is the owner with full access
+	owner := r.Header.Get("X-Owner")
+	if owner == "" {
+		owner = "anonymous"
+	}
+	defaultPolicy := metadata.BucketPolicy{
+		Bucket: bucket,
+		Owner:  owner,
+		Statements: []metadata.Statement{
+			{
+				Effect:      "allow",
+				Principal:   metadata.Principal(owner),
+				Permissions: []metadata.Permission{metadata.PermRead, metadata.PermWrite, metadata.PermAdmin},
+				Resource:    bucket,
+			},
+		},
+		DefaultAccess: "deny",
+	}
+	gw.acl.SetPolicy(bucket, &defaultPolicy)
+	_ = gw.meta.SetBucketPolicy(ctx, bucket, defaultPolicy)
+
 	w.Header().Set("Location", "/"+bucket)
 	w.WriteHeader(http.StatusOK)
 }

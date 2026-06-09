@@ -4,9 +4,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -16,35 +16,49 @@ import (
 	"time"
 
 	"github.com/example/dfs/internal/config"
+	internalhttp "github.com/example/dfs/internal/httputil"
 	"github.com/example/dfs/internal/logging"
+	"github.com/example/dfs/internal/tlsutil"
+	"github.com/example/dfs/internal/tracing"
+	"github.com/example/dfs/internal/version"
 	"github.com/example/dfs/metadata"
 )
 
 func main() {
 	var (
-		configPath    = flag.String("config", "", "Path to YAML config file")
-		dataDir       = flag.String("data-dir", "/var/lib/dfs/metadata", "Pebble data directory")
-		cacheDir      = flag.String("cache-dir", "", "Pebble read cache directory (optional)")
-		nodeID        = flag.Uint64("node-id", 1, "Metadata node ID (for chunk ID generation)")
-		memTableSize  = flag.Uint64("memtable-size", 256<<20, "Pebble memtable size in bytes")
-		enableRaft    = flag.Bool("raft", true, "Enable Raft consensus")
-		raftAddr      = flag.String("raft-addr", "0.0.0.0:7000", "Raft bind address")
-		raftDir       = flag.String("raft-dir", "/var/lib/dfs/raft", "Raft data directory")
-		raftBootstrap = flag.Bool("raft-bootstrap", false, "Bootstrap a new Raft cluster")
-		opsAddr        = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
-		advertiseOps   = flag.String("advertise-ops-addr", "", "Advertised ops URL for other metad nodes (default: http://<hostname>:8091)")
-		raftHbTimeout  = flag.Duration("raft-heartbeat", 0, "Raft heartbeat timeout (default: 1s)")
-		raftElection   = flag.Duration("raft-election", 0, "Raft election timeout (default: 1s)")
-		raftLease      = flag.Duration("raft-lease", 0, "Raft leader lease timeout (default: 500ms)")
-		leaseTTL       = flag.Duration("lease-ttl", 30*time.Second, "Node lease TTL")
-		gcInterval    = flag.Duration("gc-interval", 10*time.Minute, "GC scan interval")
-		gcDryRun      = flag.Bool("gc-dry-run", false, "GC dry-run mode (no deletes)")
-		scrubInterval = flag.Duration("scrub-interval", 1*time.Hour, "Scrub interval")
-		tlsCert       = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
-		tlsKey        = flag.String("tls-key", "", "TLS private key file")
-		authToken     = flag.String("auth-token", "", "Bearer token for ops API auth (empty = no auth)")
-		logLevel      = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
-		logJSON       = flag.Bool("log-json", false, "JSON log output")
+		configPath           = flag.String("config", "", "Path to YAML config file")
+		dataDir              = flag.String("data-dir", "/var/lib/dfs/metadata", "Pebble data directory")
+		cacheDir             = flag.String("cache-dir", "", "Pebble read cache directory (optional)")
+		nodeID               = flag.Uint64("node-id", 1, "Metadata node ID (for chunk ID generation)")
+		memTableSize         = flag.Uint64("memtable-size", 256<<20, "Pebble memtable size in bytes")
+		enableRaft           = flag.Bool("raft", true, "Enable Raft consensus")
+		raftAddr             = flag.String("raft-addr", "0.0.0.0:7000", "Raft bind address")
+		raftDir              = flag.String("raft-dir", "/var/lib/dfs/raft", "Raft data directory")
+		raftBootstrap        = flag.Bool("raft-bootstrap", false, "Bootstrap a new Raft cluster")
+		opsAddr              = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
+		advertiseOps         = flag.String("advertise-ops-addr", "", "Advertised ops URL for other metad nodes (default: http://<hostname>:8091)")
+		raftHbTimeout        = flag.Duration("raft-heartbeat", 0, "Raft heartbeat timeout (default: 1s)")
+		raftElection         = flag.Duration("raft-election", 0, "Raft election timeout (default: 1s)")
+		raftLease            = flag.Duration("raft-lease", 0, "Raft leader lease timeout (default: 500ms)")
+		leaseTTL             = flag.Duration("lease-ttl", 30*time.Second, "Node lease TTL")
+		gcInterval           = flag.Duration("gc-interval", 10*time.Minute, "GC scan interval")
+		gcDryRun             = flag.Bool("gc-dry-run", false, "GC dry-run mode (no deletes)")
+		scrubInterval        = flag.Duration("scrub-interval", 1*time.Hour, "Scrub interval")
+		tlsCert              = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
+		tlsKey               = flag.String("tls-key", "", "TLS private key file")
+		tlsCA                = flag.String("tls-ca", "", "TLS CA certificate for mutual TLS (client verification)")
+		tlsRequireClientCert = flag.Bool("tls-require-client-cert", false, "Require clients to present a certificate signed by tls-ca")
+		tlsSkipVerify        = flag.Bool("tls-skip-verify", false, "Skip TLS server certificate verification (dev only)")
+		authToken            = flag.String("auth-token", "", "Bearer token for ops API auth (empty = no auth)")
+		backupDir            = flag.String("backup-dir", "", "Directory for Pebble checkpoint backups (empty = disabled)")
+		backupInterval       = flag.Duration("backup-interval", time.Hour, "Backup interval")
+		backupMax            = flag.Int("backup-max", 24, "Maximum local backups to retain (0 = unlimited)")
+		backupDryRun         = flag.Bool("backup-dry-run", false, "Log backup actions without writing checkpoints")
+		traceEnabled         = flag.Bool("trace-enabled", false, "Enable OpenTelemetry tracing")
+		traceEndpoint        = flag.String("trace-endpoint", "", "OTLP gRPC endpoint")
+		traceInsecure        = flag.Bool("trace-insecure", true, "Use insecure OTLP connection")
+		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
+		logJSON              = flag.Bool("log-json", false, "JSON log output")
 	)
 	_ = configPath
 	config.Preload()
@@ -54,6 +68,18 @@ func main() {
 	log := logging.Named("metad")
 	log.Info("starting metadata service", "node_id", *nodeID, "data", *dataDir)
 	log.Info("runtime", "go", runtime.Version(), "os", runtime.GOOS, "arch", runtime.GOARCH)
+	log.Info("version", "version", version.Version, "git_commit", version.GitCommit, "build_time", version.BuildTime)
+
+	_, traceShutdown, err := tracing.Init(tracing.Config{
+		Enabled:  *traceEnabled,
+		Endpoint: *traceEndpoint,
+		Service:  "metad",
+		Insecure: *traceInsecure,
+	})
+	if err != nil {
+		log.Error("failed to initialize tracing", "error", err)
+		os.Exit(1)
+	}
 
 	pebbleCfg := metadata.PebbleStoreConfig{
 		Dir:          *dataDir,
@@ -90,18 +116,18 @@ func main() {
 		}
 
 		raftCfg := metadata.RaftNodeConfig{
-			NodeID:            fmt.Sprintf("meta-%d", *nodeID),
-			BindAddr:          *raftAddr,
-			RaftDir:           *raftDir,
-			Bootstrap:         *raftBootstrap,
-			HeartbeatTimeout:  *raftHbTimeout,
-			ElectionTimeout:   *raftElection,
+			NodeID:             fmt.Sprintf("meta-%d", *nodeID),
+			BindAddr:           *raftAddr,
+			RaftDir:            *raftDir,
+			Bootstrap:          *raftBootstrap,
+			HeartbeatTimeout:   *raftHbTimeout,
+			ElectionTimeout:    *raftElection,
 			LeaderLeaseTimeout: *raftLease,
-			SnapshotThreshold: 8192,
-			SnapshotInterval:  2 * time.Minute,
-			TrailingLogs:      10240,
-			AdvertiseOpsAddr:  advertiseOpsURL,
-			PeerOpsURLs:       peerOps,
+			SnapshotThreshold:  8192,
+			SnapshotInterval:   2 * time.Minute,
+			TrailingLogs:       10240,
+			AdvertiseOpsAddr:   advertiseOpsURL,
+			PeerOpsURLs:        peerOps,
 		}
 
 		raftNode, err = metadata.NewRaftNode(store, raftCfg)
@@ -164,18 +190,33 @@ func main() {
 	mux.Handle("/metrics", metadata.PrometheusHandler(bundle.Metrics))
 	// Health check endpoint
 	mux.Handle("/healthz", metadata.HealthHandler(bundle.Health))
+	// Version endpoint
+	mux.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(version.Info())
+	})
 
+	// Initialize graceful shutdown drain and wire it into request handling.
+	drain := metadata.NewShutdownDrain(15 * time.Second)
+	public := map[string]struct{}{
+		"/health":         {},
+		"/healthz":        {},
+		"/ready":          {},
+		"/metrics":        {},
+		"/api/v1/metrics": {},
+		"/api/v1/health":  {},
+		"/version":        {},
+	}
+	var handler http.Handler = drain.Middleware(public, mux)
 	if *authToken != "" {
 		log.Info("auth token enabled for ops API")
-		wrap := mux
-		mux = http.NewServeMux()
-		mux.Handle("/", authMiddleware(*authToken, wrap))
+		handler = internalhttp.BearerAuth(*authToken, public, handler)
 	}
 
 	// Rate limiting middleware: 100 req/s, burst 200
 	rateLimiter := metadata.NewRateLimiter(100, 200)
 	limitedMux := http.NewServeMux()
-	limitedMux.Handle("/", rateLimitMiddleware(rateLimiter, mux))
+	limitedMux.Handle("/", rateLimitMiddleware(rateLimiter, handler))
 
 	opsServer := &http.Server{
 		Addr:         *opsAddr,
@@ -185,10 +226,28 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	// Configure TLS if certificates are provided
+	metadTLS := tlsutil.Config{
+		CertFile:          *tlsCert,
+		KeyFile:           *tlsKey,
+		CAFile:            *tlsCA,
+		SkipVerify:        *tlsSkipVerify,
+		RequireClientCert: *tlsRequireClientCert,
+	}
+	if metadTLS.CAFile != "" && !metadTLS.RequireClientCert {
+		log.Warn("tls CA configured but client certificates are optional; set --tls-require-client-cert for strict mTLS")
+	}
+
 	go func() {
-		if *tlsCert != "" && *tlsKey != "" {
+		if metadTLS.Enabled() {
+			tlsCfg, err := tlsutil.ServerConfig(metadTLS)
+			if err != nil {
+				log.Error("tls config failed", "error", err)
+				os.Exit(1)
+			}
+			opsServer.TLSConfig = tlsCfg
 			log.Info("ops API listening", "addr", *opsAddr, "tls", true)
-			if err := opsServer.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil && err != http.ErrServerClosed {
+			if err := opsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 				log.Error("ops server error", "error", err)
 				os.Exit(1)
 			}
@@ -201,26 +260,37 @@ func main() {
 		}
 	}()
 
-	// Initialize graceful shutdown drain
-	drain := metadata.NewShutdownDrain(15 * time.Second)
-
-	// Initialize backup manager (if backup-dir is configured)
-	_ = metadata.BackupConfig{} // placeholder: configure via config file or env
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigCh
-	log.Info("received signal, shutting down", "signal", sig)
-
-	// Drain in-flight operations
-	if err := drain.Shutdown(); err != nil {
-		log.Warn("drain timeout", "error", err)
+	var backupManager *metadata.BackupManager
+	if *backupDir != "" {
+		backupManager = metadata.NewBackupManager(store, metadata.BackupConfig{
+			Dir:        *backupDir,
+			Interval:   *backupInterval,
+			MaxBackups: *backupMax,
+			DryRun:     *backupDryRun,
+		})
+		backupManager.Start()
+		log.Info("backup manager started", "dir", *backupDir, "interval", *backupInterval, "max_backups", *backupMax, "dry_run", *backupDryRun)
 	}
 
-	if raftNode != nil {
-		if err := raftNode.TriggerSnapshot(); err != nil {
-			log.Warn("snapshot failed", "error", err)
-		}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	sig := <-sigCh
+
+	// Check for SIGHUP (reload signal)
+	if sig == syscall.SIGHUP {
+		log.Info("received SIGHUP, reloading configuration")
+		// Reload log level
+		logging.SetLevel(*logLevel)
+		// Wait for termination signal after reload
+		sig = <-sigCh
+	}
+
+	log.Info("received signal, shutting down", "signal", sig)
+
+	// Begin draining before shutting down the listener so new protected
+	// requests are rejected while in-flight requests finish.
+	if err := drain.Shutdown(); err != nil {
+		log.Warn("drain timeout", "error", err)
 	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -229,21 +299,24 @@ func main() {
 		log.Warn("ops shutdown error", "error", err)
 	}
 
-	log.Info("shutdown complete")
-}
+	if backupManager != nil {
+		backupManager.Stop()
+		log.Info("backup manager stopped")
+	}
 
-// authMiddleware rejects requests that don't carry the expected Bearer token.
-func authMiddleware(token string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := r.Header.Get("Authorization")
-		expected := "Bearer " + token
-		if got != expected {
-			slog.Warn("auth rejected", "remote", r.RemoteAddr, "path", r.URL.Path)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
+	if raftNode != nil {
+		if err := raftNode.TriggerSnapshot(); err != nil {
+			log.Warn("snapshot failed", "error", err)
 		}
-		next.ServeHTTP(w, r)
-	})
+	}
+
+	traceCtx, traceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := traceShutdown(traceCtx); err != nil {
+		log.Warn("tracing shutdown error", "error", err)
+	}
+	traceCancel()
+
+	log.Info("shutdown complete")
 }
 
 // rateLimitMiddleware applies per-IP rate limiting using a token bucket.

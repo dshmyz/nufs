@@ -2,7 +2,6 @@ package s3
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -12,6 +11,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/example/dfs/internal/tlsutil"
 )
 
 // ServerConfig controls how Gateway.Run wires an *http.Server and
@@ -94,11 +95,14 @@ func (gw *Gateway) Run(ctx context.Context, cfg ServerConfig) error {
 
 	// Wrap listener with TLS if certificates are configured.
 	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
-		tlsCfg, err := loadTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile)
+		tlsCfg, err := tlsutil.ServerConfig(tlsutil.Config{
+			CertFile: cfg.TLSCertFile,
+			KeyFile:  cfg.TLSKeyFile,
+		})
 		if err != nil {
 			return fmt.Errorf("s3gw: tls: %w", err)
 		}
-		ln = tls.NewListener(ln, tlsCfg)
+		ln = tlsutil.NewListener(ln, tlsCfg)
 	}
 
 	errCh := make(chan error, 1)
@@ -141,15 +145,4 @@ func (gw *Gateway) Run(ctx context.Context, cfg ServerConfig) error {
 	}
 	log.Println("s3gw: stopped")
 	return nil
-}
-
-func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load key pair: %w", err)
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}, nil
 }

@@ -110,3 +110,111 @@ func writeJSONError(w http.ResponseWriter, statusCode int, msg string) {
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
+
+// ============================================================
+// RBAC — Bucket Policy Management API
+// ============================================================
+
+// handleGetBucketPolicy handles GET /admin/policy/{bucket}
+func (gw *Gateway) handleGetBucketPolicy(w http.ResponseWriter, r *http.Request) {
+	if gw.creds.HasCredentials() {
+		_, err := gw.creds.VerifySignatureV4(r)
+		if err != nil {
+			writeJSONError(w, http.StatusForbidden, err.Error())
+			return
+		}
+	}
+
+	bucket := r.URL.Query().Get("bucket")
+	if bucket == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing bucket parameter")
+		return
+	}
+
+	policy, err := gw.meta.GetBucketPolicy(r.Context(), bucket)
+	if err != nil {
+		if err == metadata.ErrAccessDenied {
+			writeJSONError(w, http.StatusNotFound, "no policy found for bucket")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, policy)
+}
+
+// handleSetBucketPolicy handles PUT /admin/policy/{bucket}
+func (gw *Gateway) handleSetBucketPolicy(w http.ResponseWriter, r *http.Request) {
+	if gw.creds.HasCredentials() {
+		accessKey, err := gw.creds.VerifySignatureV4(r)
+		if err != nil {
+			writeJSONError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		// Only bucket owner or admin can set policy
+		bucket := r.URL.Query().Get("bucket")
+		if bucket == "" {
+			writeJSONError(w, http.StatusBadRequest, "missing bucket parameter")
+			return
+		}
+		owner := gw.acl.OwnerOf(bucket)
+		if owner != "" && owner != accessKey {
+			// Check if the user has admin permission
+			if err := gw.acl.CheckAccess(bucket, metadata.Principal(accessKey), metadata.PermAdmin); err != nil {
+				writeJSONError(w, http.StatusForbidden, "only bucket owner or admin can set policy")
+				return
+			}
+		}
+	}
+
+	var policy metadata.BucketPolicy
+	if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid policy JSON: "+err.Error())
+		return
+	}
+
+	bucket := r.URL.Query().Get("bucket")
+	policy.Bucket = bucket
+
+	if err := gw.meta.SetBucketPolicy(r.Context(), bucket, policy); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	gw.acl.SetPolicy(bucket, &policy)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleDeleteBucketPolicy handles DELETE /admin/policy/{bucket}
+func (gw *Gateway) handleDeleteBucketPolicy(w http.ResponseWriter, r *http.Request) {
+	if gw.creds.HasCredentials() {
+		accessKey, err := gw.creds.VerifySignatureV4(r)
+		if err != nil {
+			writeJSONError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		bucket := r.URL.Query().Get("bucket")
+		owner := gw.acl.OwnerOf(bucket)
+		if owner != "" && owner != accessKey {
+			if err := gw.acl.CheckAccess(bucket, metadata.Principal(accessKey), metadata.PermAdmin); err != nil {
+				writeJSONError(w, http.StatusForbidden, "only bucket owner or admin can delete policy")
+				return
+			}
+		}
+	}
+
+	bucket := r.URL.Query().Get("bucket")
+	if bucket == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing bucket parameter")
+		return
+	}
+
+	if err := gw.meta.DeleteBucketPolicy(r.Context(), bucket); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	gw.acl.DeletePolicy(bucket)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}

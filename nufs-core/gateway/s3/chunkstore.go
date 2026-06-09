@@ -9,6 +9,7 @@ import (
 
 	"github.com/example/dfs/datanode"
 	"github.com/example/dfs/gateway"
+	"github.com/example/dfs/internal/tlsutil"
 	"github.com/example/dfs/metadata"
 )
 
@@ -38,6 +39,7 @@ var (
 type DatanodeChunkStore struct {
 	mu          sync.Mutex
 	dialTimeout time.Duration
+	tlsCfg      tlsutil.Config
 	// MinReplicasPerWrite is the floor on the number of replicas that
 	// must acknowledge a write. <= 0 (the default) means "all replicas
 	// must succeed", which is the production durability contract. Set
@@ -50,6 +52,11 @@ type DatanodeChunkStore struct {
 // uses datanode.Client's own per-request deadline.
 func NewDatanodeChunkStore() *DatanodeChunkStore {
 	return &DatanodeChunkStore{dialTimeout: 10 * time.Second}
+}
+
+// SetTLS configures TLS for connections to datanode daemons.
+func (s *DatanodeChunkStore) SetTLS(cfg tlsutil.Config) {
+	s.tlsCfg = cfg
 }
 
 // WriteChunk writes data to every replica. The write is considered
@@ -79,9 +86,8 @@ func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.Chu
 			return err
 		}
 
-		client := datanode.NewClient(rep.Addr)
-		client.SetTimeout(30 * time.Second)
-		if err := client.Connect(); err != nil {
+		client, err := s.dialClient(rep.Addr)
+		if err != nil {
 			lastErr = fmt.Errorf("connect to %s: %w", rep.Addr, err)
 			log.Printf("s3gw: connect to datanode %s: %v", rep.Addr, err)
 			continue
@@ -149,9 +155,8 @@ func (s *DatanodeChunkStore) ReadChunkRange(ctx context.Context, chunk *metadata
 			continue
 		}
 
-		client := datanode.NewClient(rep.Addr)
-		client.SetTimeout(30 * time.Second)
-		if err := client.Connect(); err != nil {
+		client, err := s.dialClient(rep.Addr)
+		if err != nil {
 			lastErr = fmt.Errorf("connect to %s: %w", rep.Addr, err)
 			log.Printf("s3gw: connect to %s: %v", rep.Addr, err)
 			continue
@@ -263,4 +268,26 @@ func (m *MemoryChunkStore) Get(chunkID metadata.ChunkID) ([]byte, bool) {
 	out := make([]byte, len(data))
 	copy(out, data)
 	return out, true
+}
+
+// dialClient creates a datanode.Client connected to the given address,
+// using TLS when configured.
+func (s *DatanodeChunkStore) dialClient(addr string) (*datanode.Client, error) {
+	if s.tlsCfg.Enabled() {
+		c, err := datanode.NewTLSClient(addr, s.tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		c.SetTimeout(30 * time.Second)
+		if err := c.Connect(); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	c := datanode.NewClient(addr)
+	c.SetTimeout(30 * time.Second)
+	if err := c.Connect(); err != nil {
+		return nil, err
+	}
+	return c, nil
 }

@@ -16,6 +16,7 @@ type Gateway struct {
 	chunkStore ChunkStore
 	dataNodes  map[metadata.NodeID]string // nodeID -> data node address
 	mux        *http.ServeMux
+	acl        *metadata.AccessController // RBAC access control
 
 	// Configurable limits and health check, captured at construction.
 	maxObjectSize       int64
@@ -84,6 +85,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		chunkStore: cfg.ChunkStore,
 		dataNodes:  make(map[metadata.NodeID]string),
 		mux:        http.NewServeMux(),
+		acl:        metadata.NewAccessController(),
 	}
 
 	if gw.creds == nil {
@@ -114,6 +116,9 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 	gw.mux.HandleFunc("/readyz", gw.handleReadyz)
 	gw.mux.HandleFunc("/admin/cluster/stats", gw.handleClusterStats)
 	gw.mux.HandleFunc("/admin/buckets", gw.handleAdminBuckets)
+	gw.mux.HandleFunc("/admin/policy", gw.handleGetBucketPolicy)       // GET ?bucket=xxx
+	gw.mux.HandleFunc("/admin/policy/set", gw.handleSetBucketPolicy)   // PUT ?bucket=xxx + JSON body
+	gw.mux.HandleFunc("/admin/policy/delete", gw.handleDeleteBucketPolicy) // DELETE ?bucket=xxx
 
 	return gw
 }
@@ -190,7 +195,50 @@ func (gw *Gateway) route(w http.ResponseWriter, r *http.Request) {
 	bucket, key := parsePath(r.URL.Path)
 	requestID := w.Header().Get("x-amz-request-id")
 
-	// Service-level operations
+	// Authenticate the request — identify the principal
+	principal := metadata.PrincipalAnonymous
+	hasAuth := gw.creds.HasCredentials()
+	if hasAuth {
+		accessKey, err := gw.creds.VerifySignatureV4(r)
+		if err != nil {
+			WriteXMLError(w, http.StatusForbidden, ErrCodeAccessDenied,
+				err.Error(), r.URL.Path, requestID)
+			return
+		}
+		if accessKey != "anonymous" && accessKey != "" {
+			principal = metadata.Principal(accessKey)
+		}
+
+		// RBAC authorization check
+		if bucket == "" {
+			// Service-level: ListBuckets requires PermList
+			if r.Method == http.MethodGet {
+				if err := gw.acl.CheckServiceAccess(principal, metadata.PermList); err != nil {
+					WriteXMLError(w, http.StatusForbidden, ErrCodeAccessDenied,
+						"Access Denied", r.URL.Path, requestID)
+					return
+				}
+			}
+		} else {
+			perm := gw.requiredPermission(r.Method, key)
+			if err := gw.acl.CheckAccess(bucket, principal, perm); err != nil {
+				// No policy = authenticated users allowed by default
+				if gw.acl.GetPolicy(bucket) == nil {
+					if principal == metadata.PrincipalAnonymous {
+						WriteXMLError(w, http.StatusForbidden, ErrCodeAccessDenied,
+							"Access Denied", r.URL.Path, requestID)
+						return
+					}
+				} else {
+					WriteXMLError(w, http.StatusForbidden, ErrCodeAccessDenied,
+						"Access Denied", r.URL.Path, requestID)
+					return
+				}
+			}
+		}
+	}
+
+	// Route to handler (same logic regardless of auth mode)
 	if bucket == "" {
 		switch r.Method {
 		case http.MethodGet:
@@ -212,14 +260,12 @@ func (gw *Gateway) route(w http.ResponseWriter, r *http.Request) {
 		case http.MethodHead:
 			gw.handleHeadBucket(w, r, bucket, requestID)
 		case http.MethodGet:
-			// Check for multipart list-parts
 			if _, ok := r.URL.Query()["uploads"]; ok {
 				gw.handleListMultipartUploads(w, r, bucket, requestID)
 			} else {
 				gw.handleListObjects(w, r, bucket, requestID)
 			}
 		case http.MethodPost:
-			// Multipart delete (batch)
 			if _, ok := r.URL.Query()["delete"]; ok {
 				gw.handleBatchDelete(w, r, bucket, requestID)
 			} else {
@@ -244,7 +290,6 @@ func (gw *Gateway) route(w http.ResponseWriter, r *http.Request) {
 			gw.handlePutObject(w, r, bucket, key, requestID)
 		}
 	case http.MethodGet:
-		// Check for multipart download
 		if r.URL.Query().Get("uploadId") != "" {
 			gw.handleListParts(w, r, bucket, key, requestID)
 		} else {
@@ -275,6 +320,28 @@ func (gw *Gateway) route(w http.ResponseWriter, r *http.Request) {
 
 // parsePath extracts bucket and key from the URL path.
 // Path format: /{bucket}/{key...}
+// requiredPermission maps an HTTP method and key presence to a Permission.
+func (gw *Gateway) requiredPermission(method, key string) metadata.Permission {
+	switch method {
+	case http.MethodGet, http.MethodHead:
+		return metadata.PermRead
+	case http.MethodPut:
+		if key == "" {
+			return metadata.PermAdmin // CreateBucket
+		}
+		return metadata.PermWrite
+	case http.MethodDelete:
+		if key == "" {
+			return metadata.PermAdmin // DeleteBucket
+		}
+		return metadata.PermWrite
+	case http.MethodPost:
+		return metadata.PermWrite // multipart uploads
+	default:
+		return metadata.PermRead
+	}
+}
+
 func parsePath(path string) (bucket, key string) {
 	// Remove leading slash
 	path = strings.TrimPrefix(path, "/")

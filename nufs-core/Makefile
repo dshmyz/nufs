@@ -5,7 +5,13 @@ BIN_DIR := bin
 
 # Go build flags
 GOFLAGS := -trimpath
-LDFLAGS := -s -w
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
+BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown")
+LDFLAGS := -s -w \
+	-X github.com/example/dfs/internal/version.Version=$(VERSION) \
+	-X github.com/example/dfs/internal/version.GitCommit=$(GIT_COMMIT) \
+	-X github.com/example/dfs/internal/version.BuildTime=$(BUILD_TIME)
 
 # All service binaries
 BINS := metad datanode nufs-s3 nufs-fuse nufs-cli

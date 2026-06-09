@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/example/dfs/internal/version"
 	"github.com/example/dfs/metadata"
 )
 
@@ -57,7 +58,9 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 
 	// Health & cluster — always served, no leader check
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/ready", s.handleReady)
+	mux.HandleFunc("/api/v1/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/metrics", s.handleMetrics)
 
@@ -104,6 +107,9 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 
 	// Scrub — data consistency check
 	mux.HandleFunc("/api/v1/scrub", s.handleScrub)
+
+	// Audit — query audit trail
+	mux.HandleFunc("/api/v1/audit", s.handleAudit)
 }
 
 // --- Health, cluster, metrics ---
@@ -129,7 +135,7 @@ func (h *opsHandlers) handleReady(w http.ResponseWriter, _ *http.Request) {
 func (h *opsHandlers) handleClusterStatus(w http.ResponseWriter, _ *http.Request) {
 	status := map[string]interface{}{
 		"is_leader":  h.store.IsLeader(),
-		"version":    "0.2.0",
+		"version":    version.Version,
 		"leader_uri": h.store.LeaderAddr(),
 	}
 	writeJSON(w, status)

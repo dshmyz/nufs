@@ -88,5 +88,37 @@ services:
       - ${NUFS_CREDENTIALS_FILE:-./credentials/s3.yaml}:/etc/nufs/credentials.yaml:ro
     restart: unless-stopped
 
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerting-rules.yaml:/etc/prometheus/alerting-rules.yaml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    depends_on:
+      - metad
+      - datanode-1
+      - datanode-2
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./monitoring/grafana-datasource.yaml:/etc/grafana/provisioning/datasources/datasource.yaml:ro
+      - ./monitoring/grafana-dashboard-provider.yaml:/etc/grafana/provisioning/dashboards/provider.yaml:ro
+      - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/nufs-overview.json:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   nufs-data:

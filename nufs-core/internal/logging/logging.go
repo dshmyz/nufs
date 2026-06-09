@@ -44,7 +44,9 @@ func Init(cfg Config) {
 		level = slog.LevelInfo
 	}
 
-	opts := &slog.HandlerOptions{Level: level, AddSource: cfg.AddSource}
+	opts := &slog.HandlerOptions{Level: &dynamicLevel, AddSource: cfg.AddSource}
+	dynamicLevel.Set(level)
+
 	var h slog.Handler
 	if cfg.JSON {
 		h = slog.NewJSONHandler(os.Stderr, opts)
@@ -52,6 +54,27 @@ func Init(cfg Config) {
 		h = slog.NewTextHandler(os.Stderr, opts)
 	}
 	slog.SetDefault(slog.New(h))
+}
+
+// dynamicLevel is the shared log level that can be changed at runtime.
+var dynamicLevel slog.LevelVar
+
+// SetLevel dynamically changes the global log level without restarting.
+// This is typically called from a SIGHUP handler to support config hot-reload.
+func SetLevel(levelStr string) {
+	var level slog.Level
+	switch levelStr {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+	dynamicLevel.Set(level)
+	slog.Info("log level changed", "new_level", levelStr)
 }
 
 // Named returns a logger with a component name attached.

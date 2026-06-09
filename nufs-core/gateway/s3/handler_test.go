@@ -405,6 +405,28 @@ func (m *mockMetaService) RemoveXAttr(_ context.Context, _ metadata.InodeID, _ s
 	return nil
 }
 
+func (m *mockMetaService) SetBucketPolicy(_ context.Context, _ string, _ metadata.BucketPolicy) error {
+	return nil
+}
+func (m *mockMetaService) GetBucketPolicy(_ context.Context, bucket string) (*metadata.BucketPolicy, error) {
+	return nil, metadata.ErrAccessDenied
+}
+func (m *mockMetaService) DeleteBucketPolicy(_ context.Context, _ string) error {
+	return nil
+}
+
+func (m *mockMetaService) EnterMaintenance(_ context.Context, _ metadata.NodeID) error {
+	return nil
+}
+
+func (m *mockMetaService) ExitMaintenance(_ context.Context, _ metadata.NodeID) error {
+	return nil
+}
+
+func (m *mockMetaService) RollingUpgradePlan(_ context.Context) ([]metadata.NodeID, error) {
+	return nil, nil
+}
+
 func (m *mockMetaService) ComputeAllBucketUsage(_ context.Context) ([]metadata.BucketUsage, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

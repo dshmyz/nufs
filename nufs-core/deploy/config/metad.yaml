@@ -28,3 +28,14 @@ lease_ttl: "30s"
 gc_interval: "10m"
 gc_dry_run: false
 scrub_interval: "1h"
+
+# Backups (empty backup_dir disables scheduled checkpoints)
+backup_dir: ""
+backup_interval: "1h"
+backup_max: 24
+backup_dry_run: false
+
+# OpenTelemetry tracing
+trace_enabled: false
+trace_endpoint: ""
+trace_insecure: true
