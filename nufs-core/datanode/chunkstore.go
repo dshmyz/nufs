@@ -1,18 +1,20 @@
 package datanode
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/example/dfs/internal/crypto"
 	"github.com/example/dfs/metadata"
 )
 
@@ -29,9 +31,16 @@ type ChunkStore struct {
 	chunkCount atomic.Int64
 	writeSem   chan struct{} // semaphore for concurrent write limiting
 	readSem    chan struct{} // semaphore for concurrent read limiting
+	syncSem    chan struct{} // semaphore for concurrent fsync limiting
 
 	// WAL for crash recovery — logs before write, commits after fsync
 	wal *WriteAheadLog
+
+	// At-rest encryption layer (nil = encryption disabled)
+	encryptor *crypto.Encryptor
+
+	// Disk health manager — used to reject writes when disk is in FAILED state
+	disk *DiskManager
 
 	// File descriptor cache for hot chunks — maps ChunkID to its open file.
 	// Uses LRU eviction to bound the number of open file descriptors.
@@ -41,6 +50,10 @@ type ChunkStore struct {
 	fdList  *fdLRU // LRU eviction tracker
 	fdMax   int    // Maximum cached file descriptors
 }
+
+// SyncConcurrency limits concurrent f.Sync() calls to prevent I/O thrashing
+// when many writers flush simultaneously.
+const SyncConcurrency = 4
 
 // NewChunkStore creates a new chunk store at the given data directory.
 // If wal is non-nil, all writes are protected by the WAL for crash recovery.
@@ -61,18 +74,36 @@ func NewChunkStore(dataDir string, maxWrites, maxReads int, wal *WriteAheadLog) 
 		chunks:    make(map[metadata.ChunkID]*LocalChunkInfo),
 		writeSem:  make(chan struct{}, maxWrites),
 		readSem:   make(chan struct{}, maxReads),
+		syncSem:   make(chan struct{}, SyncConcurrency),
 		wal:       wal,
 		fdCache:   make(map[metadata.ChunkID]*os.File),
 		fdList:    newFdLRU(256), // cache up to 256 file descriptors
 		fdMax:     256,
 	}
 
-	// Scan existing chunks on startup
-	if err := cs.scanExisting(); err != nil {
+	// Scan existing chunks on startup — runs in background to avoid
+	// blocking process initialization. Writes and reads are rejected
+	// until the scan completes.
+	cs.mu.Lock()
+	err := cs.scanExisting()
+	cs.mu.Unlock()
+	if err != nil {
 		return nil, fmt.Errorf("datanode: scan existing chunks: %w", err)
 	}
 
 	return cs, nil
+}
+
+// SetEncryptor configures at-rest encryption for chunk data.
+// When set, Write encrypts data before persisting and Read decrypts after.
+func (cs *ChunkStore) SetEncryptor(enc *crypto.Encryptor) {
+	cs.encryptor = enc
+}
+
+// SetDiskManager registers the disk health manager for write admission control.
+// When the disk transitions to FAILED state, all writes are rejected.
+func (cs *ChunkStore) SetDiskManager(dm *DiskManager) {
+	cs.disk = dm
 }
 
 // chunkPath returns the file path for a chunk.
@@ -90,6 +121,13 @@ func (cs *ChunkStore) metaPath(chunkID metadata.ChunkID) string {
 // Write stores chunk data to local disk.
 // If WAL is configured, the write is logged before and committed after for crash recovery.
 func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
+	// Reject writes if disk is in FAILED state (auto read-only on disk failure)
+	if cs.disk != nil {
+		if err := cs.disk.CanAdmitWrite(int64(len(data))); err != nil {
+			return fmt.Errorf("datanode: write rejected: %w", err)
+		}
+	}
+
 	// Acquire write semaphore
 	cs.writeSem <- struct{}{}
 	defer func() { <-cs.writeSem }()
@@ -101,7 +139,17 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
 		}
 	}
 
-	checksum := crc32.ChecksumIEEE(data)
+	// Encrypt data at rest if encryption is configured
+	storeData := data
+	if cs.encryptor != nil && cs.encryptor.Enabled() {
+		encrypted, err := cs.encryptor.EncryptChunk(data)
+		if err != nil {
+			return fmt.Errorf("datanode: encrypt chunk: %w", err)
+		}
+		storeData = encrypted
+	}
+
+	checksum := crc32.ChecksumIEEE(data) // checksum of plaintext
 	path := cs.chunkPath(chunkID)
 
 	f, err := os.Create(path)
@@ -110,21 +158,27 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
 	}
 	defer f.Close()
 
-	// Write binary header
+	// Write binary header — data_length stores the encrypted blob size
 	header := make([]byte, ChunkFileHeaderSize)
 	copy(header[0:4], ChunkFileMagic)
 	binary.BigEndian.PutUint64(header[4:12], uint64(chunkID))
-	binary.BigEndian.PutUint32(header[12:16], uint32(len(data)))
+	binary.BigEndian.PutUint32(header[12:16], uint32(len(storeData)))
 	binary.BigEndian.PutUint32(header[16:20], checksum)
 
 	if _, err := f.Write(header); err != nil {
 		return fmt.Errorf("datanode: write header: %w", err)
 	}
-	if _, err := f.Write(data); err != nil {
+	if _, err := f.Write(storeData); err != nil {
 		return fmt.Errorf("datanode: write data: %w", err)
 	}
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("datanode: fsync: %w", err)
+	// Throttle concurrent fsyncs to prevent disk I/O thrashing.
+	// Multiple concurrent writers writing to different files can
+	// saturate the disk with flush commands, hurting throughput.
+	cs.syncSem <- struct{}{}
+	syncErr := f.Sync()
+	<-cs.syncSem
+	if syncErr != nil {
+		return fmt.Errorf("datanode: fsync: %w", syncErr)
 	}
 
 	// Update in-memory index
@@ -151,7 +205,7 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
 	// Phase 2: Commit in WAL — write is durable, safe to ack
 	if cs.wal != nil {
 		if err := cs.wal.LogCommit(chunkID); err != nil {
-			log.Printf("datanode: WAL commit failed for chunk %d: %v (data is safe on disk)", chunkID, err)
+			slog.Warn("datanode: WAL commit failed for chunk, data is safe on disk", "chunkID", chunkID, "error", err)
 			// Data is already on disk, so we don't fail the write.
 			// The next startup recovery will see this as uncommitted and verify.
 		}
@@ -230,24 +284,44 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 	dataLen := binary.BigEndian.Uint32(header[12:16])
 	storedChecksum := binary.BigEndian.Uint32(header[16:20])
 
-	// Determine read range
-	readOffset := offset
-	readLen := int32(dataLen)
-	if length > 0 {
-		readLen = length
-	}
-	if readOffset+int64(readLen) > int64(dataLen) {
-		readLen = int32(int64(dataLen) - readOffset)
-	}
-
-	// Seek to data position
-	if _, err := f.Seek(int64(ChunkFileHeaderSize)+readOffset, io.SeekStart); err != nil {
+	// Read the full stored payload (may be encrypted)
+	if _, err := f.Seek(int64(ChunkFileHeaderSize), io.SeekStart); err != nil {
 		return nil, 0, fmt.Errorf("datanode: seek: %w", err)
 	}
 
-	data := make([]byte, readLen)
-	if _, err := io.ReadFull(f, data); err != nil {
+	storedData := make([]byte, dataLen)
+	if _, err := io.ReadFull(f, storedData); err != nil {
 		return nil, 0, fmt.Errorf("datanode: read data: %w", err)
+	}
+
+	// Decrypt if encryption is enabled
+	var plainData []byte
+	if cs.encryptor != nil && cs.encryptor.Enabled() {
+		decrypted, err := cs.encryptor.DecryptChunk(storedData)
+		if err != nil {
+			return nil, 0, fmt.Errorf("datanode: decrypt chunk: %w", err)
+		}
+		plainData = decrypted
+	} else {
+		plainData = storedData
+	}
+
+	// Apply offset/length on the plaintext
+	readOffset := offset
+	readLen := int32(len(plainData))
+	if length > 0 {
+		readLen = length
+	}
+	if readOffset+int64(readLen) > int64(len(plainData)) {
+		readLen = int32(int64(len(plainData)) - readOffset)
+	}
+
+	var result []byte
+	if readOffset == 0 && readLen == int32(len(plainData)) {
+		result = plainData
+	} else {
+		result = make([]byte, readLen)
+		copy(result, plainData[readOffset:readOffset+int64(readLen)])
 	}
 
 	// Update access stats
@@ -258,7 +332,7 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 	}
 	cs.mu.RUnlock()
 
-	return data, storedChecksum, nil
+	return result, storedChecksum, nil
 }
 
 // Seal finalizes a chunk: updates the state to sealed.
@@ -336,6 +410,39 @@ func (cs *ChunkStore) ListChunks() []LocalChunkInfo {
 // Stats returns storage statistics.
 func (cs *ChunkStore) Stats() (totalBytes int64, chunkCount int64) {
 	return cs.totalBytes.Load(), cs.chunkCount.Load()
+}
+
+// DrainWrites waits for all in-flight writes to release the write semaphore.
+// It returns a release function that must be called to hand the acquired slots
+// back if the process continues after draining.
+func (cs *ChunkStore) DrainWrites(ctx context.Context) (func(), error) {
+	acquired := 0
+	release := func() {
+		for i := 0; i < acquired; i++ {
+			<-cs.writeSem
+		}
+	}
+	for i := 0; i < cap(cs.writeSem); i++ {
+		select {
+		case cs.writeSem <- struct{}{}:
+			acquired++
+		case <-ctx.Done():
+			return release, ctx.Err()
+		}
+	}
+	return release, nil
+}
+
+// Close releases process-local resources owned by the chunk store.
+func (cs *ChunkStore) Close() error {
+	cs.closeFdCache()
+	return nil
+}
+
+// WriteSem returns the write semaphore channel for graceful shutdown drain.
+// Callers can attempt to acquire all slots to wait for in-flight writes.
+func (cs *ChunkStore) WriteSem() chan struct{} {
+	return cs.writeSem
 }
 
 // ========== Internal Helpers ==========

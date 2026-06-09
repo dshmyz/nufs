@@ -1,19 +1,21 @@
 package datanode
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
 
 	"time"
 
+	"github.com/example/dfs/internal/tlsutil"
 	"github.com/example/dfs/metadata"
 )
 
@@ -29,9 +31,10 @@ type Server struct {
 	requestSeq atomic.Uint64
 
 	// Connection management
-	connSem    chan struct{}   // Semaphore limiting concurrent connections
-	activeConn atomic.Int64   // Current active connection count
-	reqTimeout time.Duration  // Per-request timeout (0 = no timeout)
+	connSem          chan struct{}   // Semaphore limiting concurrent connections
+	activeConn       atomic.Int64   // Current active connection count
+	reqTimeout       time.Duration  // Per-request timeout (0 = no timeout)
+	slowReqThreshold time.Duration  // Log warnings for requests exceeding this duration
 }
 
 // NewServer creates a new data node server.
@@ -45,23 +48,40 @@ func NewServer(cfg Config, store *ChunkStore) *Server {
 		reqTimeout = 30 * time.Second
 	}
 	return &Server{
-		cfg:        cfg,
-		store:      store,
-		connSem:    make(chan struct{}, maxConns),
-		reqTimeout: reqTimeout,
+		cfg:              cfg,
+		store:            store,
+		connSem:          make(chan struct{}, maxConns),
+		reqTimeout:       reqTimeout,
+		slowReqThreshold: 500 * time.Millisecond, // Log slow requests > 500ms
 	}
 }
 
 // Start begins listening for incoming connections.
+// When Config.TLS is enabled, the listener wraps connections with TLS.
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("datanode: listen %s: %w", s.cfg.ListenAddr, err)
 	}
+
+	// Wrap with TLS if configured
+	if s.cfg.TLS.Enabled() {
+		tlsCfg, err := tlsutil.ServerConfig(s.cfg.TLS)
+		if err != nil {
+			ln.Close()
+			return fmt.Errorf("datanode: tls config: %w", err)
+		}
+		ln = tls.NewListener(ln, tlsCfg)
+	}
+
 	s.listener = ln
 	s.running.Store(true)
 
-	log.Printf("datanode: server listening on %s (node_id=%d)", s.cfg.ListenAddr, s.cfg.NodeID)
+	scheme := "tcp"
+	if s.cfg.TLS.Enabled() {
+		scheme = "tls"
+	}
+	slog.Info("datanode: server listening", "addr", s.cfg.ListenAddr, "scheme", scheme, "nodeID", s.cfg.NodeID)
 
 	s.wg.Add(1)
 	go s.acceptLoop()
@@ -78,7 +98,7 @@ func (s *Server) Stop() {
 		s.listener.Close()
 	}
 	s.wg.Wait()
-	log.Printf("datanode: server stopped")
+	slog.Info("datanode: server stopped")
 }
 
 func (s *Server) acceptLoop() {
@@ -88,7 +108,7 @@ func (s *Server) acceptLoop() {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			if s.running.Load() {
-				log.Printf("datanode: accept error: %v", err)
+				slog.Error("datanode: accept error", "error", err)
 			}
 			continue
 		}
@@ -98,8 +118,8 @@ func (s *Server) acceptLoop() {
 		case s.connSem <- struct{}{}:
 			// Got a slot
 		default:
-			log.Printf("datanode: rejecting connection from %s: max connections reached (%d)",
-				conn.RemoteAddr(), cap(s.connSem))
+			slog.Warn("datanode: rejecting connection, max connections reached",
+				"remote", conn.RemoteAddr(), "max", cap(s.connSem))
 			conn.Close()
 			continue
 		}
@@ -127,7 +147,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		header, body, err := readMessage(conn)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("datanode: read message: %v", err)
+				slog.Error("datanode: read message", "error", err)
 			}
 			return
 		}
@@ -137,9 +157,22 @@ func (s *Server) handleConn(conn net.Conn) {
 			conn.SetDeadline(time.Now().Add(s.reqTimeout))
 		}
 
+		start := time.Now()
 		resp := s.dispatch(header, body)
+		elapsed := time.Since(start)
+
+		if elapsed > s.slowReqThreshold {
+			slog.Warn("datanode: slow request",
+				"type", header.Type,
+				"chunkID", header.ChunkID,
+				"requestID", header.RequestID,
+				"duration", elapsed,
+				"remote", conn.RemoteAddr().String(),
+			)
+		}
+
 		if err := writeResponse(conn, resp); err != nil {
-			log.Printf("datanode: write response: %v", err)
+			slog.Error("datanode: write response", "error", err)
 			return
 		}
 	}
@@ -391,11 +424,21 @@ type Client struct {
 	mu      sync.Mutex
 	seq     atomic.Uint64
 	timeout time.Duration
+	tlsCfg  *tls.Config // nil = plain TCP
 }
 
 // NewClient creates a new data node client.
 func NewClient(addr string) *Client {
 	return &Client{addr: addr, timeout: 30 * time.Second}
+}
+
+// NewTLSClient creates a data node client that connects over TLS.
+func NewTLSClient(addr string, cfg tlsutil.Config) (*Client, error) {
+	tlsCfg, err := tlsutil.ClientConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("datanode: tls client config: %w", err)
+	}
+	return &Client{addr: addr, timeout: 30 * time.Second, tlsCfg: tlsCfg}, nil
 }
 
 // SetTimeout sets the operation timeout for read/write operations.
@@ -404,7 +447,20 @@ func (c *Client) SetTimeout(d time.Duration) {
 }
 
 // Connect establishes a TCP connection to the data node.
+// When the client was created with NewTLSClient, the connection
+// is upgraded to TLS automatically.
 func (c *Client) Connect() error {
+	if c.tlsCfg != nil {
+		conn, err := tls.DialWithDialer(
+			&net.Dialer{Timeout: 10 * time.Second},
+			"tcp", c.addr, c.tlsCfg,
+		)
+		if err != nil {
+			return fmt.Errorf("datanode: tls connect to %s: %w", c.addr, err)
+		}
+		c.conn = conn
+		return nil
+	}
 	// Use net.DialTimeout to avoid hanging on unreachable nodes
 	conn, err := net.DialTimeout("tcp", c.addr, 10*time.Second)
 	if err != nil {

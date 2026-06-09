@@ -3,7 +3,7 @@ package datanode
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -76,7 +76,7 @@ func (rw *RepairWorker) Start(ctx context.Context) {
 		defer rw.wg.Done()
 		rw.scanLoop(ctx)
 	}()
-	log.Printf("repair: worker started (interval=%v)", rw.interval)
+	slog.Info("repair: worker started", "interval", rw.interval)
 }
 
 // Stop halts the repair worker.
@@ -116,22 +116,22 @@ func (rw *RepairWorker) scanLoop(ctx context.Context) {
 func (rw *RepairWorker) processRepairQueue(ctx context.Context) {
 	tasks, err := rw.meta.GetRepairQueue(ctx)
 	if err != nil {
-		log.Printf("repair: failed to get repair queue: %v", err)
+		slog.Error("repair: failed to get repair queue", "error", err)
 		return
 	}
 
 	for _, task := range tasks {
 		if err := rw.repairChunk(ctx, task); err != nil {
-			log.Printf("repair: chunk %d repair failed: %v", task.ChunkID, err)
+			slog.Error("repair: chunk repair failed", "chunkID", task.ChunkID, "error", err)
 			rw.mu.Lock()
 			rw.failed++
 			rw.mu.Unlock()
 
 			// Remove stale failed tasks (retried too many times)
 			if task.Priority > 5 {
-				log.Printf("repair: removing stale task for chunk %d (priority=%d)", task.ChunkID, task.Priority)
+				slog.Warn("repair: removing stale task", "chunkID", task.ChunkID, "priority", task.Priority)
 				if removeErr := rw.meta.RemoveRepairTask(ctx, task.ChunkID); removeErr != nil {
-					log.Printf("repair: failed to remove stale task %d: %v", task.ChunkID, removeErr)
+					slog.Error("repair: failed to remove stale task", "chunkID", task.ChunkID, "error", removeErr)
 				}
 			}
 		} else {
@@ -141,7 +141,7 @@ func (rw *RepairWorker) processRepairQueue(ctx context.Context) {
 
 			// Remove completed repair task from queue
 			if removeErr := rw.meta.RemoveRepairTask(ctx, task.ChunkID); removeErr != nil {
-				log.Printf("repair: failed to remove completed task %d: %v", task.ChunkID, removeErr)
+				slog.Error("repair: failed to remove completed task", "chunkID", task.ChunkID, "error", removeErr)
 			}
 		}
 	}
@@ -167,7 +167,7 @@ func (rw *RepairWorker) repairChunk(ctx context.Context, task metadata.RepairTas
 
 	default:
 		// Chunk is healthy — remove stale repair task
-		log.Printf("repair: chunk %d is healthy, removing stale task", task.ChunkID)
+		slog.Info("repair: chunk is healthy, removing stale task", "chunkID", task.ChunkID)
 		return nil
 	}
 }
@@ -205,8 +205,9 @@ func (rw *RepairWorker) repairByAddingReplica(ctx context.Context, chunk *metada
 		return fmt.Errorf("repair: chunk %d: %w", chunk.ID, err)
 	}
 
-	log.Printf("repair: copying chunk %d from node %d (%s) to node %d (%s)",
-		chunk.ID, sourceReplica.NodeID, sourceReplica.Addr, targetNode.ID, targetNode.Addr)
+	slog.Info("repair: copying chunk to new replica",
+		"chunkID", chunk.ID, "sourceNode", sourceReplica.NodeID, "sourceAddr", sourceReplica.Addr,
+		"targetNode", targetNode.ID, "targetAddr", targetNode.Addr)
 
 	// 1. Read chunk from source via TCP
 	srcClient := NewClient(sourceReplica.Addr)
@@ -285,8 +286,8 @@ func (rw *RepairWorker) repairByRefetchLocal(ctx context.Context, chunk *metadat
 		return fmt.Errorf("repair: no healthy source for local repair of chunk %d", chunk.ID)
 	}
 
-	log.Printf("repair: refetching chunk %d from node %d (%s) for local repair",
-		chunk.ID, sourceReplica.NodeID, sourceReplica.Addr)
+	slog.Info("repair: refetching chunk for local repair",
+		"chunkID", chunk.ID, "sourceNode", sourceReplica.NodeID, "sourceAddr", sourceReplica.Addr)
 
 	// Read from source
 	client := NewClient(sourceReplica.Addr)
@@ -315,7 +316,7 @@ func (rw *RepairWorker) repairByRefetchLocal(ctx context.Context, chunk *metadat
 		}
 	}
 
-	log.Printf("repair: chunk %d local repair complete", chunk.ID)
+	slog.Info("repair: chunk local repair complete", "chunkID", chunk.ID)
 	return nil
 }
 
@@ -373,11 +374,11 @@ func (rw *RepairWorker) RepairChunksForDiskFailure(ctx context.Context, failedDi
 			continue
 		}
 		if err := rw.meta.TriggerRepair(ctx, chunk.ID); err != nil {
-			log.Printf("repair: failed to trigger repair for chunk %d after disk failure: %v", chunk.ID, err)
+			slog.Error("repair: failed to trigger repair after disk failure", "chunkID", chunk.ID, "error", err)
 			continue
 		}
 		triggered++
 	}
-	log.Printf("repair: triggered %d chunk repairs for failed disk %s", triggered, failedDiskDir)
+	slog.Info("repair: triggered chunk repairs for failed disk", "triggered", triggered, "disk", failedDiskDir)
 	return nil
 }

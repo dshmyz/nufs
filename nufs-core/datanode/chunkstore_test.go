@@ -2,12 +2,14 @@ package datanode
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/example/dfs/metadata"
 )
@@ -214,6 +216,79 @@ func TestChunkStore_DeleteNonExistent(t *testing.T) {
 	// Deleting a non-existent chunk should not error (idempotent)
 	if err := cs.Delete(metadata.ChunkID(888888)); err != nil {
 		t.Fatalf("Delete non-existent: unexpected error: %v", err)
+	}
+}
+
+func TestChunkStore_DrainWritesReleasesSlots(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	release, err := cs.DrainWrites(ctx)
+	if err != nil {
+		t.Fatalf("DrainWrites: %v", err)
+	}
+
+	select {
+	case cs.writeSem <- struct{}{}:
+		t.Fatal("write semaphore should be full while drained")
+	default:
+	}
+	release()
+
+	select {
+	case cs.writeSem <- struct{}{}:
+		<-cs.writeSem
+	case <-time.After(time.Second):
+		t.Fatal("write semaphore slot was not released")
+	}
+}
+
+func TestChunkStore_DrainWritesTimeout(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+	for i := 0; i < cap(cs.writeSem); i++ {
+		cs.writeSem <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < cap(cs.writeSem); i++ {
+			<-cs.writeSem
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	release, err := cs.DrainWrites(ctx)
+	if err == nil {
+		release()
+		t.Fatal("expected timeout")
+	}
+	if release != nil {
+		release()
+	}
+}
+
+func TestChunkStore_CloseClosesFdCache(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+	chunkID := metadata.ChunkID(909)
+	if err := cs.Write(chunkID, []byte("cached fd")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, _, err := cs.Read(chunkID, 0, 0); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	cs.fdMu.RLock()
+	cached := len(cs.fdCache)
+	cs.fdMu.RUnlock()
+	if cached == 0 {
+		t.Fatal("expected fd cache to contain entry after read")
+	}
+	if err := cs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	cs.fdMu.RLock()
+	defer cs.fdMu.RUnlock()
+	if len(cs.fdCache) != 0 {
+		t.Fatalf("expected fd cache to be empty, got %d", len(cs.fdCache))
 	}
 }
 

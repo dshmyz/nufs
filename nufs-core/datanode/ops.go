@@ -2,15 +2,21 @@ package datanode
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/example/dfs/internal/httputil"
+	"github.com/example/dfs/internal/tlsutil"
+	"github.com/example/dfs/internal/version"
 	"github.com/example/dfs/metadata"
 )
 
@@ -56,9 +62,9 @@ func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta metadata.Metadat
 	// Wire disk failure callback to trigger repair for chunks on failed disk
 	if repair != nil {
 		disk.SetOnDiskFailed(func(diskID string) {
-			log.Printf("ops: disk %s failed, triggering chunk repairs", diskID)
+			slog.Warn("ops: disk failed, triggering chunk repairs", "diskID", diskID)
 			if err := repair.RepairChunksForDiskFailure(context.Background(), diskID); err != nil {
-				log.Printf("ops: disk failure repair failed: %v", err)
+				slog.Error("ops: disk failure repair failed", "error", err)
 			}
 		})
 	}
@@ -81,12 +87,47 @@ func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta metadata.Metadat
 	mux.HandleFunc("/api/v1/gc/scan", s.handleGCScan)
 
 	// Metrics
+	mux.HandleFunc("/metrics", s.handlePrometheusMetrics)
 	mux.HandleFunc("/api/v1/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleHealth)
+	mux.HandleFunc("/api/v1/capacity/alerts", s.handleCapacityAlerts)
 
-	s.listener = &http.Server{
-		Addr:    cfg.OpsListenAddr,
-		Handler: mux,
+	// pprof — runtime profiling endpoints, disabled by default.
+	if cfg.EnablePprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+
+	// Version
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(version.Info())
+	})
+
+	if cfg.OpsAuthToken != "" {
+		public := map[string]struct{}{
+			"/api/v1/health": {},
+			"/metrics":       {},
+			"/health":        {},
+			"/healthz":       {},
+			"/ready":         {},
+			"/version":       {},
+		}
+		s.listener = &http.Server{
+			Addr:    cfg.OpsListenAddr,
+			Handler: httputil.BearerAuth(cfg.OpsAuthToken, public, mux),
+		}
+	} else {
+		s.listener = &http.Server{
+			Addr:    cfg.OpsListenAddr,
+			Handler: mux,
+		}
 	}
 	return s
 }
@@ -94,29 +135,49 @@ func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta metadata.Metadat
 // Start begins listening for operations requests.
 // It blocks until the HTTP listener is ready to accept connections,
 // eliminating the race between Start() returning and the server being
-// available for requests.
+// available for requests. When Config.TLS is enabled, the listener
+// is wrapped with TLS.
 func (s *OpsServer) Start() error {
 	if !s.running.Swap(true) {
-		// Use a channel to wait for the listener to be ready
-		ready := make(chan struct{})
+		// Use a channel to wait for the listener to be ready.
+		ready := make(chan error, 1)
 
 		go func() {
-			// Create a net.Listener first, then signal readiness
+			// Create a net.Listener first, then signal readiness.
 			ln, err := net.Listen("tcp", s.cfg.OpsListenAddr)
 			if err != nil {
-				log.Printf("ops: failed to listen on %s: %v", s.cfg.OpsListenAddr, err)
-				close(ready)
+				s.running.Store(false)
+				ready <- fmt.Errorf("ops: listen %s: %w", s.cfg.OpsListenAddr, err)
 				return
 			}
-			close(ready) // Signal that the listener is ready
+
+			// Wrap with TLS if configured.
+			if s.cfg.TLS.Enabled() {
+				tlsCfg, err := tlsutil.ServerConfig(s.cfg.TLS)
+				if err != nil {
+					ln.Close()
+					s.running.Store(false)
+					ready <- fmt.Errorf("ops: TLS config: %w", err)
+					return
+				}
+				ln = tls.NewListener(ln, tlsCfg)
+			}
+
+			ready <- nil // Signal that the listener is ready.
 
 			if err := s.listener.Serve(ln); err != nil && err != http.ErrServerClosed {
-				log.Printf("ops: HTTP server error: %v", err)
+				slog.Error("ops: HTTP server error", "error", err)
 			}
 		}()
 
-		<-ready // Wait for listener to be ready
-		log.Printf("ops: management API ready on %s", s.cfg.OpsListenAddr)
+		if err := <-ready; err != nil {
+			return err
+		}
+		scheme := "http"
+		if s.cfg.TLS.Enabled() {
+			scheme = "https"
+		}
+		slog.Info("ops: management API ready", "addr", s.cfg.OpsListenAddr, "scheme", scheme)
 	}
 	return nil
 }
@@ -127,7 +188,7 @@ func (s *OpsServer) Stop() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		s.listener.Shutdown(ctx)
-		log.Printf("ops: management API stopped")
+		slog.Info("ops: management API stopped")
 	}
 }
 
@@ -137,7 +198,7 @@ type ClusterStatus struct {
 	NodeID      uint64             `json:"node_id"`
 	State       metadata.NodeState `json:"state"`
 	Addr        string             `json:"addr"`
-	DiskStats   DiskStatsSnapshot    `json:"disk_stats"`
+	DiskStats   DiskStatsSnapshot  `json:"disk_stats"`
 	Replication struct {
 		Writes     int64 `json:"writes"`
 		Errors     int64 `json:"errors"`
@@ -277,9 +338,9 @@ func (s *OpsServer) triggerGCScan(ctx context.Context) (int, error) {
 		_, err := s.meta.GetChunk(ctx, lc.ChunkID)
 		if err != nil {
 			// Chunk not in metadata — it's an orphan
-			log.Printf("gc: orphan chunk %d (%d bytes) not in metadata, deleting", lc.ChunkID, lc.Size)
+			slog.Info("gc: orphan chunk not in metadata, deleting", "chunkID", lc.ChunkID, "size", lc.Size)
 			if delErr := s.store.Delete(lc.ChunkID); delErr != nil {
-				log.Printf("gc: failed to delete orphan chunk %d: %v", lc.ChunkID, delErr)
+				slog.Error("gc: failed to delete orphan chunk", "chunkID", lc.ChunkID, "error", delErr)
 			} else {
 				orphanCount++
 			}
@@ -287,7 +348,7 @@ func (s *OpsServer) triggerGCScan(ctx context.Context) (int, error) {
 	}
 
 	if orphanCount > 0 {
-		log.Printf("gc: scan complete, deleted %d orphan chunks out of %d local chunks", orphanCount, len(localChunks))
+		slog.Info("gc: scan complete", "deleted", orphanCount, "total", len(localChunks))
 	}
 	return orphanCount, nil
 }
@@ -308,6 +369,74 @@ type OpsMetrics struct {
 		Mismatches int64 `json:"mismatches"`
 		Repaired   int64 `json:"repaired"`
 	} `json:"anti_entropy"`
+}
+
+func (s *OpsServer) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
+	stats := s.disk.Stats()
+	writes, replErrors, avgLatency := s.repl.Stats()
+	scanned, mismatches, repaired := s.ae.Stats()
+	totalBytes, chunkCount := s.store.Stats()
+
+	state := strings.ToLower(stats.DiskState)
+	if state == "" {
+		state = "unknown"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# HELP nufs_datanode_chunks_total Local chunks stored on this datanode\n")
+	sb.WriteString("# TYPE nufs_datanode_chunks_total gauge\n")
+	fmt.Fprintf(&sb, "nufs_datanode_chunks_total %d\n", chunkCount)
+
+	sb.WriteString("# HELP nufs_datanode_bytes_total Local plaintext chunk bytes stored on this datanode\n")
+	sb.WriteString("# TYPE nufs_datanode_bytes_total gauge\n")
+	fmt.Fprintf(&sb, "nufs_datanode_bytes_total %d\n", totalBytes)
+
+	sb.WriteString("# HELP nufs_disk_capacity_bytes Configured disk capacity in bytes\n")
+	sb.WriteString("# TYPE nufs_disk_capacity_bytes gauge\n")
+	fmt.Fprintf(&sb, "nufs_disk_capacity_bytes %d\n", stats.TotalBytes)
+
+	sb.WriteString("# HELP nufs_disk_used_bytes Disk bytes used by local chunks\n")
+	sb.WriteString("# TYPE nufs_disk_used_bytes gauge\n")
+	fmt.Fprintf(&sb, "nufs_disk_used_bytes %d\n", stats.UsedBytes)
+
+	sb.WriteString("# HELP nufs_disk_available_bytes Disk bytes available before configured capacity\n")
+	sb.WriteString("# TYPE nufs_disk_available_bytes gauge\n")
+	fmt.Fprintf(&sb, "nufs_disk_available_bytes %d\n", stats.AvailBytes)
+
+	sb.WriteString("# HELP nufs_disk_io_errors_total Consecutive disk I/O error count\n")
+	sb.WriteString("# TYPE nufs_disk_io_errors_total gauge\n")
+	fmt.Fprintf(&sb, "nufs_disk_io_errors_total %d\n", stats.IOErrors)
+
+	sb.WriteString("# HELP nufs_disk_state Disk state as labeled gauge (1 for current state)\n")
+	sb.WriteString("# TYPE nufs_disk_state gauge\n")
+	fmt.Fprintf(&sb, "nufs_disk_state{state=%q} 1\n", state)
+
+	sb.WriteString("# HELP nufs_datanode_replication_writes_total Replication writes performed\n")
+	sb.WriteString("# TYPE nufs_datanode_replication_writes_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_replication_writes_total %d\n", writes)
+
+	sb.WriteString("# HELP nufs_datanode_replication_errors_total Replication errors observed\n")
+	sb.WriteString("# TYPE nufs_datanode_replication_errors_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_replication_errors_total %d\n", replErrors)
+
+	sb.WriteString("# HELP nufs_datanode_replication_avg_latency_us Average replication latency in microseconds\n")
+	sb.WriteString("# TYPE nufs_datanode_replication_avg_latency_us gauge\n")
+	fmt.Fprintf(&sb, "nufs_datanode_replication_avg_latency_us %d\n", avgLatency)
+
+	sb.WriteString("# HELP nufs_datanode_antientropy_scanned_total Anti-entropy chunks scanned\n")
+	sb.WriteString("# TYPE nufs_datanode_antientropy_scanned_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_antientropy_scanned_total %d\n", scanned)
+
+	sb.WriteString("# HELP nufs_datanode_antientropy_mismatches_total Anti-entropy mismatches found\n")
+	sb.WriteString("# TYPE nufs_datanode_antientropy_mismatches_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_antientropy_mismatches_total %d\n", mismatches)
+
+	sb.WriteString("# HELP nufs_datanode_antientropy_repaired_total Anti-entropy repairs completed\n")
+	sb.WriteString("# TYPE nufs_datanode_antientropy_repaired_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_antientropy_repaired_total %d\n", repaired)
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	_, _ = w.Write([]byte(sb.String()))
 }
 
 func (s *OpsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -354,6 +483,18 @@ func (s *OpsServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		code = http.StatusServiceUnavailable
 	}
 	s.writeJSON(w, status, code)
+}
+
+func (s *OpsServer) handleCapacityAlerts(w http.ResponseWriter, r *http.Request) {
+	stats := s.disk.Stats()
+	alertLevel := AlertLevel(s.disk.alertFired.Load())
+	s.writeJSON(w, map[string]interface{}{
+		"alert_level": alertLevel.String(),
+		"usage_pct":   fmt.Sprintf("%.1f%%", stats.UsagePct*100),
+		"used_bytes":  stats.UsedBytes,
+		"total_bytes": stats.TotalBytes,
+		"avail_bytes": stats.AvailBytes,
+	})
 }
 
 func (s *OpsServer) writeJSON(w http.ResponseWriter, v interface{}, status ...int) {

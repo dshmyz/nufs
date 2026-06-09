@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -23,6 +23,26 @@ const (
 	DiskDegraded                  // I/O errors detected, below threshold
 	DiskFailed                    // Too many I/O errors, read-only
 )
+
+// AlertLevel represents capacity alert severity.
+type AlertLevel int32
+
+const (
+	AlertNone     AlertLevel = iota // No alert
+	AlertWarn                       // Usage above warn threshold
+	AlertCritical                   // Usage above critical threshold
+)
+
+func (l AlertLevel) String() string {
+	switch l {
+	case AlertWarn:
+		return "warn"
+	case AlertCritical:
+		return "critical"
+	default:
+		return "none"
+	}
+}
 
 func (s DiskState) String() string {
 	switch s {
@@ -73,6 +93,12 @@ type DiskManager struct {
 
 	// Callback for chunk migration when disk fails
 	onDiskFailed func(diskID string)
+
+	// Capacity alert callbacks
+	warnPct         float64 // warn threshold (default 0.75)
+	criticalPct     float64 // critical threshold (default 0.85)
+	onCapacityAlert func(level AlertLevel, usagePct float64, dm *DiskManager)
+	alertFired      atomic.Int64 // stores last AlertLevel fired (0=none)
 }
 
 // DiskStats holds real-time disk utilization metrics.
@@ -100,14 +126,16 @@ type TierConfig struct {
 // The caller must provide a WAL instance (use NewWriteAheadLog to create one).
 func NewDiskManager(dataDir string, store *ChunkStore, capacityGB int64, wal *WriteAheadLog) (*DiskManager, error) {
 	dm := &DiskManager{
-		dataDir:    dataDir,
-		store:      store,
-		capacityGB: capacityGB,
-		tiers:      defaultTierConfig(),
-		admitCh:    make(chan struct{}, 64),
-		rejectPct:  0.90,
-		wal:        wal,
-		stopCh:     make(chan struct{}),
+		dataDir:     dataDir,
+		store:       store,
+		capacityGB:  capacityGB,
+		tiers:       defaultTierConfig(),
+		admitCh:     make(chan struct{}, 64),
+		rejectPct:   0.90,
+		warnPct:     0.75,
+		criticalPct: 0.85,
+		wal:         wal,
+		stopCh:      make(chan struct{}),
 	}
 	dm.diskState.Store(int64(DiskOnline))
 	dm.stats.TotalBytes = capacityGB * 1024 * 1024 * 1024
@@ -142,7 +170,6 @@ func (dm *DiskManager) Stop() {
 		close(dm.stopCh)
 	}
 	dm.wg.Wait()
-	dm.wal.Close()
 }
 
 // DiskStatsSnapshot is a point-in-time copy of DiskStats without atomic fields (safe to copy).
@@ -208,7 +235,7 @@ func (dm *DiskManager) RecordWriteError(err error) bool {
 	if n >= DiskIOErrorThreshold {
 		old := dm.diskState.Swap(int64(DiskFailed))
 		if old != int64(DiskFailed) {
-			log.Printf("disk: data dir %s marked FAILED after %d consecutive I/O errors", dm.dataDir, n)
+			slog.Error("disk: marked FAILED after consecutive I/O errors", "dir", dm.dataDir, "errors", n)
 			if dm.onDiskFailed != nil {
 				go dm.onDiskFailed(dm.dataDir)
 			}
@@ -217,7 +244,7 @@ func (dm *DiskManager) RecordWriteError(err error) bool {
 	}
 	old := dm.diskState.Swap(int64(DiskDegraded))
 	if old == int64(DiskOnline) {
-		log.Printf("disk: data dir %s DEGRADED (%d I/O errors)", dm.dataDir, n)
+		slog.Warn("disk: DEGRADED", "dir", dm.dataDir, "errors", n)
 	}
 	return false
 }
@@ -231,7 +258,7 @@ func (dm *DiskManager) RecordIOError() {
 	if n >= DiskIOErrorThreshold {
 		old := dm.diskState.Swap(int64(DiskFailed))
 		if old != int64(DiskFailed) {
-			log.Printf("disk: %s marked FAILED after %d I/O errors", dm.dataDir, n)
+			slog.Error("disk: marked FAILED after I/O errors", "dir", dm.dataDir, "errors", n)
 			if dm.onDiskFailed != nil {
 				go dm.onDiskFailed(dm.dataDir)
 			}
@@ -251,7 +278,7 @@ func (dm *DiskManager) RecordSuccess() {
 	if dm.ioErrors.Load() <= 0 {
 		dm.ioErrors.Store(0)
 		dm.diskState.Store(int64(DiskOnline))
-		log.Printf("disk: %s recovered to ONLINE state", dm.dataDir)
+		slog.Info("disk: recovered to ONLINE state", "dir", dm.dataDir)
 	}
 }
 
@@ -303,14 +330,47 @@ func (dm *DiskManager) monitorLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
+	probeTicker := time.NewTicker(30 * time.Second)
+	defer probeTicker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
 			dm.refreshStats()
+			dm.checkCapacityAlert()
+		case <-probeTicker.C:
+			dm.probeDiskRecovery()
 		case <-dm.stopCh:
 			return
 		}
 	}
+}
+
+// probeDiskRecovery attempts a small write to detect if a failed/degraded
+// disk has recovered. On success, the error counter is decremented; after
+// enough consecutive successes the disk transitions back to Online.
+func (dm *DiskManager) probeDiskRecovery() {
+	state := DiskState(dm.diskState.Load())
+	if state == DiskOnline {
+		return // nothing to probe
+	}
+
+	probePath := filepath.Join(dm.dataDir, ".diskprobe")
+	data := []byte(fmt.Sprintf("probe-%d", time.Now().UnixNano()))
+
+	if err := os.WriteFile(probePath, data, 0644); err != nil {
+		slog.Debug("disk: recovery probe failed", "dir", dm.dataDir, "error", err)
+		return
+	}
+
+	// Verify we can read it back
+	if _, err := os.ReadFile(probePath); err != nil {
+		slog.Debug("disk: recovery probe read-back failed", "dir", dm.dataDir, "error", err)
+		return
+	}
+
+	os.Remove(probePath)
+	dm.RecordSuccess()
 }
 
 func (dm *DiskManager) refreshStats() {
@@ -325,6 +385,63 @@ func (dm *DiskManager) refreshStats() {
 		dm.stats.UsagePct = float64(dm.stats.UsedBytes) / float64(dm.stats.TotalBytes)
 	}
 	dm.stats.LastUpdated = time.Now()
+}
+
+// SetOnCapacityAlert registers a callback for capacity alerts.
+// The callback receives the alert level, current usage percentage, and the DiskManager.
+func (dm *DiskManager) SetOnCapacityAlert(fn func(level AlertLevel, usagePct float64, dm *DiskManager)) {
+	dm.onCapacityAlert = fn
+}
+
+// SetCapacityThresholds configures custom warn and critical thresholds.
+func (dm *DiskManager) SetCapacityThresholds(warnPct, criticalPct float64) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.warnPct = warnPct
+	dm.criticalPct = criticalPct
+}
+
+// checkCapacityAlert evaluates current usage against thresholds and fires alerts.
+// Alerts are de-duplicated: a level change is required to re-fire.
+func (dm *DiskManager) checkCapacityAlert() {
+	dm.mu.RLock()
+	usagePct := dm.stats.UsagePct
+	warnPct := dm.warnPct
+	criticalPct := dm.criticalPct
+	cb := dm.onCapacityAlert
+	dm.mu.RUnlock()
+
+	var level AlertLevel
+	switch {
+	case usagePct >= criticalPct:
+		level = AlertCritical
+	case usagePct >= warnPct:
+		level = AlertWarn
+	default:
+		level = AlertNone
+	}
+
+	prev := AlertLevel(dm.alertFired.Load())
+	if level == prev {
+		return // no change
+	}
+
+	dm.alertFired.Store(int64(level))
+
+	if level != AlertNone && cb != nil {
+		go cb(level, usagePct, dm)
+	}
+
+	switch level {
+	case AlertCritical:
+		slog.Error("disk: capacity CRITICAL", "dir", dm.dataDir, "usage", fmt.Sprintf("%.1f%%", usagePct*100))
+	case AlertWarn:
+		slog.Warn("disk: capacity warning", "dir", dm.dataDir, "usage", fmt.Sprintf("%.1f%%", usagePct*100))
+	case AlertNone:
+		if prev != AlertNone {
+			slog.Info("disk: capacity alert cleared", "dir", dm.dataDir, "usage", fmt.Sprintf("%.1f%%", usagePct*100))
+		}
+	}
 }
 
 // ============================================================
@@ -357,6 +474,7 @@ type WriteAheadLog struct {
 	flushDone chan chan error // flush goroutine reports result
 	closeCh   chan struct{}
 	wg        sync.WaitGroup
+	closed    atomic.Bool // prevents double-close panic
 }
 
 // walGroupCommitBatchSize is the maximum number of entries buffered
@@ -579,13 +697,13 @@ func (w *WriteAheadLog) Recover() ([]metadata.ChunkID, error) {
 		for _, id := range orphans {
 			chunkPath := w.chunkPath(id)
 			if err := os.Remove(chunkPath); err != nil && !os.IsNotExist(err) {
-				log.Printf("wal: failed to clean orphan chunk %d: %v", id, err)
+				slog.Warn("wal: failed to clean orphan chunk", "chunkID", id, "error", err)
 			} else if err == nil {
 				cleaned++
 			}
 		}
 		if cleaned > 0 {
-			log.Printf("wal: cleaned %d orphan chunk files from uncommitted writes", cleaned)
+			slog.Info("wal: cleaned orphan chunk files from uncommitted writes", "cleaned", cleaned)
 		}
 	}
 
@@ -608,6 +726,9 @@ func (w *WriteAheadLog) Truncate() error {
 // Close gracefully shuts down the WAL: flushes pending entries and waits
 // for the group commit goroutine to exit.
 func (w *WriteAheadLog) Close() error {
+	if !w.closed.CompareAndSwap(false, true) {
+		return nil // already closed
+	}
 	close(w.closeCh)
 	w.wg.Wait()
 	return w.file.Close()
@@ -683,12 +804,13 @@ func (tm *TierMigrator) Start(interval time.Duration) {
 			case <-ticker.C:
 				plan, err := tm.PlanMigration()
 				if err != nil {
-					log.Printf("tier: plan error: %v", err)
+					slog.Error("tier: plan error", "error", err)
 					continue
 				}
 				if plan.HotToWarm+plan.WarmToCold+plan.ColdToArch > 0 {
-					log.Printf("tier: migration plan: hot→warm=%d warm→cold=%d cold→arch=%d (%d bytes)",
-						plan.HotToWarm, plan.WarmToCold, plan.ColdToArch, plan.TotalBytes)
+					slog.Info("tier: migration plan",
+						"hotToWarm", plan.HotToWarm, "warmToCold", plan.WarmToCold,
+						"coldToArch", plan.ColdToArch, "bytes", plan.TotalBytes)
 					tm.executeMigration()
 				}
 			case <-tm.stopCh:
@@ -731,6 +853,6 @@ func (tm *TierMigrator) executeMigration() {
 	tm.store.mu.Unlock()
 
 	if migrated > 0 {
-		log.Printf("tier: migrated %d chunks", migrated)
+		slog.Info("tier: migrated chunks", "count", migrated)
 	}
 }

@@ -6,6 +6,7 @@ package datanode
 import (
 	"time"
 
+	"github.com/example/dfs/internal/tlsutil"
 	"github.com/example/dfs/metadata"
 )
 
@@ -66,6 +67,42 @@ type Config struct {
 	// Slow clients that exceed this timeout will be disconnected.
 	// Default: 30s.
 	RequestTimeout time.Duration
+
+	// TLS configures TLS for both the chunk TCP server and the
+	// ops HTTP server. When CertFile and KeyFile are empty, both
+	// run in plain-text mode.
+	TLS tlsutil.Config
+
+	// MetadataAuthToken is sent as a bearer token to the metadata service.
+	MetadataAuthToken string
+
+	// OpsAuthToken protects the datanode HTTP operations API when set.
+	OpsAuthToken string
+
+	// EnablePprof exposes /debug/pprof on the operations API.
+	EnablePprof bool
+
+	// TraceEnabled enables OpenTelemetry tracing provider initialization.
+	TraceEnabled bool
+
+	// TraceEndpoint is the OTLP gRPC endpoint for tracing export.
+	TraceEndpoint string
+
+	// TraceInsecure uses insecure OTLP transport when tracing is enabled.
+	TraceInsecure bool
+
+	// EncryptAtRest enables AES-256-GCM encryption for chunk data
+	// stored on local disk. When true, data is encrypted before
+	// writing and decrypted after reading.
+	EncryptAtRest bool
+
+	// AllowLocalKMS permits the in-memory development KMS for at-rest
+	// encryption. It is not production safe because keys are lost on restart.
+	AllowLocalKMS bool
+
+	// LogLevel is the initial log level (debug/info/warn/error).
+	// Can be changed at runtime via SIGHUP signal.
+	LogLevel string
 }
 
 // DefaultConfig returns a Config with sensible defaults.

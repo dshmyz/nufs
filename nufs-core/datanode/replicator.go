@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 	"hash/crc32"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/example/dfs/internal/tlsutil"
 	"github.com/example/dfs/metadata"
 )
 
@@ -32,6 +33,7 @@ type Replicator struct {
 	workers   int
 	ctx       context.Context
 	cancel    context.CancelFunc
+	tlsCfg    tlsutil.Config // TLS config for inter-node connections
 }
 
 // NewReplicator creates a new replication engine with the specified concurrency.
@@ -49,13 +51,18 @@ func NewReplicator(localAddr string, workers int) *Replicator {
 	}
 }
 
+// SetTLS configures TLS for inter-node replication connections.
+func (r *Replicator) SetTLS(cfg tlsutil.Config) {
+	r.tlsCfg = cfg
+}
+
 // Start launches replication worker goroutines.
 func (r *Replicator) Start() {
 	for i := 0; i < r.workers; i++ {
 		r.wg.Add(1)
 		go r.worker(i)
 	}
-	log.Printf("datanode: replicator started with %d workers", r.workers)
+	slog.Info("datanode: replicator started", "workers", r.workers)
 }
 
 // Stop gracefully shuts down the replicator.
@@ -63,7 +70,7 @@ func (r *Replicator) Stop() {
 	r.cancel()
 	close(r.taskCh)
 	r.wg.Wait()
-	log.Printf("datanode: replicator stopped")
+	slog.Info("datanode: replicator stopped")
 }
 
 // Submit adds a replication task to the queue.
@@ -118,8 +125,7 @@ func (r *Replicator) SubmitReplication(chunkID metadata.ChunkID, sourceAddr stri
 			CreatedAt:  time.Now(),
 		}
 		if err := r.Submit(task); err != nil {
-			log.Printf("datanode: failed to submit replication for chunk %d to %s: %v",
-				chunkID, target.Addr, err)
+			slog.Warn("datanode: failed to submit replication", "chunkID", task.ChunkID, "target", task.TargetAddr, "error", err)
 		}
 	}
 }
@@ -139,8 +145,8 @@ func (r *Replicator) worker(id int) {
 
 		err := r.replicate(task)
 		if err != nil {
-			log.Printf("datanode: worker %d: replication failed for chunk %d (%s -> %s): %v",
-				id, task.ChunkID, task.SourceAddr, task.TargetAddr, err)
+			slog.Error("datanode: replication failed",
+				"worker", id, "chunkID", task.ChunkID, "source", task.SourceAddr, "target", task.TargetAddr, "error", err)
 
 			// Retry with exponential backoff (max 3 retries). We only
 			// retry fire-and-forget tasks; synchronous ones are
@@ -152,12 +158,10 @@ func (r *Replicator) worker(id int) {
 					_ = r.Submit(task)
 				})
 			} else if task.done == nil {
-				log.Printf("datanode: worker %d: giving up on chunk %d after %d retries",
-					id, task.ChunkID, task.Retries)
+				slog.Warn("datanode: giving up on chunk after retries", "worker", id, "chunkID", task.ChunkID, "retries", task.Retries)
 			}
 		} else {
-			log.Printf("datanode: worker %d: replicated chunk %d to %s",
-				id, task.ChunkID, task.TargetAddr)
+			slog.Info("datanode: replicated chunk", "worker", id, "chunkID", task.ChunkID, "target", task.TargetAddr)
 		}
 
 		// Signal any synchronous waiter exactly once. We deliver the
@@ -175,8 +179,8 @@ func (r *Replicator) worker(id int) {
 // 3. Verify checksum
 func (r *Replicator) replicate(task ReplicationTask) error {
 	// Connect to source
-	srcClient := NewClient(task.SourceAddr)
-	if err := srcClient.Connect(); err != nil {
+	srcClient, err := r.dialClient(task.SourceAddr)
+	if err != nil {
 		return fmt.Errorf("connect source: %w", err)
 	}
 	defer srcClient.Close()
@@ -194,8 +198,8 @@ func (r *Replicator) replicate(task ReplicationTask) error {
 	checksum := crc32.ChecksumIEEE(data)
 
 	// Connect to target
-	tgtClient := NewClient(task.TargetAddr)
-	if err := tgtClient.Connect(); err != nil {
+	tgtClient, err := r.dialClient(task.TargetAddr)
+	if err != nil {
 		return fmt.Errorf("connect target: %w", err)
 	}
 	defer tgtClient.Close()
@@ -215,6 +219,26 @@ func (r *Replicator) replicate(task ReplicationTask) error {
 	}
 
 	return nil
+}
+
+// dialClient creates a Client connected to the given address, using
+// TLS when configured.
+func (r *Replicator) dialClient(addr string) (*Client, error) {
+	if r.tlsCfg.Enabled() {
+		c, err := NewTLSClient(addr, r.tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.Connect(); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	c := NewClient(addr)
+	if err := c.Connect(); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // RepairTask represents a chunk repair operation (re-replicate from surviving copy).

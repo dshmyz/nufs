@@ -2,7 +2,7 @@ package datanode
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -39,14 +39,14 @@ func NewHeartbeatReporter(cfg Config, metaStore HeartbeatMeta, chunkStore *Chunk
 func (h *HeartbeatReporter) Start() {
 	h.wg.Add(1)
 	go h.loop()
-	log.Printf("datanode: heartbeat reporter started (interval=%v)", h.interval)
+	slog.Info("datanode: heartbeat reporter started", "interval", h.interval)
 }
 
 // Stop halts the heartbeat reporter.
 func (h *HeartbeatReporter) Stop() {
 	h.cancel()
 	h.wg.Wait()
-	log.Printf("datanode: heartbeat reporter stopped")
+	slog.Info("datanode: heartbeat reporter stopped")
 }
 
 func (h *HeartbeatReporter) loop() {
@@ -95,7 +95,7 @@ func (h *HeartbeatReporter) send() {
 	}
 
 	if err := h.meta.Heartbeat(h.ctx, h.cfg.NodeID, report); err != nil {
-		log.Printf("datanode: heartbeat failed: %v", err)
+		slog.Error("datanode: heartbeat failed", "error", err)
 	}
 }
 

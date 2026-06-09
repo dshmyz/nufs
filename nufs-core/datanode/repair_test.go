@@ -360,3 +360,12 @@ func (m *mockMetadataService) ListXAttr(_ context.Context, _ metadata.InodeID) (
 func (m *mockMetadataService) RemoveXAttr(_ context.Context, _ metadata.InodeID, _ string) error {
 	return nil
 }
+func (m *mockMetadataService) SetBucketPolicy(_ context.Context, _ string, _ metadata.BucketPolicy) error {
+	return nil
+}
+func (m *mockMetadataService) GetBucketPolicy(_ context.Context, _ string) (*metadata.BucketPolicy, error) {
+	return nil, metadata.ErrAccessDenied
+}
+func (m *mockMetadataService) DeleteBucketPolicy(_ context.Context, _ string) error {
+	return nil
+}

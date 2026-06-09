@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"hash/crc32"
-	"log"
+	"log/slog"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/example/dfs/internal/tlsutil"
 	"github.com/example/dfs/metadata"
 )
 
@@ -56,6 +57,7 @@ type ParallelReplicator struct {
 	localID     metadata.NodeID
 	timeout     time.Duration
 	localWriter func(chunkID metadata.ChunkID, data []byte) error
+	tlsCfg      tlsutil.Config
 
 	// Active chains per chunk
 	mu     sync.RWMutex
@@ -83,6 +85,11 @@ func NewParallelReplicator(localAddr string, localID metadata.NodeID, timeout ti
 		chains:      make(map[metadata.ChunkID]*ReplicationChain),
 		localWriter: cfg.LocalWriter,
 	}
+}
+
+// SetTLS configures TLS for inter-node chain replication connections.
+func (cr *ParallelReplicator) SetTLS(cfg tlsutil.Config) {
+	cr.tlsCfg = cfg
 }
 
 // BuildChain creates a replication chain for a chunk.
@@ -182,7 +189,7 @@ func (cr *ParallelReplicator) MarkFailed(chunkID metadata.ChunkID, nodeID metada
 	for i := range chain.Nodes {
 		if chain.Nodes[i].NodeID == nodeID {
 			chain.Nodes[i].State = ChainFailed
-			log.Printf("chain: chunk %d node %d marked failed", chunkID, nodeID)
+			slog.Warn("chain: node marked failed", "chunkID", chunkID, "nodeID", nodeID)
 			break
 		}
 	}
@@ -223,7 +230,7 @@ func (cr *ParallelReplicator) WriteToChain(ctx context.Context, chunkID metadata
 			// Write locally
 			if cr.localWriter != nil {
 				if err := cr.localWriter(chunkID, data); err != nil {
-					log.Printf("chain: local write chunk %d failed: %v", chunkID, err)
+					slog.Error("chain: local write failed", "chunkID", chunkID, "error", err)
 					cr.MarkFailed(chunkID, node.NodeID)
 					return nil, fmt.Errorf("local write: %w", err)
 				}
@@ -231,9 +238,9 @@ func (cr *ParallelReplicator) WriteToChain(ctx context.Context, chunkID metadata
 			continue
 		}
 
-		client := NewClient(node.Addr)
-		if err := client.Connect(); err != nil {
-			log.Printf("chain: connect to %s for chunk %d failed: %v", node.Addr, chunkID, err)
+		client, err := cr.dialClient(node.Addr)
+		if err != nil {
+			slog.Error("chain: connect failed", "addr", node.Addr, "chunkID", chunkID, "error", err)
 			cr.MarkFailed(chunkID, node.NodeID)
 			lastErr = fmt.Errorf("connect %s: %w", node.Addr, err)
 			continue
@@ -242,7 +249,7 @@ func (cr *ParallelReplicator) WriteToChain(ctx context.Context, chunkID metadata
 		resp, err := client.ReplicateChunk(chunkID, data)
 		client.Close()
 		if err != nil {
-			log.Printf("chain: write to %s for chunk %d failed: %v", node.Addr, chunkID, err)
+			slog.Error("chain: write failed", "addr", node.Addr, "chunkID", chunkID, "error", err)
 			cr.MarkFailed(chunkID, node.NodeID)
 			lastErr = fmt.Errorf("write %s: %w", node.Addr, err)
 			continue
@@ -279,10 +286,6 @@ func WithLocalWriter(writer func(chunkID metadata.ChunkID, data []byte) error) f
 	}
 }
 
-
-
-
-
 // ============================================================
 // Minimal Interfaces — Interface Segregation for Datanode
 // ============================================================
@@ -298,6 +301,7 @@ type HeartbeatMeta interface {
 // AntiEntropyMeta is the minimal metadata interface for AntiEntropy.
 type AntiEntropyMeta interface {
 	GetChunk(ctx context.Context, id metadata.ChunkID) (*metadata.ChunkMeta, error)
+	UpdateChunk(ctx context.Context, chunk *metadata.ChunkMeta) error
 	ReportChunkState(ctx context.Context, nodeID metadata.NodeID, states map[metadata.ChunkID]metadata.ReplicaState) error
 	TriggerRepair(ctx context.Context, chunkID metadata.ChunkID) error
 }
@@ -386,6 +390,7 @@ type AntiEntropy struct {
 	stopCh  chan struct{}
 	running atomic.Bool
 	wg      sync.WaitGroup // WaitGroup for graceful goroutine shutdown
+	tlsCfg  tlsutil.Config
 
 	// Stats
 	scanned    atomic.Int64
@@ -401,6 +406,11 @@ func NewAntiEntropy(store *ChunkStore, meta AntiEntropyMeta, localID metadata.No
 		localID: localID,
 		stopCh:  make(chan struct{}),
 	}
+}
+
+// SetTLS configures TLS for inter-node anti-entropy connections.
+func (ae *AntiEntropy) SetTLS(cfg tlsutil.Config) {
+	ae.tlsCfg = cfg
 }
 
 // ScrubResult holds the result of an anti-entropy pass.
@@ -436,19 +446,59 @@ func (ae *AntiEntropy) Scan(ctx context.Context) (*AntiEntropyResult, error) {
 			continue // chunk might have been deleted
 		}
 
-		// Verify: local checksum matches metadata checksum
+		// Check 1: Find local replica state in metadata
+		var localReplicaState metadata.ReplicaState
+		var hasLocalReplica bool
+		for _, r := range meta.Replicas {
+			if r.NodeID == ae.localID {
+				localReplicaState = r.State
+				hasLocalReplica = true
+				break
+			}
+		}
+
+		// Check 2: Checksum mismatch — local data differs from metadata
 		if meta.Checksum != 0 && local.Checksum != meta.Checksum {
 			result.Mismatches++
 			ae.mismatches.Add(1)
-			log.Printf("anti-entropy: chunk %d checksum mismatch: local=0x%08x meta=0x%08x",
-				chunkID, local.Checksum, meta.Checksum)
+			slog.Warn("anti-entropy: checksum mismatch",
+				"chunkID", chunkID, "local", fmt.Sprintf("0x%08x", local.Checksum), "meta", fmt.Sprintf("0x%08x", meta.Checksum))
 
 			// Trigger repair from a healthy replica
 			if err := ae.repairFromPeer(ctx, chunkID, meta); err != nil {
-				log.Printf("anti-entropy: repair chunk %d failed: %v", chunkID, err)
+				slog.Error("anti-entropy: repair chunk failed", "chunkID", chunkID, "error", err)
 			} else {
 				result.Repaired++
 				ae.repaired.Add(1)
+			}
+			continue
+		}
+
+		// Check 3: Local data is correct but metadata says replica is Stale/Failed
+		// This means a previous repair wrote the data but didn't update the metadata state.
+		if hasLocalReplica && (localReplicaState == metadata.ReplicaStale || localReplicaState == metadata.ReplicaFailed) {
+			slog.Info("anti-entropy: local data correct but replica state is stale/failed, promoting to ready",
+				"chunkID", chunkID, "currentState", localReplicaState)
+
+			if stateErr := ae.meta.ReportChunkState(ctx, ae.localID, map[metadata.ChunkID]metadata.ReplicaState{
+				chunkID: metadata.ReplicaReady,
+			}); stateErr != nil {
+				slog.Warn("anti-entropy: failed to promote replica state", "chunkID", chunkID, "error", stateErr)
+			} else {
+				result.Repaired++
+				ae.repaired.Add(1)
+			}
+			continue
+		}
+
+		// Check 4: Local data is correct but metadata checksum is zero or outdated.
+		// Sync the local checksum back to metadata so other replicas can verify.
+		if meta.Checksum == 0 && local.Checksum != 0 {
+			meta.Checksum = local.Checksum
+			if updateErr := ae.meta.UpdateChunk(ctx, meta); updateErr != nil {
+				slog.Warn("anti-entropy: failed to sync checksum to metadata", "chunkID", chunkID, "error", updateErr)
+			} else {
+				slog.Info("anti-entropy: synced checksum to metadata", "chunkID", chunkID, "checksum", fmt.Sprintf("0x%08x", local.Checksum))
 			}
 		}
 	}
@@ -467,34 +517,48 @@ func (ae *AntiEntropy) repairFromPeer(ctx context.Context, chunkID metadata.Chun
 			continue
 		}
 
-		log.Printf("anti-entropy: repairing chunk %d from node %d (%s)", chunkID, r.NodeID, r.Addr)
+		slog.Info("anti-entropy: repairing chunk from peer", "chunkID", chunkID, "nodeID", r.NodeID, "addr", r.Addr)
 
 		err := ae.fetchAndRepairLocal(chunkID, r.Addr)
 		if err != nil {
-			log.Printf("anti-entropy: repair chunk %d from %s failed: %v, trying next peer", chunkID, r.Addr, err)
+			slog.Warn("anti-entropy: repair from peer failed, trying next", "chunkID", chunkID, "addr", r.Addr, "error", err)
 			continue
+		}
+
+		// After repair, sync the new checksum back to metadata.
+		// The local Seal() recomputed the checksum, which may differ
+		// from the stale value in metadata.
+		ae.store.mu.RLock()
+		localInfo, ok := ae.store.chunks[chunkID]
+		ae.store.mu.RUnlock()
+		if ok && localInfo.Checksum != 0 {
+			meta.Checksum = localInfo.Checksum
+			if updateErr := ae.meta.UpdateChunk(ctx, meta); updateErr != nil {
+				slog.Warn("anti-entropy: failed to update chunk checksum after repair",
+					"chunkID", chunkID, "error", updateErr)
+			}
 		}
 
 		// Report local replica as ready to metadata
 		if stateErr := ae.meta.ReportChunkState(ctx, ae.localID, map[metadata.ChunkID]metadata.ReplicaState{
 			chunkID: metadata.ReplicaReady,
 		}); stateErr != nil {
-			log.Printf("anti-entropy: failed to report chunk %d state: %v", chunkID, stateErr)
+			slog.Warn("anti-entropy: failed to report chunk state", "chunkID", chunkID, "error", stateErr)
 		}
 
-		log.Printf("anti-entropy: chunk %d repaired successfully from node %d", chunkID, r.NodeID)
+		slog.Info("anti-entropy: chunk repaired successfully", "chunkID", chunkID, "nodeID", r.NodeID)
 		return nil
 	}
 
 	// No healthy peer available — fall back to metadata-level repair queue
-	log.Printf("anti-entropy: no healthy peer for chunk %d, queuing metadata repair", chunkID)
+	slog.Warn("anti-entropy: no healthy peer for chunk, queuing metadata repair", "chunkID", chunkID)
 	return ae.meta.TriggerRepair(ctx, chunkID)
 }
 
 // fetchAndRepairLocal reads a chunk from a remote peer via TCP and overwrites the local copy.
 func (ae *AntiEntropy) fetchAndRepairLocal(chunkID metadata.ChunkID, peerAddr string) error {
-	client := NewClient(peerAddr)
-	if err := client.Connect(); err != nil {
+	client, err := ae.dialClient(peerAddr)
+	if err != nil {
 		return fmt.Errorf("connect %s: %w", peerAddr, err)
 	}
 	defer client.Close()
@@ -531,10 +595,11 @@ func (ae *AntiEntropy) Start(interval time.Duration) {
 			case <-ticker.C:
 				result, err := ae.Scan(context.Background())
 				if err != nil {
-					log.Printf("anti-entropy: scan error: %v", err)
+					slog.Error("anti-entropy: scan error", "error", err)
 				} else if result.Mismatches > 0 {
-					log.Printf("anti-entropy: scanned=%d mismatches=%d repaired=%d in %v",
-						result.ChunksScanned, result.Mismatches, result.Repaired, result.Duration)
+					slog.Info("anti-entropy: scan complete",
+						"scanned", result.ChunksScanned, "mismatches", result.Mismatches,
+						"repaired", result.Repaired, "duration", result.Duration)
 				}
 			case <-ae.stopCh:
 				return
@@ -576,4 +641,246 @@ func (cs *ChunkStore) VerifyChunkData(chunkID metadata.ChunkID) (bool, uint32, e
 
 	computed := crc32.ChecksumIEEE(data)
 	return computed == info.Checksum, computed, nil
+}
+
+// dialClient creates a Client connected to the given address, using
+// TLS when configured. Shared helper for ParallelReplicator and AntiEntropy.
+func (cr *ParallelReplicator) dialClient(addr string) (*Client, error) {
+	if cr.tlsCfg.Enabled() {
+		c, err := NewTLSClient(addr, cr.tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.Connect(); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	c := NewClient(addr)
+	if err := c.Connect(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (ae *AntiEntropy) dialClient(addr string) (*Client, error) {
+	if ae.tlsCfg.Enabled() {
+		c, err := NewTLSClient(addr, ae.tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.Connect(); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	c := NewClient(addr)
+	if err := c.Connect(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// ============================================================
+// Chunk Integrity Checker — Cross-node data verification
+// ============================================================
+
+// ChunkIntegrityChecker periodically verifies that chunk replicas
+// across different datanodes have identical data. It computes a
+// checksum locally and compares it with checksums fetched from
+// peer nodes holding the same chunk.
+type ChunkIntegrityChecker struct {
+	store   *ChunkStore
+	meta    IntegrityMeta
+	localID metadata.NodeID
+	tlsCfg  tlsutil.Config
+
+	stopCh  chan struct{}
+	running atomic.Bool
+	wg      sync.WaitGroup
+
+	// Stats
+	verified   atomic.Int64
+	mismatches atomic.Int64
+}
+
+// IntegrityMeta provides the metadata needed to find peer replicas.
+type IntegrityMeta interface {
+	// GetChunk returns chunk metadata including replica locations.
+	GetChunk(ctx context.Context, id metadata.ChunkID) (*metadata.ChunkMeta, error)
+}
+
+// IntegrityCheckResult holds the outcome of a single integrity check pass.
+type IntegrityCheckResult struct {
+	ChunksVerified int
+	Mismatches     int
+	Duration       time.Duration
+}
+
+// NewChunkIntegrityChecker creates a new integrity checker.
+func NewChunkIntegrityChecker(store *ChunkStore, meta IntegrityMeta, localID metadata.NodeID) *ChunkIntegrityChecker {
+	return &ChunkIntegrityChecker{
+		store:   store,
+		meta:    meta,
+		localID: localID,
+		stopCh:  make(chan struct{}),
+	}
+}
+
+// SetTLS configures TLS for inter-node connections.
+func (ic *ChunkIntegrityChecker) SetTLS(cfg tlsutil.Config) {
+	ic.tlsCfg = cfg
+}
+
+// Start begins the periodic integrity check loop.
+func (ic *ChunkIntegrityChecker) Start(interval time.Duration) {
+	if ic.running.Swap(true) {
+		return
+	}
+	ic.wg.Add(1)
+	go func() {
+		defer ic.wg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				result, err := ic.Check(context.Background())
+				if err != nil {
+					slog.Error("integrity check failed", "error", err)
+				} else if result.Mismatches > 0 {
+					slog.Warn("integrity check found mismatches",
+						"verified", result.ChunksVerified,
+						"mismatches", result.Mismatches)
+				} else {
+					slog.Info("integrity check passed", "verified", result.ChunksVerified)
+				}
+			case <-ic.stopCh:
+				return
+			}
+		}
+	}()
+}
+
+// Stop terminates the integrity checker.
+func (ic *ChunkIntegrityChecker) Stop() {
+	if ic.running.Swap(false) {
+		close(ic.stopCh)
+	}
+	ic.wg.Wait()
+}
+
+// Check performs one integrity verification pass over all local chunks.
+// For each chunk, it computes the local checksum and compares it with
+// checksums from peer replicas.
+func (ic *ChunkIntegrityChecker) Check(ctx context.Context) (*IntegrityCheckResult, error) {
+	start := time.Now()
+	result := &IntegrityCheckResult{}
+
+	// Collect local chunk IDs
+	ic.store.mu.RLock()
+	chunkIDs := make([]metadata.ChunkID, 0, len(ic.store.chunks))
+	for id := range ic.store.chunks {
+		chunkIDs = append(chunkIDs, id)
+	}
+	ic.store.mu.RUnlock()
+
+	for _, chunkID := range chunkIDs {
+		select {
+		case <-ctx.Done():
+			return result, ctx.Err()
+		default:
+		}
+
+		// Compute local checksum
+		ok, localCksum, err := ic.store.VerifyChunkData(chunkID)
+		if err != nil {
+			slog.Debug("integrity: skip chunk (local read error)", "chunkID", chunkID, "error", err)
+			continue
+		}
+		if !ok {
+			slog.Warn("integrity: local checksum mismatch", "chunkID", chunkID, "checksum", localCksum)
+			result.Mismatches++
+			ic.mismatches.Add(1)
+		}
+
+		// Fetch metadata to find peer replicas
+		chunkMeta, err := ic.meta.GetChunk(ctx, chunkID)
+		if err != nil || chunkMeta == nil {
+			continue
+		}
+
+		// Compare with each peer replica
+		for _, replica := range chunkMeta.Replicas {
+			if replica.NodeID == ic.localID {
+				continue // skip self
+			}
+
+			peerCksum, err := ic.fetchPeerChecksum(ctx, replica.Addr, chunkID)
+			if err != nil {
+				slog.Debug("integrity: failed to fetch peer checksum",
+					"chunkID", chunkID, "peer", replica.Addr, "error", err)
+				continue
+			}
+
+			if peerCksum != localCksum {
+				slog.Warn("integrity: cross-node checksum mismatch",
+					"chunkID", chunkID,
+					"local", localCksum,
+					"peer", peerCksum,
+					"peerAddr", replica.Addr)
+				result.Mismatches++
+				ic.mismatches.Add(1)
+			}
+		}
+
+		result.ChunksVerified++
+		ic.verified.Add(1)
+	}
+
+	result.Duration = time.Since(start)
+	return result, nil
+}
+
+// fetchPeerChecksum connects to a peer datanode, reads the chunk data,
+// and computes the CRC32 checksum for comparison.
+func (ic *ChunkIntegrityChecker) fetchPeerChecksum(ctx context.Context, addr string, chunkID metadata.ChunkID) (uint32, error) {
+	client, err := ic.dialClient(addr)
+	if err != nil {
+		return 0, fmt.Errorf("connect to peer %s: %w", addr, err)
+	}
+	defer client.Close()
+
+	// Read full chunk from peer
+	resp, err := client.ReadChunk(chunkID, 0, 0) // offset=0, length=0 means read all
+	if err != nil {
+		return 0, fmt.Errorf("read chunk from %s: %w", addr, err)
+	}
+	if resp.Status != StatusOK {
+		return 0, fmt.Errorf("read chunk status %d from %s", resp.Status, addr)
+	}
+	return crc32.ChecksumIEEE(resp.Data), nil
+}
+
+func (ic *ChunkIntegrityChecker) dialClient(addr string) (*Client, error) {
+	if ic.tlsCfg.Enabled() {
+		c, err := NewTLSClient(addr, ic.tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.Connect(); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	c := NewClient(addr)
+	if err := c.Connect(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// Stats returns the cumulative integrity check statistics.
+func (ic *ChunkIntegrityChecker) Stats() (verified, mismatches int64) {
+	return ic.verified.Load(), ic.mismatches.Load()
 }
