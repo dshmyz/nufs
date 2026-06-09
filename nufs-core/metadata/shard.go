@@ -215,6 +215,15 @@ func (ss *ShardedStore) AddShard(id ShardID, store *PebbleStore) {
 	ss.shards[id] = store
 }
 
+// SetQuotaManager propagates the quota manager to all shards.
+func (ss *ShardedStore) SetQuotaManager(qm *QuotaManager) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	for _, store := range ss.shards {
+		store.SetQuotaManager(qm)
+	}
+}
+
 // RemoveShard unregisters a shard.
 func (ss *ShardedStore) RemoveShard(id ShardID) {
 	ss.mu.Lock()
@@ -770,6 +779,28 @@ func (ss *ShardedStore) DecommissionNode(ctx context.Context, nodeID NodeID) err
 	})
 }
 
+func (ss *ShardedStore) EnterMaintenance(ctx context.Context, nodeID NodeID) error {
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.EnterMaintenance(ctx, nodeID)
+	})
+}
+
+func (ss *ShardedStore) ExitMaintenance(ctx context.Context, nodeID NodeID) error {
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.ExitMaintenance(ctx, nodeID)
+	})
+}
+
+func (ss *ShardedStore) RollingUpgradePlan(ctx context.Context) ([]NodeID, error) {
+	ss.mu.RLock()
+	for _, store := range ss.shards {
+		ss.mu.RUnlock()
+		return store.RollingUpgradePlan(ctx)
+	}
+	ss.mu.RUnlock()
+	return nil, fmt.Errorf("sharded store: no shards available")
+}
+
 func (ss *ShardedStore) ListNodes(ctx context.Context) ([]NodeInfo, error) {
 	ss.mu.RLock()
 	for _, store := range ss.shards {
@@ -948,6 +979,35 @@ func (ss *ShardedStore) ComputeAllBucketUsage(ctx context.Context) ([]BucketUsag
 		result = append(result, *u)
 	}
 	return result, nil
+}
+
+// ========== AccessControlService Implementation ==========
+
+// SetBucketPolicy delegates to the shard that owns the bucket.
+func (s *ShardedStore) SetBucketPolicy(ctx context.Context, bucket string, policy BucketPolicy) error {
+	shard, err := s.GetShard(bucket)
+	if err != nil {
+		return err
+	}
+	return shard.SetBucketPolicy(ctx, bucket, policy)
+}
+
+// GetBucketPolicy delegates to the shard that owns the bucket.
+func (s *ShardedStore) GetBucketPolicy(ctx context.Context, bucket string) (*BucketPolicy, error) {
+	shard, err := s.GetShard(bucket)
+	if err != nil {
+		return nil, err
+	}
+	return shard.GetBucketPolicy(ctx, bucket)
+}
+
+// DeleteBucketPolicy delegates to the shard that owns the bucket.
+func (s *ShardedStore) DeleteBucketPolicy(ctx context.Context, bucket string) error {
+	shard, err := s.GetShard(bucket)
+	if err != nil {
+		return err
+	}
+	return shard.DeleteBucketPolicy(ctx, bucket)
 }
 
 // Compile-time interface check

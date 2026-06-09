@@ -1,8 +1,10 @@
 package metadata
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -74,6 +76,24 @@ func (d *ShutdownDrain) IsShuttingDown() bool {
 	return d.shutdown.Load()
 }
 
+// Middleware wraps an HTTP handler so the drain can reject new requests and
+// wait for accepted ones to finish during shutdown. Paths in publicPaths bypass
+// the drain and remain available for liveness/metrics probes.
+func (d *ShutdownDrain) Middleware(publicPaths map[string]struct{}, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := publicPaths[r.URL.Path]; ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !d.Begin() {
+			http.Error(w, "service shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		defer d.End()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // ============================================================
 // BackupManager — Scheduled Pebble database backups
 // ============================================================
@@ -95,11 +115,23 @@ type BackupConfig struct {
 }
 
 // BackupManager creates periodic Pebble checkpoint backups.
+// When a RemoteStorage is configured, backups are also uploaded to the
+// remote backend after the local checkpoint is created.
 type BackupManager struct {
 	store  *PebbleStore
 	cfg    BackupConfig
+	remote RemoteStorage // optional remote upload backend
 	stopCh chan struct{}
 	done   chan struct{}
+}
+
+// RemoteStorage is the interface for uploading backup artifacts to a
+// remote object store (S3, OSS, GCS, etc.). Implementations handle
+// authentication, retry, and multipart upload internally.
+type RemoteStorage interface {
+	// Upload copies the local backup directory to the remote store.
+	// The key parameter identifies the backup (e.g., "backup-20260608-120000").
+	Upload(ctx context.Context, key string, localDir string) error
 }
 
 // NewBackupManager creates a new backup manager.
@@ -110,6 +142,11 @@ func NewBackupManager(store *PebbleStore, cfg BackupConfig) *BackupManager {
 		stopCh: make(chan struct{}),
 		done:   make(chan struct{}),
 	}
+}
+
+// SetRemoteStorage configures a remote storage backend for backup uploads.
+func (bm *BackupManager) SetRemoteStorage(remote RemoteStorage) {
+	bm.remote = remote
 }
 
 // Start begins the backup loop. Returns immediately.
@@ -141,7 +178,7 @@ func (bm *BackupManager) loop() {
 	}
 }
 
-// doBackup creates a single checkpoint backup.
+// doBackup creates a single checkpoint backup and optionally uploads it.
 func (bm *BackupManager) doBackup() error {
 	if bm.cfg.DryRun {
 		slog.Info("backup dry-run: would create backup", "dir", bm.cfg.Dir)
@@ -149,14 +186,29 @@ func (bm *BackupManager) doBackup() error {
 	}
 
 	start := time.Now()
-	backupPath := fmt.Sprintf("%s/backup-%s", bm.cfg.Dir, time.Now().Format("20060102-150405"))
+	backupName := fmt.Sprintf("backup-%s", time.Now().Format("20060102-150405"))
+	backupPath := fmt.Sprintf("%s/%s", bm.cfg.Dir, backupName)
 
 	// Use Pebble's checkpoint API for a consistent snapshot
-	if err := bm.store.db.Checkpoint(bm.cfg.Dir); err != nil {
+	if err := bm.store.db.Checkpoint(backupPath); err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
 	}
 
 	slog.Info("backup completed", "duration", time.Since(start).Round(time.Millisecond), "path", backupPath)
+
+	// Upload to remote storage if configured
+	if bm.remote != nil {
+		uploadStart := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		if err := bm.remote.Upload(ctx, backupName, backupPath); err != nil {
+			slog.Error("backup remote upload failed", "key", backupName, "error", err)
+		} else {
+			slog.Info("backup uploaded to remote",
+				"key", backupName, "duration", time.Since(uploadStart).Round(time.Millisecond))
+		}
+	}
 
 	// Prune old backups
 	if bm.cfg.MaxBackups > 0 {
@@ -275,10 +327,19 @@ type BucketQuota struct {
 }
 
 // QuotaManager tracks per-bucket resource usage against quotas.
+// When a QuotaStore is configured, quota changes are persisted so they
+// survive restarts.
 type QuotaManager struct {
 	mu     sync.RWMutex
 	quotas map[string]*BucketQuota
 	usage  map[string]*BucketUsage
+	store  QuotaStore // optional persistence backend
+}
+
+// QuotaStore is the interface for persisting quota data.
+type QuotaStore interface {
+	SaveQuota(bucket string, quota *BucketQuota) error
+	SaveUsage(bucket string, usage *BucketUsage) error
 }
 
 // NewQuotaManager creates a new quota manager.
@@ -289,11 +350,26 @@ func NewQuotaManager() *QuotaManager {
 	}
 }
 
-// SetQuota sets the quota for a bucket.
-func (qm *QuotaManager) SetQuota(bucket string, quota *BucketQuota) {
+// SetStore configures the persistence backend for quota data.
+func (qm *QuotaManager) SetStore(store QuotaStore) {
+	qm.mu.Lock()
+	qm.store = store
+	qm.mu.Unlock()
+}
+
+// SetQuota sets the quota for a bucket and persists it if a store is configured.
+func (qm *QuotaManager) SetQuota(bucket string, quota *BucketQuota) error {
 	qm.mu.Lock()
 	qm.quotas[bucket] = quota
+	store := qm.store
 	qm.mu.Unlock()
+
+	if store != nil {
+		if err := store.SaveQuota(bucket, quota); err != nil {
+			return fmt.Errorf("quota: persist quota for %s: %w", bucket, err)
+		}
+	}
+	return nil
 }
 
 // GetQuota returns the quota for a bucket, or nil if none is set.
@@ -325,8 +401,30 @@ func (qm *QuotaManager) CheckWrite(bucket string, sizeBytes int64) error {
 	return nil
 }
 
-// UpdateUsage updates the tracked usage for a bucket.
-func (qm *QuotaManager) UpdateUsage(bucket string, usage *BucketUsage) {
+// UpdateUsage updates the tracked usage for a bucket and persists it.
+func (qm *QuotaManager) UpdateUsage(bucket string, usage *BucketUsage) error {
+	qm.mu.Lock()
+	qm.usage[bucket] = usage
+	store := qm.store
+	qm.mu.Unlock()
+
+	if store != nil {
+		if err := store.SaveUsage(bucket, usage); err != nil {
+			return fmt.Errorf("quota: persist usage for %s: %w", bucket, err)
+		}
+	}
+	return nil
+}
+
+// LoadQuota loads a quota entry from persistence (called during startup).
+func (qm *QuotaManager) LoadQuota(bucket string, quota *BucketQuota) {
+	qm.mu.Lock()
+	qm.quotas[bucket] = quota
+	qm.mu.Unlock()
+}
+
+// LoadUsage loads a usage entry from persistence (called during startup).
+func (qm *QuotaManager) LoadUsage(bucket string, usage *BucketUsage) {
 	qm.mu.Lock()
 	qm.usage[bucket] = usage
 	qm.mu.Unlock()

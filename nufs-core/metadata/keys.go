@@ -15,4 +15,8 @@ const (
 	prefixNode        = "/node/"
 	prefixPolicy      = "/policy/"
 	prefixRepair      = "/repair/"
+	prefixAudit       = "/audit/"
+	prefixACL         = "/acl/"
+	prefixQuota       = "/quota/"
+	prefixQuotaUsage  = "/quota-usage/"
 )

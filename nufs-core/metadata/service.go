@@ -54,6 +54,9 @@ type NodeService interface {
 	RegisterNode(ctx context.Context, info *NodeInfo) error
 	Heartbeat(ctx context.Context, nodeID NodeID, report *NodeReport) error
 	DecommissionNode(ctx context.Context, nodeID NodeID) error
+	EnterMaintenance(ctx context.Context, nodeID NodeID) error
+	ExitMaintenance(ctx context.Context, nodeID NodeID) error
+	RollingUpgradePlan(ctx context.Context) ([]NodeID, error)
 	ListNodes(ctx context.Context) ([]NodeInfo, error)
 	GetNode(ctx context.Context, nodeID NodeID) (*NodeInfo, error)
 }
@@ -100,6 +103,7 @@ type MetadataService interface {
 	RepairService
 	LockService
 	XAttrService
+	AccessControlService
 
 	// Admin
 	ComputeAllBucketUsage(ctx context.Context) ([]BucketUsage, error)
@@ -129,6 +133,7 @@ type ServiceBundle struct {
 	Scrub     *Scrubber
 	Raft      *RaftNode
 	Lifecycle *LifecycleEngine
+	Audit     *AuditLogger
 
 	// Ready channel: closed when all subsystems are initialized
 	Ready chan struct{}
@@ -137,6 +142,9 @@ type ServiceBundle struct {
 // Close shuts down all subsystems and the core service.
 func (sb *ServiceBundle) Close() error {
 	// Stop background workers first (reverse order of Start)
+	if sb.Audit != nil {
+		sb.Audit.Stop()
+	}
 	if sb.Lifecycle != nil {
 		sb.Lifecycle.Stop()
 	}
@@ -219,6 +227,9 @@ func NewPebbleServiceBundle(store *PebbleStore, opts ...ServiceOption) (*Service
 		}
 		bundle.Lifecycle.Start(1 * time.Hour)
 	}
+
+	// Audit logger
+	bundle.Audit = NewAuditLogger(store, defaultAuditConfig())
 
 	// Auto-sync PlacementEngine with node state changes via EventBus
 	store.SetEventBus(bundle.Events)

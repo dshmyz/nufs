@@ -129,7 +129,35 @@ func (le *LifecycleEngine) processBucket(ctx context.Context, bucket string, rul
 }
 
 // walkDir recursively walks a directory and applies lifecycle rules to regular files.
+// It performs directory-level prefix pruning: if no rule's prefix can possibly match
+// any file under the current directory path, the subtree is skipped entirely.
 func (le *LifecycleEngine) walkDir(ctx context.Context, dirID InodeID, bucket, prefix string, rules []LifecycleRule, now time.Time) error {
+	// Directory-level pruning: check if any rule could possibly match files under this prefix.
+	// A rule with prefix P can match files under directory D only if:
+	//   - P is empty (matches everything), or
+	//   - P starts with D (rule targets a deeper path under this dir), or
+	//   - D starts with P (this dir is inside the rule's prefix scope)
+	hasMatchingRule := false
+	for _, rule := range rules {
+		if rule.Prefix == "" {
+			hasMatchingRule = true
+			break
+		}
+		if len(rule.Prefix) >= len(prefix) && rule.Prefix[:len(prefix)] == prefix {
+			// Rule prefix starts with current dir prefix (rule targets deeper path)
+			hasMatchingRule = true
+			break
+		}
+		if len(prefix) > len(rule.Prefix) && prefix[:len(rule.Prefix)] == rule.Prefix {
+			// Current dir is inside rule's prefix scope
+			hasMatchingRule = true
+			break
+		}
+	}
+	if !hasMatchingRule {
+		return nil
+	}
+
 	entries, err := le.meta.ReadDir(ctx, dirID, 0, 0)
 	if err != nil {
 		return fmt.Errorf("read dir %d: %w", dirID, err)
@@ -160,7 +188,7 @@ func (le *LifecycleEngine) walkDir(ctx context.Context, dirID InodeID, bucket, p
 			fileAge := now.Sub(time.Unix(0, meta.CTime))
 
 			for _, rule := range rules {
-				// Prefix matching
+				// Prefix matching (S3 semantics: prefix must match at path boundary)
 				if !matchesPrefix(relPath, rule.Prefix) {
 					continue
 				}
@@ -206,11 +234,17 @@ func (le *LifecycleEngine) walkDir(ctx context.Context, dirID InodeID, bucket, p
 	return nil
 }
 
+// matchesPrefix checks if name matches the given prefix using S3-compatible semantics.
+// A prefix "logs/" matches "logs/app.log" but not "logsapp.log".
+// An empty prefix matches everything.
 func matchesPrefix(name, prefix string) bool {
 	if prefix == "" {
 		return true
 	}
-	return len(name) >= len(prefix) && name[:len(prefix)] == prefix
+	if len(name) < len(prefix) {
+		return false
+	}
+	return name[:len(prefix)] == prefix
 }
 
 // Stats returns lifecycle statistics.

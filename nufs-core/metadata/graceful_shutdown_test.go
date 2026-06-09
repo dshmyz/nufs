@@ -1,6 +1,8 @@
 package metadata
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -88,8 +90,39 @@ func TestShutdownDrain_ConcurrentBegin(t *testing.T) {
 	}
 }
 
+func TestShutdownDrain_MiddlewareRejectsAfterShutdown(t *testing.T) {
+	d := NewShutdownDrain(50 * time.Millisecond)
+	h := d.Middleware(nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	if err := d.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api", nil))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 after shutdown, got %d", rr.Code)
+	}
+}
+
+func TestShutdownDrain_MiddlewarePublicPathBypassesShutdown(t *testing.T) {
+	d := NewShutdownDrain(50 * time.Millisecond)
+	h := d.Middleware(map[string]struct{}{"/healthz": {}}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	if err := d.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected public path through, got %d", rr.Code)
+	}
+}
+
 // ============================================================
-// RateLimiter Tests
 // ============================================================
 
 func TestRateLimiter_BasicAllow(t *testing.T) {
@@ -164,9 +197,13 @@ func TestQuotaManager_NoQuota(t *testing.T) {
 
 func TestQuotaManager_SizeLimit(t *testing.T) {
 	qm := NewQuotaManager()
-	qm.SetQuota("bucket1", &BucketQuota{MaxSizeBytes: 1000})
+	if err := qm.SetQuota("bucket1", &BucketQuota{MaxSizeBytes: 1000}); err != nil {
+		t.Fatalf("SetQuota: %v", err)
+	}
 
-	qm.UpdateUsage("bucket1", &BucketUsage{UsedBytes: 500, Objects: 1})
+	if err := qm.UpdateUsage("bucket1", &BucketUsage{UsedBytes: 500, Objects: 1}); err != nil {
+		t.Fatalf("UpdateUsage: %v", err)
+	}
 
 	if err := qm.CheckWrite("bucket1", 400); err != nil {
 		t.Fatalf("write within quota should succeed: %v", err)
@@ -179,9 +216,13 @@ func TestQuotaManager_SizeLimit(t *testing.T) {
 
 func TestQuotaManager_ObjectLimit(t *testing.T) {
 	qm := NewQuotaManager()
-	qm.SetQuota("bucket1", &BucketQuota{MaxObjects: 2})
+	if err := qm.SetQuota("bucket1", &BucketQuota{MaxObjects: 2}); err != nil {
+		t.Fatalf("SetQuota: %v", err)
+	}
 
-	qm.UpdateUsage("bucket1", &BucketUsage{Objects: 2})
+	if err := qm.UpdateUsage("bucket1", &BucketUsage{Objects: 2}); err != nil {
+		t.Fatalf("UpdateUsage: %v", err)
+	}
 
 	if err := qm.CheckWrite("bucket1", 100); err == nil {
 		t.Fatal("write exceeding object limit should fail")
@@ -195,7 +236,9 @@ func TestQuotaManager_SetGetQuota(t *testing.T) {
 		t.Fatal("GetQuota should return nil for unset bucket")
 	}
 
-	qm.SetQuota("bucket1", &BucketQuota{MaxSizeBytes: 1000})
+	if err := qm.SetQuota("bucket1", &BucketQuota{MaxSizeBytes: 1000}); err != nil {
+		t.Fatalf("SetQuota: %v", err)
+	}
 	q := qm.GetQuota("bucket1")
 	if q == nil || q.MaxSizeBytes != 1000 {
 		t.Fatal("GetQuota should return the set quota")

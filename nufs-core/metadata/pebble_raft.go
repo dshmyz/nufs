@@ -185,8 +185,16 @@ func readBytes(r *bytes.Reader) ([]byte, error) {
 // ============================================================
 
 // PebbleFSM implements raft.FSM, applying log entries to a PebbleStore.
+//
+// Write sync policy: Raft log entries are already durably written to the Raft WAL
+// before they are committed and applied to the FSM. Therefore, the FSM does NOT
+// call pebble.Sync on every write — this avoids fsync amplification. Instead,
+// a background goroutine calls pebble.LogData (WAL sync) periodically, providing
+// eventual durability without sacrificing throughput.
 type PebbleFSM struct {
-	store *PebbleStore
+	store        *PebbleStore
+	syncStopCh   chan struct{}
+	syncInterval time.Duration
 }
 
 // Apply applies a committed Raft log entry to the Pebble store.
@@ -203,10 +211,10 @@ func (f *PebbleFSM) Apply(l *raft.Log) interface{} {
 
 	switch entry.Op {
 	case OpSet:
-		err = f.store.db.Set(entry.Key, entry.Value, pebble.Sync)
+		err = f.store.db.Set(entry.Key, entry.Value, pebble.NoSync)
 
 	case OpDelete:
-		err = f.store.db.Delete(entry.Key, pebble.Sync)
+		err = f.store.db.Delete(entry.Key, pebble.NoSync)
 
 	case OpBatch:
 		batch := f.store.db.NewBatch()
@@ -217,7 +225,7 @@ func (f *PebbleFSM) Apply(l *raft.Log) interface{} {
 				batch.Set(op.Key, op.Value, nil)
 			}
 		}
-		err = batch.Commit(pebble.Sync)
+		err = batch.Commit(pebble.NoSync)
 		batch.Close()
 
 	case OpCAS:
@@ -251,13 +259,51 @@ func (f *PebbleFSM) Apply(l *raft.Log) interface{} {
 		}
 
 		// Apply update
-		err = f.store.db.Set(entry.Key, newData, pebble.Sync)
+		err = f.store.db.Set(entry.Key, newData, pebble.NoSync)
 	}
 
 	if err != nil {
 		slog.Error("fsm: apply error", "index", l.Index, "error", err)
 	}
 	return err
+}
+
+// StartSync starts a background goroutine that periodically syncs the Pebble
+// WAL. Since FSM.Apply uses pebble.NoSync (durability is provided by Raft's own
+// WAL), this ensures that data eventually reaches disk in case of a crash.
+func (f *PebbleFSM) StartSync(interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	f.syncInterval = interval
+	f.syncStopCh = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := f.store.db.LogData(nil, pebble.Sync); err != nil {
+					slog.Error("fsm: WAL sync error", "error", err)
+				}
+			case <-f.syncStopCh:
+				// Final sync before exit
+				if err := f.store.db.LogData(nil, pebble.Sync); err != nil {
+					slog.Error("fsm: final WAL sync error", "error", err)
+				}
+				return
+			}
+		}
+	}()
+	slog.Info("fsm: periodic WAL sync started", "interval", interval)
+}
+
+// StopSync stops the background WAL sync goroutine.
+func (f *PebbleFSM) StopSync() {
+	if f.syncStopCh != nil {
+		close(f.syncStopCh)
+		f.syncStopCh = nil
+	}
 }
 
 // ============================================================
@@ -331,6 +377,13 @@ type PebbleSnapshot struct {
 func (s *PebbleSnapshot) Persist(sink raft.SnapshotSink) error {
 	if s.store.cfg.UseInMemory {
 		return persistKVStream(s.store, sink)
+	}
+
+	// Flush memtable to SST before checkpointing so that NoSync-applied
+	// entries are durable in the checkpoint, not just the WAL.
+	if err := s.store.db.Flush(); err != nil {
+		sink.Cancel()
+		return fmt.Errorf("pebble flush before checkpoint: %w", err)
 	}
 
 	cpDir := filepath.Join(filepath.Dir(s.store.cfg.Dir), fmt.Sprintf("raft-checkpoint-%d", time.Now().UnixNano()))
@@ -583,6 +636,12 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 		return nil, fmt.Errorf("new raft: %w", err)
 	}
 
+	// Start periodic WAL sync for FSM durability.
+	// Raft logs are already durably written; this provides eventual
+	// durability for the FSM's own WAL to survive crash without replaying
+	// all Raft logs from last snapshot.
+	fsm.StartSync(5 * time.Second)
+
 	// Bootstrap
 	if cfg.Bootstrap {
 		servers := []raft.Server{
@@ -615,6 +674,11 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 // IsLeader returns true if this node is the current leader.
 func (n *RaftNode) IsLeader() bool {
 	return n.raft.State() == raft.Leader
+}
+
+// NodeID returns the Raft node ID of this node.
+func (n *RaftNode) NodeID() string {
+	return n.nodeID
 }
 
 // LeaderAddr returns the address of the current leader.
@@ -808,6 +872,9 @@ func (n *RaftNode) Stats() map[string]string {
 
 // Shutdown gracefully stops the node.
 func (n *RaftNode) Shutdown() error {
+	if n.fsm != nil {
+		n.fsm.StopSync()
+	}
 	f := n.raft.Shutdown()
 	return f.Error()
 }

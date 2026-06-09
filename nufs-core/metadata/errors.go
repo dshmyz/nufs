@@ -58,6 +58,12 @@ var (
 	ErrCrossBucketRename = errors.New("metadata: rename across buckets is not allowed")
 	ErrXAttrNotFound     = errors.New("metadata: extended attribute not found")
 	ErrDirTooLarge       = errors.New("metadata: directory exceeds maximum entries limit")
+	ErrAccessDenied      = errors.New("metadata: access denied")
+)
+
+// Internal sentinel errors
+var (
+	errStopIteration = errors.New("metadata: stop iteration")
 )
 
 // Chunk errors

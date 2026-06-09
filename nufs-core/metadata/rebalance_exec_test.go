@@ -74,6 +74,15 @@ func (m *mockRebalanceStore) ListXAttr(_ context.Context, _ InodeID) (map[string
 func (m *mockRebalanceStore) RemoveXAttr(_ context.Context, _ InodeID, _ string) error {
 	return nil
 }
+func (m *mockRebalanceStore) SetBucketPolicy(_ context.Context, _ string, _ BucketPolicy) error {
+	return nil
+}
+func (m *mockRebalanceStore) GetBucketPolicy(_ context.Context, _ string) (*BucketPolicy, error) {
+	return nil, ErrAccessDenied
+}
+func (m *mockRebalanceStore) DeleteBucketPolicy(_ context.Context, _ string) error {
+	return nil
+}
 
 func TestRebalanceExecutor_ExecuteDecommission(t *testing.T) {
 	store := &mockRebalanceStore{

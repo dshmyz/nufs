@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/example/dfs/internal/tlsutil"
 )
 
 // HTTPClient implements MetadataService over HTTP to a remote metad server.
@@ -18,6 +20,7 @@ type HTTPClient struct {
 	baseURL    string
 	httpClient *http.Client
 	timeout    time.Duration
+	authToken  string
 
 	// Retry configuration
 	maxRetries    int           // Maximum number of retries (default: 3)
@@ -51,7 +54,11 @@ func NewHTTPClient(baseURL string, timeout time.Duration) *HTTPClient {
 	}
 }
 
-// SetRetryConfig configures the retry behavior.
+// SetAuthToken configures a bearer token sent with every metadata request.
+func (c *HTTPClient) SetAuthToken(token string) {
+	c.authToken = token
+}
+
 func (c *HTTPClient) SetRetryConfig(maxRetries int, baseWait time.Duration) {
 	if maxRetries >= 0 {
 		c.maxRetries = maxRetries
@@ -59,6 +66,27 @@ func (c *HTTPClient) SetRetryConfig(maxRetries int, baseWait time.Duration) {
 	if baseWait > 0 {
 		c.retryBaseWait = baseWait
 	}
+}
+
+// EnableTLS configures the underlying HTTP transport to use TLS based on
+// the provided config. It must be called before any requests are made.
+func (c *HTTPClient) EnableTLS(cfg tlsutil.Config) error {
+	tlsCfg, err := tlsutil.ClientConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("metadata client: tls config: %w", err)
+	}
+	transport, ok := c.httpClient.Transport.(*http.Transport)
+	if !ok {
+		transport = &http.Transport{
+			MaxIdleConns:        256,
+			MaxIdleConnsPerHost: 128,
+			MaxConnsPerHost:     256,
+			IdleConnTimeout:     90 * time.Second,
+		}
+	}
+	transport.TLSClientConfig = tlsCfg
+	c.httpClient.Transport = transport
+	return nil
 }
 
 // doRequestWithRetry executes an HTTP request with exponential backoff retry
@@ -108,6 +136,7 @@ func (c *HTTPClient) doRequestWithRetry(ctx context.Context, method, path string
 						continue
 					}
 					req.Header.Set("Content-Type", "application/json")
+					c.addHeaders(req)
 					resp, err = c.httpClient.Do(req)
 					if err != nil {
 						lastErr = err
@@ -148,12 +177,19 @@ func (c *HTTPClient) doRequest(ctx context.Context, method, path string, body in
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.addHeaders(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http request: %w", err)
 	}
 	return resp, nil
+}
+
+func (c *HTTPClient) addHeaders(req *http.Request) {
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
 }
 
 func (c *HTTPClient) readResponse(resp *http.Response, v interface{}) error {
@@ -484,6 +520,34 @@ func (c *HTTPClient) DecommissionNode(ctx context.Context, nodeID NodeID) error 
 	return c.readResponse(resp, nil)
 }
 
+func (c *HTTPClient) EnterMaintenance(ctx context.Context, nodeID NodeID) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, fmt.Sprintf("/api/v1/nodes/%d/maintenance", nodeID), nil)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) ExitMaintenance(ctx context.Context, nodeID NodeID) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, fmt.Sprintf("/api/v1/nodes/%d/maintenance", nodeID), nil)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) RollingUpgradePlan(ctx context.Context) ([]NodeID, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/nodes/upgrade-plan", nil)
+	if err != nil {
+		return nil, err
+	}
+	var plan []NodeID
+	if err := c.readResponse(resp, &plan); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
 func (c *HTTPClient) ListNodes(ctx context.Context) ([]NodeInfo, error) {
 	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/nodes", nil)
 	if err != nil {
@@ -557,9 +621,9 @@ func (c *HTTPClient) ChunksByNode(ctx context.Context, nodeID NodeID) ([]ChunkMe
 
 func (c *HTTPClient) MigrateChunkReplica(ctx context.Context, chunkID ChunkID, fromNode, toNode NodeID) error {
 	req := map[string]interface{}{
-		"chunk_id":   chunkID,
-		"from_node":  fromNode,
-		"to_node":    toNode,
+		"chunk_id":  chunkID,
+		"from_node": fromNode,
+		"to_node":   toNode,
 	}
 	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/chunks/migrate-replica", req)
 	if err != nil {
@@ -661,4 +725,38 @@ func (c *HTTPClient) ListXAttr(_ context.Context, _ InodeID) (map[string][]byte,
 }
 func (c *HTTPClient) RemoveXAttr(_ context.Context, _ InodeID, _ string) error {
 	return fmt.Errorf("xattr not yet supported over HTTP")
+}
+
+// ========== AccessControlService Implementation ==========
+
+func (c *HTTPClient) SetBucketPolicy(ctx context.Context, bucket string, policy BucketPolicy) error {
+	req := map[string]interface{}{
+		"bucket": bucket,
+		"policy": policy,
+	}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, "/api/v1/acl/"+bucket, req)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) GetBucketPolicy(ctx context.Context, bucket string) (*BucketPolicy, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/acl/"+bucket, nil)
+	if err != nil {
+		return nil, err
+	}
+	var policy BucketPolicy
+	if err := c.readResponse(resp, &policy); err != nil {
+		return nil, err
+	}
+	return &policy, nil
+}
+
+func (c *HTTPClient) DeleteBucketPolicy(ctx context.Context, bucket string) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, "/api/v1/acl/"+bucket, nil)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
 }

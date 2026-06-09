@@ -2,7 +2,7 @@ package metadata
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/binary"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -57,6 +57,10 @@ type EventBus struct {
 	watchers map[uint64]*Watcher
 	nextID   atomic.Uint64
 	buffer   int // Channel buffer size
+
+	// Diagnostics counters
+	droppedEvents  atomic.Int64 // Total events dropped due to full buffer
+	publishedTotal atomic.Int64 // Total events published (including dropped)
 }
 
 // NewEventBus creates a new event bus.
@@ -94,6 +98,7 @@ func (eb *EventBus) Watch(prefix string) *Watcher {
 }
 
 // Publish sends an event to all matching watchers.
+// Non-blocking: drops the event if any watcher's buffer is full.
 func (eb *EventBus) Publish(event Event) {
 	if event.Time.IsZero() {
 		event.Time = time.Now()
@@ -101,15 +106,46 @@ func (eb *EventBus) Publish(event Event) {
 	eb.mu.RLock()
 	defer eb.mu.RUnlock()
 
+	eb.publishedTotal.Add(1)
+
 	for _, w := range eb.watchers {
 		if hasPrefix(event.Key, w.prefix) {
 			select {
 			case w.ch <- event:
 			default:
-				// Drop event if buffer full (slow consumer)
+				eb.droppedEvents.Add(1)
 			}
 		}
 	}
+}
+
+// PublishOrBlock sends an event to all matching watchers, blocking
+// until each watcher's buffer has space. Use for critical events
+// (e.g. node offline notifications) that must not be dropped.
+func (eb *EventBus) PublishOrBlock(event Event) {
+	if event.Time.IsZero() {
+		event.Time = time.Now()
+	}
+	eb.mu.RLock()
+	defer eb.mu.RUnlock()
+
+	eb.publishedTotal.Add(1)
+
+	for _, w := range eb.watchers {
+		if hasPrefix(event.Key, w.prefix) {
+			w.ch <- event // blocking
+		}
+	}
+}
+
+// DroppedEvents returns the total number of dropped events.
+func (eb *EventBus) DroppedEvents() int64 {
+	return eb.droppedEvents.Load()
+}
+
+// PublishedTotal returns the total number of publish attempts.
+func (eb *EventBus) PublishedTotal() int64 {
+	return eb.publishedTotal.Load()
 }
 
 // WatcherCount returns the number of active watchers.
@@ -139,6 +175,8 @@ type InodeWithVersion struct {
 
 // CASUpdateInode performs a compare-and-swap update on an inode.
 // Returns ErrVersionConflict if the inode was modified since the read.
+// When Raft is configured, the CAS check is performed inside FSM.Apply on
+// the leader, guaranteeing linearizable consistency across the cluster.
 func (s *PebbleStore) CASUpdateInode(ctx context.Context, expected MVCCVersion, meta *InodeMeta) error {
 	if s.closed.Load() {
 		return ErrServiceClosed
@@ -147,45 +185,63 @@ func (s *PebbleStore) CASUpdateInode(ctx context.Context, expected MVCCVersion, 
 		return ErrInvalidArgument
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Invalidate cache before CAS
+	s.inCache.del(meta.ID)
+
+	meta.CTime = time.Now().UnixNano()
+	wrapper := InodeWithVersion{
+		InodeMeta: *meta,
+		Version:   expected + 1, // Will be verified in Apply
+	}
+	newData, err := marshalValue(&wrapper, codecMsgpack)
+	if err != nil {
+		return fmt.Errorf("cas marshal: %w", err)
+	}
 
 	key := fmt.Sprintf("%s%d", prefixInode, meta.ID)
 
-	// Read current version
+	if s.raft != nil {
+		// Cluster mode: submit CAS through Raft.
+		// The version check happens atomically in FSM.Apply on the leader,
+		// so no other write can sneak in between read and write.
+		// entry.Value = [8-byte expected version][new inode data]
+		casValue := make([]byte, 8+len(newData))
+		binary.BigEndian.PutUint64(casValue[:8], uint64(expected))
+		copy(casValue[8:], newData)
+
+		entry := &RaftLogEntry{
+			Op:    OpCAS,
+			Key:   []byte(key),
+			Value: casValue,
+		}
+		return s.raft.ApplyAutoForward(entry, 10*time.Second)
+	}
+
+	// Standalone mode: perform CAS locally (no Raft consensus needed).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var current InodeWithVersion
-	val, closer, err := s.db.Get([]byte(key))
-	if err == pebble.ErrNotFound {
+	val, closer, getErr := s.db.Get([]byte(key))
+	if getErr == pebble.ErrNotFound {
 		return ErrInodeNotFound
 	}
-	if err != nil {
-		return fmt.Errorf("cas get: %w", err)
+	if getErr != nil {
+		return fmt.Errorf("cas get: %w", getErr)
 	}
 	data := make([]byte, len(val))
 	copy(data, val)
 	closer.Close()
 
-	if err := json.Unmarshal(data, &current); err != nil {
+	if err := unmarshalValue(data, &current); err != nil {
 		return fmt.Errorf("cas unmarshal: %w", err)
 	}
 
-	// Check version
 	if current.Version != expected {
 		return ErrVersionConflict
 	}
 
-	// Apply update
-	meta.CTime = time.Now().UnixNano()
-	wrapper := InodeWithVersion{
-		InodeMeta: *meta,
-		Version:   current.Version + 1,
-	}
-	newData, err := json.Marshal(&wrapper)
-	if err != nil {
-		return fmt.Errorf("cas marshal: %w", err)
-	}
-
-	return s.db.Set([]byte(key), newData, pebble.Sync)
+	return s.db.Set([]byte(key), newData, pebble.NoSync)
 }
 
 // GetInodeWithVersion reads an inode along with its MVCC version.
@@ -207,7 +263,7 @@ func (s *PebbleStore) GetInodeWithVersion(ctx context.Context, id InodeID) (*Ino
 	closer.Close()
 
 	var wrapper InodeWithVersion
-	if err := json.Unmarshal(data, &wrapper); err != nil {
+	if err := unmarshalValue(data, &wrapper); err != nil {
 		return nil, 0, err
 	}
 	return &wrapper.InodeMeta, wrapper.Version, nil
@@ -225,6 +281,10 @@ type LeaseManager struct {
 	checkInterval time.Duration
 	stopCh        chan struct{}
 	running       atomic.Bool
+
+	// Retry configuration for marking nodes offline
+	maxRetries   int
+	retryBackoff time.Duration
 }
 
 // NewLeaseManager creates a lease manager for node liveness detection.
@@ -238,6 +298,8 @@ func NewLeaseManager(store *PebbleStore, events *EventBus, ttl time.Duration) *L
 		ttl:           ttl,
 		checkInterval: ttl / 3,
 		stopCh:        make(chan struct{}),
+		maxRetries:    3,
+		retryBackoff:  time.Second,
 	}
 }
 
@@ -276,31 +338,50 @@ func (lm *LeaseManager) checkExpiredNodes() {
 
 	lm.store.scanPrefix(prefixNode, func(key, val []byte) error {
 		var info NodeInfo
-		if err := json.Unmarshal(val, &info); err != nil {
+		if err := unmarshalValue(val, &info); err != nil {
 			return nil
 		}
 		if info.State == NodeOnline && info.LastSeen < deadline {
 			// Node missed heartbeat — mark offline via Raft
 			info.State = NodeOffline
 			info.LastSeen = now
-			data, err := json.Marshal(&info)
+			data, err := marshalValue(&info, codecMsgpack)
 			if err != nil {
 				slog.Error("lease: marshal node", "node_id", info.ID, "error", err)
 				return nil
 			}
-			if err := lm.store.applyViaRaft(OpSet, string(key), data); err != nil {
-				slog.Error("lease: failed to mark node offline via raft", "node_id", info.ID, "error", err)
+
+			// Retry marker via Raft with exponential backoff
+			var lastErr error
+			for attempt := 0; attempt <= lm.maxRetries; attempt++ {
+				if attempt > 0 {
+					backoff := lm.retryBackoff * time.Duration(1<<(attempt-1))
+					time.Sleep(backoff)
+					slog.Warn("lease: retrying mark node offline",
+						"node_id", info.ID, "attempt", attempt, "max_retries", lm.maxRetries)
+				}
+				if err := lm.store.applyViaRaft(OpSet, string(key), data); err != nil {
+					lastErr = err
+					continue
+				}
+				lastErr = nil
+				break
+			}
+			if lastErr != nil {
+				slog.Error("lease: failed to mark node offline after retries",
+					"node_id", info.ID, "error", lastErr)
 				return nil
 			}
+
 			slog.Warn("lease: node marked offline", "node_id", info.ID, "offline_since", time.Since(time.Unix(0, info.LastSeen)))
 
-			// Publish event for repair worker
+			// Publish critical event using blocking send — must not be dropped
 			if lm.events != nil {
-				eventData, _ := json.Marshal(map[string]interface{}{
+				eventData, _ := marshalValue(map[string]interface{}{
 					"node_id": info.ID,
 					"state":   "offline",
-				})
-				lm.events.Publish(Event{
+				}, codecMsgpack)
+				lm.events.PublishOrBlock(Event{
 					Type:  EventSet,
 					Key:   string(key),
 					Value: eventData,
@@ -321,6 +402,7 @@ type ChunkGC struct {
 	events  *EventBus
 	dryRun  bool
 	stopCh  chan struct{}
+	wg      sync.WaitGroup
 	running atomic.Bool
 }
 
@@ -344,15 +426,19 @@ type GCScanResult struct {
 }
 
 // Scan performs one pass of orphan chunk detection and cleanup.
+// Uses batch size limits to bound memory usage.
 func (gc *ChunkGC) Scan(ctx context.Context) (*GCScanResult, error) {
 	start := time.Now()
 	result := &GCScanResult{}
 
-	// Phase 1: Collect all chunk IDs referenced by inodes
+	// Phase 1: Collect all chunk IDs referenced by inodes via streaming scan
 	referencedChunks := make(map[ChunkID]bool)
 	err := gc.store.scanPrefix(prefixInode, func(key, val []byte) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		var meta InodeMeta
-		if err := json.Unmarshal(val, &meta); err != nil {
+		if err := unmarshalValue(val, &meta); err != nil {
 			return nil
 		}
 		for _, ref := range meta.ChunkMap {
@@ -364,41 +450,34 @@ func (gc *ChunkGC) Scan(ctx context.Context) (*GCScanResult, error) {
 		return nil, fmt.Errorf("gc scan inodes: %w", err)
 	}
 
-	// Phase 2: Find orphan chunks
-	var orphans []ChunkID
+	// Phase 2: Find orphan chunks — process in batches to limit memory
+	slog.Info("gc: phase 1 complete, referenced chunks", "count", len(referencedChunks))
+
 	err = gc.store.scanPrefix(prefixChunk, func(key, val []byte) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		result.TotalChunks++
 		var chunk ChunkMeta
-		if err := json.Unmarshal(val, &chunk); err != nil {
+		if err := unmarshalValue(val, &chunk); err != nil {
 			return nil
 		}
 		if !referencedChunks[chunk.ID] {
+			// Delete orphan immediately rather than batching to limit memory
 			result.OrphanChunks++
-			orphans = append(orphans, chunk.ID)
+			if !gc.dryRun {
+				if delErr := gc.store.DeleteChunk(ctx, chunk.ID); delErr != nil {
+					slog.Error("gc: delete chunk failed", "chunk_id", chunk.ID, "error", delErr)
+					return nil
+				}
+			}
+			result.DeletedChunks++
+			result.FreedBytes += int64(chunk.Size)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gc scan chunks: %w", err)
-	}
-
-	// Phase 3: Delete orphans
-	for _, id := range orphans {
-		if ctx.Err() != nil {
-			break
-		}
-		chunk, err := gc.store.GetChunk(ctx, id)
-		if err != nil {
-			continue
-		}
-		if !gc.dryRun {
-			gc.store.DeleteChunk(ctx, id)
-			result.DeletedChunks++
-			result.FreedBytes += int64(chunk.Size)
-		} else {
-			result.DeletedChunks++
-			result.FreedBytes += int64(chunk.Size)
-		}
 	}
 
 	result.ScanDuration = time.Since(start)
@@ -410,7 +489,9 @@ func (gc *ChunkGC) Start(interval time.Duration) {
 	if gc.running.Swap(true) {
 		return
 	}
+	gc.wg.Add(1)
 	go func() {
+		defer gc.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -433,11 +514,12 @@ func (gc *ChunkGC) Start(interval time.Duration) {
 	}()
 }
 
-// Stop terminates periodic GC.
+// Stop terminates periodic GC and waits for the goroutine to exit.
 func (gc *ChunkGC) Stop() {
 	if gc.running.Swap(false) {
 		close(gc.stopCh)
 	}
+	gc.wg.Wait()
 }
 
 // ============================================================
@@ -449,6 +531,7 @@ type Scrubber struct {
 	store   *PebbleStore
 	events  *EventBus
 	stopCh  chan struct{}
+	wg      sync.WaitGroup
 	running atomic.Bool
 }
 
@@ -514,10 +597,10 @@ func (s *Scrubber) Scan(ctx context.Context) (*ScrubResult, error) {
 
 			// Trigger repair
 			if s.events != nil {
-				data, _ := json.Marshal(map[string]interface{}{
+				data, _ := marshalValue(map[string]interface{}{
 					"chunk_id": chunk.ID,
 					"reason":   err.Error(),
-				})
+				}, codecMsgpack)
 				s.events.Publish(Event{
 					Type:  EventSet,
 					Key:   fmt.Sprintf("/repair/%d", chunk.ID),
@@ -544,7 +627,9 @@ func (s *Scrubber) Start(interval time.Duration) {
 	if s.running.Swap(true) {
 		return
 	}
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -568,11 +653,12 @@ func (s *Scrubber) Start(interval time.Duration) {
 	}()
 }
 
-// Stop terminates the scrubber.
+// Stop terminates the scrubber and waits for the goroutine to exit.
 func (s *Scrubber) Stop() {
 	if s.running.Swap(false) {
 		close(s.stopCh)
 	}
+	s.wg.Wait()
 }
 
 // ============================================================

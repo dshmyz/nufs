@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -245,6 +246,13 @@ type PebbleStore struct {
 	// Optional EventBus for publishing change notifications.
 	// Set by SetEventBus() after initialization.
 	events *EventBus
+
+	// Quota enforcement for bucket writes
+	quota *QuotaManager
+
+	// Auto-rebalance on node registration
+	autoRebalance bool
+	rebalanceMu   sync.Mutex // prevents concurrent rebalance runs
 }
 
 // inodeCache is a read-through cache for GetInode.
@@ -434,6 +442,22 @@ func (s *PebbleStore) Close() error {
 // This should be called after NewPebbleServiceBundle creates the EventBus.
 func (s *PebbleStore) SetEventBus(events *EventBus) {
 	s.events = events
+}
+
+// SetQuotaManager registers the quota manager for write admission control.
+// When set, AllocateChunk checks bucket quotas before allocating new chunks.
+// It also wires the PebbleStore as the QuotaStore backend so quota changes
+// are persisted to Pebble, and loads any previously saved quota data.
+func (s *PebbleStore) SetQuotaManager(qm *QuotaManager) {
+	qm.SetStore(s)
+	s.quota = qm
+	s.loadQuotas(qm)
+}
+
+// SetAutoRebalance enables automatic rebalance when new nodes register.
+// When enabled, RegisterNode triggers a rebalance if the cluster is imbalanced.
+func (s *PebbleStore) SetAutoRebalance(enabled bool) {
+	s.autoRebalance = enabled
 }
 
 // publishEvent publishes a change event if an EventBus is configured.
@@ -1125,9 +1149,21 @@ func (s *PebbleStore) ReadDir(ctx context.Context, parent InodeID, offset int, l
 
 	prefix := fmt.Sprintf("%s%d/", prefixNS, parent)
 	var entries []DirEntry
+	var skipped int
+
+	// Paginate at scan level: skip |offset| entries, collect |limit| entries,
+	// then stop scanning. This avoids loading the entire directory into memory.
 	err := s.scanPrefix(prefix, func(key, val []byte) error {
+		if len(entries) >= limit {
+			return errStopIteration
+		}
 		name := strings.TrimPrefix(string(key), prefix)
 		if name == "" {
+			return nil
+		}
+		// Skip entries before the offset
+		if skipped < offset {
+			skipped++
 			return nil
 		}
 		var entry DirEntry
@@ -1138,18 +1174,11 @@ func (s *PebbleStore) ReadDir(ctx context.Context, parent InodeID, offset int, l
 		entries = append(entries, entry)
 		return nil
 	})
-	if err != nil {
+	if err != nil && err != errStopIteration {
 		return nil, err
 	}
 
-	if offset >= len(entries) {
-		return nil, nil
-	}
-	end := offset + limit
-	if end > len(entries) {
-		end = len(entries)
-	}
-	return entries[offset:end], nil
+	return entries, nil
 }
 
 func (s *PebbleStore) CreateFile(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error) {
@@ -1281,8 +1310,22 @@ func (s *PebbleStore) GetInode(ctx context.Context, id InodeID) (*InodeMeta, err
 			s.metrics.RecordCacheHit()
 			s.metrics.RecordRead(time.Since(start))
 		}
-		meta := *cached
-		return &meta, nil
+		// Deep copy to prevent callers from mutating cached data.
+		// ChunkMap and XAttrs are reference types that must be cloned.
+		cp := *cached
+		if len(cached.ChunkMap) > 0 {
+			cp.ChunkMap = make([]ChunkRef, len(cached.ChunkMap))
+			copy(cp.ChunkMap, cached.ChunkMap)
+		}
+		if len(cached.XAttrs) > 0 {
+			cp.XAttrs = make(map[string][]byte, len(cached.XAttrs))
+			for k, v := range cached.XAttrs {
+				vc := make([]byte, len(v))
+				copy(vc, v)
+				cp.XAttrs[k] = vc
+			}
+		}
+		return &cp, nil
 	}
 	if s.metrics != nil {
 		s.metrics.RecordCacheMiss()
@@ -1318,16 +1361,19 @@ func (s *PebbleStore) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 	// Invalidate cache — next GetInode fetches fresh data
 	s.inCache.del(meta.ID)
 
-	// Read old inode to compute size delta for bucket stats
-	var oldMeta InodeMeta
-	oldExists, _ := s.getJSON(fmt.Sprintf("%s%d", prefixInode, meta.ID), &oldMeta)
-
 	meta.CTime = time.Now().UnixNano()
 	ops := []batchJSONOp{
 		{Key: fmt.Sprintf("%s%d", prefixInode, meta.ID), Value: meta},
 	}
-	if oldExists {
-		s.addBucketStatsOp(oldMeta.BucketRoot, meta.Size-oldMeta.Size, 0, &ops)
+
+	// Only read old inode if bucket stats are enabled (avoid unnecessary Pebble I/O).
+	// Most callers (e.g. SetXAttr/RemoveXAttr) don't change Size, so the delta read
+	// is a no-op waste. This optimization saves a local Pebble + unmarshal per call.
+	if s.cfg.UseBucketStats {
+		var oldMeta InodeMeta
+		if oldExists, _ := s.getJSON(fmt.Sprintf("%s%d", prefixInode, meta.ID), &oldMeta); oldExists {
+			s.addBucketStatsOp(oldMeta.BucketRoot, meta.Size-oldMeta.Size, 0, &ops)
+		}
 	}
 	return s.applyBatchJSON(ops, nil)
 }
@@ -1475,6 +1521,24 @@ func (s *PebbleStore) Link(ctx context.Context, parent InodeID, name string, tar
 func (s *PebbleStore) AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error) {
 	if s.closed.Load() {
 		return nil, ErrServiceClosed
+	}
+
+	// Quota check: resolve bucket from inode and verify write is allowed
+	if s.quota != nil {
+		var meta InodeMeta
+		inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+		exists, err := s.getJSON(inodeKey, &meta)
+		if err != nil {
+			return nil, err
+		}
+		if exists && meta.BucketRoot != 0 {
+			bucketName := s.bucketNameByRoot(meta.BucketRoot)
+			if bucketName != "" {
+				if err := s.quota.CheckWrite(bucketName, MaxChunkSize); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 
 	chunkID := s.chunkGen.Next()
@@ -1701,7 +1765,54 @@ func (s *PebbleStore) RegisterNode(ctx context.Context, info *NodeInfo) error {
 	}
 	s.placement.UpdateNode(info)
 	s.publishNodeEvent(key, info)
+
+	// Auto-rebalance: trigger in background if cluster is imbalanced
+	if s.autoRebalance {
+		go s.triggerAutoRebalance()
+	}
+
 	return nil
+}
+
+// triggerAutoRebalance checks cluster balance and triggers rebalance if needed.
+// It uses a mutex to prevent concurrent runs.
+func (s *PebbleStore) triggerAutoRebalance() {
+	if !s.rebalanceMu.TryLock() {
+		slog.Info("auto-rebalance: already running, skipping")
+		return
+	}
+	defer s.rebalanceMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	nodes, err := s.ListNodes(ctx)
+	if err != nil {
+		slog.Error("auto-rebalance: failed to list nodes", "error", err)
+		return
+	}
+
+	if len(nodes) < 2 {
+		return // nothing to rebalance
+	}
+
+	planner := &RebalancePlanner{}
+	result := planner.PlanRebalance(nodes, 0.15) // 15% imbalance threshold
+	if result == nil || len(result.Plans) == 0 {
+		slog.Info("auto-rebalance: cluster is balanced, no action needed")
+		return
+	}
+
+	slog.Info("auto-rebalance: triggering rebalance",
+		"plans", len(result.Plans),
+		"imbalance", fmt.Sprintf("%.1f%%", result.Imbalance*100))
+
+	executor := NewRebalanceExecutor(s)
+	if err := executor.ExecutePlans(ctx, result.Plans); err != nil {
+		slog.Error("auto-rebalance: execution failed", "error", err)
+		return
+	}
+	slog.Info("auto-rebalance: completed successfully")
 }
 
 func (s *PebbleStore) Heartbeat(ctx context.Context, nodeID NodeID, report *NodeReport) error {
@@ -1749,7 +1860,95 @@ func (s *PebbleStore) DecommissionNode(ctx context.Context, nodeID NodeID) error
 		return ErrNodeNotFound
 	}
 	info.State = NodeDraining
-	return s.putMsgpack(key, &info)
+	if err := s.putMsgpack(key, &info); err != nil {
+		return err
+	}
+	s.placement.UpdateNode(&info)
+	return nil
+}
+
+// EnterMaintenance transitions a node to maintenance mode for rolling upgrades.
+// The node stops receiving new chunk allocations but continues serving reads.
+// Existing chunks are migrated off before the node is taken down.
+func (s *PebbleStore) EnterMaintenance(ctx context.Context, nodeID NodeID) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	key := prefixNode + fmt.Sprintf("%d", nodeID)
+	var info NodeInfo
+	exists, err := s.getJSON(key, &info)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNodeNotFound
+	}
+	if info.State == NodeMaint {
+		return nil // already in maintenance
+	}
+	info.State = NodeMaint
+	if err := s.putMsgpack(key, &info); err != nil {
+		return err
+	}
+	s.placement.UpdateNode(&info)
+	slog.Info("node entered maintenance mode", "nodeID", nodeID)
+	return nil
+}
+
+// ExitMaintenance transitions a node back to online after a rolling upgrade.
+func (s *PebbleStore) ExitMaintenance(ctx context.Context, nodeID NodeID) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	key := prefixNode + fmt.Sprintf("%d", nodeID)
+	var info NodeInfo
+	exists, err := s.getJSON(key, &info)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNodeNotFound
+	}
+	if info.State != NodeMaint {
+		return fmt.Errorf("node %d is not in maintenance state (current: %s)", nodeID, info.State)
+	}
+	info.State = NodeOnline
+	info.LastSeen = time.Now().UnixNano()
+	if err := s.putMsgpack(key, &info); err != nil {
+		return err
+	}
+	s.placement.UpdateNode(&info)
+	slog.Info("node exited maintenance mode", "nodeID", nodeID)
+	return nil
+}
+
+// RollingUpgradePlan generates a node-by-node upgrade order that maintains
+// quorum and replication health. It returns nodes sorted by least impact first.
+func (s *PebbleStore) RollingUpgradePlan(ctx context.Context) ([]NodeID, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	nodes, err := s.ListNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter to online nodes only, sort by used capacity ascending (least data first)
+	var online []NodeInfo
+	for _, n := range nodes {
+		if n.State == NodeOnline {
+			online = append(online, n)
+		}
+	}
+	sort.Slice(online, func(i, j int) bool {
+		return online[i].UsedGB < online[j].UsedGB
+	})
+
+	result := make([]NodeID, len(online))
+	for i, n := range online {
+		result[i] = n.ID
+	}
+	return result, nil
 }
 
 func (s *PebbleStore) ListNodes(ctx context.Context) ([]NodeInfo, error) {
@@ -2070,11 +2269,12 @@ func (s *PebbleStore) LeaderOpsAddr() string {
 	return s.raft.LeaderOpsAddr()
 }
 
-// applyBatchJSON commits multiple JSON-encoded key-value pairs atomically via Raft or directly.
-func (s *PebbleStore) applyBatchJSON(ops []batchJSONOp, deletes []string) error {
+// applyBatch commits multiple key-value pairs atomically via Raft or directly.
+// Values are serialized using msgpack for better performance on hot paths.
+func (s *PebbleStore) applyBatch(ops []batchJSONOp, deletes []string) error {
 	raftOps := make([]BatchOp, 0, len(ops)+len(deletes))
 	for _, op := range ops {
-		data, err := json.Marshal(op.Value)
+		data, err := marshalValue(op.Value, codecMsgpack)
 		if err != nil {
 			return fmt.Errorf("marshal batch value: %w", err)
 		}
@@ -2084,6 +2284,13 @@ func (s *PebbleStore) applyBatchJSON(ops []batchJSONOp, deletes []string) error 
 		raftOps = append(raftOps, BatchOp{Delete: true, Key: []byte(key)})
 	}
 	return s.applyBatchViaRaft(raftOps)
+}
+
+// applyBatchJSON commits multiple JSON-encoded key-value pairs atomically via Raft or directly.
+// Deprecated: prefer applyBatch which uses msgpack for hot paths.
+// Kept for backward compatibility with existing code that explicitly wants JSON.
+func (s *PebbleStore) applyBatchJSON(ops []batchJSONOp, deletes []string) error {
+	return s.applyBatch(ops, deletes)
 }
 
 // applyViaRaft proposes a write operation through the Raft log.
@@ -2116,7 +2323,7 @@ func (s *PebbleStore) applyViaRaft(op RaftLogOp, key string, value []byte) error
 		Key:   []byte(key),
 		Value: value,
 	}
-	err := s.raft.Apply(entry, 10*time.Second)
+	err := s.raft.ApplyAutoForward(entry, 10*time.Second)
 	if err == nil && s.metrics != nil {
 		s.metrics.RecordWrite(time.Since(start))
 	}
@@ -2158,7 +2365,7 @@ func (s *PebbleStore) applyBatchViaRaft(ops []BatchOp) error {
 		Op:    OpBatch,
 		Batch: ops,
 	}
-	err := s.raft.Apply(entry, 10*time.Second)
+	err := s.raft.ApplyAutoForward(entry, 10*time.Second)
 	if err == nil && s.metrics != nil {
 		s.metrics.RecordWrite(time.Since(start))
 	}
@@ -2308,6 +2515,24 @@ type BucketUsage struct {
 
 func (s *PebbleStore) bucketStatsKey(rootInode InodeID) string {
 	return fmt.Sprintf("%s%d", prefixBucketStats, rootInode)
+}
+
+// bucketNameByRoot looks up the bucket name given a root inode ID.
+// It scans the bucket prefix to find the matching RootInode.
+// Returns empty string if not found.
+func (s *PebbleStore) bucketNameByRoot(rootInode InodeID) string {
+	prefix := []byte(prefixBucket)
+	iter, _ := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix})
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		var info BucketInfo
+		if err := json.Unmarshal(iter.Value(), &info); err == nil {
+			if info.RootInode == rootInode {
+				return info.Name
+			}
+		}
+	}
+	return ""
 }
 
 // readBucketStats reads the current counter for a bucket. Returns zeros
@@ -2484,4 +2709,89 @@ func splitNSPath(key string) (parent, name string) {
 		return s, ""
 	}
 	return s[:slash], s[slash+1:]
+}
+
+// ========== AccessControlService Implementation ==========
+
+// SetBucketPolicy stores the access control policy for a bucket.
+func (s *PebbleStore) SetBucketPolicy(_ context.Context, bucket string, policy BucketPolicy) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	policy.Bucket = bucket
+	return s.applyBatchJSON([]batchJSONOp{
+		{Key: prefixACL + bucket, Value: &policy},
+	}, nil)
+}
+
+// GetBucketPolicy retrieves the access control policy for a bucket.
+func (s *PebbleStore) GetBucketPolicy(_ context.Context, bucket string) (*BucketPolicy, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	var policy BucketPolicy
+	exists, err := s.getJSON(prefixACL+bucket, &policy)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrAccessDenied // no policy = default deny
+	}
+	return &policy, nil
+}
+
+// DeleteBucketPolicy removes the access control policy for a bucket.
+func (s *PebbleStore) DeleteBucketPolicy(_ context.Context, bucket string) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	return s.applyBatchJSON(nil, []string{prefixACL + bucket})
+}
+
+// ============================================================
+// QuotaStore implementation — persist quota data to Pebble
+// ============================================================
+
+// SaveQuota persists a bucket's quota configuration to Pebble.
+func (s *PebbleStore) SaveQuota(bucket string, quota *BucketQuota) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	return s.putMsgpack(prefixQuota+bucket, quota)
+}
+
+// SaveUsage persists a bucket's usage data to Pebble.
+func (s *PebbleStore) SaveUsage(bucket string, usage *BucketUsage) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	return s.putMsgpack(prefixQuotaUsage+bucket, usage)
+}
+
+// loadQuotas restores previously persisted quota and usage data from Pebble
+// into the QuotaManager's in-memory maps. Called during SetQuotaManager.
+func (s *PebbleStore) loadQuotas(qm *QuotaManager) {
+	// Load quotas
+	s.scanPrefix(prefixQuota, func(key, val []byte) error {
+		var quota BucketQuota
+		if err := json.Unmarshal(val, &quota); err != nil {
+			slog.Warn("quota: failed to unmarshal quota entry", "key", string(key), "error", err)
+			return nil
+		}
+		bucket := strings.TrimPrefix(string(key), prefixQuota)
+		qm.LoadQuota(bucket, &quota)
+		return nil
+	})
+
+	// Load usage
+	s.scanPrefix(prefixQuotaUsage, func(key, val []byte) error {
+		var usage BucketUsage
+		if err := json.Unmarshal(val, &usage); err != nil {
+			slog.Warn("quota: failed to unmarshal usage entry", "key", string(key), "error", err)
+			return nil
+		}
+		bucket := strings.TrimPrefix(string(key), prefixQuotaUsage)
+		qm.LoadUsage(bucket, &usage)
+		return nil
+	})
 }

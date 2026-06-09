@@ -2,6 +2,7 @@
 package metadata
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -150,11 +151,29 @@ type NodeInfo struct {
 type NodeState uint8
 
 const (
-	NodeOnline   NodeState = iota
-	NodeDraining           // Being decommissioned
+	NodeOnline    NodeState = iota
+	NodeDraining             // Being decommissioned
+	NodeMaint                // Under maintenance (rolling upgrade)
 	NodeOffline
 	NodeFailed
 )
+
+func (s NodeState) String() string {
+	switch s {
+	case NodeOnline:
+		return "online"
+	case NodeDraining:
+		return "draining"
+	case NodeMaint:
+		return "maintenance"
+	case NodeOffline:
+		return "offline"
+	case NodeFailed:
+		return "failed"
+	default:
+		return fmt.Sprintf("unknown(%d)", s)
+	}
+}
 
 // NodeReport is sent by data nodes during heartbeat.
 type NodeReport struct {
@@ -182,6 +201,16 @@ type PlacementPolicy struct {
 	ECConfig          *ECConfig      `json:"ec_config,omitempty"`
 	TopologySpread    TopologySpread `json:"topology_spread"`
 	StorageTier       StorageTier    `json:"storage_tier"`
+	// CrossZoneReplication enables async replication to a remote zone.
+	CrossZoneReplication *CrossZoneConfig `json:"cross_zone_replication,omitempty"`
+}
+
+// CrossZoneConfig defines cross-zone (cross-DC) replication settings.
+type CrossZoneConfig struct {
+	RemoteZone    string `json:"remote_zone"`     // Target zone name
+	ReplicaFactor int    `json:"replica_factor"`  // Number of remote replicas (default: 1)
+	AsyncMode     bool   `json:"async_mode"`      // true=async, false=sync
+	BandwidthMBps int    `json:"bandwidth_mbps"`  // Bandwidth limit in MB/s (0=unlimited)
 }
 
 // ECConfig defines erasure coding parameters.
