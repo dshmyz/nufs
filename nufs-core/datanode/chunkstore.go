@@ -49,6 +49,55 @@ type ChunkStore struct {
 	fdCache map[metadata.ChunkID]*os.File
 	fdList  *fdLRU // LRU eviction tracker
 	fdMax   int    // Maximum cached file descriptors
+
+	perf chunkStorePerf
+}
+
+type chunkStorePerf struct {
+	writeSemWaitNs     atomic.Int64
+	readSemWaitNs      atomic.Int64
+	fsyncNs            atomic.Int64
+	fsyncCount         atomic.Int64
+	readRequestedBytes atomic.Int64
+	readAmplifiedBytes atomic.Int64
+	fdCacheHits        atomic.Int64
+	fdCacheMisses      atomic.Int64
+	fdCacheEvictions   atomic.Int64
+	listChunksNs       atomic.Int64
+	listChunksCalls    atomic.Int64
+	listChunksItems    atomic.Int64
+}
+
+type ChunkStorePerfSnapshot struct {
+	WriteSemWaitNs     int64 `json:"write_sem_wait_ns"`
+	ReadSemWaitNs      int64 `json:"read_sem_wait_ns"`
+	FsyncNs            int64 `json:"fsync_ns"`
+	FsyncCount         int64 `json:"fsync_count"`
+	ReadRequestedBytes int64 `json:"read_requested_bytes"`
+	ReadAmplifiedBytes int64 `json:"read_amplified_bytes"`
+	FdCacheHits        int64 `json:"fd_cache_hits"`
+	FdCacheMisses      int64 `json:"fd_cache_misses"`
+	FdCacheEvictions   int64 `json:"fd_cache_evictions"`
+	ListChunksNs       int64 `json:"list_chunks_ns"`
+	ListChunksCalls    int64 `json:"list_chunks_calls"`
+	ListChunksItems    int64 `json:"list_chunks_items"`
+}
+
+func (cs *ChunkStore) PerfSnapshot() ChunkStorePerfSnapshot {
+	return ChunkStorePerfSnapshot{
+		WriteSemWaitNs:     cs.perf.writeSemWaitNs.Load(),
+		ReadSemWaitNs:      cs.perf.readSemWaitNs.Load(),
+		FsyncNs:            cs.perf.fsyncNs.Load(),
+		FsyncCount:         cs.perf.fsyncCount.Load(),
+		ReadRequestedBytes: cs.perf.readRequestedBytes.Load(),
+		ReadAmplifiedBytes: cs.perf.readAmplifiedBytes.Load(),
+		FdCacheHits:        cs.perf.fdCacheHits.Load(),
+		FdCacheMisses:      cs.perf.fdCacheMisses.Load(),
+		FdCacheEvictions:   cs.perf.fdCacheEvictions.Load(),
+		ListChunksNs:       cs.perf.listChunksNs.Load(),
+		ListChunksCalls:    cs.perf.listChunksCalls.Load(),
+		ListChunksItems:    cs.perf.listChunksItems.Load(),
+	}
 }
 
 // SyncConcurrency limits concurrent f.Sync() calls to prevent I/O thrashing
@@ -129,7 +178,9 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
 	}
 
 	// Acquire write semaphore
+	writeSemStart := time.Now()
 	cs.writeSem <- struct{}{}
+	cs.perf.writeSemWaitNs.Add(time.Since(writeSemStart).Nanoseconds())
 	defer func() { <-cs.writeSem }()
 
 	// Phase 1: Log intent to WAL (crash recovery: uncommitted writes are cleaned up)
@@ -175,7 +226,10 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
 	// Multiple concurrent writers writing to different files can
 	// saturate the disk with flush commands, hurting throughput.
 	cs.syncSem <- struct{}{}
+	fsyncStart := time.Now()
 	syncErr := f.Sync()
+	cs.perf.fsyncNs.Add(time.Since(fsyncStart).Nanoseconds())
+	cs.perf.fsyncCount.Add(1)
 	<-cs.syncSem
 	if syncErr != nil {
 		return fmt.Errorf("datanode: fsync: %w", syncErr)
@@ -216,8 +270,12 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
 
 // WriteAt writes data at a specific offset within a chunk file.
 // Used for partial/appending writes during replication.
+// CRC is deferred to Seal() for performance — the on-disk CRC may be
+// stale until Seal() recomputes it from the full file.
 func (cs *ChunkStore) WriteAt(chunkID metadata.ChunkID, offset int64, data []byte) error {
+	writeSemStart := time.Now()
 	cs.writeSem <- struct{}{}
+	cs.perf.writeSemWaitNs.Add(time.Since(writeSemStart).Nanoseconds())
 	defer func() { <-cs.writeSem }()
 
 	path := cs.chunkPath(chunkID)
@@ -251,14 +309,69 @@ func (cs *ChunkStore) WriteAt(chunkID metadata.ChunkID, offset int64, data []byt
 	if _, err := f.WriteAt(data, fileOffset); err != nil {
 		return fmt.Errorf("datanode: write at offset: %w", err)
 	}
+
+	// Mark chunk as dirty (CRC is stale) — Seal() will recompute.
+	// Write CRC=0 to the on-disk header so Read skips CRC check.
+	cs.mu.Lock()
+	if info, ok := cs.chunks[chunkID]; ok {
+		info.State = LocalWritten
+		info.Checksum = 0
+	}
+	cs.mu.Unlock()
+
+	// Write CRC=0 to file header (cheap 4-byte overwrite at offset 16).
+	zeroCRC := make([]byte, 4)
+	f.WriteAt(zeroCRC, 16)
+
+	// Invalidate fd cache so next Read picks up modified data.
+	cs.fdMu.Lock()
+	delete(cs.fdCache, chunkID)
+	cs.fdMu.Unlock()
+
 	return f.Sync()
+}
+
+// computeFileCRC reads the chunk file, computes CRC32 of plaintext.
+// Used by Seal() to finalize CRC after WriteAt modifications.
+func (cs *ChunkStore) computeFileCRC(_ metadata.ChunkID, path string) (uint32, error) {
+	rf, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer rf.Close()
+
+	header := make([]byte, ChunkFileHeaderSize)
+	if _, err := io.ReadFull(rf, header); err != nil {
+		return 0, err
+	}
+	dataLen := binary.BigEndian.Uint32(header[12:16])
+
+	storedData := make([]byte, dataLen)
+	if _, err := io.ReadFull(rf, storedData); err != nil {
+		return 0, err
+	}
+
+	var plainData []byte
+	if cs.encryptor != nil && cs.encryptor.Enabled() {
+		decrypted, err := cs.encryptor.DecryptChunk(storedData)
+		if err != nil {
+			return 0, err
+		}
+		plainData = decrypted
+	} else {
+		plainData = storedData
+	}
+
+	return crc32.ChecksumIEEE(plainData), nil
 }
 
 // Read retrieves chunk data from local disk.
 // If offset and length are 0, reads the entire chunk.
 // Uses the LRU file descriptor cache for hot chunks to avoid repeated open/close.
 func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32) ([]byte, uint32, error) {
+	readSemStart := time.Now()
 	cs.readSem <- struct{}{}
+	cs.perf.readSemWaitNs.Add(time.Since(readSemStart).Nanoseconds())
 	defer func() { <-cs.readSem }()
 
 	path := cs.chunkPath(chunkID)
@@ -284,7 +397,27 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 	dataLen := binary.BigEndian.Uint32(header[12:16])
 	storedChecksum := binary.BigEndian.Uint32(header[16:20])
 
-	// Read the full stored payload (may be encrypted)
+	// Optimized path: unsealed chunk with a range read and no encryption.
+	// CRC=0 means CRC is stale (post-WriteAt), so we skip CRC verification
+	// and use io.SectionReader to read only the needed bytes.
+	wantRange := (offset > 0 || length > 0) && length > 0
+	if wantRange && storedChecksum == 0 && (cs.encryptor == nil || !cs.encryptor.Enabled()) {
+		dataStart := int64(ChunkFileHeaderSize)
+		readLen := int64(length)
+		if readLen > int64(dataLen)-offset {
+			readLen = int64(dataLen) - offset
+		}
+		sr := io.NewSectionReader(f, dataStart+offset, readLen)
+		result := make([]byte, readLen)
+		if _, err := io.ReadFull(sr, result); err != nil {
+			return nil, 0, fmt.Errorf("datanode: range read: %w", err)
+		}
+		cs.perf.readRequestedBytes.Add(int64(len(result)))
+		cs.perf.readAmplifiedBytes.Add(int64(len(result)))
+		return result, 0, nil
+	}
+
+	// General path: read full stored payload (required for CRC or encryption).
 	if _, err := f.Seek(int64(ChunkFileHeaderSize), io.SeekStart); err != nil {
 		return nil, 0, fmt.Errorf("datanode: seek: %w", err)
 	}
@@ -315,6 +448,8 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 	if readOffset+int64(readLen) > int64(len(plainData)) {
 		readLen = int32(int64(len(plainData)) - readOffset)
 	}
+	cs.perf.readRequestedBytes.Add(int64(readLen))
+	cs.perf.readAmplifiedBytes.Add(int64(len(storedData)))
 
 	var result []byte
 	if readOffset == 0 && readLen == int32(len(plainData)) {
@@ -322,6 +457,17 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 	} else {
 		result = make([]byte, readLen)
 		copy(result, plainData[readOffset:readOffset+int64(readLen)])
+	}
+
+	// End-to-end integrity check: verify CRC32 of plaintext matches
+	// the stored checksum. Skipped for unsealed chunks (header checksum=0)
+	// where CRC is stale from partial WriteAt operations; Seal() will
+	// recompute it.
+	if storedChecksum != 0 {
+		computedChecksum := crc32.ChecksumIEEE(plainData)
+		if computedChecksum != storedChecksum {
+			return nil, 0, fmt.Errorf("datanode: checksum mismatch for chunk %d: stored=%d computed=%d (possible bitrot)", chunkID, storedChecksum, computedChecksum)
+		}
 	}
 
 	// Update access stats
@@ -336,9 +482,9 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 }
 
 // Seal finalizes a chunk: updates the state to sealed.
-// Since Write already computes the CRC32 checksum via rolling hash and
-// stores it in the header, Seal no longer needs to re-read the entire
-// chunk data. It only updates the in-memory state and metadata sidecar.
+// For chunks written via Seal() directly (no WriteAt), CRC was already
+// computed during Write and is correct. For chunks that went through
+// WriteAt (dirty state), CRC is recomputed from the file now.
 func (cs *ChunkStore) Seal(chunkID metadata.ChunkID) (uint32, error) {
 	cs.writeSem <- struct{}{}
 	defer func() { <-cs.writeSem }()
@@ -355,10 +501,24 @@ func (cs *ChunkStore) Seal(chunkID metadata.ChunkID) (uint32, error) {
 		return checksum, nil
 	}
 
-	// Checksum was already computed during Write — just update state
+	// Compute CRC from file (required after WriteAt or first Seal).
+	path := cs.chunkPath(chunkID)
+	checksum, err := cs.computeFileCRC(chunkID, path)
+	if err != nil {
+		cs.mu.Unlock()
+		return 0, fmt.Errorf("datanode: seal compute CRC: %w", err)
+	}
 	info.State = LocalSealed
-	checksum := info.Checksum
+	info.Checksum = checksum
 	cs.mu.Unlock()
+
+	// Persist CRC to file header so Read can verify it.
+	crcBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(crcBuf, checksum)
+	if wf, err := os.OpenFile(path, os.O_WRONLY, 0644); err == nil {
+		_, _ = wf.WriteAt(crcBuf, 16)
+		wf.Close()
+	}
 
 	// Update metadata sidecar with sealed state
 	cs.writeMetaSidecar(chunkID, info)
@@ -397,6 +557,7 @@ func (cs *ChunkStore) Info(chunkID metadata.ChunkID) (*LocalChunkInfo, bool) {
 
 // ListChunks returns all locally stored chunk information.
 func (cs *ChunkStore) ListChunks() []LocalChunkInfo {
+	start := time.Now()
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 
@@ -404,6 +565,9 @@ func (cs *ChunkStore) ListChunks() []LocalChunkInfo {
 	for _, info := range cs.chunks {
 		result = append(result, *info)
 	}
+	cs.perf.listChunksNs.Add(time.Since(start).Nanoseconds())
+	cs.perf.listChunksCalls.Add(1)
+	cs.perf.listChunksItems.Add(int64(len(result)))
 	return result
 }
 
@@ -600,9 +764,11 @@ func (cs *ChunkStore) getFd(chunkID metadata.ChunkID, path string) *os.File {
 	cs.fdMu.RUnlock()
 
 	if ok {
+		cs.perf.fdCacheHits.Add(1)
 		cs.fdList.touch(chunkID)
 		return f
 	}
+	cs.perf.fdCacheMisses.Add(1)
 
 	// Open the file
 	newF, err := os.Open(path)
@@ -616,6 +782,7 @@ func (cs *ChunkStore) getFd(chunkID metadata.ChunkID, path string) *os.File {
 	// Double-check after acquiring write lock
 	if f, ok := cs.fdCache[chunkID]; ok {
 		newF.Close()
+		cs.perf.fdCacheHits.Add(1)
 		cs.fdList.touch(chunkID)
 		return f
 	}
@@ -627,6 +794,7 @@ func (cs *ChunkStore) getFd(chunkID metadata.ChunkID, path string) *os.File {
 			if oldF, ok := cs.fdCache[evictID]; ok {
 				oldF.Close()
 				delete(cs.fdCache, evictID)
+				cs.perf.fdCacheEvictions.Add(1)
 			}
 		}
 	}

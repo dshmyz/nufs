@@ -42,6 +42,11 @@ spec:
             - "--raft={{ .Values.metad.config.raftEnabled }}"
             - "--raft-addr=0.0.0.0:{{ .Values.metad.service.raftPort }}"
             - "--raft-dir=/data/raft"
+            {{- if .Values.observability.tracing.enabled }}
+            - "--trace-enabled=true"
+            - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
+            - "--trace-insecure={{ .Values.observability.tracing.insecure }}"
+            {{- end }}
             - "--log-json=true"
             {{- if .Values.observability.tracing.enabled }}
             - "--trace-enabled=true"

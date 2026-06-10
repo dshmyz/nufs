@@ -359,6 +359,7 @@ type OpsMetrics struct {
 		ChunkCount int64 `json:"chunk_count"`
 		UsedBytes  int64 `json:"used_bytes"`
 	} `json:"cache"`
+	Perf        ChunkStorePerfSnapshot `json:"perf"`
 	Replication struct {
 		Writes     int64 `json:"writes"`
 		Errors     int64 `json:"errors"`
@@ -376,6 +377,7 @@ func (s *OpsServer) handlePrometheusMetrics(w http.ResponseWriter, r *http.Reque
 	writes, replErrors, avgLatency := s.repl.Stats()
 	scanned, mismatches, repaired := s.ae.Stats()
 	totalBytes, chunkCount := s.store.Stats()
+	perf := s.store.PerfSnapshot()
 
 	state := strings.ToLower(stats.DiskState)
 	if state == "" {
@@ -435,6 +437,50 @@ func (s *OpsServer) handlePrometheusMetrics(w http.ResponseWriter, r *http.Reque
 	sb.WriteString("# TYPE nufs_datanode_antientropy_repaired_total counter\n")
 	fmt.Fprintf(&sb, "nufs_datanode_antientropy_repaired_total %d\n", repaired)
 
+	sb.WriteString("# HELP nufs_datanode_read_requested_bytes_total Bytes requested by read calls after range clipping\n")
+	sb.WriteString("# TYPE nufs_datanode_read_requested_bytes_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_read_requested_bytes_total %d\n", perf.ReadRequestedBytes)
+
+	sb.WriteString("# HELP nufs_datanode_read_amplified_bytes_total Bytes read from chunk payloads before range slicing\n")
+	sb.WriteString("# TYPE nufs_datanode_read_amplified_bytes_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_read_amplified_bytes_total %d\n", perf.ReadAmplifiedBytes)
+
+	sb.WriteString("# HELP nufs_datanode_fsync_seconds_total Total time spent in chunk file fsync\n")
+	sb.WriteString("# TYPE nufs_datanode_fsync_seconds_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_fsync_seconds_total %g\n", float64(perf.FsyncNs)/1e9)
+
+	sb.WriteString("# HELP nufs_datanode_fsync_total Chunk file fsync count\n")
+	sb.WriteString("# TYPE nufs_datanode_fsync_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_fsync_total %d\n", perf.FsyncCount)
+
+	sb.WriteString("# HELP nufs_datanode_fd_cache_hits_total File descriptor cache hits\n")
+	sb.WriteString("# TYPE nufs_datanode_fd_cache_hits_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_fd_cache_hits_total %d\n", perf.FdCacheHits)
+
+	sb.WriteString("# HELP nufs_datanode_fd_cache_misses_total File descriptor cache misses\n")
+	sb.WriteString("# TYPE nufs_datanode_fd_cache_misses_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_fd_cache_misses_total %d\n", perf.FdCacheMisses)
+
+	sb.WriteString("# HELP nufs_datanode_fd_cache_evictions_total File descriptor cache evictions\n")
+	sb.WriteString("# TYPE nufs_datanode_fd_cache_evictions_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_fd_cache_evictions_total %d\n", perf.FdCacheEvictions)
+
+	sb.WriteString("# HELP nufs_datanode_list_chunks_seconds_total Total time spent copying local chunk lists\n")
+	sb.WriteString("# TYPE nufs_datanode_list_chunks_seconds_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_list_chunks_seconds_total %g\n", float64(perf.ListChunksNs)/1e9)
+
+	sb.WriteString("# HELP nufs_datanode_list_chunks_total ListChunks call count\n")
+	sb.WriteString("# TYPE nufs_datanode_list_chunks_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_list_chunks_total %d\n", perf.ListChunksCalls)
+
+	sb.WriteString("# HELP nufs_datanode_write_semaphore_wait_seconds_total Total time waiting for write semaphore\n")
+	sb.WriteString("# TYPE nufs_datanode_write_semaphore_wait_seconds_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_write_semaphore_wait_seconds_total %g\n", float64(perf.WriteSemWaitNs)/1e9)
+
+	sb.WriteString("# HELP nufs_datanode_read_semaphore_wait_seconds_total Total time waiting for read semaphore\n")
+	sb.WriteString("# TYPE nufs_datanode_read_semaphore_wait_seconds_total counter\n")
+	fmt.Fprintf(&sb, "nufs_datanode_read_semaphore_wait_seconds_total %g\n", float64(perf.ReadSemWaitNs)/1e9)
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(sb.String()))
 }
@@ -447,6 +493,7 @@ func (s *OpsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	m.Disk = s.disk.Stats()
 	m.Cache.ChunkCount = s.store.chunkCount.Load()
 	m.Cache.UsedBytes = s.store.totalBytes.Load()
+	m.Perf = s.store.PerfSnapshot()
 	m.Replication.Writes = writes
 	m.Replication.Errors = errors
 	m.Replication.AvgLatency = avgLatency

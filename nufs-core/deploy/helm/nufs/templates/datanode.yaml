@@ -44,6 +44,11 @@ spec:
             - "--capacity={{ .Values.datanode.config.capacityGB }}"
             - "--rack={{ .Values.datanode.config.rack }}"
             - "--zone={{ .Values.datanode.config.zone }}"
+            {{- if .Values.observability.tracing.enabled }}
+            - "--trace-enabled=true"
+            - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
+            - "--trace-insecure={{ .Values.observability.tracing.insecure }}"
+            {{- end }}
             - "--log-json=true"
             {{- if .Values.observability.tracing.enabled }}
             - "--trace-enabled=true"

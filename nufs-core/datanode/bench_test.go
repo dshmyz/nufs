@@ -231,6 +231,116 @@ func BenchmarkWALWrite(b *testing.B) {
 	}
 }
 
+// BenchmarkChunkStoreRangeReadAmplification benchmarks small range reads from large chunks.
+func BenchmarkChunkStoreRangeReadAmplification(b *testing.B) {
+	dir := b.TempDir()
+	store, err := NewChunkStore(dir, 64, 64, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	data := make([]byte, 4*1024*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	chunkID := metadata.ChunkID(1)
+	if err := store.Write(chunkID, data); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.SetBytes(4 * 1024)
+	for i := 0; i < b.N; i++ {
+		off := int64((i * 4096) % (len(data) - 4096))
+		if _, _, err := store.Read(chunkID, off, 4*1024); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkChunkStoreWriteAt benchmarks partial writes that update CRC state.
+func BenchmarkChunkStoreWriteAt(b *testing.B) {
+	dir := b.TempDir()
+	store, err := NewChunkStore(dir, 64, 64, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	base := make([]byte, 1024*1024)
+	if err := store.Write(metadata.ChunkID(1), base); err != nil {
+		b.Fatal(err)
+	}
+	patch := make([]byte, 4*1024)
+	for i := range patch {
+		patch[i] = byte(i % 256)
+	}
+
+	b.ResetTimer()
+	b.SetBytes(int64(len(patch)))
+	for i := 0; i < b.N; i++ {
+		off := int64((i * len(patch)) % (len(base) - len(patch)))
+		if err := store.WriteAt(metadata.ChunkID(1), off, patch); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkChunkStoreRangeReadUnsealed benchmarks small range reads on unsealed
+// chunks where the optimized SectionReader path applies (no CRC, no full read).
+func BenchmarkChunkStoreRangeReadUnsealed(b *testing.B) {
+	dir := b.TempDir()
+	store, err := NewChunkStore(dir, 64, 64, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	base := make([]byte, 4*1024*1024)
+	for i := range base {
+		base[i] = byte(i % 256)
+	}
+	chunkID := metadata.ChunkID(1)
+	if err := store.Write(chunkID, base); err != nil {
+		b.Fatal(err)
+	}
+	// Partial write marks chunk as unsealed (CRC=0)
+	if err := store.WriteAt(chunkID, 0, make([]byte, 4096)); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.SetBytes(4 * 1024)
+	for i := 0; i < b.N; i++ {
+		off := int64((i * 4096) % (len(base) - 4096))
+		if _, _, err := store.Read(chunkID, off, 4096); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkChunkStoreListChunks benchmarks full in-memory chunk list snapshots.
+func BenchmarkChunkStoreListChunks(b *testing.B) {
+	dir := b.TempDir()
+	store, err := NewChunkStore(dir, 64, 64, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	data := []byte("x")
+	for i := 0; i < 10000; i++ {
+		if err := store.Write(metadata.ChunkID(i+1), data); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		chunks := store.ListChunks()
+		if len(chunks) != 10000 {
+			b.Fatalf("expected 10000 chunks, got %d", len(chunks))
+		}
+	}
+}
+
 // BenchmarkChunkStoreVariousSizes benchmarks writes at different chunk sizes.
 func BenchmarkChunkStoreVariousSizes(b *testing.B) {
 	sizes := []int{1024, 4 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024}

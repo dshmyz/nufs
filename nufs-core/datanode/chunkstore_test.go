@@ -267,6 +267,71 @@ func TestChunkStore_DrainWritesTimeout(t *testing.T) {
 	}
 }
 
+func TestChunkStore_WriteAtThenSealCRC(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+
+	// Write initial 1MB chunk
+	base := make([]byte, 1024*1024)
+	for i := range base {
+		base[i] = byte(i % 256)
+	}
+	chunkID := metadata.ChunkID(900)
+	if err := cs.Write(chunkID, base); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Seal sets CRC
+	checksum1, err := cs.Seal(chunkID)
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	expectedCRC := crc32.ChecksumIEEE(base)
+	if checksum1 != expectedCRC {
+		t.Fatalf("Seal CRC: got %d, want %d", checksum1, expectedCRC)
+	}
+
+	// Read should verify CRC
+	got, checksum2, err := cs.Read(chunkID, 0, 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !bytes.Equal(got, base) {
+		t.Fatalf("Read data mismatch")
+	}
+	if checksum2 != expectedCRC {
+		t.Fatalf("Read CRC: got %d, want %d", checksum2, expectedCRC)
+	}
+
+	// Partial write (WriteAt)
+	patch := make([]byte, 4*1024)
+	for i := range patch {
+		patch[i] = byte((i + 100) % 256)
+	}
+	if err := cs.WriteAt(chunkID, 0, patch); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	// After WriteAt, Seal should recompute CRC
+	expectedCRC2 := crc32.ChecksumIEEE(append(append([]byte{}, patch...), base[len(patch):]...))
+	checksum3, err := cs.Seal(chunkID)
+	if err != nil {
+		t.Fatalf("Seal after WriteAt: %v", err)
+	}
+	if checksum3 != expectedCRC2 {
+		t.Fatalf("Seal after WriteAt CRC: got %d, want %d", checksum3, expectedCRC2)
+	}
+
+	// Read after Seal should verify new CRC
+	got2, _, err := cs.Read(chunkID, 0, 0)
+	if err != nil {
+		t.Fatalf("Read after Seal: %v", err)
+	}
+	expectedData := append(append([]byte{}, patch...), base[len(patch):]...)
+	if !bytes.Equal(got2, expectedData) {
+		t.Fatalf("Read after Seal data mismatch")
+	}
+}
+
 func TestChunkStore_CloseClosesFdCache(t *testing.T) {
 	cs, _ := newTestChunkStore(t)
 	chunkID := metadata.ChunkID(909)
