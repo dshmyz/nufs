@@ -86,3 +86,58 @@ func TestLoadIgnoresUnknownKeys(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadDatanodeConfigEndToEnd(t *testing.T) {
+	withFlagSet(t, func() {
+		dataDir := flag.String("data-dir", "default", "")
+		listen := flag.String("listen", "", "")
+		opsAddr := flag.String("ops-addr", "", "")
+		rack := flag.String("rack", "", "")
+		zone := flag.String("zone", "", "")
+		capacity := flag.Int64("capacity", 0, "")
+		nodeID := flag.String("node-id", "", "")
+		traceEnabled := flag.Bool("trace-enabled", false, "")
+
+		path := writeConfig(t, `
+listen: "0.0.0.0:9100"
+node_id: "42"
+data_dir: "/var/lib/dfs/data"
+metadata: "metad:8091"
+ops_addr: "0.0.0.0:8092"
+rack: "rack1"
+zone: "zone1"
+capacity_gb: 2000
+log_level: "info"
+trace_enabled: true
+trace_endpoint: "otel:4317"
+`)
+
+		if err := Load(path); err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if *dataDir != "/var/lib/dfs/data" {
+			t.Fatalf("data-dir: %q", *dataDir)
+		}
+		if *listen != "0.0.0.0:9100" {
+			t.Fatalf("listen: %q", *listen)
+		}
+		if *opsAddr != "0.0.0.0:8092" {
+			t.Fatalf("ops-addr: %q", *opsAddr)
+		}
+		if *rack != "rack1" {
+			t.Fatalf("rack: %q", *rack)
+		}
+		if *zone != "zone1" {
+			t.Fatalf("zone: %q", *zone)
+		}
+		if *capacity != 2000 {
+			t.Fatalf("capacity: %d", *capacity)
+		}
+		if *nodeID != "42" {
+			t.Fatalf("node-id: %q", *nodeID)
+		}
+		if !*traceEnabled {
+			t.Fatal("trace-enabled not loaded")
+		}
+	})
+}

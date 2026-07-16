@@ -6,10 +6,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.34.0"
@@ -67,6 +69,10 @@ func Init(cfg Config) (trace.Tracer, ShutdownFunc, error) {
 	)
 
 	otel.SetTracerProvider(provider)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
 
 	tracer := provider.Tracer("github.com/example/dfs",
 		trace.WithInstrumentationVersion("1.0.0"),
@@ -89,4 +95,38 @@ func newResource(serviceName string) (*sdkresource.Resource, error) {
 			semconv.ServiceNameKey.String(serviceName),
 		),
 	)
+}
+
+// StartSpan starts a new span with the given name and options.
+// Returns the context with the span and a function to end the span.
+func StartSpan(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+	tracer := otel.Tracer("github.com/example/dfs")
+	return tracer.Start(ctx, name, opts...)
+}
+
+// HTTPMiddleware returns an HTTP middleware that extracts trace context
+// from incoming requests and creates a span for each request.
+func HTTPMiddleware(tracer trace.Tracer) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+			ctx, span := tracer.Start(ctx, r.Method+" "+r.URL.Path,
+				trace.WithSpanKind(trace.SpanKindServer),
+				trace.WithAttributes(
+					semconv.HTTPRequestMethodKey.String(r.Method),
+					semconv.URLFull(r.URL.String()),
+					semconv.ServerAddress(r.Host),
+				),
+			)
+			defer span.End()
+
+			r = r.WithContext(ctx)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// InjectTraceHeaders injects trace context into outgoing HTTP request headers.
+func InjectTraceHeaders(ctx context.Context, req *http.Request) {
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 }

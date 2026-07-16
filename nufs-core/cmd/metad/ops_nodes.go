@@ -9,6 +9,11 @@ import (
 	"github.com/example/dfs/metadata"
 )
 
+// retryAfterSeconds is the Retry-After value set on 429 responses.
+// We use a small integer (seconds, RFC 7231) so clients can do a
+// simple time.Sleep before retrying.
+const retryAfterSeconds = 2
+
 // --- Node handlers ---
 
 func (h *opsHandlers) handleNodes(w http.ResponseWriter, r *http.Request) {
@@ -29,6 +34,9 @@ func (h *opsHandlers) handleNodes(w http.ResponseWriter, r *http.Request) {
 		if err := h.store.RegisterNode(r.Context(), &info); err != nil {
 			if errors.Is(err, metadata.ErrNodeAlreadyExists) {
 				writeJSONErrorC(w, http.StatusConflict, "node_already_registered", err.Error())
+			} else if errors.Is(err, metadata.ErrTooManyRequests) {
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfterSeconds))
+				writeJSONErrorC(w, http.StatusTooManyRequests, "too_many_requests", err.Error())
 			} else {
 				writeJSONError(w, http.StatusInternalServerError, err.Error())
 			}
@@ -82,6 +90,11 @@ func (h *opsHandlers) handleNodesByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.store.Heartbeat(r.Context(), nodeID, &report); err != nil {
+			if errors.Is(err, metadata.ErrTooManyRequests) {
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfterSeconds))
+				writeJSONErrorC(w, http.StatusTooManyRequests, "too_many_requests", err.Error())
+				return
+			}
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -111,3 +124,4 @@ func (h *opsHandlers) handleNodesByID(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "unknown node sub-path")
 	}
 }
+

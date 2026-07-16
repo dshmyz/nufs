@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -363,6 +364,10 @@ func (a *remoteAPI) get(path string) []byte {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fmt.Fprintf(os.Stderr, "Error: GET %s failed: %s: %s\n", path, resp.Status, string(body))
+		os.Exit(1)
+	}
 	return body
 }
 
@@ -375,6 +380,10 @@ func (a *remoteAPI) post(path string, body io.Reader) []byte {
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fmt.Fprintf(os.Stderr, "Error: POST %s failed: %s: %s\n", path, resp.Status, string(b))
+		os.Exit(1)
+	}
 	return b
 }
 
@@ -406,6 +415,23 @@ func (a *remoteAPI) cmdBuckets(args []string) {
 			fmt.Println("Usage: nufs-cli bucket create <name>")
 			os.Exit(1)
 		}
+		req := struct {
+			Name   string                   `json:"name"`
+			Policy metadata.PlacementPolicy `json:"policy"`
+		}{
+			Name: args[1],
+			Policy: metadata.PlacementPolicy{
+				ID:                "default",
+				ReplicationFactor: 3,
+				TopologySpread:    metadata.SpreadNode,
+			},
+		}
+		body, err := json.Marshal(req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: marshal bucket request: %v\n", err)
+			os.Exit(1)
+		}
+		a.post("/api/v1/buckets", bytes.NewReader(body))
 		fmt.Printf("Bucket '%s' created\n", args[1])
 		return
 	}

@@ -84,8 +84,7 @@ func runSupervisor(dataDirs []string, basePort int, machineID, externalHost, met
 	sv.wg.Add(1)
 	go sv.monitorLoop()
 
-	sv.wg.Add(1)
-	go sv.socketListener(sockPath)
+	sv.startSocketListener(sockPath)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -262,7 +261,13 @@ type sockResp struct {
 	Data   interface{} `json:"data,omitempty"`
 }
 
+func (sv *supervisor) startSocketListener(sockPath string) {
+	sv.wg.Add(1)
+	go sv.socketListener(sockPath)
+}
+
 func (sv *supervisor) socketListener(sockPath string) {
+	defer sv.wg.Done()
 	os.Remove(sockPath)
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {

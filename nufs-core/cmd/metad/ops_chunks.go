@@ -170,3 +170,26 @@ func (h *opsHandlers) handleReportChunkState(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, map[string]string{"status": "reported"})
 }
+
+func (h *opsHandlers) handleChunksBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		InodeID metadata.InodeID        `json:"inode_id"`
+		Offsets []int64                 `json:"offsets"`
+		Policy  metadata.PlacementPolicy `json:"policy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	chunks, err := h.store.AllocateChunksBatch(r.Context(), req.InodeID, req.Offsets, req.Policy)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, chunks)
+}

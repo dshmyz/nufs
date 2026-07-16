@@ -2,8 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/example/dfs/metadata"
 )
@@ -223,9 +227,15 @@ func (h *opsHandlers) handleLink(w http.ResponseWriter, r *http.Request) {
 
 func (h *opsHandlers) handleInodesByID(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path[len("/api/v1/inodes/"):]
-	var inodeID metadata.InodeID
-	if _, err := fmt.Sscanf(path, "%d", &inodeID); err != nil {
+	parts := strings.SplitN(path, "/", 3)
+	rawID, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil || rawID == 0 {
 		writeJSONError(w, http.StatusBadRequest, "invalid inode ID")
+		return
+	}
+	inodeID := metadata.InodeID(rawID)
+	if len(parts) >= 2 && parts[1] == "xattrs" {
+		h.handleXAttrs(w, r, inodeID, parts)
 		return
 	}
 	switch r.Method {
@@ -248,6 +258,72 @@ func (h *opsHandlers) handleInodesByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]string{"status": "updated"})
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *opsHandlers) handleXAttrs(w http.ResponseWriter, r *http.Request, inodeID metadata.InodeID, parts []string) {
+	if r.Method == http.MethodPut || r.Method == http.MethodDelete {
+		if !h.requireLeader(w, r) {
+			return
+		}
+	}
+
+	if len(parts) == 2 {
+		if r.Method != http.MethodGet {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		attrs, err := h.store.ListXAttr(r.Context(), inodeID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if attrs == nil {
+			attrs = map[string][]byte{}
+		}
+		writeJSON(w, attrs)
+		return
+	}
+
+	name, err := url.PathUnescape(parts[2])
+	if err != nil || name == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid xattr name")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		value, err := h.store.GetXAttr(r.Context(), inodeID, name)
+		if errors.Is(err, metadata.ErrXAttrNotFound) {
+			writeJSONErrorC(w, http.StatusNotFound, "xattr_not_found", err.Error())
+			return
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string][]byte{"value": value})
+	case http.MethodPut:
+		var req struct {
+			Value []byte `json:"value"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if err := h.store.SetXAttr(r.Context(), inodeID, name, req.Value); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]string{"status": "updated"})
+	case http.MethodDelete:
+		if err := h.store.RemoveXAttr(r.Context(), inodeID, name); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]string{"status": "removed"})
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}

@@ -17,7 +17,7 @@ func startTestSocket(t *testing.T) (*supervisor, string, func()) {
 		stopCh:   make(chan struct{}),
 	}
 
-	go sv.socketListener(sockPath)
+	sv.startSocketListener(sockPath)
 
 	for i := 0; i < 100; i++ {
 		conn, err := net.Dial("unix", sockPath)
@@ -33,7 +33,7 @@ func startTestSocket(t *testing.T) (*supervisor, string, func()) {
 
 	cleanup := func() {
 		close(sv.stopCh)
-		time.Sleep(100 * time.Millisecond)
+		sv.wg.Wait()
 		os.Remove(sockPath)
 	}
 	return sv, sockPath, cleanup

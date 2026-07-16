@@ -77,9 +77,14 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 
 	// Chunks
 	mux.HandleFunc("/api/v1/chunks", mut(s.handleChunks))
+	mux.HandleFunc("/api/v1/chunks/batch", mut(s.handleChunksBatch))
 	mux.HandleFunc("/api/v1/chunks/", mut(s.handleChunksByID))
 	mux.HandleFunc("/api/v1/chunks/migrate-replica", mut(s.handleMigrateReplica))
 	mux.HandleFunc("/api/v1/chunks/report-state", mut(s.handleReportChunkState))
+
+	// Watch — long-poll SSE stream of metadata change events
+	// (doesn't need leader check; followers already consume from their local EventBus)
+	mux.HandleFunc("/api/v1/watch", s.handleWatch)
 
 	// Namespace — readdir/lookup/readlink are read-only, no leader check
 	mux.HandleFunc("/api/v1/namespace/mkdir", mut(s.handleMkDir))

@@ -128,7 +128,7 @@ func Watch(ctx context.Context, path string, onReload func()) error {
 	}
 
 	// Debounce: coalesce multiple rapid events (e.g., editor saves).
-	var debounce *time.Timer
+	var debounceTimer *time.Timer
 
 	for {
 		select {
@@ -147,16 +147,14 @@ func Watch(ctx context.Context, path string, onReload func()) error {
 			}
 
 			// Debounce: reset timer on each event.
-			if debounce != nil {
-				debounce.Stop()
+			if debounceTimer != nil {
+				debounceTimer.Stop()
 			}
-			debounce = time.NewTimer(200 * time.Millisecond)
-			go func() {
-				<-debounce.C
+			debounceTimer = time.AfterFunc(200*time.Millisecond, func() {
 				if err := reload(path, onReload); err != nil {
 					slog.Warn("config reload", "error", err)
 				}
-			}()
+			})
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -174,8 +172,21 @@ func reload(path string, onReload func()) error {
 		return fmt.Errorf("re-read config: %w", err)
 	}
 	var raw map[string]interface{}
-	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return fmt.Errorf("re-parse yaml: %w", err)
+	switch ext := filepath.Ext(path); ext {
+	case ".yaml", ".yml":
+		if err := yaml.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("re-parse yaml: %w", err)
+		}
+	case ".json":
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("re-parse json: %w", err)
+		}
+	case ".toml":
+		if err := toml.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("re-parse toml: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported config format for reload: %s", ext)
 	}
 	if err := applyFlags(raw, ""); err != nil {
 		return fmt.Errorf("re-apply flags: %w", err)

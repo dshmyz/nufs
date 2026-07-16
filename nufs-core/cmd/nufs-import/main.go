@@ -14,8 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/example/dfs/metadata"
@@ -23,13 +21,13 @@ import (
 
 func main() {
 	var (
-		metaAddr   = flag.String("meta-addr", "localhost:8091", "Metadata HTTP address")
-		metaDir    = flag.String("meta-dir", "", "Local Pebble metadata directory (auto-detect)")
-		workers    = flag.Int("workers", 4, "Number of parallel import workers")
-		dryRun     = flag.Bool("dry-run", false, "Print what would be imported without actually importing")
-		overwrite  = flag.Bool("overwrite", false, "Overwrite existing files")
-		prefix     = flag.String("prefix", "", "Only import files with this prefix")
-		exclude    = flag.String("exclude", "", "Exclude files matching this pattern")
+		metaAddr  = flag.String("meta-addr", "localhost:8091", "Metadata HTTP address")
+		metaDir   = flag.String("meta-dir", "", "Local Pebble metadata directory (auto-detect)")
+		workers   = flag.Int("workers", 4, "Number of parallel import workers")
+		dryRun    = flag.Bool("dry-run", false, "Print what would be imported without actually importing")
+		overwrite = flag.Bool("overwrite", false, "Overwrite existing files")
+		prefix    = flag.String("prefix", "", "Only import files with this prefix")
+		exclude   = flag.String("exclude", "", "Exclude files matching this pattern")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `NUFS Data Import Tool
@@ -107,11 +105,11 @@ type Importer interface {
 // ============================================================
 
 type s3Importer struct {
-	bucket     string
-	dfsBucket  string
-	metaAddr   string
-	workers    int
-	dryRun     bool
+	bucket    string
+	dfsBucket string
+	metaAddr  string
+	workers   int
+	dryRun    bool
 }
 
 func newS3Importer(bucket, dfsBucket, metaAddr string, workers int, dryRun bool) *s3Importer {
@@ -125,11 +123,7 @@ func newS3Importer(bucket, dfsBucket, metaAddr string, workers int, dryRun bool)
 }
 
 func (i *s3Importer) Import(ctx context.Context, prefix, exclude string, overwrite bool) error {
-	fmt.Println("S3 import: listing objects...")
-	// This is a placeholder - in production, use AWS SDK or MinIO client
-	// to list and download objects from S3
-	fmt.Println("S3 import: not yet implemented (requires AWS SDK or MinIO client)")
-	return nil
+	return fmt.Errorf("s3 import is not implemented: no S3 object reader or NUFS data writer is wired yet")
 }
 
 // ============================================================
@@ -236,129 +230,5 @@ func importFromFS(ctx context.Context, sourcePath, dfsBucket, metaAddr string, w
 		return nil
 	}
 
-	// Create metadata client
-	var meta metadata.MetadataService
-	if store != nil {
-		meta = store
-	} else {
-		client := metadata.NewHTTPClient("http://"+metaAddr, 30*time.Second)
-		meta = client
-	}
-
-	// Create bucket if it doesn't exist
-	if err := meta.CreateBucket(ctx, dfsBucket, metadata.PlacementPolicy{
-		ID:               "default",
-		ReplicationFactor: 1,
-	}); err != nil && !strings.Contains(err.Error(), "already exists") {
-		return fmt.Errorf("create bucket: %w", err)
-	}
-
-	// Get bucket root inode
-	bucketInfo, err := meta.GetBucket(ctx, dfsBucket)
-	if err != nil {
-		return fmt.Errorf("get bucket: %w", err)
-	}
-
-	// Process files in parallel
-	var (
-		wg      sync.WaitGroup
-		imported atomic.Int64
-		failed   atomic.Int64
-		total    = int64(len(files))
-	)
-
-	sem := make(chan struct{}, workers)
-	progress := make(chan string, 100)
-
-	// Progress reporter
-	go func() {
-		for msg := range progress {
-			fmt.Print(msg)
-		}
-	}()
-
-	for _, file := range files {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(filePath string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			relPath, _ := filepath.Rel(sourcePath, filePath)
-
-			// Read file
-			data, err := os.ReadFile(filePath)
-			if err != nil {
-				failed.Add(1)
-				progress <- fmt.Sprintf("  [FAIL] %s: %v\n", relPath, err)
-				return
-			}
-
-			// Create parent directories
-			dir := filepath.Dir(relPath)
-			if dir != "." && dir != "" {
-				// Create directory hierarchy in DFS
-				parentID := bucketInfo.RootInode
-				parts := strings.Split(dir, string(filepath.Separator))
-				for _, part := range parts {
-					if part == "" || part == "." {
-						continue
-					}
-					// Try to create directory, ignore if exists
-					_, err := meta.MkDir(ctx, parentID, part, 0755)
-					if err != nil && !strings.Contains(err.Error(), "already exists") {
-						// Directory might already exist, try to lookup
-						inode, lookupErr := meta.Lookup(ctx, parentID, part)
-						if lookupErr != nil {
-							failed.Add(1)
-							progress <- fmt.Sprintf("  [FAIL] %s: create dir %s: %v\n", relPath, part, err)
-							return
-						}
-						parentID = inode.ID
-					} else {
-						// Get the directory inode
-						inode, lookupErr := meta.Lookup(ctx, parentID, part)
-						if lookupErr != nil {
-							failed.Add(1)
-							progress <- fmt.Sprintf("  [FAIL] %s: lookup dir %s: %v\n", relPath, part, lookupErr)
-							return
-						}
-						parentID = inode.ID
-					}
-				}
-			}
-
-			// Create file
-			_, err = meta.CreateFile(ctx, bucketInfo.RootInode, relPath, 0644)
-			if err != nil && !strings.Contains(err.Error(), "already exists") {
-				if !overwrite {
-					failed.Add(1)
-					progress <- fmt.Sprintf("  [FAIL] %s: create file: %v\n", relPath, err)
-					return
-				}
-			}
-
-			// Write file content
-			// For now, we create the file but don't write content through the API
-			// In a real implementation, this would use the chunk store API
-			_ = data // Content would be written via chunk store
-
-			imported.Add(1)
-			progress <- fmt.Sprintf("  [OK]   %s (%d bytes)\n", relPath, len(data))
-		}(file)
-	}
-
-	wg.Wait()
-	close(progress)
-
-	fmt.Printf("\nImport Results:\n")
-	fmt.Printf("  Total:    %d\n", total)
-	fmt.Printf("  Imported: %d\n", imported.Load())
-	fmt.Printf("  Failed:   %d\n", failed.Load())
-
-	if failed.Load() > 0 {
-		return fmt.Errorf("%d files failed to import", failed.Load())
-	}
-	return nil
+	return fmt.Errorf("filesystem import is not implemented: refusing to create metadata-only files without writing chunk data")
 }
