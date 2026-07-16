@@ -59,6 +59,10 @@ type ParallelReplicator struct {
 	localWriter func(chunkID metadata.ChunkID, data []byte) error
 	tlsCfg      tlsutil.Config
 
+	// Connection pool and write pipeline for parallel replication
+	pool     *ClientPool
+	pipeline *WritePipeline
+
 	// Active chains per chunk
 	mu     sync.RWMutex
 	chains map[metadata.ChunkID]*ReplicationChain
@@ -78,18 +82,23 @@ func NewParallelReplicator(localAddr string, localID metadata.NodeID, timeout ti
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	pool := NewClientPool(4, 30*time.Second, 10*time.Second)
+	pipeline := NewWritePipeline(pool, timeout)
 	return &ParallelReplicator{
 		localAddr:   localAddr,
 		localID:     localID,
 		timeout:     timeout,
 		chains:      make(map[metadata.ChunkID]*ReplicationChain),
 		localWriter: cfg.LocalWriter,
+		pool:        pool,
+		pipeline:    pipeline,
 	}
 }
 
 // SetTLS configures TLS for inter-node chain replication connections.
 func (cr *ParallelReplicator) SetTLS(cfg tlsutil.Config) {
 	cr.tlsCfg = cfg
+	cr.pool.SetTLS(cfg)
 }
 
 // BuildChain creates a replication chain for a chunk.
@@ -206,72 +215,73 @@ func (cr *ParallelReplicator) Stats() (writes, errors int64, avgLatencyUs int64)
 	return 0, e, 0
 }
 
-// WriteToChain performs a synchronous chain-replicated write.
-// Returns the response from the tail node, which is the most consistent.
+// WriteToChain performs a parallel-replicated write to all alive replicas.
+// Instead of serial Head→Middle→Tail forwarding, writes are dispatched
+// concurrently to all replicas, reducing latency from O(N*RTT) to O(RTT).
+// The local node (if in the chain) writes synchronously via localWriter.
 func (cr *ParallelReplicator) WriteToChain(ctx context.Context, chunkID metadata.ChunkID, data []byte) (*Response, error) {
-	chain := cr.Head(chunkID)
-	if chain == nil {
-		return nil, fmt.Errorf("chain for chunk %d has no alive head", chunkID)
-	}
-
-	// Propagate write through the chain: Head -> Middle -> Tail
 	nodes := cr.AliveReplicas(chunkID)
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("chain for chunk %d has no alive replicas", chunkID)
 	}
 
 	start := time.Now()
-	var lastResp *Response
-	var lastErr error
 
-	for i := 0; i < len(nodes); i++ {
-		node := nodes[i]
-		if node.Addr == cr.localAddr {
-			// Write locally
+	// Write locally first (if this node is in the chain)
+	localOK := false
+	var remoteNodes []ChainNode
+	for _, n := range nodes {
+		if n.Addr == cr.localAddr {
 			if cr.localWriter != nil {
 				if err := cr.localWriter(chunkID, data); err != nil {
 					slog.Error("chain: local write failed", "chunkID", chunkID, "error", err)
-					cr.MarkFailed(chunkID, node.NodeID)
-					return nil, fmt.Errorf("local write: %w", err)
+					cr.MarkFailed(chunkID, n.NodeID)
+				} else {
+					localOK = true
 				}
+			} else {
+				localOK = true
 			}
-			continue
+		} else {
+			remoteNodes = append(remoteNodes, n)
 		}
+	}
 
-		client, err := cr.dialClient(node.Addr)
-		if err != nil {
-			slog.Error("chain: connect failed", "addr", node.Addr, "chunkID", chunkID, "error", err)
-			cr.MarkFailed(chunkID, node.NodeID)
-			lastErr = fmt.Errorf("connect %s: %w", node.Addr, err)
-			continue
-		}
+	// Dispatch writes to remote replicas in parallel via pipeline
+	var remoteReplicas []metadata.ReplicaInfo
+	for _, n := range remoteNodes {
+		remoteReplicas = append(remoteReplicas, metadata.ReplicaInfo{
+			NodeID: n.NodeID,
+			Addr:   n.Addr,
+		})
+	}
 
-		resp, err := client.ReplicateChunk(chunkID, data)
-		client.Close()
-		if err != nil {
-			slog.Error("chain: write failed", "addr", node.Addr, "chunkID", chunkID, "error", err)
-			cr.MarkFailed(chunkID, node.NodeID)
-			lastErr = fmt.Errorf("write %s: %w", node.Addr, err)
-			continue
+	var lastErr error
+	if len(remoteReplicas) > 0 {
+		if err := cr.pipeline.Write(ctx, chunkID, data, remoteReplicas); err != nil {
+			lastErr = err
+			// Mark failed remote nodes
+			for _, n := range remoteNodes {
+				cr.MarkFailed(chunkID, n.NodeID)
+			}
 		}
-		lastResp = resp
 	}
 
 	cr.writeCount.Add(1)
 	cr.writeLatency.Add(time.Since(start).Microseconds())
 
-	if lastResp == nil && nodes[len(nodes)-1].Addr == cr.localAddr {
-		// All remote replicas failed, but local write succeeded
-		cr.writeErrors.Add(int64(len(nodes) - 1))
-		return &Response{Status: ResponseStatus(1), Data: data}, nil
-	}
-
-	if lastResp == nil && lastErr != nil {
+	if lastErr != nil && !localOK {
 		cr.writeErrors.Add(int64(len(nodes)))
 		return nil, fmt.Errorf("chain write failed: %w", lastErr)
 	}
 
-	return lastResp, nil
+	if lastErr != nil && localOK {
+		// Remote replicas failed but local write succeeded
+		cr.writeErrors.Add(int64(len(remoteNodes)))
+		return &Response{Status: ResponseStatus(1), Data: data}, nil
+	}
+
+	return &Response{Status: StatusOK, Data: data}, nil
 }
 
 // ParallelReplicatorConfig holds configuration for chain replication.
@@ -546,6 +556,11 @@ func (ae *AntiEntropy) repairFromPeer(ctx context.Context, chunkID metadata.Chun
 			slog.Warn("anti-entropy: failed to report chunk state", "chunkID", chunkID, "error", stateErr)
 		}
 
+		// After successful repair, check if other replicas also need repair.
+		// If other replicas are in Failed/Stale state, they may have corrupted data
+		// that wasn't repaired because their state prevented them from being source.
+		ae.triggerRepairForStaleReplicas(ctx, chunkID, meta)
+
 		slog.Info("anti-entropy: chunk repaired successfully", "chunkID", chunkID, "nodeID", r.NodeID)
 		return nil
 	}
@@ -553,6 +568,28 @@ func (ae *AntiEntropy) repairFromPeer(ctx context.Context, chunkID metadata.Chun
 	// No healthy peer available — fall back to metadata-level repair queue
 	slog.Warn("anti-entropy: no healthy peer for chunk, queuing metadata repair", "chunkID", chunkID)
 	return ae.meta.TriggerRepair(ctx, chunkID)
+}
+
+// triggerRepairForStaleReplicas checks other replicas and triggers repair if they are in
+// Failed/Stale state. This ensures that when we repair from a healthy peer, other replicas
+// that may have corrupted data (but were skipped because their state was Failed/Stale)
+// are also scheduled for repair.
+func (ae *AntiEntropy) triggerRepairForStaleReplicas(ctx context.Context, chunkID metadata.ChunkID, meta *metadata.ChunkMeta) {
+	for _, r := range meta.Replicas {
+		if r.NodeID == ae.localID {
+			continue // Skip local node, already repaired above
+		}
+		if r.State == metadata.ReplicaFailed || r.State == metadata.ReplicaStale {
+			slog.Info("anti-entropy: found stale replica, triggering repair",
+				"chunkID", chunkID, "replicaNodeID", r.NodeID, "currentState", r.State)
+			if err := ae.meta.TriggerRepair(ctx, chunkID); err != nil {
+				slog.Warn("anti-entropy: failed to trigger repair for stale replica",
+					"chunkID", chunkID, "replicaNodeID", r.NodeID, "error", err)
+			}
+			// Only trigger once per chunk to avoid flooding the repair queue
+			return
+		}
+	}
 }
 
 // fetchAndRepairLocal reads a chunk from a remote peer via TCP and overwrites the local copy.
@@ -563,12 +600,25 @@ func (ae *AntiEntropy) fetchAndRepairLocal(chunkID metadata.ChunkID, peerAddr st
 	}
 	defer client.Close()
 
+	// Throttle the background data copy so foreground client traffic
+	// is never starved by anti-entropy. We call this *after* connecting
+	// but *before* reading so the peer isn't kept busy while we wait.
+	// We don't know the size yet so we read first, then back-pay the token cost.
+
 	resp, err := client.ReadChunk(chunkID, 0, 0)
 	if err != nil {
 		return fmt.Errorf("read from %s: %w", peerAddr, err)
 	}
 	if resp.Status != StatusOK {
 		return fmt.Errorf("read from %s: status %d", peerAddr, resp.Status)
+	}
+
+	// Back-pay: throttle after the read since we now know the data length.
+	if len(resp.Data) > 0 {
+		if err := ThrottleRead(context.Background(), len(resp.Data)); err != nil {
+			slog.Warn("anti-entropy: bandwidth throttle cancelled",
+				"chunkID", chunkID, "bytes", len(resp.Data), "error", err)
+		}
 	}
 
 	if err := ae.store.Write(chunkID, resp.Data); err != nil {
@@ -858,6 +908,11 @@ func (ic *ChunkIntegrityChecker) fetchPeerChecksum(ctx context.Context, addr str
 	}
 	if resp.Status != StatusOK {
 		return 0, fmt.Errorf("read chunk status %d from %s", resp.Status, addr)
+	}
+
+	// Throttle background integrity scan traffic.
+	if len(resp.Data) > 0 {
+		_ = ThrottleRead(ctx, len(resp.Data))
 	}
 	return crc32.ChecksumIEEE(resp.Data), nil
 }

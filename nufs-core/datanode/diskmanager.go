@@ -468,6 +468,11 @@ type WriteAheadLog struct {
 	file *os.File
 	mu   sync.Mutex
 
+	// dataDir is the root data directory for chunk storage.
+	// Set via SetDataDir() after ChunkStore creation so that
+	// Recover() can clean up orphaned chunk files at the correct path.
+	dataDir string
+
 	// Group commit state
 	pending   []func() error  // buffered entry writers
 	flushCh   chan struct{}   // signals flush goroutine
@@ -713,7 +718,18 @@ func (w *WriteAheadLog) Recover() ([]metadata.ChunkID, error) {
 // chunkPath returns the filesystem path for a chunk data file.
 // This is used during recovery to clean up orphaned chunks.
 func (w *WriteAheadLog) chunkPath(id metadata.ChunkID) string {
+	if w.dataDir != "" {
+		chunksDir := filepath.Join(w.dataDir, "chunks")
+		shard := uint64(id) % MaxShards
+		return filepath.Join(chunksDir, fmt.Sprintf("%02x", shard), fmt.Sprintf("%d.dat", id))
+	}
 	return filepath.Join(w.dir, fmt.Sprintf("chunk_%d.dat", id))
+}
+
+// SetDataDir sets the root data directory for chunk storage.
+// Must be called before Recover() so orphan cleanup uses the correct path.
+func (w *WriteAheadLog) SetDataDir(dataDir string) {
+	w.dataDir = dataDir
 }
 
 // Truncate clears the WAL (call after successful recovery).
@@ -744,6 +760,7 @@ type TierMigrator struct {
 	disk    *DiskManager
 	stopCh  chan struct{}
 	running atomic.Bool
+	wg      sync.WaitGroup // Tracks background goroutine for graceful shutdown
 }
 
 // NewTierMigrator creates a tier migration engine.
@@ -792,11 +809,19 @@ func (tm *TierMigrator) PlanMigration() (*MigrationPlan, error) {
 }
 
 // Start runs tier migration periodically.
+// Safe to call again after Stop: stopCh is recreated so the new
+// goroutine receives a fresh signal channel.
 func (tm *TierMigrator) Start(interval time.Duration) {
 	if tm.running.Swap(true) {
 		return
 	}
+	// Recreate stopCh so Start/Stop/Start cycles work. The previous
+	// stopCh was closed by Stop(); a closed channel would cause the
+	// new goroutine to exit immediately.
+	tm.stopCh = make(chan struct{})
+	tm.wg.Add(1)
 	go func() {
+		defer tm.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -820,10 +845,13 @@ func (tm *TierMigrator) Start(interval time.Duration) {
 	}()
 }
 
-// Stop terminates tier migration.
+// Stop terminates tier migration and blocks until the background
+// goroutine has fully exited, preventing races with store shutdown.
+// Safe to call multiple times.
 func (tm *TierMigrator) Stop() {
 	if tm.running.Swap(false) {
 		close(tm.stopCh)
+		tm.wg.Wait()
 	}
 }
 

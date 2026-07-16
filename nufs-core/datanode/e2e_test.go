@@ -14,9 +14,10 @@ import (
 )
 
 // TestE2E_DataNodeMetaDIntegration tests the full data path:
-//   metad: CreateBucket → AllocateChunk
-//   datanode: WriteChunk → ReadChunk
-//   metad: CommitChunk → GetChunk (verify)
+//
+//	metad: CreateBucket → AllocateChunk
+//	datanode: WriteChunk → ReadChunk
+//	metad: CommitChunk → GetChunk (verify)
 //
 // This test starts a real datanode TCP server and a real metad PebbleStore
 // (not a mock), exercising the actual interaction between the two services.
@@ -349,12 +350,12 @@ func TestE2E_MultipleChunkWrites(t *testing.T) {
 // ============================================================
 
 // TestE2E_RaftClusterFullPipeline tests the complete production path:
-//   1. Start a 3-node Raft cluster (metad)
-//   2. Start 3 datanode TCP servers
-//   3. Register datanodes with metad
-//   4. Create bucket → allocate chunk → write data → read back → commit
-//   5. Kill leader → verify failover → verify data still accessible
-//   6. Verify data consistency across Raft nodes
+//  1. Start a 3-node Raft cluster (metad)
+//  2. Start 3 datanode TCP servers
+//  3. Register datanodes with metad
+//  4. Create bucket → allocate chunk → write data → read back → commit
+//  5. Kill leader → verify failover → verify data still accessible
+//  6. Verify data consistency across Raft nodes
 func TestE2E_RaftClusterFullPipeline(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e Raft cluster test in short mode")
@@ -412,7 +413,7 @@ func TestE2E_RaftClusterFullPipeline(t *testing.T) {
 			NodeID:             fmt.Sprintf("node-%d", i+1),
 			BindAddr:           raftAddrs[i],
 			RaftDir:            raftDir,
-			Bootstrap:          i == 0, // Only first node bootstraps
+			Bootstrap:          i == 0,        // Only first node bootstraps
 			Peers:              raftAddrs[1:], // Peer addresses for bootstrap
 			HeartbeatTimeout:   2 * time.Second,
 			ElectionTimeout:    2 * time.Second,
@@ -774,7 +775,7 @@ func TestE2E_LifecyclePrefixPruning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mkdir 2024: %v", err)
 	}
-	_, err = store.MkDir(ctx, logsDir.ID, "2025", 0755)
+	dir2025, err := store.MkDir(ctx, logsDir.ID, "2025", 0755)
 	if err != nil {
 		t.Fatalf("mkdir 2025: %v", err)
 	}
@@ -788,7 +789,7 @@ func TestE2E_LifecyclePrefixPruning(t *testing.T) {
 	}
 
 	// Create files
-	oldTime := time.Now().Add(-100 * 24 * time.Hour) // 100 days ago
+	oldTime := time.Now().Add(-100 * 24 * time.Hour)  // 100 days ago
 	recentTime := time.Now().Add(-1 * 24 * time.Hour) // 1 day ago
 
 	createFileWithTime := func(parent metadata.InodeID, name string, ctime time.Time) {
@@ -797,14 +798,16 @@ func TestE2E_LifecyclePrefixPruning(t *testing.T) {
 			t.Fatalf("create file %s: %v", name, err)
 		}
 		inode.CTime = ctime.UnixNano()
+		inode.MTime = ctime.UnixNano()
+		inode.ATime = ctime.UnixNano()
 		if err := store.UpdateInode(ctx, inode); err != nil {
 			t.Fatalf("update inode %s: %v", name, err)
 		}
 	}
 
-	createFileWithTime(dir2024.ID, "app.log", oldTime)     // 100 days old
-	createFileWithTime(logsDir.ID, "2025", oldTime)         // Will be treated as dir, not file
-	createFileWithTime(cacheDir.ID, "data.bin", oldTime)    // 100 days old
+	createFileWithTime(dir2024.ID, "app.log", oldTime)         // 100 days old
+	createFileWithTime(dir2025.ID, "app.log", oldTime)         // 100 days old
+	createFileWithTime(cacheDir.ID, "data.bin", oldTime)       // 100 days old
 	createFileWithTime(importantDir.ID, "doc.txt", recentTime) // 1 day old
 
 	// Add lifecycle rule: expire files under "logs/" after 30 days
@@ -817,10 +820,10 @@ func TestE2E_LifecyclePrefixPruning(t *testing.T) {
 		},
 	})
 
-	// Execute lifecycle
-	engine.Start(1 * time.Hour)
-	time.Sleep(100 * time.Millisecond) // Let it process
-	engine.Stop()
+	// Execute lifecycle directly; Start waits for the first ticker interval.
+	if err := engine.ExecuteOnce(ctx); err != nil {
+		t.Fatalf("execute lifecycle: %v", err)
+	}
 
 	transitions, deletions := engine.Stats()
 	t.Logf("lifecycle: transitions=%d, deletions=%d", transitions, deletions)

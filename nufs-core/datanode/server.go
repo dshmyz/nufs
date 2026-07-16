@@ -280,6 +280,12 @@ func (s *Server) handleReplicate(header *Header, data []byte) *Response {
 			Error:     err.Error(),
 		}
 	}
+
+	// Seal the chunk so CRC is set and integrity checks work on subsequent reads.
+	if _, err := s.store.Seal(header.ChunkID); err != nil {
+		slog.Warn("datanode: seal after replicate failed", "chunkID", header.ChunkID, "error", err)
+	}
+
 	return &Response{
 		RequestID: header.RequestID,
 		Status:    StatusOK,
@@ -399,20 +405,111 @@ func readMessage(r io.Reader) (*Header, []byte, error) {
 	return &header, body, nil
 }
 
+// responseHeader is the JSON-serialized portion of a Response.
+// The Data field is excluded so that binary chunk data is written
+// verbatim after the header, avoiding the ~33% base64 expansion
+// that json.Marshal would apply to []byte fields.
+type responseHeader struct {
+	RequestID uint64         `json:"request_id"`
+	Status    ResponseStatus `json:"status"`
+	Error     string         `json:"error,omitempty"`
+	Length    int32          `json:"length"`
+	Checksum  uint32         `json:"checksum"`
+}
+
+const (
+	maxResponseHeaderLen = 64 * 1024  // 64KB
+	maxResponseDataLen   = 128 * 1024 * 1024 // 128MB
+)
+
+// writeResponse serializes a Response using a binary framing that
+// avoids base64-encoding the Data field. Wire format:
+//
+//	[4-byte header_len][header JSON][4-byte data_len][raw data bytes]
+//
+// The header JSON contains all metadata (status, checksum, etc.)
+// without the Data payload, so it stays small. The Data bytes are
+// written directly after the data length prefix.
 func writeResponse(w io.Writer, resp *Response) error {
-	data, err := json.Marshal(resp)
+	hdr := responseHeader{
+		RequestID: resp.RequestID,
+		Status:    resp.Status,
+		Error:     resp.Error,
+		Length:    resp.Length,
+		Checksum:  resp.Checksum,
+	}
+	hdrData, err := json.Marshal(&hdr)
 	if err != nil {
-		return fmt.Errorf("datanode: marshal response: %w", err)
+		return fmt.Errorf("datanode: marshal response header: %w", err)
 	}
 
-	// Write length-prefixed response
-	if err := binary.Write(w, binary.BigEndian, uint32(len(data))); err != nil {
-		return fmt.Errorf("datanode: write response length: %w", err)
+	// Write header length + header JSON
+	if err := binary.Write(w, binary.BigEndian, uint32(len(hdrData))); err != nil {
+		return fmt.Errorf("datanode: write response header length: %w", err)
 	}
-	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("datanode: write response: %w", err)
+	if _, err := w.Write(hdrData); err != nil {
+		return fmt.Errorf("datanode: write response header: %w", err)
+	}
+
+	// Write data length + raw data bytes
+	dataLen := uint32(len(resp.Data))
+	if err := binary.Write(w, binary.BigEndian, dataLen); err != nil {
+		return fmt.Errorf("datanode: write response data length: %w", err)
+	}
+	if dataLen > 0 {
+		if _, err := w.Write(resp.Data); err != nil {
+			return fmt.Errorf("datanode: write response data: %w", err)
+		}
 	}
 	return nil
+}
+
+// readResponse deserializes a Response from the binary framing
+// produced by writeResponse. It is the counterpart used by clients
+// to parse server replies without base64 overhead.
+func readResponse(r io.Reader) (*Response, error) {
+	var hdrLen uint32
+	if err := binary.Read(r, binary.BigEndian, &hdrLen); err != nil {
+		return nil, fmt.Errorf("datanode: read response header length: %w", err)
+	}
+	if hdrLen > maxResponseHeaderLen {
+		return nil, fmt.Errorf("datanode: response header too large: %d", hdrLen)
+	}
+
+	hdrData := make([]byte, hdrLen)
+	if _, err := io.ReadFull(r, hdrData); err != nil {
+		return nil, fmt.Errorf("datanode: read response header: %w", err)
+	}
+
+	var hdr responseHeader
+	if err := json.Unmarshal(hdrData, &hdr); err != nil {
+		return nil, fmt.Errorf("datanode: unmarshal response header: %w", err)
+	}
+
+	var dataLen uint32
+	if err := binary.Read(r, binary.BigEndian, &dataLen); err != nil {
+		return nil, fmt.Errorf("datanode: read response data length: %w", err)
+	}
+	if dataLen > maxResponseDataLen {
+		return nil, fmt.Errorf("datanode: response data too large: %d", dataLen)
+	}
+
+	var data []byte
+	if dataLen > 0 {
+		data = make([]byte, dataLen)
+		if _, err := io.ReadFull(r, data); err != nil {
+			return nil, fmt.Errorf("datanode: read response data: %w", err)
+		}
+	}
+
+	return &Response{
+		RequestID: hdr.RequestID,
+		Status:    hdr.Status,
+		Error:     hdr.Error,
+		Data:      data,
+		Length:    hdr.Length,
+		Checksum:  hdr.Checksum,
+	}, nil
 }
 
 // ========== Client (for inter-node communication) ==========
@@ -425,6 +522,7 @@ type Client struct {
 	seq     atomic.Uint64
 	timeout time.Duration
 	tlsCfg  *tls.Config // nil = plain TCP
+	closed  atomic.Bool
 }
 
 // NewClient creates a new data node client.
@@ -472,10 +570,16 @@ func (c *Client) Connect() error {
 
 // Close closes the connection.
 func (c *Client) Close() error {
+	c.closed.Store(true)
 	if c.conn != nil {
 		return c.conn.Close()
 	}
 	return nil
+}
+
+// IsClosed reports whether the client has been closed.
+func (c *Client) IsClosed() bool {
+	return c.closed.Load()
 }
 
 // WriteChunk sends a chunk write request.
@@ -556,21 +660,12 @@ func (c *Client) sendRequest(header *Header, body []byte) (*Response, error) {
 		}
 	}
 
-	// Read response
-	var respLen uint32
-	if err := binary.Read(c.conn, binary.BigEndian, &respLen); err != nil {
-		return nil, fmt.Errorf("datanode: read response length: %w", err)
-	}
-	respData := make([]byte, respLen)
-	if _, err := io.ReadFull(c.conn, respData); err != nil {
+	// Read response using binary framing (no base64 overhead)
+	resp, err := readResponse(c.conn)
+	if err != nil {
 		return nil, fmt.Errorf("datanode: read response: %w", err)
 	}
-
-	var resp Response
-	if err := json.Unmarshal(respData, &resp); err != nil {
-		return nil, fmt.Errorf("datanode: unmarshal response: %w", err)
-	}
-	return &resp, nil
+	return resp, nil
 }
 
 func isChunkNotFound(err error) bool {

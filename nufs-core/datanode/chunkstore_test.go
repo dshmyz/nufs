@@ -219,6 +219,117 @@ func TestChunkStore_DeleteNonExistent(t *testing.T) {
 	}
 }
 
+func TestChunkStore_Overwrite_Bookkeeping(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+
+	chunkID := metadata.ChunkID(50000)
+	data1 := []byte("short")       // 5 bytes
+	data2 := []byte("much longer data") // 16 bytes
+
+	// Write initial chunk
+	if err := cs.Write(chunkID, data1); err != nil {
+		t.Fatalf("Write 1: %v", err)
+	}
+
+	totalBytes1, chunkCount1 := cs.Stats()
+	if chunkCount1 != 1 {
+		t.Fatalf("after first write: expected chunkCount=1, got %d", chunkCount1)
+	}
+	if totalBytes1 != int64(len(data1)) {
+		t.Fatalf("after first write: expected totalBytes=%d, got %d", len(data1), totalBytes1)
+	}
+
+	// Overwrite same chunk with different size
+	if err := cs.Write(chunkID, data2); err != nil {
+		t.Fatalf("Write 2: %v", err)
+	}
+
+	totalBytes2, chunkCount2 := cs.Stats()
+	if chunkCount2 != 1 {
+		t.Errorf("after overwrite: expected chunkCount=1, got %d (should not double-count)", chunkCount2)
+	}
+	if totalBytes2 != int64(len(data2)) {
+		t.Errorf("after overwrite: expected totalBytes=%d, got %d (should reflect new size only)", len(data2), totalBytes2)
+	}
+
+	// Read should return the overwritten data
+	got, _, err := cs.Read(chunkID, 0, 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !bytes.Equal(got, data2) {
+		t.Fatalf("Read data mismatch: got %q, want %q", got, data2)
+	}
+}
+
+func TestChunkStore_ConcurrentAccess_NoDataRace(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+
+	// Write multiple chunks to reduce fd cache contention
+	for i := 0; i < 10; i++ {
+		chunkID := metadata.ChunkID(60000 + i)
+		data := []byte(fmt.Sprintf("race test data chunk %d", i))
+		if err := cs.Write(chunkID, data); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	// Run concurrent reads — each updates LastAccess/AccessCount.
+	// With -race flag, this should detect the data race on access stats.
+	done := make(chan struct{})
+	for i := 0; i < 10; i++ {
+		go func(id int) {
+			defer func() { done <- struct{}{} }()
+			chunkID := metadata.ChunkID(60000 + id)
+			for j := 0; j < 50; j++ {
+				cs.Read(chunkID, 0, 0)
+			}
+		}(i)
+	}
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+}
+
+func TestChunkStore_Seal_PersistsCRC(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+
+	chunkID := metadata.ChunkID(70000)
+	data := []byte("seal persist crc test data")
+	expectedCRC := crc32.ChecksumIEEE(data)
+
+	if err := cs.Write(chunkID, data); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Seal should persist CRC to the file header
+	checksum, err := cs.Seal(chunkID)
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if checksum != expectedCRC {
+		t.Fatalf("Seal checksum mismatch: got %d, want %d", checksum, expectedCRC)
+	}
+
+	// Create a new ChunkStore from the same directory to verify CRC persists on disk
+	cs2, err := NewChunkStore(cs.dataDir, 8, 8, nil)
+	if err != nil {
+		t.Fatalf("NewChunkStore: %v", err)
+	}
+
+	// Read from the new store — CRC should be verified
+	got, gotCRC, err := cs2.Read(chunkID, 0, 0)
+	if err != nil {
+		t.Fatalf("Read from new store: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("data mismatch: got %q, want %q", got, data)
+	}
+	if gotCRC != expectedCRC {
+		t.Fatalf("CRC mismatch: got %d, want %d", gotCRC, expectedCRC)
+	}
+}
+
 func TestChunkStore_DrainWritesReleasesSlots(t *testing.T) {
 	cs, _ := newTestChunkStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

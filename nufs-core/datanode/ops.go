@@ -20,6 +20,17 @@ import (
 	"github.com/example/dfs/metadata"
 )
 
+// OpsMetadata is the narrow interface OpsServer needs from the metadata layer.
+// Define this instead of depending on the full MetadataService to keep the
+// datanode package loosely coupled and testable with fakes.
+type OpsMetadata interface {
+	ListNodes(ctx context.Context) ([]metadata.NodeInfo, error)
+	DecommissionNode(ctx context.Context, nodeID metadata.NodeID) error
+	ListBuckets(ctx context.Context) ([]metadata.BucketInfo, error)
+	GetChunk(ctx context.Context, chunkID metadata.ChunkID) (*metadata.ChunkMeta, error)
+	GetRepairQueue(ctx context.Context) ([]metadata.RepairTask, error)
+}
+
 // ============================================================
 // Operations API — Production Cluster Management HTTP Interface
 // ============================================================
@@ -28,7 +39,7 @@ import (
 type OpsServer struct {
 	cfg        Config
 	store      *ChunkStore
-	meta       metadata.MetadataService
+	meta       OpsMetadata
 	disk       *DiskManager
 	repl       *ParallelReplicator
 	ae         *AntiEntropy
@@ -39,13 +50,13 @@ type OpsServer struct {
 }
 
 // NewOpsServer creates the operations HTTP server.
-func NewOpsServer(cfg Config, store *ChunkStore, meta metadata.MetadataService,
+func NewOpsServer(cfg Config, store *ChunkStore, meta OpsMetadata,
 	disk *DiskManager, repl *ParallelReplicator, ae *AntiEntropy) *OpsServer {
 	return NewOpsServerWithRepair(cfg, store, meta, disk, repl, ae, nil)
 }
 
 // NewOpsServerWithRepair creates an ops server with repair worker integration.
-func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta metadata.MetadataService,
+func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta OpsMetadata,
 	disk *DiskManager, repl *ParallelReplicator, ae *AntiEntropy, repair *RepairWorker) *OpsServer {
 	mux := http.NewServeMux()
 
@@ -336,14 +347,21 @@ func (s *OpsServer) triggerGCScan(ctx context.Context) (int, error) {
 			break
 		}
 		_, err := s.meta.GetChunk(ctx, lc.ChunkID)
-		if err != nil {
-			// Chunk not in metadata — it's an orphan
-			slog.Info("gc: orphan chunk not in metadata, deleting", "chunkID", lc.ChunkID, "size", lc.Size)
-			if delErr := s.store.Delete(lc.ChunkID); delErr != nil {
-				slog.Error("gc: failed to delete orphan chunk", "chunkID", lc.ChunkID, "error", delErr)
-			} else {
-				orphanCount++
-			}
+		if err == nil {
+			continue // chunk exists in metadata
+		}
+		// Only delete if the error is specifically "chunk not found".
+		// Transient errors (network timeout, metadata unavailable) must NOT
+		// trigger deletion — that would destroy valid data.
+		if !isChunkNotFound(err) {
+			slog.Warn("gc: skipping chunk due to metadata error", "chunkID", lc.ChunkID, "error", err)
+			continue
+		}
+		slog.Info("gc: orphan chunk not in metadata, deleting", "chunkID", lc.ChunkID, "size", lc.Size)
+		if delErr := s.store.Delete(lc.ChunkID); delErr != nil {
+			slog.Error("gc: failed to delete orphan chunk", "chunkID", lc.ChunkID, "error", delErr)
+		} else {
+			orphanCount++
 		}
 	}
 

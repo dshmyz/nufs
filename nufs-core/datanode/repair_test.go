@@ -15,6 +15,7 @@ type mockMetadataService struct {
 	nodes         []metadata.NodeInfo
 	repairQueue   []metadata.RepairTask
 	repairRemoved map[metadata.ChunkID]bool
+	getChunkErr   error // if set, GetChunk returns this error instead of looking up chunks
 }
 
 func newMockMetadataService() *mockMetadataService {
@@ -29,6 +30,9 @@ func (m *mockMetadataService) Close() error { return nil }
 func (m *mockMetadataService) GetChunk(_ context.Context, chunkID metadata.ChunkID) (*metadata.ChunkMeta, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.getChunkErr != nil {
+		return nil, m.getChunkErr
+	}
 	chunk, ok := m.chunks[chunkID]
 	if !ok {
 		return nil, metadata.ErrChunkNotFound
@@ -73,31 +77,77 @@ func (m *mockMetadataService) RemoveRepairTask(_ context.Context, chunkID metada
 func (m *mockMetadataService) TriggerRebalance(_ context.Context) error { return nil }
 
 // Unused interface methods
-func (m *mockMetadataService) CreateBucket(_ context.Context, _ string, _ metadata.PlacementPolicy) error { return nil }
+func (m *mockMetadataService) CreateBucket(_ context.Context, _ string, _ metadata.PlacementPolicy) error {
+	return nil
+}
 func (m *mockMetadataService) DeleteBucket(_ context.Context, _ string) error { return nil }
-func (m *mockMetadataService) ListBuckets(_ context.Context) ([]metadata.BucketInfo, error) { return nil, nil }
-func (m *mockMetadataService) GetBucket(_ context.Context, _ string) (*metadata.BucketInfo, error) { return nil, nil }
-func (m *mockMetadataService) MkDir(_ context.Context, _ metadata.InodeID, _ string, _ uint32) (*metadata.InodeMeta, error) { return nil, nil }
-func (m *mockMetadataService) RmDir(_ context.Context, _ metadata.InodeID, _ string) error { return nil }
-func (m *mockMetadataService) ReadDir(_ context.Context, _ metadata.InodeID, _ int, _ int) ([]metadata.DirEntry, error) { return nil, nil }
-func (m *mockMetadataService) CreateFile(_ context.Context, _ metadata.InodeID, _ string, _ uint32) (*metadata.InodeMeta, error) { return nil, nil }
-func (m *mockMetadataService) Unlink(_ context.Context, _ metadata.InodeID, _ string) error { return nil }
-func (m *mockMetadataService) Lookup(_ context.Context, _ metadata.InodeID, _ string) (*metadata.InodeMeta, error) { return nil, nil }
-func (m *mockMetadataService) Rename(_ context.Context, _ metadata.InodeID, _ string, _ metadata.InodeID, _ string) error { return nil }
-func (m *mockMetadataService) Symlink(_ context.Context, _ metadata.InodeID, _ string, _ string) (*metadata.InodeMeta, error) { return nil, nil }
-func (m *mockMetadataService) Readlink(_ context.Context, _ metadata.InodeID) (string, error) { return "", nil }
-func (m *mockMetadataService) Link(_ context.Context, _ metadata.InodeID, _ string, _ metadata.InodeID) (*metadata.InodeMeta, error) { return nil, nil }
-func (m *mockMetadataService) GetInode(_ context.Context, _ metadata.InodeID) (*metadata.InodeMeta, error) { return nil, nil }
+func (m *mockMetadataService) ListBuckets(_ context.Context) ([]metadata.BucketInfo, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) GetBucket(_ context.Context, _ string) (*metadata.BucketInfo, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) GetBucketByRoot(_ context.Context, _ metadata.InodeID) (*metadata.BucketInfo, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) MkDir(_ context.Context, _ metadata.InodeID, _ string, _ uint32) (*metadata.InodeMeta, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) RmDir(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}
+func (m *mockMetadataService) ReadDir(_ context.Context, _ metadata.InodeID, _ int, _ int) ([]metadata.DirEntry, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) ReadDirFrom(_ context.Context, _ metadata.InodeID, _ string, _ int) ([]metadata.DirEntry, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) CreateFile(_ context.Context, _ metadata.InodeID, _ string, _ uint32) (*metadata.InodeMeta, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) Unlink(_ context.Context, _ metadata.InodeID, _ string) error {
+	return nil
+}
+func (m *mockMetadataService) Lookup(_ context.Context, _ metadata.InodeID, _ string) (*metadata.InodeMeta, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) Rename(_ context.Context, _ metadata.InodeID, _ string, _ metadata.InodeID, _ string) error {
+	return nil
+}
+func (m *mockMetadataService) Symlink(_ context.Context, _ metadata.InodeID, _ string, _ string) (*metadata.InodeMeta, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) Readlink(_ context.Context, _ metadata.InodeID) (string, error) {
+	return "", nil
+}
+func (m *mockMetadataService) Link(_ context.Context, _ metadata.InodeID, _ string, _ metadata.InodeID) (*metadata.InodeMeta, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) GetInode(_ context.Context, _ metadata.InodeID) (*metadata.InodeMeta, error) {
+	return nil, nil
+}
 func (m *mockMetadataService) UpdateInode(_ context.Context, _ *metadata.InodeMeta) error { return nil }
-func (m *mockMetadataService) AllocateChunk(_ context.Context, _ metadata.InodeID, _ int64, _ metadata.PlacementPolicy) (*metadata.ChunkMeta, error) { return nil, nil }
-func (m *mockMetadataService) CommitChunk(_ context.Context, _ metadata.ChunkID, _ uint32) error { return nil }
+func (m *mockMetadataService) AllocateChunk(_ context.Context, _ metadata.InodeID, _ int64, _ metadata.PlacementPolicy) (*metadata.ChunkMeta, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) CommitChunk(_ context.Context, _ metadata.ChunkID, _ uint32) error {
+	return nil
+}
 func (m *mockMetadataService) SealChunk(_ context.Context, _ metadata.ChunkID) error { return nil }
-func (m *mockMetadataService) ListChunks(_ context.Context, _ metadata.InodeID) ([]metadata.ChunkRef, error) { return nil, nil }
-func (m *mockMetadataService) DeleteChunk(_ context.Context, _ metadata.ChunkID) error { return nil }
+func (m *mockMetadataService) ListChunks(_ context.Context, _ metadata.InodeID) ([]metadata.ChunkRef, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) DeleteChunk(_ context.Context, _ metadata.ChunkID) error    { return nil }
 func (m *mockMetadataService) RegisterNode(_ context.Context, _ *metadata.NodeInfo) error { return nil }
-func (m *mockMetadataService) Heartbeat(_ context.Context, _ metadata.NodeID, _ *metadata.NodeReport) error { return nil }
-func (m *mockMetadataService) DecommissionNode(_ context.Context, _ metadata.NodeID) error { return nil }
-func (m *mockMetadataService) GetNode(_ context.Context, _ metadata.NodeID) (*metadata.NodeInfo, error) { return nil, nil }
+func (m *mockMetadataService) Heartbeat(_ context.Context, _ metadata.NodeID, _ *metadata.NodeReport) error {
+	return nil
+}
+func (m *mockMetadataService) DecommissionNode(_ context.Context, _ metadata.NodeID) error {
+	return nil
+}
+func (m *mockMetadataService) GetNode(_ context.Context, _ metadata.NodeID) (*metadata.NodeInfo, error) {
+	return nil, nil
+}
 func (m *mockMetadataService) ChunksByNode(_ context.Context, nodeID metadata.NodeID) ([]metadata.ChunkMeta, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -112,6 +162,24 @@ func (m *mockMetadataService) ChunksByNode(_ context.Context, nodeID metadata.No
 	}
 	return result, nil
 }
+func (m *mockMetadataService) ComputeAllBucketUsage(_ context.Context) ([]metadata.BucketUsage, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) EnterMaintenance(_ context.Context, _ metadata.NodeID) error {
+	return nil
+}
+func (m *mockMetadataService) ExitMaintenance(_ context.Context, _ metadata.NodeID) error { return nil }
+func (m *mockMetadataService) RollingUpgradePlan(_ context.Context) ([]metadata.NodeID, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) SetBucketPolicy(_ context.Context, _ string, _ metadata.BucketPolicy) error {
+	return nil
+}
+func (m *mockMetadataService) GetBucketPolicy(_ context.Context, _ string) (*metadata.BucketPolicy, error) {
+	return nil, nil
+}
+func (m *mockMetadataService) DeleteBucketPolicy(_ context.Context, _ string) error { return nil }
+
 func (m *mockMetadataService) MigrateChunkReplica(_ context.Context, chunkID metadata.ChunkID, fromNode, toNode metadata.NodeID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -282,6 +350,32 @@ func TestRepairWorker_FindTargetNode(t *testing.T) {
 	})
 }
 
+func TestRepairWorker_RecordReplacementReplacesUnhealthyReplica(t *testing.T) {
+	rw := &RepairWorker{}
+	chunk := &metadata.ChunkMeta{
+		ID: 10,
+		Replicas: []metadata.ReplicaInfo{
+			{NodeID: 1, Addr: "host1:9100", State: metadata.ReplicaReady},
+			{NodeID: 2, Addr: "host2:9100", State: metadata.ReplicaFailed},
+		},
+	}
+	target := &metadata.NodeInfo{ID: 3, Addr: "host3:9100", State: metadata.NodeOnline}
+
+	rw.recordReplacementReplica(chunk, target)
+
+	if len(chunk.Replicas) != 2 {
+		t.Fatalf("expected replacement to preserve replica count, got %d", len(chunk.Replicas))
+	}
+	for _, replica := range chunk.Replicas {
+		if replica.NodeID == 2 {
+			t.Fatalf("failed replica should have been replaced: %+v", chunk.Replicas)
+		}
+	}
+	if chunk.Replicas[1].NodeID != 3 || chunk.Replicas[1].Addr != "host3:9100" || chunk.Replicas[1].State != metadata.ReplicaSyncing {
+		t.Fatalf("unexpected replacement replica: %+v", chunk.Replicas[1])
+	}
+}
+
 func TestRepairWorker_ProcessRepairQueue_RemovesCompleted(t *testing.T) {
 	meta := newMockMetadataService()
 
@@ -358,14 +452,5 @@ func (m *mockMetadataService) ListXAttr(_ context.Context, _ metadata.InodeID) (
 	return nil, nil
 }
 func (m *mockMetadataService) RemoveXAttr(_ context.Context, _ metadata.InodeID, _ string) error {
-	return nil
-}
-func (m *mockMetadataService) SetBucketPolicy(_ context.Context, _ string, _ metadata.BucketPolicy) error {
-	return nil
-}
-func (m *mockMetadataService) GetBucketPolicy(_ context.Context, _ string) (*metadata.BucketPolicy, error) {
-	return nil, metadata.ErrAccessDenied
-}
-func (m *mockMetadataService) DeleteBucketPolicy(_ context.Context, _ string) error {
 	return nil
 }

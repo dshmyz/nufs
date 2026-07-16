@@ -19,8 +19,8 @@ const repairReplicationTimeout = 60 * time.Second
 
 // RepairWorker monitors chunk health and triggers repairs for degraded chunks.
 type RepairWorker struct {
-	meta     RepairMeta
-	nodeID   metadata.NodeID
+	meta   RepairMeta
+	nodeID metadata.NodeID
 
 	mu       sync.Mutex
 	running  bool
@@ -29,8 +29,8 @@ type RepairWorker struct {
 	wg       sync.WaitGroup // Tracks background goroutine
 
 	// Stats
-	repaired  int64
-	failed    int64
+	repaired int64
+	failed   int64
 
 	// Replicator for cross-node data copy
 	replicator *Replicator
@@ -209,23 +209,7 @@ func (rw *RepairWorker) repairByAddingReplica(ctx context.Context, chunk *metada
 		"chunkID", chunk.ID, "sourceNode", sourceReplica.NodeID, "sourceAddr", sourceReplica.Addr,
 		"targetNode", targetNode.ID, "targetAddr", targetNode.Addr)
 
-	// 1. Read chunk from source via TCP
-	srcClient := NewClient(sourceReplica.Addr)
-	if err := srcClient.Connect(); err != nil {
-		return fmt.Errorf("repair: connect to source %s: %w", sourceReplica.Addr, err)
-	}
-	defer srcClient.Close()
-
-	resp, err := srcClient.ReadChunk(chunk.ID, 0, 0)
-	if err != nil {
-		return fmt.Errorf("repair: read from source %s: %w", sourceReplica.Addr, err)
-	}
-	if resp.Status != StatusOK {
-		return fmt.Errorf("repair: source read failed: status=%d err=%s", resp.Status, resp.Error)
-	}
-	data := resp.Data
-
-	// 2. Write chunk to target via TCP
+	// 1. Copy chunk to target.
 	if rw.replicator != nil {
 		// Use replicator for an async copy and wait for the actual
 		// completion signal. This replaces the previous
@@ -242,6 +226,28 @@ func (rw *RepairWorker) repairByAddingReplica(ctx context.Context, chunk *metada
 			return fmt.Errorf("repair: replication to %s: %w", targetNode.Addr, err)
 		}
 	} else {
+		srcClient := NewClient(sourceReplica.Addr)
+		if err := srcClient.Connect(); err != nil {
+			return fmt.Errorf("repair: connect to source %s: %w", sourceReplica.Addr, err)
+		}
+		defer srcClient.Close()
+
+		resp, err := srcClient.ReadChunk(chunk.ID, 0, 0)
+		if err != nil {
+			return fmt.Errorf("repair: read from source %s: %w", sourceReplica.Addr, err)
+		}
+		if resp.Status != StatusOK {
+			return fmt.Errorf("repair: source read failed: status=%d err=%s", resp.Status, resp.Error)
+		}
+
+		// Throttle background copy so it doesn't compete with foreground traffic.
+		if len(resp.Data) > 0 {
+			if err := ThrottleRead(ctx, len(resp.Data)); err != nil {
+				slog.Warn("repair: bandwidth throttle cancelled",
+					"chunkID", chunk.ID, "bytes", len(resp.Data), "error", err)
+			}
+		}
+
 		// Sync copy directly
 		tgtClient := NewClient(targetNode.Addr)
 		if err := tgtClient.Connect(); err != nil {
@@ -249,7 +255,7 @@ func (rw *RepairWorker) repairByAddingReplica(ctx context.Context, chunk *metada
 		}
 		defer tgtClient.Close()
 
-		replResp, err := tgtClient.ReplicateChunk(chunk.ID, data)
+		replResp, err := tgtClient.ReplicateChunk(chunk.ID, resp.Data)
 		if err != nil {
 			return fmt.Errorf("repair: write to target %s: %w", targetNode.Addr, err)
 		}
@@ -258,17 +264,14 @@ func (rw *RepairWorker) repairByAddingReplica(ctx context.Context, chunk *metada
 		}
 	}
 
-	// 3. Update metadata: add new replica and mark it syncing
-	chunk.Replicas = append(chunk.Replicas, metadata.ReplicaInfo{
-		NodeID: targetNode.ID,
-		Addr:   targetNode.Addr,
-		State:  metadata.ReplicaSyncing,
-	})
+	// 2. Update metadata: replace a failed/stale replica, or append if this is
+	// recovering from under-replication with no placeholder replica.
+	rw.recordReplacementReplica(chunk, targetNode)
 	if err := rw.meta.UpdateChunk(ctx, chunk); err != nil {
 		return fmt.Errorf("repair: update chunk metadata: %w", err)
 	}
 
-	// 4. Report chunk state on the new node
+	// 3. Report chunk state on the new node
 	states := map[metadata.ChunkID]metadata.ReplicaState{
 		chunk.ID: metadata.ReplicaReady,
 	}
@@ -277,6 +280,21 @@ func (rw *RepairWorker) repairByAddingReplica(ctx context.Context, chunk *metada
 	}
 
 	return nil
+}
+
+func (rw *RepairWorker) recordReplacementReplica(chunk *metadata.ChunkMeta, targetNode *metadata.NodeInfo) {
+	replacement := metadata.ReplicaInfo{
+		NodeID: targetNode.ID,
+		Addr:   targetNode.Addr,
+		State:  metadata.ReplicaSyncing,
+	}
+	for i := range chunk.Replicas {
+		if chunk.Replicas[i].State == metadata.ReplicaFailed || chunk.Replicas[i].State == metadata.ReplicaStale {
+			chunk.Replicas[i] = replacement
+			return
+		}
+	}
+	chunk.Replicas = append(chunk.Replicas, replacement)
 }
 
 // repairByRefetchLocal fetches chunk data from a healthy peer and overwrites local copy.
@@ -289,31 +307,18 @@ func (rw *RepairWorker) repairByRefetchLocal(ctx context.Context, chunk *metadat
 	slog.Info("repair: refetching chunk for local repair",
 		"chunkID", chunk.ID, "sourceNode", sourceReplica.NodeID, "sourceAddr", sourceReplica.Addr)
 
-	// Read from source
-	client := NewClient(sourceReplica.Addr)
-	if err := client.Connect(); err != nil {
-		return fmt.Errorf("repair: connect to source: %w", err)
-	}
-	defer client.Close()
-
-	resp, err := client.ReadChunk(chunk.ID, 0, 0)
-	if err != nil {
-		return fmt.Errorf("repair: read from source: %w", err)
-	}
-	if resp.Status != StatusOK {
-		return fmt.Errorf("repair: source read failed: status=%d", resp.Status)
+	if rw.replicator == nil {
+		return fmt.Errorf("repair: local refetch requires a replicator")
 	}
 
 	// Overwrite local chunk via replicator
-	if rw.replicator != nil {
-		err = rw.replicator.Repair(ChunkRepairTask{
-			ChunkID:       chunk.ID,
-			SurvivingAddr: sourceReplica.Addr,
-			NewTargetAddr: rw.localAddr,
-		})
-		if err != nil {
-			return fmt.Errorf("repair: local chunk rewrite: %w", err)
-		}
+	err := rw.replicator.Repair(ChunkRepairTask{
+		ChunkID:       chunk.ID,
+		SurvivingAddr: sourceReplica.Addr,
+		NewTargetAddr: rw.localAddr,
+	})
+	if err != nil {
+		return fmt.Errorf("repair: local chunk rewrite: %w", err)
 	}
 
 	slog.Info("repair: chunk local repair complete", "chunkID", chunk.ID)

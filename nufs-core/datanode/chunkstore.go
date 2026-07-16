@@ -50,6 +50,11 @@ type ChunkStore struct {
 	fdList  *fdLRU // LRU eviction tracker
 	fdMax   int    // Maximum cached file descriptors
 
+	// Background scan state — scanDone is closed when the initial scan
+	// completes. Write/Read block on this channel to avoid serving stale data.
+	scanDone chan struct{}
+	scanErr  error
+
 	perf chunkStorePerf
 }
 
@@ -130,17 +135,29 @@ func NewChunkStore(dataDir string, maxWrites, maxReads int, wal *WriteAheadLog) 
 		fdMax:     256,
 	}
 
-	// Scan existing chunks on startup — runs in background to avoid
-	// blocking process initialization. Writes and reads are rejected
-	// until the scan completes.
-	cs.mu.Lock()
-	err := cs.scanExisting()
-	cs.mu.Unlock()
-	if err != nil {
-		return nil, fmt.Errorf("datanode: scan existing chunks: %w", err)
+	// Tell the WAL where chunk files live so Recover() cleans up the right paths.
+	if wal != nil {
+		wal.SetDataDir(dataDir)
 	}
 
+	// Scan existing chunks in background to avoid blocking startup.
+	// Write/Read wait on scanDone before proceeding.
+	cs.scanDone = make(chan struct{})
+	go func() {
+		cs.mu.Lock()
+		cs.scanErr = cs.scanExisting()
+		cs.mu.Unlock()
+		close(cs.scanDone)
+	}()
+
 	return cs, nil
+}
+
+// WaitForScan blocks until the initial background scan completes.
+// Returns the scan error if any.
+func (cs *ChunkStore) WaitForScan() error {
+	<-cs.scanDone
+	return cs.scanErr
 }
 
 // SetEncryptor configures at-rest encryption for chunk data.
@@ -170,6 +187,11 @@ func (cs *ChunkStore) metaPath(chunkID metadata.ChunkID) string {
 // Write stores chunk data to local disk.
 // If WAL is configured, the write is logged before and committed after for crash recovery.
 func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
+	// Wait for background scan to complete before accepting writes.
+	if err := cs.WaitForScan(); err != nil {
+		return fmt.Errorf("datanode: scan failed: %w", err)
+	}
+
 	// Reject writes if disk is in FAILED state (auto read-only on disk failure)
 	if cs.disk != nil {
 		if err := cs.disk.CanAdmitWrite(int64(len(data))); err != nil {
@@ -247,11 +269,16 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
 	}
 
 	cs.mu.Lock()
+	if existing, ok := cs.chunks[chunkID]; ok {
+		// Overwrite: subtract old size, don't double-count chunkCount
+		cs.totalBytes.Add(-existing.Size)
+	} else {
+		cs.chunkCount.Add(1)
+	}
 	cs.chunks[chunkID] = info
 	cs.mu.Unlock()
 
 	cs.totalBytes.Add(int64(len(data)))
-	cs.chunkCount.Add(1)
 
 	// Write metadata sidecar
 	cs.writeMetaSidecar(chunkID, info)
@@ -262,6 +289,202 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) error {
 			slog.Warn("datanode: WAL commit failed for chunk, data is safe on disk", "chunkID", chunkID, "error", err)
 			// Data is already on disk, so we don't fail the write.
 			// The next startup recovery will see this as uncommitted and verify.
+		}
+	}
+
+	return nil
+}
+
+// WriteChunkReq is a single chunk write request for WriteBatch.
+type WriteChunkReq struct {
+	ChunkID metadata.ChunkID
+	Data    []byte
+}
+
+// WriteBatch writes multiple chunks in a single batch, sharing the
+// fsync semaphore slot so that N chunks incur at most one syncSem
+// acquisition instead of N. Each file is still fsynced individually
+// (the OS needs per-fd Sync), but they run concurrently under a
+// single group slot, reducing contention on syncSem (P2.8).
+//
+// The batch is atomic from the caller's perspective: if any chunk
+// fails to write, the whole batch returns an error and no chunks
+// are committed to the in-memory index or WAL.
+func (cs *ChunkStore) WriteBatch(reqs []WriteChunkReq) error {
+	if len(reqs) == 0 {
+		return nil
+	}
+
+	// Wait for background scan to complete before accepting writes.
+	if err := cs.WaitForScan(); err != nil {
+		return fmt.Errorf("datanode: scan failed: %w", err)
+	}
+
+	// Check disk capacity for the total batch size
+	totalSize := int64(0)
+	for _, r := range reqs {
+		totalSize += int64(len(r.Data))
+	}
+	if cs.disk != nil {
+		if err := cs.disk.CanAdmitWrite(totalSize); err != nil {
+			return fmt.Errorf("datanode: batch write rejected: %w", err)
+		}
+	}
+
+	// Acquire a single write semaphore slot for the whole batch.
+	writeSemStart := time.Now()
+	cs.writeSem <- struct{}{}
+	cs.perf.writeSemWaitNs.Add(time.Since(writeSemStart).Nanoseconds())
+	defer func() { <-cs.writeSem }()
+
+	// Phase 1: Log all intents to WAL (crash recovery)
+	if cs.wal != nil {
+		for _, r := range reqs {
+			if err := cs.wal.LogWrite(r.ChunkID, len(r.Data)); err != nil {
+				return fmt.Errorf("datanode: WAL log write %d: %w", r.ChunkID, err)
+			}
+		}
+	}
+
+	// Open all files and write headers + data. We keep them open so
+	// we can fsync them together. If any file fails, we close and
+	// remove all files created by this batch.
+	type openFile struct {
+		req      WriteChunkReq
+		f        *os.File
+		checksum uint32
+	}
+	openFiles := make([]*openFile, 0, len(reqs))
+
+	for _, r := range reqs {
+		storeData := r.Data
+		if cs.encryptor != nil && cs.encryptor.Enabled() {
+			encrypted, err := cs.encryptor.EncryptChunk(r.Data)
+			if err != nil {
+				for _, of := range openFiles {
+					of.f.Close()
+					os.Remove(cs.chunkPath(of.req.ChunkID))
+				}
+				return fmt.Errorf("datanode: encrypt chunk %d: %w", r.ChunkID, err)
+			}
+			storeData = encrypted
+		}
+
+		checksum := crc32.ChecksumIEEE(r.Data)
+		path := cs.chunkPath(r.ChunkID)
+
+		f, err := os.Create(path)
+		if err != nil {
+			for _, of := range openFiles {
+				of.f.Close()
+				os.Remove(cs.chunkPath(of.req.ChunkID))
+			}
+			return fmt.Errorf("datanode: create chunk file %d: %w", r.ChunkID, err)
+		}
+
+		header := make([]byte, ChunkFileHeaderSize)
+		copy(header[0:4], ChunkFileMagic)
+		binary.BigEndian.PutUint64(header[4:12], uint64(r.ChunkID))
+		binary.BigEndian.PutUint32(header[12:16], uint32(len(storeData)))
+		binary.BigEndian.PutUint32(header[16:20], checksum)
+
+		if _, err := f.Write(header); err != nil {
+			f.Close()
+			for _, of := range openFiles {
+				of.f.Close()
+				os.Remove(cs.chunkPath(of.req.ChunkID))
+			}
+			os.Remove(path)
+			return fmt.Errorf("datanode: write header %d: %w", r.ChunkID, err)
+		}
+		if _, err := f.Write(storeData); err != nil {
+			f.Close()
+			for _, of := range openFiles {
+				of.f.Close()
+				os.Remove(cs.chunkPath(of.req.ChunkID))
+			}
+			os.Remove(path)
+			return fmt.Errorf("datanode: write data %d: %w", r.ChunkID, err)
+		}
+
+		openFiles = append(openFiles, &openFile{req: r, f: f, checksum: checksum})
+	}
+
+	// Phase 2: Fsync all files under a SINGLE syncSem slot. This is
+	// the key optimization: N chunks share one fsync-group slot
+	// instead of each acquiring its own. The fsyncs run sequentially
+	// within the slot (parallel fsync to the same disk can cause
+	// thrashing), but the semaphore contention is reduced 1/N.
+	cs.syncSem <- struct{}{}
+	fsyncStart := time.Now()
+	var syncErr error
+	for _, of := range openFiles {
+		if err := of.f.Sync(); err != nil {
+			syncErr = err
+			break
+		}
+	}
+	cs.perf.fsyncNs.Add(time.Since(fsyncStart).Nanoseconds())
+	cs.perf.fsyncCount.Add(1) // single fsync-group count
+	<-cs.syncSem
+
+	// Close all files
+	for _, of := range openFiles {
+		of.f.Close()
+	}
+
+	if syncErr != nil {
+		for _, of := range openFiles {
+			os.Remove(cs.chunkPath(of.req.ChunkID))
+		}
+		return fmt.Errorf("datanode: batch fsync: %w", syncErr)
+	}
+
+	// Phase 3: Update in-memory index for all chunks
+	cs.mu.Lock()
+	for _, of := range openFiles {
+		info := &LocalChunkInfo{
+			ChunkID:     of.req.ChunkID,
+			Size:        int64(len(of.req.Data)),
+			Checksum:    of.checksum,
+			State:       LocalWritten,
+			WrittenAt:   time.Now(),
+			LastAccess:  time.Now(),
+			AccessCount: 0,
+		}
+		if existing, ok := cs.chunks[of.req.ChunkID]; ok {
+			cs.totalBytes.Add(-existing.Size)
+		} else {
+			cs.chunkCount.Add(1)
+		}
+		cs.chunks[of.req.ChunkID] = info
+	}
+	cs.mu.Unlock()
+
+	for _, of := range openFiles {
+		cs.totalBytes.Add(int64(len(of.req.Data)))
+	}
+
+	// Write metadata sidecars
+	for _, of := range openFiles {
+		info := &LocalChunkInfo{
+			ChunkID:    of.req.ChunkID,
+			Size:       int64(len(of.req.Data)),
+			Checksum:   of.checksum,
+			State:      LocalWritten,
+			WrittenAt:  time.Now(),
+			LastAccess: time.Now(),
+		}
+		cs.writeMetaSidecar(of.req.ChunkID, info)
+	}
+
+	// Phase 4: Commit all in WAL
+	if cs.wal != nil {
+		for _, of := range openFiles {
+			if err := cs.wal.LogCommit(of.req.ChunkID); err != nil {
+				slog.Warn("datanode: WAL commit failed for chunk, data is safe on disk",
+					"chunkID", of.req.ChunkID, "error", err)
+			}
 		}
 	}
 
@@ -369,6 +592,11 @@ func (cs *ChunkStore) computeFileCRC(_ metadata.ChunkID, path string) (uint32, e
 // If offset and length are 0, reads the entire chunk.
 // Uses the LRU file descriptor cache for hot chunks to avoid repeated open/close.
 func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32) ([]byte, uint32, error) {
+	// Wait for background scan to complete before accepting reads.
+	if err := cs.WaitForScan(); err != nil {
+		return nil, 0, fmt.Errorf("datanode: scan failed: %w", err)
+	}
+
 	readSemStart := time.Now()
 	cs.readSem <- struct{}{}
 	cs.perf.readSemWaitNs.Add(time.Since(readSemStart).Nanoseconds())
@@ -397,15 +625,27 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 	dataLen := binary.BigEndian.Uint32(header[12:16])
 	storedChecksum := binary.BigEndian.Uint32(header[16:20])
 
-	// Optimized path: unsealed chunk with a range read and no encryption.
-	// CRC=0 means CRC is stale (post-WriteAt), so we skip CRC verification
-	// and use io.SectionReader to read only the needed bytes.
+	// Optimized path: range read without encryption reads only the
+	// requested bytes using io.SectionReader, avoiding reading the
+	// full chunk into memory. This applies to both sealed and unsealed
+	// chunks:
+	//   - Unsealed (CRC=0): CRC is stale anyway, so skipping verification is safe.
+	//   - Sealed (CRC!=0): CRC verification requires the full plaintext,
+	//     so it is deferred to full reads. Range reads trade integrity
+	//     checking of the unread portion for dramatically lower I/O.
+	// Full reads (offset=0, length=0) always go through the general
+	// path below to verify CRC end-to-end.
 	wantRange := (offset > 0 || length > 0) && length > 0
-	if wantRange && storedChecksum == 0 && (cs.encryptor == nil || !cs.encryptor.Enabled()) {
+	if wantRange && (cs.encryptor == nil || !cs.encryptor.Enabled()) {
 		dataStart := int64(ChunkFileHeaderSize)
 		readLen := int64(length)
 		if readLen > int64(dataLen)-offset {
 			readLen = int64(dataLen) - offset
+		}
+		if readLen <= 0 {
+			cs.perf.readRequestedBytes.Add(0)
+			cs.perf.readAmplifiedBytes.Add(0)
+			return nil, storedChecksum, nil
 		}
 		sr := io.NewSectionReader(f, dataStart+offset, readLen)
 		result := make([]byte, readLen)
@@ -414,7 +654,16 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 		}
 		cs.perf.readRequestedBytes.Add(int64(len(result)))
 		cs.perf.readAmplifiedBytes.Add(int64(len(result)))
-		return result, 0, nil
+
+		// Update access stats
+		cs.mu.Lock()
+		if info, ok := cs.chunks[chunkID]; ok {
+			info.LastAccess = time.Now()
+			info.AccessCount++
+		}
+		cs.mu.Unlock()
+
+		return result, storedChecksum, nil
 	}
 
 	// General path: read full stored payload (required for CRC or encryption).
@@ -470,13 +719,13 @@ func (cs *ChunkStore) Read(chunkID metadata.ChunkID, offset int64, length int32)
 		}
 	}
 
-	// Update access stats
-	cs.mu.RLock()
+	// Update access stats (requires write lock since we mutate the struct)
+	cs.mu.Lock()
 	if info, ok := cs.chunks[chunkID]; ok {
 		info.LastAccess = time.Now()
 		info.AccessCount++
 	}
-	cs.mu.RUnlock()
+	cs.mu.Unlock()
 
 	return result, storedChecksum, nil
 }
@@ -515,8 +764,13 @@ func (cs *ChunkStore) Seal(chunkID metadata.ChunkID) (uint32, error) {
 	// Persist CRC to file header so Read can verify it.
 	crcBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(crcBuf, checksum)
-	if wf, err := os.OpenFile(path, os.O_WRONLY, 0644); err == nil {
-		_, _ = wf.WriteAt(crcBuf, 16)
+	wf, err := os.OpenFile(path, os.O_WRONLY, 0644)
+	if err != nil {
+		slog.Warn("datanode: seal: cannot open file to persist CRC", "chunkID", chunkID, "error", err)
+	} else {
+		if _, err := wf.WriteAt(crcBuf, 16); err != nil {
+			slog.Warn("datanode: seal: failed to persist CRC to file header", "chunkID", chunkID, "error", err)
+		}
 		wf.Close()
 	}
 
@@ -549,6 +803,7 @@ func (cs *ChunkStore) Delete(chunkID metadata.ChunkID) error {
 
 // Info returns the local chunk info.
 func (cs *ChunkStore) Info(chunkID metadata.ChunkID) (*LocalChunkInfo, bool) {
+	<-cs.scanDone
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	info, ok := cs.chunks[chunkID]
@@ -557,6 +812,7 @@ func (cs *ChunkStore) Info(chunkID metadata.ChunkID) (*LocalChunkInfo, bool) {
 
 // ListChunks returns all locally stored chunk information.
 func (cs *ChunkStore) ListChunks() []LocalChunkInfo {
+	<-cs.scanDone
 	start := time.Now()
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -573,6 +829,7 @@ func (cs *ChunkStore) ListChunks() []LocalChunkInfo {
 
 // Stats returns storage statistics.
 func (cs *ChunkStore) Stats() (totalBytes int64, chunkCount int64) {
+	<-cs.scanDone
 	return cs.totalBytes.Load(), cs.chunkCount.Load()
 }
 
@@ -613,28 +870,48 @@ func (cs *ChunkStore) WriteSem() chan struct{} {
 
 // scanExisting reads existing chunk files on startup to rebuild the in-memory index.
 func (cs *ChunkStore) scanExisting() error {
+	type shardResult struct {
+		chunks     map[metadata.ChunkID]*LocalChunkInfo
+		totalBytes int64
+		chunkCount int64
+	}
+
+	results := make(chan shardResult, MaxShards)
 	for i := 0; i < MaxShards; i++ {
-		shardDir := filepath.Join(cs.chunksDir, fmt.Sprintf("%02x", i))
-		entries, err := os.ReadDir(shardDir)
-		if err != nil {
-			continue
-		}
-
-		for _, entry := range entries {
-			if entry.IsDir() || filepath.Ext(entry.Name()) != ".dat" {
-				continue
-			}
-
-			path := filepath.Join(shardDir, entry.Name())
-			info, err := cs.readChunkFileHeader(path)
+		go func(shard int) {
+			shardDir := filepath.Join(cs.chunksDir, fmt.Sprintf("%02x", shard))
+			entries, err := os.ReadDir(shardDir)
 			if err != nil {
-				continue // skip corrupt files
+				results <- shardResult{}
+				return
 			}
 
-			cs.chunks[info.ChunkID] = info
-			cs.totalBytes.Add(info.Size)
-			cs.chunkCount.Add(1)
+			chunks := make(map[metadata.ChunkID]*LocalChunkInfo)
+			var totalBytes, chunkCount int64
+			for _, entry := range entries {
+				if entry.IsDir() || filepath.Ext(entry.Name()) != ".dat" {
+					continue
+				}
+				path := filepath.Join(shardDir, entry.Name())
+				info, err := cs.readChunkFileHeader(path)
+				if err != nil {
+					continue
+				}
+				chunks[info.ChunkID] = info
+				totalBytes += info.Size
+				chunkCount++
+			}
+			results <- shardResult{chunks, totalBytes, chunkCount}
+		}(i)
+	}
+
+	for i := 0; i < MaxShards; i++ {
+		r := <-results
+		for id, info := range r.chunks {
+			cs.chunks[id] = info
 		}
+		cs.totalBytes.Add(r.totalBytes)
+		cs.chunkCount.Add(r.chunkCount)
 	}
 	return nil
 }

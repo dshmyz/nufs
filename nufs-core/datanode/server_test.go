@@ -144,6 +144,97 @@ func TestServerClient_HealthCheck(t *testing.T) {
 	}
 }
 
+func TestServerClient_ReplicateChunk_SealsTarget(t *testing.T) {
+	srcDir := t.TempDir()
+	srcStore, err := NewChunkStore(srcDir, 8, 8, nil)
+	if err != nil {
+		t.Fatalf("src NewChunkStore: %v", err)
+	}
+	tgtDir := t.TempDir()
+	tgtStore, err := NewChunkStore(tgtDir, 8, 8, nil)
+	if err != nil {
+		t.Fatalf("tgt NewChunkStore: %v", err)
+	}
+
+	srcCfg := DefaultConfig()
+	srcCfg.ListenAddr = "127.0.0.1:0"
+	srcCfg.NodeID = 1
+	tgtCfg := DefaultConfig()
+	tgtCfg.ListenAddr = "127.0.0.1:0"
+	tgtCfg.NodeID = 2
+
+	srcSrv := NewServer(srcCfg, srcStore)
+	tgtSrv := NewServer(tgtCfg, tgtStore)
+	if err := srcSrv.Start(); err != nil {
+		t.Fatalf("src Start: %v", err)
+	}
+	defer srcSrv.Stop()
+	if err := tgtSrv.Start(); err != nil {
+		t.Fatalf("tgt Start: %v", err)
+	}
+	defer tgtSrv.Stop()
+
+	srcAddr := srcSrv.listener.Addr().String()
+	tgtAddr := tgtSrv.listener.Addr().String()
+
+	srcClient := NewClient(srcAddr)
+	if err := srcClient.Connect(); err != nil {
+		t.Fatalf("src Connect: %v", err)
+	}
+	defer srcClient.Close()
+
+	chunkID := metadata.ChunkID(77777)
+	data := []byte("replicate and seal test data")
+	resp, err := srcClient.WriteChunk(chunkID, data)
+	if err != nil {
+		t.Fatalf("src WriteChunk: %v", err)
+	}
+	if resp.Status != StatusOK {
+		t.Fatalf("src WriteChunk status: %v", resp.Status)
+	}
+
+	// Seal on source first
+	srcStore.Seal(chunkID)
+
+	tgtClient := NewClient(tgtAddr)
+	if err := tgtClient.Connect(); err != nil {
+		t.Fatalf("tgt Connect: %v", err)
+	}
+	defer tgtClient.Close()
+
+	readResp, err := srcClient.ReadChunk(chunkID, 0, 0)
+	if err != nil {
+		t.Fatalf("src ReadChunk: %v", err)
+	}
+
+	// Replicate to target
+	replResp, err := tgtClient.ReplicateChunk(chunkID, readResp.Data)
+	if err != nil {
+		t.Fatalf("tgt ReplicateChunk: %v", err)
+	}
+	if replResp.Status != StatusOK {
+		t.Fatalf("tgt ReplicateChunk status: %v", replResp.Status)
+	}
+
+	// Verify target chunk is sealed (non-zero CRC in memory)
+	tgtInfo, ok := tgtStore.Info(chunkID)
+	if !ok {
+		t.Fatal("target chunk not found after replication")
+	}
+	if tgtInfo.Checksum == 0 {
+		t.Error("replicated chunk has CRC=0 — Seal was not called after replicate")
+	}
+	if tgtInfo.State != LocalSealed {
+		t.Errorf("replicated chunk state=%v, want LocalSealed", tgtInfo.State)
+	}
+
+	// Verify data matches
+	expectedCRC := crc32.ChecksumIEEE(data)
+	if tgtInfo.Checksum != expectedCRC {
+		t.Errorf("checksum mismatch: got %d, want %d", tgtInfo.Checksum, expectedCRC)
+	}
+}
+
 func TestServerClient_LargeChunkTransfer(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewChunkStore(dir, 8, 8, nil)

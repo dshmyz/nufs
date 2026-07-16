@@ -265,6 +265,48 @@ func TestDiskManager_NilOnDiskFailed(t *testing.T) {
 	}
 }
 
+func TestWAL_Recover_CleansCorrectChunkPath(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	dataDir := dir
+
+	wal, err := NewWriteAheadLog(walDir)
+	if err != nil {
+		t.Fatalf("NewWriteAheadLog: %v", err)
+	}
+	defer wal.Close()
+
+	cs, err := NewChunkStore(dataDir, 8, 8, wal)
+	if err != nil {
+		t.Fatalf("NewChunkStore: %v", err)
+	}
+
+	// Write a chunk via the store (creates real chunk file in dataDir/chunks/)
+	chunkID := metadata.ChunkID(99999)
+	data := []byte("test orphan cleanup")
+	if err := cs.Write(chunkID, data); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Verify the chunk file exists at the correct path
+	chunkPath := cs.chunkPath(chunkID)
+	if _, err := os.Stat(chunkPath); os.IsNotExist(err) {
+		t.Fatalf("chunk file should exist at %s", chunkPath)
+	}
+
+	// WAL's chunkPath should match the store's chunkPath for the same chunkID
+	// The bug: WAL uses its own dir instead of the data dir
+	walChunkPath := wal.chunkPath(chunkID)
+	if walChunkPath == chunkPath {
+		// If they match, the bug is already fixed
+		t.Logf("WAL chunkPath matches store chunkPath (bug already fixed): %s", walChunkPath)
+	} else {
+		// They don't match — this is the bug
+		t.Errorf("WAL chunkPath (%s) does not match store chunkPath (%s) — orphan cleanup will fail",
+			walChunkPath, chunkPath)
+	}
+}
+
 func TestDiskManager_MonitorLoop(t *testing.T) {
 	dm, _ := newTestDiskManager(t)
 	defer dm.Stop()
@@ -298,4 +340,102 @@ func createTestDiskManagerWithStore(t *testing.T) (*DiskManager, string) {
 		t.Fatalf("NewDiskManager: %v", err)
 	}
 	return dm, dataDir
+}
+
+// TestTierMigrator_StopWaitsForGoroutine verifies that Stop() blocks until
+// the background migration goroutine has fully exited. Without wg.Wait(),
+// a subsequent store close could race with in-flight migration work.
+//
+// TDD red phase: before the fix, Stop() returns immediately after
+// close(stopCh) without waiting, so the goroutine may still be running
+// when we proceed to close the store.
+func TestTierMigrator_StopWaitsForGoroutine(t *testing.T) {
+	dm, _ := newTestDiskManager(t)
+	defer dm.Stop()
+
+	tm := NewTierMigrator(dm.store, dm)
+	tm.Start(10 * time.Millisecond)
+
+	// Let the goroutine run at least one tick.
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop must block until the goroutine has returned. We assert this
+	// by verifying Stop returns within a reasonable time (not hanging
+	// due to a missing wg.Done, and not returning instantly while the
+	// goroutine is still alive).
+	stopDone := make(chan struct{})
+	go func() {
+		tm.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+		// success: Stop returned
+	case <-time.After(2 * time.Second):
+		t.Fatal("TierMigrator.Stop() did not return within 2s — goroutine leak or deadlock")
+	}
+
+	// Double Stop must not panic (idempotency).
+	tm.Stop()
+}
+
+// TestTierMigrator_RestartAfterStop verifies that Start can be called
+// again after Stop without panicking. Before the fix, stopCh was not
+// recreated on Start, causing "close of closed channel" panic on the
+// second Stop.
+func TestTierMigrator_RestartAfterStop(t *testing.T) {
+	dm, _ := newTestDiskManager(t)
+	defer dm.Stop()
+
+	tm := NewTierMigrator(dm.store, dm)
+
+	// First cycle
+	tm.Start(50 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	tm.Stop()
+
+	// Second cycle — must not panic on close(stopCh)
+	tm.Start(50 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	stopDone := make(chan struct{})
+	go func() {
+		tm.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Stop did not return — stopCh not recreated on Start")
+	}
+}
+
+// TestTierMigrator_StartIdempotent ensures Start called twice does not
+// spawn two goroutines.
+func TestTierMigrator_StartIdempotent(t *testing.T) {
+	dm, _ := newTestDiskManager(t)
+	defer dm.Stop()
+
+	tm := NewTierMigrator(dm.store, dm)
+	tm.Start(50 * time.Millisecond)
+	defer tm.Stop()
+
+	// Second Start should be a no-op (running flag already true).
+	tm.Start(50 * time.Millisecond)
+
+	// If two goroutines were spawned, Stop would close stopCh once and
+	// the second goroutine would never exit — but we can't directly
+	// observe that. The wg.Wait() in Stop would hang. So this test
+	// mainly ensures Stop returns in reasonable time.
+	done := make(chan struct{})
+	go func() {
+		tm.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return — possible duplicate goroutine")
+	}
 }

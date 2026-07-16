@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/dfs/internal/tlsutil"
@@ -34,6 +35,86 @@ type Replicator struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	tlsCfg    tlsutil.Config // TLS config for inter-node connections
+
+	// Connection pool — avoids re-dialing for every replication task.
+	// Each addr has a stack of idle *Client connections; workers pop
+	// one off, use it, and push it back. If the stack is empty, a new
+	// connection is dialed.
+	pool        *connPool
+	poolDialCount  atomic.Int64 // total dials (for testing/diagnostics)
+	poolOpenConns  atomic.Int64 // currently open connections in pool
+}
+
+// connPool maintains per-address idle connection stacks.
+type connPool struct {
+	mu    sync.Mutex
+	idle  map[string][]*Client // addr → idle connections (LIFO stack)
+	tls   tlsutil.Config
+	dials *atomic.Int64
+	open  *atomic.Int64
+}
+
+func newConnPool(tls tlsutil.Config, dials, open *atomic.Int64) *connPool {
+	return &connPool{
+		idle:  make(map[string][]*Client),
+		tls:   tls,
+		dials: dials,
+		open:  open,
+	}
+}
+
+// get returns an idle connection for addr, dialing a new one if none idle.
+func (p *connPool) get(addr string) (*Client, error) {
+	p.mu.Lock()
+	stack := p.idle[addr]
+	if len(stack) > 0 {
+		c := stack[len(stack)-1]
+		p.idle[addr] = stack[:len(stack)-1]
+		p.mu.Unlock()
+		return c, nil
+	}
+	p.mu.Unlock()
+
+	// Dial new connection
+	p.dials.Add(1)
+	c := NewClient(addr)
+	if p.tls.Enabled() {
+		tc, err := NewTLSClient(addr, p.tls)
+		if err != nil {
+			return nil, err
+		}
+		c = tc
+	}
+	if err := c.Connect(); err != nil {
+		return nil, err
+	}
+	p.open.Add(1)
+	return c, nil
+}
+
+// put returns a connection to the idle pool. If the connection is
+// closed, it is discarded instead of recycled.
+func (p *connPool) put(addr string, c *Client) {
+	if c.IsClosed() {
+		p.open.Add(-1)
+		return
+	}
+	p.mu.Lock()
+	p.idle[addr] = append(p.idle[addr], c)
+	p.mu.Unlock()
+}
+
+// closeAll closes every idle connection and clears the pool.
+func (p *connPool) closeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for addr, stack := range p.idle {
+		for _, c := range stack {
+			c.Close()
+			p.open.Add(-1)
+		}
+		delete(p.idle, addr)
+	}
 }
 
 // NewReplicator creates a new replication engine with the specified concurrency.
@@ -42,18 +123,22 @@ func NewReplicator(localAddr string, workers int) *Replicator {
 		workers = 4
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Replicator{
+	r := &Replicator{
 		localAddr: localAddr,
 		taskCh:    make(chan ReplicationTask, 1024),
 		workers:   workers,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+	r.pool = newConnPool(r.tlsCfg, &r.poolDialCount, &r.poolOpenConns)
+	return r
 }
 
 // SetTLS configures TLS for inter-node replication connections.
 func (r *Replicator) SetTLS(cfg tlsutil.Config) {
 	r.tlsCfg = cfg
+	// Recreate pool with updated TLS config
+	r.pool = newConnPool(r.tlsCfg, &r.poolDialCount, &r.poolOpenConns)
 }
 
 // Start launches replication worker goroutines.
@@ -70,7 +155,13 @@ func (r *Replicator) Stop() {
 	r.cancel()
 	close(r.taskCh)
 	r.wg.Wait()
+	r.pool.closeAll()
 	slog.Info("datanode: replicator stopped")
+}
+
+// closeAllPooledConns closes all idle pooled connections (for testing).
+func (r *Replicator) closeAllPooledConns() {
+	r.pool.closeAll()
 }
 
 // Submit adds a replication task to the queue.
@@ -175,40 +266,60 @@ func (r *Replicator) worker(id int) {
 
 // replicate performs the actual chunk replication:
 // 1. Read chunk from source node
-// 2. Write chunk to target node
-// 3. Verify checksum
+// 2. Throttle to background bandwidth limit (shared with anti-entropy and repair)
+// 3. Write chunk to target node
+// 4. Verify checksum
 func (r *Replicator) replicate(task ReplicationTask) error {
-	// Connect to source
-	srcClient, err := r.dialClient(task.SourceAddr)
+	// Get source connection from pool
+	srcClient, err := r.pool.get(task.SourceAddr)
 	if err != nil {
 		return fmt.Errorf("connect source: %w", err)
 	}
-	defer srcClient.Close()
 
 	// Read chunk from source
 	resp, err := srcClient.ReadChunk(task.ChunkID, 0, 0)
 	if err != nil {
+		// Connection may be broken — discard it
+		srcClient.Close()
+		r.poolOpenConns.Add(-1)
 		return fmt.Errorf("read from source: %w", err)
 	}
+	// Return source connection to pool for reuse
+	r.pool.put(task.SourceAddr, srcClient)
+
 	if resp.Status != StatusOK {
 		return fmt.Errorf("source read failed: %s", resp.Error)
+	}
+
+	// Throttle the background data copy so it doesn't starve
+	// foreground client reads/writes. We back-pay since we only
+	// know the data length after ReadChunk returns.
+	if len(resp.Data) > 0 {
+		if err := ThrottleRead(context.Background(), len(resp.Data)); err != nil {
+			slog.Warn("replicator: bandwidth throttle cancelled",
+				"chunkID", task.ChunkID, "bytes", len(resp.Data), "error", err)
+		}
 	}
 
 	data := resp.Data
 	checksum := crc32.ChecksumIEEE(data)
 
-	// Connect to target
-	tgtClient, err := r.dialClient(task.TargetAddr)
+	// Get target connection from pool
+	tgtClient, err := r.pool.get(task.TargetAddr)
 	if err != nil {
 		return fmt.Errorf("connect target: %w", err)
 	}
-	defer tgtClient.Close()
 
 	// Write chunk to target
 	resp, err = tgtClient.ReplicateChunk(task.ChunkID, data)
 	if err != nil {
+		tgtClient.Close()
+		r.poolOpenConns.Add(-1)
 		return fmt.Errorf("write to target: %w", err)
 	}
+	// Return target connection to pool for reuse
+	r.pool.put(task.TargetAddr, tgtClient)
+
 	if resp.Status != StatusOK {
 		return fmt.Errorf("target write failed: %s", resp.Error)
 	}
@@ -219,26 +330,6 @@ func (r *Replicator) replicate(task ReplicationTask) error {
 	}
 
 	return nil
-}
-
-// dialClient creates a Client connected to the given address, using
-// TLS when configured.
-func (r *Replicator) dialClient(addr string) (*Client, error) {
-	if r.tlsCfg.Enabled() {
-		c, err := NewTLSClient(addr, r.tlsCfg)
-		if err != nil {
-			return nil, err
-		}
-		if err := c.Connect(); err != nil {
-			return nil, err
-		}
-		return c, nil
-	}
-	c := NewClient(addr)
-	if err := c.Connect(); err != nil {
-		return nil, err
-	}
-	return c, nil
 }
 
 // RepairTask represents a chunk repair operation (re-replicate from surviving copy).
