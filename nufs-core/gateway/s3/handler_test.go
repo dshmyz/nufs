@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -111,6 +112,17 @@ func (m *mockMetaService) GetBucket(_ context.Context, name string) (*metadata.B
 	return b, nil
 }
 
+func (m *mockMetaService) GetBucketByRoot(_ context.Context, rootInode metadata.InodeID) (*metadata.BucketInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, b := range m.buckets {
+		if b.RootInode == rootInode {
+			return b, nil
+		}
+	}
+	return nil, metadata.ErrBucketNotFound
+}
+
 // ---- Directory operations ----
 
 func (m *mockMetaService) MkDir(_ context.Context, parent metadata.InodeID, name string, mode uint32) (*metadata.InodeMeta, error) {
@@ -162,6 +174,41 @@ func (m *mockMetaService) ReadDir(_ context.Context, parent metadata.InodeID, of
 		end = len(result)
 	}
 	return result[offset:end], nil
+}
+
+func (m *mockMetaService) ReadDirFrom(_ context.Context, parent metadata.InodeID, afterName string, limit int) ([]metadata.DirEntry, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	pk := m.parentKey(parent)
+	children, ok := m.entries[pk]
+	if !ok {
+		return nil, nil
+	}
+	var result []metadata.DirEntry
+	for name, inode := range children {
+		result = append(result, metadata.DirEntry{InodeID: inode.ID, Type: inode.Type, Name: name})
+	}
+	// Sort by name for deterministic cursor pagination
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	// Find start position after cursor
+	start := 0
+	if afterName != "" {
+		for i, e := range result {
+			if e.Name > afterName {
+				start = i
+				break
+			}
+			start = i + 1
+		}
+	}
+	if start >= len(result) {
+		return nil, nil
+	}
+	end := start + limit
+	if end > len(result) {
+		end = len(result)
+	}
+	return result[start:end], nil
 }
 
 // ---- File operations ----
@@ -270,6 +317,23 @@ func (m *mockMetaService) AllocateChunk(_ context.Context, inodeID metadata.Inod
 	}
 	m.chunks[id] = chunk
 	return chunk, nil
+}
+
+func (m *mockMetaService) AllocateChunksBatch(_ context.Context, inodeID metadata.InodeID, offsets []int64, policy metadata.PlacementPolicy) ([]*metadata.ChunkMeta, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	chunks := make([]*metadata.ChunkMeta, len(offsets))
+	for i := range offsets {
+		id := metadata.ChunkID(m.nextID)
+		m.nextID++
+		chunks[i] = &metadata.ChunkMeta{
+			ID:         id,
+			State:      metadata.ChunkCreated,
+			CreateTime: time.Now().UnixNano(),
+		}
+		m.chunks[id] = chunks[i]
+	}
+	return chunks, nil
 }
 
 func (m *mockMetaService) CommitChunk(_ context.Context, chunkID metadata.ChunkID, checksum uint32) error {

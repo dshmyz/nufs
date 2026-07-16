@@ -26,20 +26,19 @@ type ChunkStore = gateway.ChunkStore
 // both gateway.ChunkStore (the canonical interface) and the
 // s3.ChunkStore alias (the legacy name).
 var (
-	_ ChunkStore        = (*DatanodeChunkStore)(nil)
-	_ ChunkStore        = (*MemoryChunkStore)(nil)
+	_ ChunkStore         = (*DatanodeChunkStore)(nil)
+	_ ChunkStore         = (*MemoryChunkStore)(nil)
 	_ gateway.ChunkStore = (*DatanodeChunkStore)(nil)
 	_ gateway.ChunkStore = (*MemoryChunkStore)(nil)
 )
 
 // DatanodeChunkStore is the production ChunkStore implementation: it
-// talks to datanode daemons over TCP. The previous in-process behaviour
-// (commit chunk without writing data) is replaced by an actual data path
-// that goes through datanode.Client.
+// talks to datanode daemons over TCP using a connection pool for
+// efficient reuse and a write pipeline for parallel replication.
 type DatanodeChunkStore struct {
-	mu          sync.Mutex
-	dialTimeout time.Duration
-	tlsCfg      tlsutil.Config
+	pool     *datanode.ClientPool
+	pipeline *datanode.WritePipeline
+	tlsCfg   tlsutil.Config
 	// MinReplicasPerWrite is the floor on the number of replicas that
 	// must acknowledge a write. <= 0 (the default) means "all replicas
 	// must succeed", which is the production durability contract. Set
@@ -48,23 +47,25 @@ type DatanodeChunkStore struct {
 }
 
 // NewDatanodeChunkStore returns a ChunkStore that dials datanode daemons
-// over TCP. dialTimeout applies to the connect step; each request then
-// uses datanode.Client's own per-request deadline.
+// over TCP using a connection pool. The pool reuses connections across
+// operations, eliminating per-request TCP handshake overhead.
 func NewDatanodeChunkStore() *DatanodeChunkStore {
-	return &DatanodeChunkStore{dialTimeout: 10 * time.Second}
+	pool := datanode.NewClientPool(4, 30*time.Second, 10*time.Second)
+	pipeline := datanode.NewWritePipeline(pool, 30*time.Second)
+	return &DatanodeChunkStore{pool: pool, pipeline: pipeline}
 }
 
 // SetTLS configures TLS for connections to datanode daemons.
 func (s *DatanodeChunkStore) SetTLS(cfg tlsutil.Config) {
 	s.tlsCfg = cfg
+	s.pool.SetTLS(cfg)
 }
 
-// WriteChunk writes data to every replica. The write is considered
-// successful only when at least s.requiredReplicas(chunk) replicas
-// return OK; for production deployments that is "all of N" (i.e. a
-// non-zero MinReplicasPerWrite means "at least this many, capped by
-// the total"). The default (MinReplicasPerWrite == 0) means the write
-// must reach every replica before it is considered durable.
+// WriteChunk writes data to every replica using the write pipeline.
+// The write is considered successful only when at least
+// s.requiredReplicas(chunk) replicas return OK; for production
+// deployments that is "all of N". The pipeline dispatches writes
+// to all replicas in parallel, reducing latency from O(N*RTT) to O(RTT).
 func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.ChunkMeta, data []byte) error {
 	if chunk == nil {
 		return fmt.Errorf("chunkstore: nil chunk")
@@ -74,48 +75,8 @@ func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.Chu
 	}
 
 	required := s.requiredReplicas(len(chunk.Replicas))
-	successes := 0
-	var lastErr error
-	for _, rep := range chunk.Replicas {
-		if rep.Addr == "" {
-			lastErr = fmt.Errorf("replica on node %d has empty addr", rep.NodeID)
-			log.Printf("s3gw: skip replica on node %d: empty addr", rep.NodeID)
-			continue
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		client, err := s.dialClient(rep.Addr)
-		if err != nil {
-			lastErr = fmt.Errorf("connect to %s: %w", rep.Addr, err)
-			log.Printf("s3gw: connect to datanode %s: %v", rep.Addr, err)
-			continue
-		}
-		resp, err := client.WriteChunk(chunk.ID, data)
-		client.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("write to %s: %w", rep.Addr, err)
-			log.Printf("s3gw: write to datanode %s: %v", rep.Addr, err)
-			continue
-		}
-		if resp.Status != datanode.StatusOK {
-			lastErr = fmt.Errorf("datanode %s status=%d: %s", rep.Addr, resp.Status, resp.Error)
-			log.Printf("s3gw: datanode %s returned status %d: %s", rep.Addr, resp.Status, resp.Error)
-			continue
-		}
-		successes++
-	}
-
-	if successes < required {
-		if lastErr != nil {
-			return fmt.Errorf("chunkstore: only %d of %d required replicas wrote chunk %d, last error: %w",
-				successes, required, chunk.ID, lastErr)
-		}
-		return fmt.Errorf("chunkstore: only %d of %d required replicas wrote chunk %d",
-			successes, required, chunk.ID)
-	}
-	return nil
+	pp := datanode.NewWritePipeline(s.pool, 30*time.Second, datanode.WithQuorum(required))
+	return pp.Write(ctx, chunk.ID, data, chunk.Replicas)
 }
 
 // requiredReplicas maps MinReplicasPerWrite to the actual floor for
@@ -137,6 +98,7 @@ func (s *DatanodeChunkStore) ReadChunk(ctx context.Context, chunk *metadata.Chun
 
 // ReadChunkRange reads a subrange [offset, offset+length) from the chunk
 // via the datanode TCP protocol. offset=0, length=0 reads the entire chunk.
+// Connections are sourced from the pool and returned after use.
 func (s *DatanodeChunkStore) ReadChunkRange(ctx context.Context, chunk *metadata.ChunkMeta, offset int64, length int32) ([]byte, error) {
 	if chunk == nil {
 		return nil, fmt.Errorf("chunkstore: nil chunk")
@@ -155,7 +117,7 @@ func (s *DatanodeChunkStore) ReadChunkRange(ctx context.Context, chunk *metadata
 			continue
 		}
 
-		client, err := s.dialClient(rep.Addr)
+		client, err := s.pool.Get(rep.Addr)
 		if err != nil {
 			lastErr = fmt.Errorf("connect to %s: %w", rep.Addr, err)
 			log.Printf("s3gw: connect to %s: %v", rep.Addr, err)
@@ -163,7 +125,7 @@ func (s *DatanodeChunkStore) ReadChunkRange(ctx context.Context, chunk *metadata
 		}
 		// Read the specified range; offset=0, length=0 means full chunk.
 		resp, err := client.ReadChunk(chunk.ID, offset, length)
-		client.Close()
+		s.pool.Put(rep.Addr, client)
 		if err != nil {
 			lastErr = fmt.Errorf("read from %s: %w", rep.Addr, err)
 			log.Printf("s3gw: read from %s: %v", rep.Addr, err)
@@ -271,23 +233,7 @@ func (m *MemoryChunkStore) Get(chunkID metadata.ChunkID) ([]byte, bool) {
 }
 
 // dialClient creates a datanode.Client connected to the given address,
-// using TLS when configured.
+// using TLS when configured. DEPRECATED: use s.pool.Get instead.
 func (s *DatanodeChunkStore) dialClient(addr string) (*datanode.Client, error) {
-	if s.tlsCfg.Enabled() {
-		c, err := datanode.NewTLSClient(addr, s.tlsCfg)
-		if err != nil {
-			return nil, err
-		}
-		c.SetTimeout(30 * time.Second)
-		if err := c.Connect(); err != nil {
-			return nil, err
-		}
-		return c, nil
-	}
-	c := datanode.NewClient(addr)
-	c.SetTimeout(30 * time.Second)
-	if err := c.Connect(); err != nil {
-		return nil, err
-	}
-	return c, nil
+	return s.pool.Get(addr)
 }

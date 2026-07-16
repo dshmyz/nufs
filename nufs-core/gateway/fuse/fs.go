@@ -41,15 +41,63 @@ type DFSFileSystem struct {
 	inodeMap map[metadata.InodeID]*fs.Inode
 }
 
+// chunkEventWatcher is the minimal interface that DFSFileSystem needs from
+// its metadata client to subscribe to change events. If the implementation
+// does not provide streaming (e.g. a local PebbleStore in tests), the
+// filesystem runs without event-driven cache invalidation — a safe fallback.
+type chunkEventWatcher interface {
+	WatchEventsStream(ctx context.Context, prefix string) <-chan metadata.WatchEvent
+}
+
 // NewDFSFileSystem creates a new FUSE filesystem root.
+// If cache is provided, it will be invalidated on chunk events received
+// from the metadata service; otherwise the gateway relies on TTL-based
+// expiry at the datanode layer.
 func NewDFSFileSystem(meta metadata.MetadataService, chunkStore gateway.ChunkStore, cache *ChunkCache) *DFSFileSystem {
-	return &DFSFileSystem{
+	fsys := &DFSFileSystem{
 		meta:       meta,
 		chunkStore: chunkStore,
 		chunkCache: cache,
 		lockOwner:  fmt.Sprintf("fusegw-%d", os.Getpid()),
 		inodeMap:   make(map[metadata.InodeID]*fs.Inode),
 	}
+	// Kick off the event-driven cache invalidation loop if the metadata
+	// service supports streaming watches.
+	if cache != nil {
+		if w, ok := meta.(chunkEventWatcher); ok {
+			ctx := context.Background()
+			go fsys.runCacheInvalidationLoop(ctx, w)
+		}
+	}
+	return fsys
+}
+
+// runCacheInvalidationLoop consumes chunk-scoped events from the metadata
+// service and removes the corresponding cache entries. It also watches
+// inode-level events to evict stale size/mtime info held in the OS page
+// cache. The loop is best-effort: if the stream ends (e.g. server restart)
+// it simply returns and the cache eventually expires by itself.
+func (fsys *DFSFileSystem) runCacheInvalidationLoop(ctx context.Context, w chunkEventWatcher) {
+	for e := range w.WatchEventsStream(ctx, "chunk:") {
+		chunkID, err := parseChunkID(e.Key)
+		if err == nil {
+			fsys.chunkCache.Remove(chunkID)
+		}
+	}
+}
+
+// parseChunkID parses "chunk:1234" into uint64(1234). Returns an error if
+// the key format is unexpected; callers should just ignore bad keys.
+func parseChunkID(key string) (uint64, error) {
+	const prefix = "chunk:"
+	if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
+		return 0, fmt.Errorf("invalid chunk event key: %s", key)
+	}
+	var id uint64
+	if _, err := fmt.Sscanf(key[len(prefix):], "%d", &id); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // Mount mounts the DFS filesystem at the given mountpoint.

@@ -37,21 +37,37 @@ var readBufPool = sync.Pool{
 // chunk per MaxChunkPayload window.
 const MaxChunkPayload = 64 * 1024 * 1024 // 64 MiB
 
-// fuseChunkPolicy is the placement policy used when Flush allocates
-// a new chunk for a FUSE write. Commit 1.1 only handles single-chunk
-// files (one Flush = one chunk); for multi-chunk files we need to
-// thread the parent bucket's policy through, which is commit 1.2
-// work. Single-replica is the right default for now: it makes the
-// MemoryChunkStore test double trivially correct and it matches
-// the existing DatanodeChunkStore default for unit tests.
-//
-// TODO(commit-1.2): look up the parent bucket's policy via
-// meta.GetBucket and use it here, so a /mnt/dfs/foo/ write honours
-// the policy that `s3gw CreateBucket` set.
-var fuseChunkPolicy = metadata.PlacementPolicy{
+// fuseDefaultPolicy is the fallback placement policy used when Flush
+// cannot determine the parent bucket's policy (e.g., the inode has no
+// BucketRoot). This is a safe single-replica default for orphan files.
+var fuseDefaultPolicy = metadata.PlacementPolicy{
 	ID:                "fuse-default",
 	ReplicationFactor: 1,
 	TopologySpread:    metadata.SpreadNode,
+}
+
+// resolveChunkPolicy looks up the placement policy for the file's
+// containing bucket. It uses the inode's BucketRoot field to look up
+// the bucket directly via GetBucketByRoot (reverse index), avoiding
+// a full ListBuckets scan. If the inode has no BucketRoot (orphan
+// file) or the bucket cannot be found, it falls back to
+// fuseDefaultPolicy.
+//
+// This fixes D3: previously Flush used a hardcoded fuseChunkPolicy
+// with ReplicationFactor=1, ignoring the bucket's configured policy.
+// Now a bucket with ReplicationFactor=3 will actually get 3 replicas.
+//
+// P1.5: replaced ListBuckets + linear scan with O(1) GetBucketByRoot.
+func (f *DFSFile) resolveChunkPolicy(ctx context.Context, inode *metadata.InodeMeta) metadata.PlacementPolicy {
+	if inode.BucketRoot == 0 {
+		return fuseDefaultPolicy
+	}
+	bucket, err := f.meta.GetBucketByRoot(ctx, inode.BucketRoot)
+	if err != nil {
+		logf("flush: get bucket by root %d for policy lookup: %v — using default", inode.BucketRoot, err)
+		return fuseDefaultPolicy
+	}
+	return bucket.Policy
 }
 
 // DFSFile represents a regular file in the DFS FUSE filesystem.
@@ -274,7 +290,13 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 		}
 	}
 
-	chunk, err := f.meta.AllocateChunk(ctx, f.inodeID, 0, fuseChunkPolicy)
+	// Resolve the placement policy from the file's containing bucket
+	// instead of using a hardcoded fuseChunkPolicy. This ensures a
+	// bucket configured with ReplicationFactor=3 actually gets 3
+	// replicas for FUSE writes (fixes D3).
+	policy := f.resolveChunkPolicy(ctx, metaInode)
+
+	chunk, err := f.meta.AllocateChunk(ctx, f.inodeID, 0, policy)
 	if err != nil {
 		logf("flush: allocate chunk: %v", err)
 		return syscall.EIO

@@ -35,27 +35,11 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 	}
 
 	// Cap the body at MaxObjectSize + 1 so http.MaxBytesReader trips
-	// exactly when the client overshoots. ReadAll will then return
-	// *http.MaxBytesError and we can return 413 instead of buffering
-	// gigabytes into memory.
+	// exactly when the client overshoots.
 	r.Body = http.MaxBytesReader(w, r.Body, gw.maxObjectSize)
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			WriteXMLError(w, http.StatusRequestEntityTooLarge, ErrCodeEntityTooLarge,
-				fmt.Sprintf("Object size exceeds %d bytes", gw.maxObjectSize),
-				"/"+bucket+"/"+key, requestID)
-			return
-		}
-		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			"Failed to read request body: "+err.Error(), "/"+bucket+"/"+key, requestID)
-		return
-	}
 
 	// Try to create file; if exists, look up the existing inode and
-	// update it in place.  This avoids the Unlink+CreateFile window
-	// where the key temporarily disappears.
+	// update it in place.
 	var oldChunks []metadata.ChunkRef
 	inode, err := gw.meta.CreateFile(ctx, b.RootInode, key, 0644)
 	if err != nil {
@@ -74,10 +58,7 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 		}
 	}
 
-	// Acquire an exclusive advisory lock on the inode so a
-	// concurrent FUSE writer (or another S3 PUT to the same key)
-	// sees ErrLockBusy rather than a silent overwrite.  The lock
-	// owner is unique per-request so we don't hold our own lock.
+	// Acquire an exclusive advisory lock on the inode
 	lockOwner := fmt.Sprintf("s3gw-%s-%s-%d", bucket, key, time.Now().UnixNano())
 	if err := gw.meta.AdvisoryLock(ctx, inode.ID, lockOwner); err != nil {
 		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
@@ -87,67 +68,186 @@ func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucke
 	}
 	defer gw.meta.AdvisoryUnlock(ctx, inode.ID, lockOwner)
 
-	// Allocate a chunk for the data
-	chunk, err := gw.meta.AllocateChunk(ctx, inode.ID, 0, b.Policy)
-	if err != nil {
-		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			"Failed to allocate chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
-		return
+	// Determine content length if known (Content-Length header)
+	contentLength := int64(-1)
+	if r.ContentLength > 0 {
+		contentLength = r.ContentLength
 	}
 
-	// Reject the request up front if the placement policy produced no
-	// replicas. This is a clearer 503 than waiting for the chunk store
-	// to fail with "no replicas", and it stops a misconfigured cluster
-	// from accepting writes that cannot satisfy the durability contract.
-	// Only enforced when the gateway is configured to do so (production
-	// sets it; in-memory tests do not).
-	if gw.rejectEmptyReplicas && len(chunk.Replicas) == 0 {
-		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
-			"No datanode replicas are available for this bucket's placement policy",
-			"/"+bucket+"/"+key, requestID)
-		return
+	// --- Streaming chunked write ---
+	// Read body in MaxChunkSize pieces, allocating and writing chunks
+	// one at a time. If Content-Length is known and requires multiple
+	// chunks, use batch allocation to reduce metadata round trips.
+	var (
+		newChunkRefs []metadata.ChunkRef
+		totalSize    int64
+		hash         = sha256.New()
+	)
+
+	// Pre-allocate chunks if Content-Length is known and large enough
+	if contentLength > metadata.MaxChunkSize {
+		numChunks := int((contentLength + metadata.MaxChunkSize - 1) / metadata.MaxChunkSize)
+		offsets := make([]int64, numChunks)
+		for i := 0; i < numChunks; i++ {
+			offsets[i] = int64(i) * metadata.MaxChunkSize
+		}
+
+		preAllocChunks, err := gw.meta.AllocateChunksBatch(ctx, inode.ID, offsets, b.Policy)
+		if err != nil {
+			WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"Failed to batch allocate chunks: "+err.Error(), "/"+bucket+"/"+key, requestID)
+			return
+		}
+
+		// Validate replica availability
+		if gw.rejectEmptyReplicas {
+			for _, ch := range preAllocChunks {
+				if len(ch.Replicas) == 0 {
+					WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
+						"No datanode replicas are available for this bucket's placement policy",
+						"/"+bucket+"/"+key, requestID)
+					return
+				}
+			}
+		}
+
+		// Stream data through pre-allocated chunks
+		buf := make([]byte, metadata.MaxChunkSize)
+		chunkIdx := 0
+		remaining := contentLength
+
+		for remaining > 0 && chunkIdx < len(preAllocChunks) {
+			readSize := int64(metadata.MaxChunkSize)
+			if remaining < readSize {
+				readSize = remaining
+			}
+
+			// Read exactly readSize bytes into the buffer
+			n, err := io.ReadFull(r.Body, buf[:readSize])
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				// MaxBytesReader trips here if the client exceeds the limit
+				var maxErr *http.MaxBytesError
+				if errors.As(err, &maxErr) {
+					WriteXMLError(w, http.StatusRequestEntityTooLarge, ErrCodeEntityTooLarge,
+						fmt.Sprintf("Object size exceeds %d bytes", gw.maxObjectSize),
+						"/"+bucket+"/"+key, requestID)
+					return
+				}
+				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					"Failed to read request body: "+err.Error(), "/"+bucket+"/"+key, requestID)
+				return
+			}
+			if n == 0 {
+				break
+			}
+
+			chunkData := buf[:n]
+			chunk := preAllocChunks[chunkIdx]
+
+			checksum := crc32Checksum(chunkData)
+			if err := gw.chunkStore.WriteChunk(ctx, chunk, chunkData); err != nil {
+				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					"Failed to write chunk data: "+err.Error(), "/"+bucket+"/"+key, requestID)
+				return
+			}
+
+			if err := gw.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
+				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					"Failed to commit chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
+				return
+			}
+
+			if err := gw.meta.SealChunk(ctx, chunk.ID); err != nil {
+				log.Printf("s3gw: seal chunk %d: %v", chunk.ID, err)
+			}
+
+			newChunkRefs = append(newChunkRefs, metadata.ChunkRef{
+				ID:     chunk.ID,
+				Offset: int64(chunkIdx) * metadata.MaxChunkSize,
+				Length: int32(n),
+				Version: 1,
+			})
+			_, _ = hash.Write(chunkData)
+			totalSize += int64(n)
+			remaining -= int64(n)
+			chunkIdx++
+		}
+	} else {
+		// Small or unknown size: allocate and write single chunks on the fly
+		buf := make([]byte, metadata.MaxChunkSize)
+		for {
+			n, err := io.ReadFull(r.Body, buf)
+			if n == 0 || err == io.EOF {
+				break
+			}
+			if err != nil && err != io.ErrUnexpectedEOF {
+				var maxErr *http.MaxBytesError
+				if errors.As(err, &maxErr) {
+					WriteXMLError(w, http.StatusRequestEntityTooLarge, ErrCodeEntityTooLarge,
+						fmt.Sprintf("Object size exceeds %d bytes", gw.maxObjectSize),
+						"/"+bucket+"/"+key, requestID)
+					return
+				}
+				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					"Failed to read request body: "+err.Error(), "/"+bucket+"/"+key, requestID)
+				return
+			}
+
+			chunkData := buf[:n]
+			chunk, err := gw.meta.AllocateChunk(ctx, inode.ID, totalSize, b.Policy)
+			if err != nil {
+				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					"Failed to allocate chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
+				return
+			}
+
+			if gw.rejectEmptyReplicas && len(chunk.Replicas) == 0 {
+				WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
+					"No datanode replicas are available for this bucket's placement policy",
+					"/"+bucket+"/"+key, requestID)
+				return
+			}
+
+			checksum := crc32Checksum(chunkData)
+			if err := gw.chunkStore.WriteChunk(ctx, chunk, chunkData); err != nil {
+				WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
+					"Failed to write data to enough datanodes: "+err.Error(),
+					"/"+bucket+"/"+key, requestID)
+				return
+			}
+
+			if err := gw.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
+				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					"Failed to commit chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
+				return
+			}
+
+			if err := gw.meta.SealChunk(ctx, chunk.ID); err != nil {
+				log.Printf("s3gw: seal chunk %d: %v", chunk.ID, err)
+			}
+
+			newChunkRefs = append(newChunkRefs, metadata.ChunkRef{
+				ID: chunk.ID, Offset: totalSize, Length: int32(n), Version: 1,
+			})
+			_, _ = hash.Write(chunkData)
+			totalSize += int64(n)
+		}
 	}
 
-	// Write data to each replica via the chunk store (TCP for prod,
-	// in-memory for tests).
-	checksum := crc32Checksum(data)
-	if err := gw.chunkStore.WriteChunk(ctx, chunk, data); err != nil {
-		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
-			"Failed to write data to enough datanodes: "+err.Error(),
-			"/"+bucket+"/"+key, requestID)
-		return
-	}
-
-	// Commit chunk with checksum
-	if err := gw.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
-		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			"Failed to commit chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
-		return
-	}
-
-	// Seal chunk
-	if err := gw.meta.SealChunk(ctx, chunk.ID); err != nil {
-		log.Printf("s3gw: seal chunk %d: %v", chunk.ID, err)
-	}
-
-	// Update inode with size and chunk reference
-	inode.Size = int64(len(data))
-	inode.ChunkMap = []metadata.ChunkRef{
-		{ID: chunk.ID, Offset: 0, Length: int32(len(data)), Version: 1},
-	}
+	// Update inode with final size and all chunk references
+	inode.Size = totalSize
+	inode.ChunkMap = newChunkRefs
 	if err := gw.meta.UpdateInode(ctx, inode); err != nil {
 		log.Printf("s3gw: update inode %d: %v", inode.ID, err)
 	}
 
-	// Clean up old chunks (async — readers still holding in-flight
-	// references will finish before the chunk data is removed).
+	// Clean up old chunks (async)
 	for _, cref := range oldChunks {
 		_ = gw.meta.DeleteChunk(ctx, cref.ID)
 	}
 
-	// Compute ETag from content hash
-	hash := sha256.Sum256(data)
-	etag := "\"" + hex.EncodeToString(hash[:8]) + "\""
+	// ETag from hash (truncated to 16 hex chars for consistency)
+	etag := "\"" + hex.EncodeToString(hash.Sum(nil)[:8]) + "\""
 
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)

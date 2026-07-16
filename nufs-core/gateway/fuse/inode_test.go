@@ -5,6 +5,7 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"hash/crc32"
 	"syscall"
 	"testing"
@@ -736,3 +737,160 @@ func TestDFSFile_Open_AcquiresSharedLock(t *testing.T) {
 }
 
 // ========== Helper: nothing here. ==========
+
+// ========== D3: Flush uses bucket policy, not hardcoded replica count ==========
+
+// newTestMetaStoreWithPolicy creates a bucket with a custom placement
+// policy so we can verify Flush honours it instead of the hardcoded
+// fuseChunkPolicy (ReplicationFactor=1). It also registers enough
+// nodes to satisfy the placement engine.
+func newTestMetaStoreWithPolicy(t *testing.T, policy metadata.PlacementPolicy) (*metadata.PebbleStore, metadata.InodeID) {
+	t.Helper()
+	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
+		UseInMemory: true,
+	})
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx := context.Background()
+
+	// Register enough nodes to satisfy the replication factor.
+	nodeCount := policy.ReplicationFactor
+	if nodeCount < 1 {
+		nodeCount = 1
+	}
+	for i := 1; i <= int(nodeCount); i++ {
+		err := store.RegisterNode(ctx, &metadata.NodeInfo{
+			ID:         metadata.NodeID(i),
+			Addr:       fmt.Sprintf("127.0.0.1:%d", 9000+i),
+			CapacityGB: 100,
+		})
+		if err != nil {
+			t.Fatalf("RegisterNode %d: %v", i, err)
+		}
+	}
+
+	if err := store.CreateBucket(ctx, "test", policy); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "test")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	file, err := store.CreateFile(ctx, bucket.RootInode, "hello.txt", 0o644)
+	if err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+	return store, file.ID
+}
+
+// TestDFSFile_Flush_UsesBucketPolicy verifies that Flush allocates
+// chunks using the parent bucket's placement policy, not the hardcoded
+// fuseChunkPolicy with ReplicationFactor=1.
+//
+// TDD red phase: before the fix, Flush always used fuseChunkPolicy
+// (ReplicationFactor=1) regardless of the bucket's policy. This test
+// creates a bucket with ReplicationFactor=3 and checks that the
+// allocated chunk has 3 replicas.
+func TestDFSFile_Flush_UsesBucketPolicy(t *testing.T) {
+	policy := metadata.PlacementPolicy{
+		ID:                "test-rf3",
+		ReplicationFactor: 3,
+		TopologySpread:    metadata.SpreadNode,
+	}
+	meta, id := newTestMetaStoreWithPolicy(t, policy)
+	cs := s3.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	// Write and flush.
+	data := []byte("replicated data")
+	if _, errno := f.Write(context.Background(), nil, data, 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	// Read back the inode and check the chunk's replica count.
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if len(inode.ChunkMap) == 0 {
+		t.Fatal("ChunkMap is empty after Flush")
+	}
+
+	chunkID := inode.ChunkMap[0].ID
+	chunk, err := meta.GetChunk(context.Background(), chunkID)
+	if err != nil {
+		t.Fatalf("GetChunk: %v", err)
+	}
+
+	if len(chunk.Replicas) != 3 {
+		t.Fatalf("expected 3 replicas (from bucket policy), got %d — Flush used hardcoded fuseChunkPolicy instead of bucket policy",
+			len(chunk.Replicas))
+	}
+}
+
+// TestDFSFile_Flush_FallsBackToDefaultOnNoBucket verifies that when
+// the inode has no BucketRoot (edge case), Flush falls back to a
+// safe default policy rather than panicking.
+func TestDFSFile_Flush_FallsBackToDefaultOnNoBucket(t *testing.T) {
+	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
+		UseInMemory: true,
+	})
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx := context.Background()
+
+	// Register one node so the placement engine can satisfy the
+	// default single-replica policy.
+	if err := store.RegisterNode(ctx, &metadata.NodeInfo{
+		ID:         metadata.NodeID(1),
+		Addr:       "127.0.0.1:9001",
+		CapacityGB: 100,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	// Create a file directly at root inode (no bucket) — BucketRoot=0.
+	inode, err := store.CreateFile(ctx, metadata.RootInodeID, "orphan.txt", 0o644)
+	if err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+
+	cs := s3.NewMemoryChunkStore()
+	f := newTestFile(store, cs, inode.ID)
+
+	data := []byte("orphan file")
+	if _, errno := f.Write(context.Background(), nil, data, 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	// Should succeed with default replica count (1).
+	metaInode, err := store.GetInode(ctx, inode.ID)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if len(metaInode.ChunkMap) == 0 {
+		t.Fatal("ChunkMap is empty after Flush on orphan file")
+	}
+
+	// Verify the chunk has exactly 1 replica (default policy).
+	chunkID := metaInode.ChunkMap[0].ID
+	chunk, err := store.GetChunk(ctx, chunkID)
+	if err != nil {
+		t.Fatalf("GetChunk: %v", err)
+	}
+	if len(chunk.Replicas) != 1 {
+		t.Fatalf("expected 1 replica (default policy), got %d", len(chunk.Replicas))
+	}
+}
