@@ -54,3 +54,22 @@ nufs-core/fusegw
 nufs-core/nufs-fuse
 nufs-core/nufs-s3
 nufs-core/nufs-cli
+nufs-core/metad
+
+# Raft runtime checkpoints
+nufs-core/metadata/raft-checkpoint-*/
+
+# IDE / tooling directories
+.codegraph/
+.mimocode/
+
+# Build output for nufs-admin
+nufs-admin/bin/
+
+# Personal documents (kept in workspace, not committed)
+*.docx
+convert_to_docx.py
+DEFECTS_ANALYSIS_*.md
+NON_GATEWAY_ANALYSIS.md
+PROBLEM_ANALYSIS.md
+社会研究方法课程论文.*
