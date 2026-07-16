@@ -570,7 +570,7 @@ func TestDFSXAttr_NotFound(t *testing.T) {
 // returned ENOTDIR.
 func TestDFSFileSystem_Readdir_ListsBuckets(t *testing.T) {
 	store, _ := newTestMetaStore(t)
-	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore(), nil, nil)
+	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore(), nil, nil, nil)
 	ctx := context.Background()
 
 	// Create a second bucket so we have two entries.
@@ -608,7 +608,7 @@ func TestDFSFileSystem_Readdir_ListsBuckets(t *testing.T) {
 // kernel caches it correctly.
 func TestDFSFileSystem_Lookup_ExistingBucket(t *testing.T) {
 	store, _ := newTestMetaStore(t)
-	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore(), nil, nil)
+	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore(), nil, nil, nil)
 	ctx := context.Background()
 
 	bucket, err := store.GetBucket(ctx, "test")
@@ -633,7 +633,7 @@ func TestDFSFileSystem_Lookup_ExistingBucket(t *testing.T) {
 // that doesn't exist.
 func TestDFSFileSystem_Lookup_MissingBucket(t *testing.T) {
 	store, _ := newTestMetaStore(t)
-	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore(), nil, nil)
+	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore(), nil, nil, nil)
 	ctx := context.Background()
 
 	var out fuse.EntryOut
@@ -654,7 +654,7 @@ func TestDFSFile_Open_AcquiresExclusiveLock(t *testing.T) {
 	store, id := newTestMetaStore(t)
 	cs := s3.NewMemoryChunkStore()
 
-	dfs := NewDFSFileSystem(store, cs, nil, nil)
+	dfs := NewDFSFileSystem(store, cs, nil, nil, nil)
 	f := &DFSFile{
 		meta:       store,
 		chunkStore: cs,

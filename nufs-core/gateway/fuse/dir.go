@@ -182,7 +182,7 @@ func (d *DFSDir) Create(ctx context.Context, name string, flags uint32, mode uin
 	}
 
 	dfs := rootFromInode(&d.Inode)
-	file := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec}
+	file := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, file, fs.StableAttr{
@@ -286,7 +286,7 @@ func (d *DFSDir) Link(ctx context.Context, target fs.InodeEmbedder, name string,
 	}
 
 	dfs := rootFromInode(&d.Inode)
-	child := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec}
+	child := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{

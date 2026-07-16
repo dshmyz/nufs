@@ -62,8 +62,12 @@ func (f *DFSFile) resolveChunkPolicy(ctx context.Context, inode *metadata.InodeM
 	if inode.BucketRoot == 0 {
 		return fuseDefaultPolicy
 	}
-	bucket, err := f.meta.GetBucketByRoot(ctx, inode.BucketRoot)
-	if err != nil {
+	var bucket *metadata.BucketInfo
+	if err := f.reliability.DoMeta("flush", func() error {
+		var gerr error
+		bucket, gerr = f.meta.GetBucketByRoot(ctx, inode.BucketRoot)
+		return gerr
+	}); err != nil {
 		logf("flush: get bucket by root %d for policy lookup: %v — using default", inode.BucketRoot, err)
 		return fuseDefaultPolicy
 	}
@@ -88,6 +92,10 @@ type DFSFile struct {
 
 	// recorder 记录 FUSE 操作指标。nil 时不打点（兼容旧测试）。
 	recorder MetricsRecorder
+
+	// reliability 包装 retry + circuit breaker + 路径锁。
+	// nil 时为 passthrough 模式（直接调用 fn），兼容旧测试。
+	reliability *ReliabilityWrapper
 
 	// Write buffer for small writes before flush
 	mu     sync.Mutex
@@ -150,8 +158,12 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 	rec := recorderFor(f.recorder)
 	rec.IncOp("read")
 
-	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
-	if err != nil {
+	var metaInode *metadata.InodeMeta
+	if err := f.reliability.DoMeta("read", func() error {
+		var gerr error
+		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
+		return gerr
+	}); err != nil {
 		rec.IncOpError("read")
 		return nil, syscall.EIO
 	}
@@ -198,13 +210,20 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 			}
 		}
 		if payload == nil {
-			chunk, err := f.meta.GetChunk(ctx, cref.ID)
-			if err != nil {
+			var chunk *metadata.ChunkMeta
+			if err := f.reliability.DoMeta("read", func() error {
+				var gerr error
+				chunk, gerr = f.meta.GetChunk(ctx, cref.ID)
+				return gerr
+			}); err != nil {
 				rec.IncOpError("read")
 				return nil, syscall.EIO
 			}
-			payload, err = f.chunkStore.ReadChunk(ctx, chunk)
-			if err != nil {
+			if err := f.reliability.DoChunk("read", func() error {
+				var gerr error
+				payload, gerr = f.chunkStore.ReadChunk(ctx, chunk)
+				return gerr
+			}); err != nil {
 				rec.IncOpError("read")
 				return nil, syscall.EIO
 			}
@@ -296,8 +315,18 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 		return syscall.EFBIG
 	}
 
-	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
-	if err != nil {
+	// 路径锁：串行化同一 inode 的并发 Flush，防止不同 DFSFile
+	// 实例（go-fuse inode cache eviction 后重建）交叉写入。
+	// nil receiver 时为 no-op（passthrough 模式）。
+	unlock := f.reliability.LockInode(uint64(f.inodeID))
+	defer unlock()
+
+	var metaInode *metadata.InodeMeta
+	if err := f.reliability.DoMeta("flush", func() error {
+		var gerr error
+		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
+		return gerr
+	}); err != nil {
 		rec.IncOpError("flush")
 		return syscall.EIO
 	}
@@ -318,8 +347,12 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	// replicas for FUSE writes (fixes D3).
 	policy := f.resolveChunkPolicy(ctx, metaInode)
 
-	chunk, err := f.meta.AllocateChunk(ctx, f.inodeID, 0, policy)
-	if err != nil {
+	var chunk *metadata.ChunkMeta
+	if err := f.reliability.DoMeta("flush", func() error {
+		var gerr error
+		chunk, gerr = f.meta.AllocateChunk(ctx, f.inodeID, 0, policy)
+		return gerr
+	}); err != nil {
 		logf("flush: allocate chunk: %v", err)
 		rec.IncOpError("flush")
 		return syscall.EIO
@@ -329,18 +362,24 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	// returns a fresh ID today; that's a metadata-layer bug — see
 	// TODO in the design doc).
 
-	if err := f.chunkStore.WriteChunk(ctx, chunk, f.buffer); err != nil {
+	if err := f.reliability.DoChunk("flush", func() error {
+		return f.chunkStore.WriteChunk(ctx, chunk, f.buffer)
+	}); err != nil {
 		logf("flush: write chunk %d: %v", chunk.ID, err)
 		rec.IncOpError("flush")
 		return syscall.EIO
 	}
 	checksum := crc32.ChecksumIEEE(f.buffer)
-	if err := f.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
+	if err := f.reliability.DoMeta("flush", func() error {
+		return f.meta.CommitChunk(ctx, chunk.ID, checksum)
+	}); err != nil {
 		logf("flush: commit chunk %d: %v", chunk.ID, err)
 		rec.IncOpError("flush")
 		return syscall.EIO
 	}
-	if err := f.meta.SealChunk(ctx, chunk.ID); err != nil {
+	if err := f.reliability.DoMeta("flush", func() error {
+		return f.meta.SealChunk(ctx, chunk.ID)
+	}); err != nil {
 		logf("flush: seal chunk %d: %v", chunk.ID, err)
 		// Not fatal: a sealed chunk can already be read.
 	}
@@ -348,8 +387,11 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	// Re-read the inode to find the ChunkRef that AllocateChunk
 	// just appended, then stamp the actual data length on it so
 	// Read can trim the payload to the data window.
-	metaInode, err = f.meta.GetInode(ctx, f.inodeID)
-	if err != nil {
+	if err := f.reliability.DoMeta("flush", func() error {
+		var gerr error
+		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
+		return gerr
+	}); err != nil {
 		rec.IncOpError("flush")
 		return syscall.EIO
 	}
@@ -366,7 +408,9 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	metaInode.Size = int64(len(f.buffer))
 	metaInode.MTime = time.Now().UnixNano()
 
-	if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+	if err := f.reliability.DoMeta("flush", func() error {
+		return f.meta.UpdateInode(ctx, metaInode)
+	}); err != nil {
 		rec.IncOpError("flush")
 		return syscall.EIO
 	}

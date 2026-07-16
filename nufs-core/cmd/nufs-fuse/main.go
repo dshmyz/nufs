@@ -29,6 +29,8 @@ import (
 
 	"github.com/example/dfs/internal/config"
 	"github.com/example/dfs/internal/logging"
+	"github.com/example/dfs/internal/resilience/breaker"
+	"github.com/example/dfs/internal/resilience/retry"
 )
 
 func main() {
@@ -146,7 +148,23 @@ func runDFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, ca
 		}
 	}
 
-	server, err := gofuse.Mount(mountpoint, meta, chunkStore, chunkCache, gofuse.GlobalMetricsRecorder(), nil)
+	// 构造 ReliabilityWrapper：retry + breaker + pathlock。
+	// 默认重试 3 次（指数退避 500ms→5s），熔断阈值 5 次失败 / 30s 恢复。
+	recorder := gofuse.GlobalMetricsRecorder()
+	reliability := gofuse.NewReliabilityWrapper(
+		recorder,
+		retry.Config{
+			MaxAttempts: 4,
+			BaseDelay:   500 * time.Millisecond,
+			MaxDelay:    5 * time.Second,
+		},
+		breaker.Config{
+			Threshold: 5,
+			Timeout:   30 * time.Second,
+		},
+	)
+
+	server, err := gofuse.Mount(mountpoint, meta, chunkStore, chunkCache, recorder, reliability, nil)
 	if err != nil {
 		log.Error("failed to mount", "error", err)
 		os.Exit(1)
