@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "nufs.metad.labels" . | nindent 4 }}
 spec:
-  serviceName: {{ .Release.Name }}-metad
+  serviceName: {{ .Release.Name }}-metad-headless
   replicas: {{ .Values.metad.replicaCount }}
   updateStrategy:
     type: RollingUpdate
@@ -30,6 +30,11 @@ spec:
         - name: metad
           image: "{{ .Values.global.imageRegistry }}{{ .Values.metad.image.repository }}:{{ .Values.metad.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.metad.image.pullPolicy }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           ports:
             - name: http
               containerPort: {{ .Values.metad.service.port }}
@@ -38,21 +43,30 @@ spec:
           args:
             - "--data-dir=/data/metadata"
             - "--ops-addr=0.0.0.0:{{ .Values.metad.service.port }}"
-            - "--node-id=1"
+            - "--node-id=$(POD_NAME)"
             - "--raft={{ .Values.metad.config.raftEnabled }}"
             - "--raft-addr=0.0.0.0:{{ .Values.metad.service.raftPort }}"
+            - "--raft-advertise-addr=$(POD_NAME).{{ .Release.Name }}-metad-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.metad.service.raftPort }}"
             - "--raft-dir=/data/raft"
+            {{- if .Values.metad.config.raftEnabled }}
+            - "--raft-bootstrap=true"
+            - "--raft-bootstrap-peers={{- range $i := until (int .Values.metad.replicaCount) }}{{- if $i }},{{- end }}meta-{{ add $i 1 }}={{ $.Release.Name }}-metad-{{ $i }}.{{ $.Release.Name }}-metad-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.metad.service.raftPort }}{{- end }}"
+            - "--raft-peer-ops={{- range $i := until (int .Values.metad.replicaCount) }}{{- if $i }},{{- end }}meta-{{ add $i 1 }}=http://{{ $.Release.Name }}-metad-{{ $i }}.{{ $.Release.Name }}-metad-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.metad.service.port }}{{- end }}"
+            - "--advertise-ops-addr=http://$(POD_NAME).{{ .Release.Name }}-metad-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.metad.service.port }}"
+            {{- end }}
+            {{- if .Values.upgradeStrategy.autoRebalance }}
+            - "--auto-balance-interval={{ .Values.upgradeStrategy.autoRebalanceInterval }}"
+            - "--auto-balance-threshold={{ .Values.upgradeStrategy.autoRebalanceThreshold }}"
+            - "--auto-balance-max-migrations={{ .Values.upgradeStrategy.autoRebalanceMaxMigrations }}"
+            {{- else }}
+            - "--auto-balance-interval=0"
+            {{- end }}
             {{- if .Values.observability.tracing.enabled }}
             - "--trace-enabled=true"
             - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
             - "--trace-insecure={{ .Values.observability.tracing.insecure }}"
             {{- end }}
             - "--log-json=true"
-            {{- if .Values.observability.tracing.enabled }}
-            - "--trace-enabled=true"
-            - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
-            - "--trace-insecure={{ .Values.observability.tracing.insecure }}"
-            {{- end }}
           volumeMounts:
             - name: data
               mountPath: /data
@@ -115,6 +129,25 @@ metadata:
     {{- include "nufs.metad.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.metad.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.metad.service.port }}
+      targetPort: http
+    - name: raft
+      port: {{ .Values.metad.service.raftPort }}
+      targetPort: raft
+  selector:
+    {{- include "nufs.metad.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-metad-headless
+  labels:
+    {{- include "nufs.metad.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
   ports:
     - name: http
       port: {{ .Values.metad.service.port }}

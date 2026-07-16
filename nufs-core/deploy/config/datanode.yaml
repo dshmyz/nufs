@@ -22,8 +22,3 @@ log_json: false
 trace_enabled: false
 trace_endpoint: ""
 trace_insecure: true
-
-# OpenTelemetry tracing
-trace_enabled: false
-trace_endpoint: ""
-trace_insecure: true

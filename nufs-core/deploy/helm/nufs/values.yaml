@@ -152,3 +152,6 @@ observability:
 upgradeStrategy:
   maxUnavailable: 1
   autoRebalance: true
+  autoRebalanceInterval: 5m
+  autoRebalanceThreshold: 0.15
+  autoRebalanceMaxMigrations: 10
