@@ -16,6 +16,11 @@ type MountConfig struct {
 	MetaDir    string `json:"meta_dir,omitempty"`
 	CacheDir   string `json:"cache_dir,omitempty"`
 
+	// CacheQuotaBytes 是 chunk 缓存的字节配额上限。
+	// 0 表示不限字节配额（仅按条目数淘汰）。
+	// 默认 1 GiB（在 DefaultMountConfig 中设置）。
+	CacheQuotaBytes int64 `json:"cache_quota_bytes,omitempty"`
+
 	MetricsAddr string        `json:"metrics_addr,omitempty"`
 	ScanTTL     time.Duration `json:"scan_ttl,omitempty"`
 	ReadOnly    bool          `json:"read_only,omitempty"`
@@ -29,13 +34,14 @@ type MountConfig struct {
 
 func DefaultMountConfig() *MountConfig {
 	return &MountConfig{
-		Mountpoint:  "/mnt/dfs",
-		MetaDir:     "/var/lib/dfs/metadata",
-		MetricsAddr: "",
-		ScanTTL:     60 * time.Second,
-		UID:         uint32(os.Getuid()),
-		GID:         uint32(os.Getgid()),
-		AllowOther:  false,
+		Mountpoint:      "/mnt/dfs",
+		MetaDir:         "/var/lib/dfs/metadata",
+		CacheQuotaBytes: 1 << 30, // 1 GiB
+		MetricsAddr:     "",
+		ScanTTL:         60 * time.Second,
+		UID:             uint32(os.Getuid()),
+		GID:             uint32(os.Getgid()),
+		AllowOther:      false,
 	}
 }
 
