@@ -101,6 +101,10 @@ func PrometheusHandler(m *Metrics) http.Handler {
 		sb.WriteString("# TYPE nufs_gc_deleted_chunks counter\n")
 		sb.WriteString(fmt.Sprintf("nufs_gc_deleted_chunks %d\n", snap.GCDeletedChunks))
 
+		sb.WriteString("# HELP nufs_gc_orphan_chunks Orphan chunks (no valid owner inode)\n")
+		sb.WriteString("# TYPE nufs_gc_orphan_chunks gauge\n")
+		sb.WriteString(fmt.Sprintf("nufs_gc_orphan_chunks %d\n", snap.GCOrphanChunks))
+
 		// Raft
 		sb.WriteString("# HELP nufs_raft_state Raft state (0=follower, 1=candidate, 2=leader)\n")
 		sb.WriteString("# TYPE nufs_raft_state gauge\n")

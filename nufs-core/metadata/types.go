@@ -104,9 +104,10 @@ const (
 // ReplicaInfo describes a replica location.
 type ReplicaInfo struct {
 	NodeID   NodeID       `json:"node_id"`
-	Addr     string       `json:"addr"` // Data node address (host:port)
-	State    ReplicaState `json:"state"`
-	DiskPath string       `json:"disk_path"` // Local storage path on data node
+	Addr       string       `json:"addr"` // Data node address (host:port)
+	State      ReplicaState `json:"state"`
+	DiskPath   string       `json:"disk_path"`   // Local storage path on data node
+	ShardIndex int          `json:"shard_index"` // EC shard index (0=first data shard, K=first parity)
 }
 
 // ReplicaState represents the sync state of a replica.
@@ -201,6 +202,12 @@ type PlacementPolicy struct {
 	ECConfig          *ECConfig      `json:"ec_config,omitempty"`
 	TopologySpread    TopologySpread `json:"topology_spread"`
 	StorageTier       StorageTier    `json:"storage_tier"`
+	// WriteQuorum controls how many replicas must acknowledge a write
+	// before returning success. 0 = auto (safe default).
+	// 1 = async (fire-and-forget, risk of data loss on primary failure).
+	// For 3-replication, default is 2 (majority).
+	// For EC(K,M), default is K (all data shards must land).
+	WriteQuorum int `json:"write_quorum,omitempty"`
 	// CrossZoneReplication enables async replication to a remote zone.
 	CrossZoneReplication *CrossZoneConfig `json:"cross_zone_replication,omitempty"`
 }
@@ -219,6 +226,26 @@ type ECConfig struct {
 	ParityShards int `json:"parity_shards"` // e.g., 2
 }
 
+// TotalShards returns the total number of shards (data + parity).
+func (ec ECConfig) TotalShards() int {
+	return ec.DataShards + ec.ParityShards
+}
+
+// StorageOverhead returns the space amplification factor.
+// EC(4+2) = 6/4 = 1.5x overhead vs 3x for 3-replication.
+func (ec ECConfig) StorageOverhead() float64 {
+	if ec.DataShards == 0 {
+		return 0
+	}
+	return float64(ec.DataShards+ec.ParityShards) / float64(ec.DataShards)
+}
+
+// MaxFailures returns the maximum number of shard failures that
+// can be tolerated without data loss (equals ParityShards).
+func (ec ECConfig) MaxFailures() int {
+	return ec.ParityShards
+}
+
 // TopologySpread defines the fault domain isolation level.
 type TopologySpread uint8
 
@@ -228,6 +255,51 @@ const (
 	SpreadRack                          // Replicas on different racks
 	SpreadZone                          // Replicas on different AZs/DCs
 )
+
+// EffectiveWriteQuorum returns the minimum number of replica acknowledgements
+// required before a write is considered successful.
+// Default: min(ReplicationFactor, 2) for replication, DataShards for EC.
+func (p PlacementPolicy) EffectiveWriteQuorum() int {
+	if p.WriteQuorum > 0 {
+		return p.WriteQuorum
+	}
+	// EC: all data shards must be written
+	if p.ECConfig != nil && p.ECConfig.DataShards > 0 {
+		return p.ECConfig.DataShards
+	}
+	// Replication: majority (at least 2 for 3-replication)
+	if p.ReplicationFactor <= 1 {
+		return 1
+	}
+	if p.ReplicationFactor == 2 {
+		return 2
+	}
+	// 3+: use majority (N/2 + 1)
+	return p.ReplicationFactor/2 + 1
+}
+
+// EffectiveReadQuorum returns the minimum number of replicas to read
+// to guarantee seeing the latest write. Ensures W + R > N.
+func (p PlacementPolicy) EffectiveReadQuorum() int {
+	n := p.ReplicationFactor
+	if p.ECConfig != nil && p.ECConfig.DataShards > 0 {
+		n = p.ECConfig.TotalShards()
+	}
+	if n <= 0 {
+		return 1
+	}
+	w := p.EffectiveWriteQuorum()
+	r := n - w + 1
+	if r < 1 {
+		r = 1
+	}
+	return r
+}
+
+// IsSyncWrite returns true if writes require more than 1 replica ACK.
+func (p PlacementPolicy) IsSyncWrite() bool {
+	return p.EffectiveWriteQuorum() > 1
+}
 
 // StorageTier defines the storage performance tier.
 type StorageTier uint8

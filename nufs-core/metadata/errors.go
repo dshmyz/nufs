@@ -82,6 +82,10 @@ var (
 	ErrInsufficientNodes = errors.New("metadata: insufficient healthy nodes for placement")
 	ErrPlacementFailed   = errors.New("metadata: failed to satisfy placement constraints")
 	ErrNodeDraining      = errors.New("metadata: node is being decommissioned")
+	// ErrTooManyRequests is returned when a node management operation
+	// (register / heartbeat) exceeds the configured rate limit.
+	// Callers should wait RetryAfter seconds and retry.
+	ErrTooManyRequests = errors.New("metadata: request rate exceeded")
 )
 
 // System errors

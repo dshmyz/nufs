@@ -202,7 +202,7 @@ func (rp *RebalancePlanner) PlanDecommission(nodeID NodeID, nodes []NodeInfo) ([
 		}
 	}
 	if source == nil {
-		return nil, fmt.Errorf("node %d not found", nodeID)
+		return nil, fmt.Errorf("node %d: %w", nodeID, ErrNodeNotFound)
 	}
 
 	var candidates []NodeInfo

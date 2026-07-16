@@ -198,6 +198,12 @@ type ShardedStore struct {
 	ring   *HashRing
 	shards map[ShardID]*PebbleStore
 	mu     sync.RWMutex
+
+	// Node throttling — evaluated at the sharded-store level so a
+	// single incoming RegisterNode/Heartbeat doesn't consume N
+	// tokens across N shards. Individual shard-level throttle is
+	// not used; this is the single source of truth.
+	throttle *NodeRegistrationThrottle
 }
 
 // NewShardedStore creates a sharded metadata store.
@@ -429,8 +435,7 @@ func (sm *ShardManager) findMergeCandidates(shards map[ShardID]*PebbleStore) [][
 }
 
 // getApproxKeyCount returns an approximate key count for a PebbleStore.
-// Uses a limited scan with early exit — good enough for split/merge decisions
-// where exact counts are not required.
+// Uses a full scan — accurate enough for split/merge decisions.
 func getApproxKeyCount(s *PebbleStore) int64 {
 	iter, err := s.db.NewIter(nil)
 	if err != nil {
@@ -438,13 +443,9 @@ func getApproxKeyCount(s *PebbleStore) int64 {
 	}
 	defer iter.Close()
 
-	const sampleLimit = 10000
 	var count int64
 	for iter.First(); iter.Valid(); iter.Next() {
 		count++
-		if count >= sampleLimit {
-			break
-		}
 	}
 	return count
 }
@@ -581,6 +582,16 @@ func (ss *ShardedStore) GetBucket(ctx context.Context, name string) (*BucketInfo
 	return nil, fmt.Errorf("sharded store: no shards available")
 }
 
+func (ss *ShardedStore) GetBucketByRoot(ctx context.Context, rootInode InodeID) (*BucketInfo, error) {
+	ss.mu.RLock()
+	for _, store := range ss.shards {
+		ss.mu.RUnlock()
+		return store.GetBucketByRoot(ctx, rootInode)
+	}
+	ss.mu.RUnlock()
+	return nil, fmt.Errorf("sharded store: no shards available")
+}
+
 // --- NamespaceService ---
 
 func (ss *ShardedStore) MkDir(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error) {
@@ -605,6 +616,14 @@ func (ss *ShardedStore) ReadDir(ctx context.Context, parent InodeID, offset int,
 		return nil, err
 	}
 	return store.ReadDir(ctx, parent, offset, limit)
+}
+
+func (ss *ShardedStore) ReadDirFrom(ctx context.Context, parent InodeID, afterName string, limit int) ([]DirEntry, error) {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return nil, err
+	}
+	return store.ReadDirFrom(ctx, parent, afterName, limit)
 }
 
 func (ss *ShardedStore) CreateFile(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error) {
@@ -694,6 +713,14 @@ func (ss *ShardedStore) AllocateChunk(ctx context.Context, inodeID InodeID, offs
 	return store.AllocateChunk(ctx, inodeID, offset, policy)
 }
 
+func (ss *ShardedStore) AllocateChunksBatch(ctx context.Context, inodeID InodeID, offsets []int64, policy PlacementPolicy) ([]*ChunkMeta, error) {
+	store, err := ss.routeToShard(shardKeyForInode(inodeID))
+	if err != nil {
+		return nil, err
+	}
+	return store.AllocateChunksBatch(ctx, inodeID, offsets, policy)
+}
+
 func (ss *ShardedStore) CommitChunk(ctx context.Context, chunkID ChunkID, checksum uint32) error {
 	store, err := ss.routeToShard(shardKeyForChunk(chunkID))
 	if err != nil {
@@ -760,6 +787,9 @@ func (ss *ShardedStore) ReportChunkState(ctx context.Context, nodeID NodeID, sta
 // --- NodeService ---
 
 func (ss *ShardedStore) RegisterNode(ctx context.Context, info *NodeInfo) error {
+	if ss.throttle != nil && !ss.throttle.Allow(info.ID) {
+		return ErrTooManyRequests
+	}
 	// Broadcast: nodes must be visible on all shards for placement
 	return ss.forEachShard(func(s *PebbleStore) error {
 		return s.RegisterNode(ctx, info)
@@ -767,10 +797,28 @@ func (ss *ShardedStore) RegisterNode(ctx context.Context, info *NodeInfo) error 
 }
 
 func (ss *ShardedStore) Heartbeat(ctx context.Context, nodeID NodeID, report *NodeReport) error {
+	if ss.throttle != nil && !ss.throttle.Allow(nodeID) {
+		return ErrTooManyRequests
+	}
 	// Broadcast to all shards
 	return ss.forEachShard(func(s *PebbleStore) error {
 		return s.Heartbeat(ctx, nodeID, report)
 	})
+}
+
+// SetNodeThrottle installs or replaces the registration/heartbeat rate
+// limiter at the sharded-store level. Passing nil disables throttling.
+func (ss *ShardedStore) SetNodeThrottle(t *NodeRegistrationThrottle) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.throttle = t
+}
+
+// GetNodeThrottle returns the installed limiter (may be nil).
+func (ss *ShardedStore) GetNodeThrottle() *NodeRegistrationThrottle {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	return ss.throttle
 }
 
 func (ss *ShardedStore) DecommissionNode(ctx context.Context, nodeID NodeID) error {

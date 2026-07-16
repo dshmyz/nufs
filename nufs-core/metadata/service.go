@@ -15,6 +15,7 @@ type BucketService interface {
 	DeleteBucket(ctx context.Context, name string) error
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
 	GetBucket(ctx context.Context, name string) (*BucketInfo, error)
+	GetBucketByRoot(ctx context.Context, rootInode InodeID) (*BucketInfo, error)
 }
 
 // NamespaceService defines directory and file namespace operations.
@@ -22,6 +23,7 @@ type NamespaceService interface {
 	MkDir(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error)
 	RmDir(ctx context.Context, parent InodeID, name string) error
 	ReadDir(ctx context.Context, parent InodeID, offset int, limit int) ([]DirEntry, error)
+	ReadDirFrom(ctx context.Context, parent InodeID, afterName string, limit int) ([]DirEntry, error)
 	CreateFile(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error)
 	Unlink(ctx context.Context, parent InodeID, name string) error
 	Lookup(ctx context.Context, parent InodeID, name string) (*InodeMeta, error)
@@ -40,6 +42,7 @@ type InodeService interface {
 // ChunkService defines chunk lifecycle operations.
 type ChunkService interface {
 	AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error)
+	AllocateChunksBatch(ctx context.Context, inodeID InodeID, offsets []int64, policy PlacementPolicy) ([]*ChunkMeta, error)
 	CommitChunk(ctx context.Context, chunkID ChunkID, checksum uint32) error
 	GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error)
 	UpdateChunk(ctx context.Context, chunk *ChunkMeta) error
@@ -125,15 +128,16 @@ type ServiceBundle struct {
 	Metadata MetadataService
 
 	// Production subsystems
-	Events    *EventBus
-	Metrics   *Metrics
-	Health    *HealthChecker
-	Leases    *LeaseManager
-	GC        *ChunkGC
-	Scrub     *Scrubber
-	Raft      *RaftNode
-	Lifecycle *LifecycleEngine
-	Audit     *AuditLogger
+	Events       *EventBus
+	Metrics      *Metrics
+	Health       *HealthChecker
+	Leases       *LeaseManager
+	GC           *ChunkGC
+	Scrub        *Scrubber
+	Raft         *RaftNode
+	Lifecycle    *LifecycleEngine
+	Audit        *AuditLogger
+	AutoBalancer *AutoBalancer
 
 	// Ready channel: closed when all subsystems are initialized
 	Ready chan struct{}
@@ -147,6 +151,9 @@ func (sb *ServiceBundle) Close() error {
 	}
 	if sb.Lifecycle != nil {
 		sb.Lifecycle.Stop()
+	}
+	if sb.AutoBalancer != nil {
+		sb.AutoBalancer.Stop()
 	}
 	if sb.Scrub != nil {
 		sb.Scrub.Stop()
@@ -209,7 +216,7 @@ func NewPebbleServiceBundle(store *PebbleStore, opts ...ServiceOption) (*Service
 
 	// Chunk GC
 	if sopts.GCInterval > 0 {
-		bundle.GC = NewChunkGC(store, bundle.Events, sopts.GCDryRun)
+		bundle.GC = NewChunkGC(store, bundle.Events, bundle.Metrics, sopts.GCDryRun)
 		bundle.GC.Start(sopts.GCInterval)
 	}
 
@@ -231,6 +238,18 @@ func NewPebbleServiceBundle(store *PebbleStore, opts ...ServiceOption) (*Service
 	// Audit logger
 	bundle.Audit = NewAuditLogger(store, defaultAuditConfig())
 
+	// Auto balancer
+	if sopts.AutoBalanceInterval > 0 {
+		bundle.AutoBalancer = NewAutoBalancer(AutoBalancerConfig{
+			Threshold:               sopts.AutoBalanceThreshold,
+			Interval:                sopts.AutoBalanceInterval,
+			MaxConcurrentMigrations: sopts.AutoBalanceMaxConcurrentMigrations,
+		})
+		bundle.AutoBalancer.SetStore(store)
+		bundle.AutoBalancer.SetExecutor(NewRebalanceExecutor(store))
+		bundle.AutoBalancer.Start()
+	}
+
 	// Auto-sync PlacementEngine with node state changes via EventBus
 	store.SetEventBus(bundle.Events)
 	store.placement.SubscribeEvents(bundle.Events)
@@ -245,20 +264,25 @@ func NewPebbleServiceBundle(store *PebbleStore, opts ...ServiceOption) (*Service
 type ServiceOption func(*serviceOptions)
 
 type serviceOptions struct {
-	Version        string
-	LeaseTTL       time.Duration
-	GCInterval     time.Duration
-	GCDryRun       bool
-	ScrubInterval  time.Duration
-	LifecycleRules []LifecycleRule
+	Version                            string
+	LeaseTTL                           time.Duration
+	GCInterval                         time.Duration
+	GCDryRun                           bool
+	ScrubInterval                      time.Duration
+	LifecycleRules                     []LifecycleRule
+	AutoBalanceInterval                time.Duration
+	AutoBalanceThreshold               float64
+	AutoBalanceMaxConcurrentMigrations int
 }
 
 func defaultServiceOptions() *serviceOptions {
 	return &serviceOptions{
-		Version:       "0.2.0",
-		LeaseTTL:      30 * time.Second,
-		GCInterval:    10 * time.Minute,
-		ScrubInterval: 1 * time.Hour,
+		Version:                            "0.2.0",
+		LeaseTTL:                           30 * time.Second,
+		GCInterval:                         10 * time.Minute,
+		ScrubInterval:                      1 * time.Hour,
+		AutoBalanceThreshold:               0.15,
+		AutoBalanceMaxConcurrentMigrations: 10,
 	}
 }
 
@@ -290,4 +314,20 @@ func WithGCDryRun(enabled bool) ServiceOption {
 // WithLifecycleRules sets lifecycle management rules.
 func WithLifecycleRules(rules []LifecycleRule) ServiceOption {
 	return func(o *serviceOptions) { o.LifecycleRules = rules }
+}
+
+// WithAutoBalanceInterval enables periodic automatic rebalance checks.
+// A non-positive interval disables the periodic auto balancer.
+func WithAutoBalanceInterval(d time.Duration) ServiceOption {
+	return func(o *serviceOptions) { o.AutoBalanceInterval = d }
+}
+
+// WithAutoBalanceThreshold sets the imbalance threshold for periodic auto balance.
+func WithAutoBalanceThreshold(threshold float64) ServiceOption {
+	return func(o *serviceOptions) { o.AutoBalanceThreshold = threshold }
+}
+
+// WithAutoBalanceMaxConcurrentMigrations caps migration plans per auto-balance pass.
+func WithAutoBalanceMaxConcurrentMigrations(n int) ServiceOption {
+	return func(o *serviceOptions) { o.AutoBalanceMaxConcurrentMigrations = n }
 }

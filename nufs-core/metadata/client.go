@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/example/dfs/internal/tlsutil"
@@ -111,6 +113,21 @@ func (c *HTTPClient) doRequestWithRetry(ctx context.Context, method, path string
 			continue // Retry on network errors
 		}
 
+		// 429 Too Many Requests — honor Retry-After. We block until the
+		// server says we can try again (short) or give up on this attempt
+		// but keep looping.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
+			wait := parseRetryAfter(resp.Header.Get("Retry-After"), 2*time.Second)
+			select {
+			case <-time.After(wait):
+				lastErr = fmt.Errorf("metadata server returned 429 (throttled)")
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
 		// Handle leader redirect (HTTP 301/307 from follower nodes)
 		if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect {
 			location := resp.Header.Get("Location")
@@ -192,6 +209,29 @@ func (c *HTTPClient) addHeaders(req *http.Request) {
 	}
 }
 
+// parseRetryAfter parses the HTTP Retry-After header (RFC 7231) which may
+// be an integer number of seconds or an HTTP-date. Returns def on parse
+// failure or when header is empty.
+func parseRetryAfter(h string, def time.Duration) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return def
+	}
+	// Try seconds first (most common).
+	if n, err := strconv.Atoi(h); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	// Try HTTP-date (e.g. "Wed, 21 Oct 2015 07:28:00 GMT").
+	if t, err := http.ParseTime(h); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			return def
+		}
+		return d
+	}
+	return def
+}
+
 func (c *HTTPClient) readResponse(resp *http.Response, v interface{}) error {
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -206,6 +246,15 @@ func (c *HTTPClient) readResponse(resp *http.Response, v interface{}) error {
 			}
 			if json.Unmarshal(data, &errResp) == nil && errResp.Code == "node_already_registered" {
 				return ErrNodeAlreadyExists
+			}
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			var errResp struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+			}
+			if json.Unmarshal(data, &errResp) == nil && errResp.Code == "xattr_not_found" {
+				return ErrXAttrNotFound
 			}
 		}
 		return fmt.Errorf("metad: %s (status=%d)", string(data), resp.StatusCode)
@@ -264,6 +313,18 @@ func (c *HTTPClient) GetBucket(ctx context.Context, name string) (*BucketInfo, e
 	return &bucket, nil
 }
 
+func (c *HTTPClient) GetBucketByRoot(ctx context.Context, rootInode InodeID) (*BucketInfo, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, fmt.Sprintf("/api/v1/buckets/by-root/%d", rootInode), nil)
+	if err != nil {
+		return nil, err
+	}
+	var bucket BucketInfo
+	if err := c.readResponse(resp, &bucket); err != nil {
+		return nil, err
+	}
+	return &bucket, nil
+}
+
 // Namespace operations — these are typically handled by the gateway layer
 // but we provide them for completeness.
 
@@ -291,6 +352,19 @@ func (c *HTTPClient) RmDir(ctx context.Context, parent InodeID, name string) err
 
 func (c *HTTPClient) ReadDir(ctx context.Context, parent InodeID, offset int, limit int) ([]DirEntry, error) {
 	path := fmt.Sprintf("/api/v1/namespace/readdir?parent=%d&offset=%d&limit=%d", parent, offset, limit)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var entries []DirEntry
+	if err := c.readResponse(resp, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func (c *HTTPClient) ReadDirFrom(ctx context.Context, parent InodeID, afterName string, limit int) ([]DirEntry, error) {
+	path := fmt.Sprintf("/api/v1/namespace/readdir-from?parent=%d&after=%s&limit=%d", parent, url.QueryEscape(afterName), limit)
 	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
@@ -423,6 +497,19 @@ func (c *HTTPClient) AllocateChunk(ctx context.Context, inodeID InodeID, offset 
 		return nil, err
 	}
 	return &chunk, nil
+}
+
+func (c *HTTPClient) AllocateChunksBatch(ctx context.Context, inodeID InodeID, offsets []int64, policy PlacementPolicy) ([]*ChunkMeta, error) {
+	req := map[string]interface{}{"inode_id": inodeID, "offsets": offsets, "policy": policy}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/chunks/batch", req)
+	if err != nil {
+		return nil, err
+	}
+	var chunks []*ChunkMeta
+	if err := c.readResponse(resp, &chunks); err != nil {
+		return nil, err
+	}
+	return chunks, nil
 }
 
 func (c *HTTPClient) CommitChunk(ctx context.Context, chunkID ChunkID, checksum uint32) error {
@@ -698,7 +785,7 @@ func (c *HTTPClient) advisoryLockCall(ctx context.Context, path string, inode In
 	return c.readResponse(resp, nil)
 }
 
-// ========== Extended attributes (stubs — xattr not yet exposed via HTTP) ==========
+// ========== Extended attributes ==========
 
 func (c *HTTPClient) ComputeAllBucketUsage(ctx context.Context) ([]BucketUsage, error) {
 	path := "/api/v1/admin/bucket-usage"
@@ -714,17 +801,48 @@ func (c *HTTPClient) ComputeAllBucketUsage(ctx context.Context) ([]BucketUsage, 
 	return usage, nil
 }
 
-func (c *HTTPClient) GetXAttr(_ context.Context, _ InodeID, _ string) ([]byte, error) {
-	return nil, ErrXAttrNotFound
+func (c *HTTPClient) GetXAttr(ctx context.Context, id InodeID, name string) ([]byte, error) {
+	path := fmt.Sprintf("/api/v1/inodes/%d/xattrs/%s", id, url.PathEscape(name))
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Value []byte `json:"value"`
+	}
+	if err := c.readResponse(resp, &result); err != nil {
+		return nil, err
+	}
+	return result.Value, nil
 }
-func (c *HTTPClient) SetXAttr(_ context.Context, _ InodeID, _ string, _ []byte) error {
-	return fmt.Errorf("xattr not yet supported over HTTP")
+
+func (c *HTTPClient) SetXAttr(ctx context.Context, id InodeID, name string, value []byte) error {
+	req := map[string][]byte{"value": value}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, fmt.Sprintf("/api/v1/inodes/%d/xattrs/%s", id, url.PathEscape(name)), req)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
 }
-func (c *HTTPClient) ListXAttr(_ context.Context, _ InodeID) (map[string][]byte, error) {
-	return nil, nil
+
+func (c *HTTPClient) ListXAttr(ctx context.Context, id InodeID) (map[string][]byte, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, fmt.Sprintf("/api/v1/inodes/%d/xattrs", id), nil)
+	if err != nil {
+		return nil, err
+	}
+	var attrs map[string][]byte
+	if err := c.readResponse(resp, &attrs); err != nil {
+		return nil, err
+	}
+	return attrs, nil
 }
-func (c *HTTPClient) RemoveXAttr(_ context.Context, _ InodeID, _ string) error {
-	return fmt.Errorf("xattr not yet supported over HTTP")
+
+func (c *HTTPClient) RemoveXAttr(ctx context.Context, id InodeID, name string) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, fmt.Sprintf("/api/v1/inodes/%d/xattrs/%s", id, url.PathEscape(name)), nil)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
 }
 
 // ========== AccessControlService Implementation ==========
@@ -759,4 +877,115 @@ func (c *HTTPClient) DeleteBucketPolicy(ctx context.Context, bucket string) erro
 		return err
 	}
 	return c.readResponse(resp, nil)
+}
+
+// WatchEvent represents a single metadata change event delivered over
+// the watch stream.
+type WatchEvent struct {
+	Type  string    `json:"type"` // "set" or "delete"
+	Key   string    `json:"key"`  // "inode:42", "chunk:123", "bucket:photos"
+	Time  time.Time `json:"time"`
+	Value []byte    `json:"value,omitempty"` // optional serialized payload
+}
+
+// WatchEvents opens a long-lived streaming connection to the metad server
+// and delivers events as they are published. It blocks until ctx is
+// cancelled, the server closes the connection, or an error occurs.
+//
+// prefix filters events by key prefix (e.g. "inode:" or "chunk:"); leave
+// empty for all events. The function returns an error on initial connection
+// failure; afterwards any I/O error just ends the stream cleanly (nil error)
+// so clients can reconnect.
+func (c *HTTPClient) WatchEvents(ctx context.Context, prefix string) ([]WatchEvent, error) {
+	// Build the request URL with query params.
+	u := c.baseURL + "/api/v1/watch"
+	if prefix != "" {
+		u += "?prefix=" + url.QueryEscape(prefix)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.addHeaders(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("watch: status %d", resp.StatusCode)
+	}
+	defer resp.Body.Close()
+
+	// Decode the stream: read ndjson lines, each line is one event.
+	// The channel is unbuffered because consumer runs in this goroutine.
+	var events []WatchEvent
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var e WatchEvent
+		if err := dec.Decode(&e); err != nil {
+			// EOF or connection reset by the server (watchdog timeout)
+			// is a clean shutdown — return events we have, not an error.
+			if err.Error() == "EOF" {
+				return events, nil
+			}
+			return events, nil
+		}
+		events = append(events, e)
+	}
+}
+
+// WatchEventsStream streams events via a channel pattern. It spawns a
+// goroutine that pushes events onto the returned channel; the channel is
+// closed when ctx is cancelled or the stream ends.
+//
+// This is the pattern preferred by gateways that want to continuously
+// invalidate caches as events arrive, not just after the stream closes.
+func (c *HTTPClient) WatchEventsStream(ctx context.Context, prefix string) <-chan WatchEvent {
+	ch := make(chan WatchEvent, 64)
+	go func() {
+		defer close(ch)
+
+		u := c.baseURL + "/api/v1/watch"
+		if prefix != "" {
+			u += "?prefix=" + url.QueryEscape(prefix)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return
+		}
+		c.addHeaders(req)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return
+		}
+		defer resp.Body.Close()
+
+		dec := json.NewDecoder(resp.Body)
+		for {
+			var e WatchEvent
+			if err := dec.Decode(&e); err != nil {
+				// End of stream — client will reconnect.
+				return
+			}
+			// Ignore keep-alive empty events.
+			if e.Key == "" {
+				continue
+			}
+			select {
+			case ch <- e:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
 }

@@ -48,8 +48,11 @@ func (b *SmallFileBlockMeta) FindSmallFile(name string) *SmallFileIndex {
 	return nil
 }
 
-// AddSmallFile adds a file to the block index. Returns false if block is full.
+// AddSmallFile adds a file to the block index. Returns false if block is full or sealed.
 func (b *SmallFileBlockMeta) AddSmallFile(name string, offset uint32, length uint32, crc uint16) bool {
+	if b.Sealed {
+		return false
+	}
 	if b.FileCount >= MaxSmallFilesPerBlock {
 		return false
 	}

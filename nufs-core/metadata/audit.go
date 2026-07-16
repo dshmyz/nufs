@@ -192,27 +192,36 @@ func (al *AuditLogger) flush() {
 		return
 	}
 
-	// Write to Pebble in a batch
-	batch := al.store.db.NewBatch()
-	defer batch.Close()
-
-	for _, rec := range records {
+	// Write to Pebble via the Raft replication path (applyBatchViaRaft).
+	// This ensures audit records are:
+	//   1. Replicated to all Raft peers (cluster-wide durability)
+	//   2. Persisted with pebble.Sync (crash-safe)
+	// Previously flush() called db.NewBatch().Commit(nil) which bypassed
+	// both replication and sync — audit data could be lost on crash or
+	// exist only on a single node.
+	raftOps := make([]BatchOp, 0, len(records))
+	for i, rec := range records {
+		// Generate a unique ID if not set, so records with the same
+		// timestamp don't collide in the keyspace. We append a sequence
+		// number to guarantee uniqueness within a single flush batch.
+		if rec.ID == "" {
+			rec.ID = formatAuditUniqueID(rec.Timestamp, i)
+		}
 		key := []byte(auditKey(rec.Timestamp, rec.ID))
 		val, err := json.Marshal(rec)
 		if err != nil {
 			al.logger.Error("audit marshal failed", "error", err)
 			continue
 		}
-		if err := batch.Set(key, val, nil); err != nil {
-			al.logger.Error("audit batch set failed", "error", err)
-			continue
-		}
+		raftOps = append(raftOps, BatchOp{Key: key, Value: val})
 	}
-
-	if err := batch.Commit(nil); err != nil {
-		al.logger.Error("audit flush failed", "error", err, "records", len(records))
+	if len(raftOps) == 0 {
+		return
+	}
+	if err := al.store.applyBatchViaRaft(raftOps); err != nil {
+		al.logger.Error("audit flush failed", "error", err, "records", len(raftOps))
 	} else {
-		al.logger.Debug("audit flushed", "records", len(records))
+		al.logger.Debug("audit flushed", "records", len(raftOps))
 	}
 }
 
@@ -271,6 +280,14 @@ func formatAuditKey(ts int64, id string) string {
 		return prefixAudit + formatInt64(ts)
 	}
 	return prefixAudit + formatInt64(ts) + "/" + id
+}
+
+// formatAuditUniqueID generates a unique record ID from the timestamp
+// and a sequence number. This prevents key collisions when multiple
+// records share the same nanosecond timestamp (common when records are
+// logged in a tight loop).
+func formatAuditUniqueID(ts int64, seq int) string {
+	return formatInt64(ts) + "-" + formatInt64(int64(seq))
 }
 
 func formatInt64(v int64) string {

@@ -48,11 +48,46 @@ func NewPlacementEngine() *PlacementEngine {
 	}
 }
 
+// NewPlacementEngineWithSeed creates a placement engine with a deterministic
+// RNG seed. This ensures PlaceChunk produces identical results for identical
+// inputs, which is critical for reproducible placement across leader failover.
+func NewPlacementEngineWithSeed(seed int64) *PlacementEngine {
+	return &PlacementEngine{
+		nodes:     make(map[NodeID]*NodeInfo),
+		loadIndex: make(map[NodeID]float64),
+		rng:       rand.New(rand.NewSource(seed)),
+	}
+}
+
 // UpdateNode updates the placement engine's view of a node.
 func (p *PlacementEngine) UpdateNode(info *NodeInfo) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.nodes[info.ID] = info
+}
+
+// GetNodeInfo returns the node info for the given ID directly from
+// the in-memory map, avoiding a Pebble lookup. Returns nil, false if
+// the node is not registered with the placement engine.
+func (p *PlacementEngine) GetNodeInfo(nodeID NodeID) (*NodeInfo, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	info, ok := p.nodes[nodeID]
+	return info, ok
+}
+
+// GetNodeInfosBatch returns node info for multiple IDs in a single
+// call. The result slice has the same length and order as the input;
+// entries for unknown IDs are nil. This avoids N separate Pebble
+// Get calls when building replica lists after PlaceChunk.
+func (p *PlacementEngine) GetNodeInfosBatch(ids []NodeID) []*NodeInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]*NodeInfo, len(ids))
+	for i, id := range ids {
+		result[i] = p.nodes[id] // nil if not present
+	}
+	return result
 }
 
 // UpdateLoad updates the load index for a node.
@@ -123,8 +158,9 @@ func (p *PlacementEngine) PlaceChunk(
 		}
 
 		score := freeCapacity*0.4 + lowLoad*0.3 + tierMatch*0.3
-		// Add jitter to avoid thundering herd
-		score += p.rng.Float64() * 0.05
+		// Deterministic jitter based on node ID to avoid thundering herd
+		// while ensuring reproducible placement across leader failover.
+		score += float64(n.ID%100) * 0.0005
 
 		scored = append(scored, scoredNode{node: n, score: score})
 	}

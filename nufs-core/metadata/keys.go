@@ -8,6 +8,7 @@ const (
 	// Key prefixes for PebbleStore KV layout.
 	// Each prefix defines a separate namespace in the key-value store.
 	prefixBucket      = "/bucket/"
+	prefixBucketByRoot = "/bucket-by-root/" // rootInode → bucket name (reverse index)
 	prefixBucketStats = "/bucket-stats/"
 	prefixNS          = "/ns/"
 	prefixInode       = "/inode/"
@@ -19,4 +20,5 @@ const (
 	prefixACL         = "/acl/"
 	prefixQuota       = "/quota/"
 	prefixQuotaUsage  = "/quota-usage/"
+	prefixFreeList    = "/freelist/" // Recycled inode IDs
 )

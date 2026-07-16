@@ -63,6 +63,7 @@ type Metrics struct {
 	GCScannedBytes   atomic.Int64
 	GCFreedBytes     atomic.Int64
 	GCLastDurationMs atomic.Int64
+	GCOrphanChunks   atomic.Int64 // Orphan chunks detected (no valid owner inode)
 
 	// Repair / Rebalance
 	RepairTasksQueued   atomic.Int64
@@ -156,6 +157,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		GCScannedBytes:   m.GCScannedBytes.Load(),
 		GCFreedBytes:     m.GCFreedBytes.Load(),
 		GCLastDurationMs: m.GCLastDurationMs.Load(),
+		GCOrphanChunks:   m.GCOrphanChunks.Load(),
 		RepairTasksQueued:    m.RepairTasksQueued.Load(),
 		RepairTasksCompleted: m.RepairTasksCompleted.Load(),
 		RebalanceBytesMoved:  m.RebalanceBytesMoved.Load(),
@@ -205,6 +207,7 @@ type MetricsSnapshot struct {
 	GCScannedBytes   int64 `json:"gc_scanned_bytes"`
 	GCFreedBytes     int64 `json:"gc_freed_bytes"`
 	GCLastDurationMs int64 `json:"gc_last_duration_ms"`
+	GCOrphanChunks   int64 `json:"gc_orphan_chunks"`
 
 	// Repair / Rebalance
 	RepairTasksQueued    int64 `json:"repair_tasks_queued"`

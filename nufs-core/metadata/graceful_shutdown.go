@@ -22,6 +22,7 @@ import (
 type ShutdownDrain struct {
 	mu       sync.Mutex
 	wg       sync.WaitGroup
+	counter  atomic.Int64 // tracks in-flight count for diagnostics
 	shutdown atomic.Bool
 	timeout  time.Duration
 }
@@ -38,9 +39,11 @@ func (d *ShutdownDrain) Begin() bool {
 		return false
 	}
 	d.wg.Add(1)
+	d.counter.Add(1)
 	// Double-check after Add to avoid race with Shutdown
 	if d.shutdown.Load() {
 		d.wg.Done()
+		d.counter.Add(-1)
 		return false
 	}
 	return true
@@ -48,12 +51,15 @@ func (d *ShutdownDrain) Begin() bool {
 
 // End marks an in-flight operation as complete.
 func (d *ShutdownDrain) End() {
+	d.counter.Add(-1)
 	d.wg.Done()
 }
 
 // Shutdown initiates graceful drain. It first marks the store as
 // shutting down (rejecting new requests), then waits for in-flight
 // operations to complete up to the configured timeout.
+// If operations remain after timeout, it logs a warning and returns
+// an error with the count of remaining operations.
 func (d *ShutdownDrain) Shutdown() error {
 	d.shutdown.Store(true)
 
@@ -67,7 +73,13 @@ func (d *ShutdownDrain) Shutdown() error {
 	case <-done:
 		return nil
 	case <-time.After(d.timeout):
-		return fmt.Errorf("shutdown: timed out after %s waiting for in-flight operations", d.timeout)
+		// Count remaining in-flight operations
+		remaining := int(d.counter.Load())
+		if remaining > 0 {
+			slog.Warn("shutdown: timed out waiting for in-flight operations",
+				"remaining", remaining, "timeout", d.timeout)
+		}
+		return fmt.Errorf("shutdown: timed out after %s with %d in-flight operations remaining", d.timeout, remaining)
 	}
 }
 
@@ -313,6 +325,78 @@ func (rl *RateLimiter) Remove(key string) {
 	rl.mu.Lock()
 	delete(rl.buckets, key)
 	rl.mu.Unlock()
+}
+
+// Burst returns the maximum burst size.
+func (rl *RateLimiter) Burst() int {
+	return rl.burst
+}
+
+// Available returns the number of tokens available for the given key.
+func (rl *RateLimiter) Available(key string) int {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	b, ok := rl.buckets[key]
+	if !ok {
+		return rl.burst
+	}
+
+	// Calculate tokens without modifying state
+	now := time.Now()
+	elapsed := now.Sub(b.lastTime).Seconds()
+	tokens := b.tokens + elapsed*rl.rate
+	if tokens > float64(rl.burst) {
+		tokens = float64(rl.burst)
+	}
+	return int(tokens)
+}
+
+// WaitTime returns how long until the next token is available for the key.
+func (rl *RateLimiter) WaitTime(key string) time.Duration {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	b, ok := rl.buckets[key]
+	if !ok {
+		return 0
+	}
+
+	if b.tokens >= 1.0 {
+		return 0
+	}
+
+	// Time to accumulate 1 token
+	tokensNeeded := 1.0 - b.tokens
+	waitSeconds := tokensNeeded / rl.rate
+	return time.Duration(waitSeconds * float64(time.Second))
+}
+
+// StartCleanup starts a background goroutine that periodically removes
+// stale rate limit buckets to prevent unbounded memory growth.
+// Call stop() to terminate the goroutine.
+func (rl *RateLimiter) StartCleanup(interval time.Duration) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				rl.mu.Lock()
+				now := time.Now()
+				for key, b := range rl.buckets {
+					if now.Sub(b.lastTime) > 5*interval {
+						delete(rl.buckets, key)
+					}
+				}
+				rl.mu.Unlock()
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 // ============================================================

@@ -42,6 +42,11 @@ func NewECEncoder(dataShards, parityShards int) *ECEncoder {
 
 // Encode splits data into K data shards and computes M parity shards.
 // The data is padded to a multiple of K shard size.
+//
+// Optimization (P3.12): data shards reference the freshly-allocated
+// padded buffer directly — no extra copy. Only parity shards are
+// allocated separately (they're filled by the encoder). This halves
+// the allocations for large writes.
 func (ec *ECEncoder) Encode(data []byte) (*ECResult, error) {
 	k := ec.DataShards
 	m := ec.ParityShards
@@ -51,7 +56,8 @@ func (ec *ECEncoder) Encode(data []byte) (*ECResult, error) {
 	padded := make([]byte, paddedLen)
 	copy(padded, data)
 
-	// Split into shards
+	// Split into shards — data shards slice into padded (no copy),
+	// parity shards get their own buffers.
 	shards := make([][]byte, k+m)
 	for i := 0; i < k; i++ {
 		shards[i] = padded[i*shardSize : (i+1)*shardSize]
@@ -65,22 +71,14 @@ func (ec *ECEncoder) Encode(data []byte) (*ECResult, error) {
 		return nil, fmt.Errorf("ec: encode: %w", err)
 	}
 
+	// Build result: data shards reference padded (no extra copy),
+	// parity shards reference their buffers directly. The shards
+	// slice is local and won't be reused, so this is safe.
 	result := &ECResult{
-		DataShards:   make([][]byte, k),
-		ParityShards: make([][]byte, m),
+		DataShards:   shards[:k],
+		ParityShards: shards[k:],
 		TotalShards:  k + m,
 	}
-	for i := 0; i < k; i++ {
-		copied := make([]byte, shardSize)
-		copy(copied, shards[i])
-		result.DataShards[i] = copied
-	}
-	for j := 0; j < m; j++ {
-		copied := make([]byte, shardSize)
-		copy(copied, shards[k+j])
-		result.ParityShards[j] = copied
-	}
-
 	return result, nil
 }
 

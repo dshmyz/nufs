@@ -99,6 +99,13 @@ func (le *LifecycleEngine) Stop() {
 	le.wg.Wait()
 }
 
+// ExecuteOnce runs the currently registered lifecycle rules synchronously.
+// It is used by ops paths and tests that need deterministic execution without
+// waiting for the periodic ticker.
+func (le *LifecycleEngine) ExecuteOnce(ctx context.Context) error {
+	return le.execute(ctx)
+}
+
 func (le *LifecycleEngine) execute(ctx context.Context) error {
 	le.mu.RLock()
 	rules := make(map[string][]LifecycleRule)
@@ -185,7 +192,11 @@ func (le *LifecycleEngine) walkDir(ctx context.Context, dirID InodeID, bucket, p
 			}
 
 			relPath := prefix + entry.Name
-			fileAge := now.Sub(time.Unix(0, meta.CTime))
+			ageTime := meta.MTime
+			if ageTime == 0 {
+				ageTime = meta.CTime
+			}
+			fileAge := now.Sub(time.Unix(0, ageTime))
 
 			for _, rule := range rules {
 				// Prefix matching (S3 semantics: prefix must match at path boundary)

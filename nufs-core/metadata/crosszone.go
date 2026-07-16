@@ -12,12 +12,17 @@ import (
 // re-enqueued for cross-zone replication before being discarded.
 const maxReplicationRetries = 10
 
+// maxPendingAge is the maximum age of a pending replication before it's discarded.
+// This implements the 72h retention policy for cross-zone replication logs.
+const maxPendingAge = 72 * time.Hour
+
 // pendingChunk holds the context needed to replicate a chunk to a remote zone.
 type pendingChunk struct {
 	bucket   string
 	inodeID  InodeID
 	offset   int64
 	retries  int
+	enqueued time.Time // Track when this was enqueued for 72h retention
 }
 
 // CrossZoneReplicator manages async replication of chunks to a remote zone.
@@ -45,6 +50,22 @@ type CrossZoneReplicator struct {
 	// dataTransferer triggers datanode-to-datanode chunk data transfer.
 	// When nil, only metadata is replicated (legacy behavior).
 	dataTransferer DataTransferer
+
+	// wal provides persistent storage for pending replications.
+	// When nil, pending queue is only in-memory (lost on restart).
+	wal WALWriter
+}
+
+// WALWriter defines the interface for persisting pending replications.
+// Implementations should write to durable storage (WAL, local file, etc.)
+// to survive restarts.
+type WALWriter interface {
+	// WritePending persists a pending chunk entry.
+	WritePending(chunkID ChunkID, info pendingChunk) error
+	// ReadPending returns all persisted pending chunks for recovery.
+	ReadPending() (map[ChunkID]pendingChunk, error)
+	// DeletePending removes a persisted pending chunk after successful replication.
+	DeletePending(chunkID ChunkID) error
 }
 
 // DataTransferer triggers the actual chunk data transfer between datanodes
@@ -81,6 +102,15 @@ func (r *CrossZoneReplicator) SetDataTransferer(dt DataTransferer) {
 	r.dataTransferer = dt
 }
 
+// SetWAL configures persistent storage for pending replications.
+// If a WAL is configured, pending replications survive restarts.
+// Must be called before Start().
+func (r *CrossZoneReplicator) SetWAL(wal WALWriter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.wal = wal
+}
+
 // Enqueue adds a chunk to the replication queue for the given bucket.
 // The bucket's PlacementPolicy.CrossZoneReplication determines the target zone.
 // inodeID and offset are required so the remote zone can allocate the chunk
@@ -88,10 +118,21 @@ func (r *CrossZoneReplicator) SetDataTransferer(dt DataTransferer) {
 func (r *CrossZoneReplicator) Enqueue(chunkID ChunkID, bucket string, inodeID InodeID, offset int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.pending[chunkID] = pendingChunk{
-		bucket:  bucket,
-		inodeID: inodeID,
-		offset:  offset,
+
+	info := pendingChunk{
+		bucket:   bucket,
+		inodeID:  inodeID,
+		offset:   offset,
+		enqueued: time.Now(),
+	}
+	r.pending[chunkID] = info
+
+	// Persist to WAL if configured
+	if r.wal != nil {
+		if err := r.wal.WritePending(chunkID, info); err != nil {
+			slog.Warn("cross-zone: failed to persist pending chunk to WAL",
+				"chunkID", chunkID, "error", err)
+		}
 	}
 }
 
@@ -104,6 +145,28 @@ func (r *CrossZoneReplicator) Start() {
 	}
 	r.running = true
 	r.stopCh = make(chan struct{})
+
+	// Recover pending queue from WAL if configured
+	if r.wal != nil {
+		if recovered, err := r.wal.ReadPending(); err != nil {
+			slog.Warn("cross-zone: failed to recover pending from WAL", "error", err)
+		} else if len(recovered) > 0 {
+			slog.Info("cross-zone: recovered pending chunks from WAL", "count", len(recovered))
+			for chunkID, info := range recovered {
+				// Check if the pending chunk has exceeded max age
+				if time.Since(info.enqueued) > maxPendingAge {
+					// Delete expired entry from WAL
+					if delErr := r.wal.DeletePending(chunkID); delErr != nil {
+						slog.Warn("cross-zone: failed to delete expired pending from WAL",
+							"chunkID", chunkID, "error", delErr)
+					}
+					continue
+				}
+				r.pending[chunkID] = info
+			}
+		}
+	}
+
 	r.mu.Unlock()
 
 	r.wg.Add(1)
@@ -154,6 +217,7 @@ func (r *CrossZoneReplicator) drainQueue() {
 		clients[k] = v
 	}
 	dt := r.dataTransferer
+	wal := r.wal
 	r.mu.Unlock()
 
 	if len(batch) == 0 {
@@ -170,6 +234,20 @@ func (r *CrossZoneReplicator) drainQueue() {
 	}
 	zoneChunks := make(map[string][]zoneChunk)
 	for chunkID, info := range batch {
+		// Check if the pending chunk has exceeded max age (72h)
+		if time.Since(info.enqueued) > maxPendingAge {
+			slog.Warn("cross-zone: discarding chunk after max age (72h)",
+				"chunkID", chunkID, "enqueued", info.enqueued)
+			// Clean up WAL entry
+			if wal != nil {
+				if err := wal.DeletePending(chunkID); err != nil {
+					slog.Warn("cross-zone: failed to delete expired WAL entry",
+						"chunkID", chunkID, "error", err)
+				}
+			}
+			continue
+		}
+
 		bi, err := r.store.GetBucket(ctx, info.bucket)
 		if err != nil || bi == nil {
 			continue
@@ -202,6 +280,14 @@ func (r *CrossZoneReplicator) drainQueue() {
 				slog.Error("cross-zone: replication failed",
 					"chunkID", zc.chunkID, "zone", zone, "error", err)
 				r.reEnqueueOne(zc.chunkID, zc.info)
+			} else {
+				// Replication succeeded - delete WAL entry
+				if wal != nil {
+					if err := wal.DeletePending(zc.chunkID); err != nil {
+						slog.Warn("cross-zone: failed to delete WAL entry after success",
+							"chunkID", zc.chunkID, "error", err)
+					}
+				}
 			}
 		}
 	}
@@ -231,6 +317,13 @@ func (r *CrossZoneReplicator) reEnqueueLocked(chunkID ChunkID, info pendingChunk
 	if info.retries > maxReplicationRetries {
 		slog.Warn("cross-zone: discarding chunk after max retries",
 			"chunkID", chunkID, "retries", info.retries)
+		// Clean up WAL entry since we're discarding this chunk
+		if r.wal != nil {
+			if err := r.wal.DeletePending(chunkID); err != nil {
+				slog.Warn("cross-zone: failed to delete WAL entry",
+					"chunkID", chunkID, "error", err)
+			}
+		}
 		return
 	}
 	r.pending[chunkID] = info
@@ -240,8 +333,15 @@ func (r *CrossZoneReplicator) reEnqueueLocked(chunkID ChunkID, info pendingChunk
 // service and then triggers the actual data transfer if a DataTransferer is
 // configured. Without a DataTransferer, only metadata is replicated.
 func (r *CrossZoneReplicator) replicateChunk(ctx context.Context, remote MetadataService, dt DataTransferer, chunkID ChunkID, info pendingChunk) error {
+	// Look up the bucket's policy to determine replication factor
+	replFactor := 1
+	if bucket, err := r.store.GetBucket(ctx, info.bucket); err == nil && bucket != nil {
+		if bucket.Policy.ReplicationFactor > 0 {
+			replFactor = bucket.Policy.ReplicationFactor
+		}
+	}
 	remotePolicy := PlacementPolicy{
-		ReplicationFactor: 1,
+		ReplicationFactor: replFactor,
 		TopologySpread:    SpreadZone,
 	}
 	remoteMeta, err := remote.AllocateChunk(ctx, info.inodeID, info.offset, remotePolicy)

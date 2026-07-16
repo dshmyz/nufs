@@ -76,19 +76,62 @@ type lockState struct {
 	holders map[string]*lockHolder
 }
 
-// advisoryLockManager is the central lock table. It is owned by
-// PebbleStore and accessed under mu; the per-inode state is itself
-// protected by mu (no per-inode mutexes — the per-inode state is
-// short-lived and contended only at the moment of acquire/release,
-// so the global mutex is fine at the scales we care about).
-type advisoryLockManager struct {
+// lockShard groups several inodes under one mutex. The number of
+// shards is a power of two so that shardFor can use a bitmask
+// instead of a modulo, and the shards are independent so that
+// operations on inodes in different shards proceed in parallel.
+type lockShard struct {
 	mu    sync.Mutex
 	locks map[InodeID]*lockState
 }
 
-// newAdvisoryLockManager returns an empty lock table.
+// advisoryLockManager is the central lock table. It is owned by
+// PebbleStore. Inodes are hashed across shardCount shards; each
+// shard has its own mutex, so lock operations on different inodes
+// only contend when they happen to land in the same shard. This
+// avoids the global-mutex bottleneck at high concurrency (P1.6).
+type advisoryLockManager struct {
+	shards     []*lockShard
+	shardCount uint
+}
+
+// defaultLockShardCount is 32 — enough to reduce contention for
+// typical workloads (hundreds of concurrent lockers) while keeping
+// memory overhead trivial (32 empty maps).
+const defaultLockShardCount = 32
+
+// newAdvisoryLockManager returns an empty lock table with
+// defaultLockShardCount shards.
 func newAdvisoryLockManager() *advisoryLockManager {
-	return &advisoryLockManager{locks: make(map[InodeID]*lockState)}
+	return &advisoryLockManager{
+		shards:     newLockShards(defaultLockShardCount),
+		shardCount: defaultLockShardCount,
+	}
+}
+
+// newLockShards allocates n independent lock shards.
+func newLockShards(n uint) []*lockShard {
+	shards := make([]*lockShard, n)
+	for i := range shards {
+		shards[i] = &lockShard{locks: make(map[InodeID]*lockState)}
+	}
+	return shards
+}
+
+// shardFor returns the shard index for the given inode. Uses FNV-1a
+// for a cheap, well-distributed hash; the bitmask works because
+// shardCount is a power of two.
+func (m *advisoryLockManager) shardFor(inode InodeID) uint {
+	h := uint64(inode)
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	return uint(h) & (m.shardCount - 1)
+}
+
+// shard returns the lockShard for the given inode.
+func (m *advisoryLockManager) shard(inode InodeID) *lockShard {
+	return m.shards[m.shardFor(inode)]
 }
 
 // validateOwner rejects empty or whitespace-only owners. We do not
@@ -109,13 +152,14 @@ func (m *advisoryLockManager) acquire(inode InodeID, owner string, mode LockMode
 		return err
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	shard := m.shard(inode)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	state, ok := m.locks[inode]
+	state, ok := shard.locks[inode]
 	if !ok {
 		state = &lockState{holders: make(map[string]*lockHolder)}
-		m.locks[inode] = state
+		shard.locks[inode] = state
 	}
 
 	// Same-owner re-entry: bump the refcount and accept the request
@@ -163,10 +207,11 @@ func (m *advisoryLockManager) release(inode InodeID, owner string) error {
 		return err
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	shard := m.shard(inode)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	state, ok := m.locks[inode]
+	state, ok := shard.locks[inode]
 	if !ok {
 		return nil
 	}
@@ -179,7 +224,7 @@ func (m *advisoryLockManager) release(inode InodeID, owner string) error {
 		delete(state.holders, owner)
 	}
 	if len(state.holders) == 0 {
-		delete(m.locks, inode)
+		delete(shard.locks, inode)
 	}
 	return nil
 }
@@ -188,10 +233,11 @@ func (m *advisoryLockManager) release(inode InodeID, owner string) error {
 // The result is detached from internal state so the caller can
 // iterate without holding the lock manager mutex.
 func (m *advisoryLockManager) list(inode InodeID) []LockInfo {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	shard := m.shard(inode)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	state, ok := m.locks[inode]
+	state, ok := shard.locks[inode]
 	if !ok {
 		return nil
 	}

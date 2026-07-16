@@ -274,6 +274,8 @@ func (s *PebbleStore) GetInodeWithVersion(ctx context.Context, id InodeID) (*Ino
 // ============================================================
 
 // LeaseManager monitors node heartbeats and marks offline nodes.
+// Uses an in-memory index of online nodes for O(log n) expiration checks
+// instead of scanning all nodes.
 type LeaseManager struct {
 	store         *PebbleStore
 	events        *EventBus
@@ -285,6 +287,19 @@ type LeaseManager struct {
 	// Retry configuration for marking nodes offline
 	maxRetries   int
 	retryBackoff time.Duration
+
+	// In-memory index of online nodes sorted by LastSeen time.
+	// Enables O(log n) expiration checks instead of O(n) full scan.
+	mu          sync.RWMutex
+	nodesByLast map[NodeID]*nodeExpiry // nodeID -> expiry info
+	sortedNodes []*nodeExpiry          // min-heap by LastSeen
+}
+
+type nodeExpiry struct {
+	nodeID   NodeID
+	key      string // Pebble key for Raft update
+	lastSeen int64  // UnixNano
+	heapIdx  int    // index in sortedNodes heap
 }
 
 // NewLeaseManager creates a lease manager for node liveness detection.
@@ -300,6 +315,8 @@ func NewLeaseManager(store *PebbleStore, events *EventBus, ttl time.Duration) *L
 		stopCh:        make(chan struct{}),
 		maxRetries:    3,
 		retryBackoff:  time.Second,
+		nodesByLast:   make(map[NodeID]*nodeExpiry),
+		sortedNodes:   make([]*nodeExpiry, 0, 1024),
 	}
 }
 
@@ -308,7 +325,81 @@ func (lm *LeaseManager) Start() {
 	if lm.running.Swap(true) {
 		return
 	}
+	// Build initial index from store
+	lm.buildIndex()
 	go lm.loop()
+}
+
+// buildIndex loads all online nodes into the in-memory index.
+func (lm *LeaseManager) buildIndex() {
+	lm.store.scanPrefix(prefixNode, func(key, val []byte) error {
+		var info NodeInfo
+		if err := unmarshalValue(val, &info); err != nil {
+			return nil
+		}
+		if info.State == NodeOnline {
+			lm.addNode(&nodeExpiry{
+				nodeID:   info.ID,
+				key:      string(key),
+				lastSeen: info.LastSeen,
+			})
+		}
+		return nil
+	})
+	lm.heapify()
+	slog.Info("lease: index built", "online_nodes", len(lm.sortedNodes))
+}
+
+// addNode adds a node to the in-memory index (caller must hold mu).
+func (lm *LeaseManager) addNode(n *nodeExpiry) {
+	lm.nodesByLast[n.nodeID] = n
+	lm.sortedNodes = append(lm.sortedNodes, n)
+}
+
+// heapify builds the min-heap from the unsorted slice.
+func (lm *LeaseManager) heapify() {
+	n := len(lm.sortedNodes)
+	for i := n/2 - 1; i >= 0; i-- {
+		lm.down(i, n)
+	}
+	for i, node := range lm.sortedNodes {
+		node.heapIdx = i
+	}
+}
+
+func (lm *LeaseManager) down(i, n int) {
+	for {
+		left := 2*i + 1
+		right := 2*i + 2
+		smallest := i
+		if left < n && lm.sortedNodes[left].lastSeen < lm.sortedNodes[smallest].lastSeen {
+			smallest = left
+		}
+		if right < n && lm.sortedNodes[right].lastSeen < lm.sortedNodes[smallest].lastSeen {
+			smallest = right
+		}
+		if smallest == i {
+			break
+		}
+		lm.sortedNodes[i], lm.sortedNodes[smallest] = lm.sortedNodes[smallest], lm.sortedNodes[i]
+		lm.sortedNodes[i].heapIdx = i
+		lm.sortedNodes[smallest].heapIdx = smallest
+		i = smallest
+	}
+}
+
+// up restores heap property after increasing lastSeen.
+func (lm *LeaseManager) up(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if lm.sortedNodes[i].lastSeen >= lm.sortedNodes[parent].lastSeen {
+			break
+		}
+		lm.sortedNodes[i], lm.sortedNodes[parent] = lm.sortedNodes[parent], lm.sortedNodes[i]
+		lm.sortedNodes[i].heapIdx = i
+		lm.sortedNodes[parent].heapIdx = parent
+		i = parent
+	}
 }
 
 // Stop terminates the lease monitoring loop.
@@ -336,60 +427,100 @@ func (lm *LeaseManager) checkExpiredNodes() {
 	now := time.Now().UnixNano()
 	deadline := now - lm.ttl.Nanoseconds()
 
-	lm.store.scanPrefix(prefixNode, func(key, val []byte) error {
-		var info NodeInfo
-		if err := unmarshalValue(val, &info); err != nil {
-			return nil
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	// Pop expired nodes from min-heap (sorted by oldest lastSeen first)
+	for len(lm.sortedNodes) > 0 {
+		oldest := lm.sortedNodes[0]
+		if oldest.lastSeen >= deadline {
+			break // no more expired nodes
 		}
-		if info.State == NodeOnline && info.LastSeen < deadline {
-			// Node missed heartbeat — mark offline via Raft
-			info.State = NodeOffline
-			info.LastSeen = now
-			data, err := marshalValue(&info, codecMsgpack)
-			if err != nil {
-				slog.Error("lease: marshal node", "node_id", info.ID, "error", err)
-				return nil
-			}
 
-			// Retry marker via Raft with exponential backoff
-			var lastErr error
-			for attempt := 0; attempt <= lm.maxRetries; attempt++ {
-				if attempt > 0 {
-					backoff := lm.retryBackoff * time.Duration(1<<(attempt-1))
-					time.Sleep(backoff)
-					slog.Warn("lease: retrying mark node offline",
-						"node_id", info.ID, "attempt", attempt, "max_retries", lm.maxRetries)
-				}
-				if err := lm.store.applyViaRaft(OpSet, string(key), data); err != nil {
-					lastErr = err
-					continue
-				}
-				lastErr = nil
-				break
-			}
-			if lastErr != nil {
-				slog.Error("lease: failed to mark node offline after retries",
-					"node_id", info.ID, "error", lastErr)
-				return nil
-			}
+		// Pop from heap
+		lm.popMin()
 
-			slog.Warn("lease: node marked offline", "node_id", info.ID, "offline_since", time.Since(time.Unix(0, info.LastSeen)))
-
-			// Publish critical event using blocking send — must not be dropped
-			if lm.events != nil {
-				eventData, _ := marshalValue(map[string]interface{}{
-					"node_id": info.ID,
-					"state":   "offline",
-				}, codecMsgpack)
-				lm.events.PublishOrBlock(Event{
-					Type:  EventSet,
-					Key:   string(key),
-					Value: eventData,
-				})
-			}
+		// Mark node offline
+		info := &NodeInfo{ID: oldest.nodeID, State: NodeOffline, LastSeen: now}
+		data, err := marshalValue(info, codecMsgpack)
+		if err != nil {
+			slog.Error("lease: marshal node", "node_id", oldest.nodeID, "error", err)
+			continue
 		}
+
+		var lastErr error
+		for attempt := 0; attempt <= lm.maxRetries; attempt++ {
+			if attempt > 0 {
+				backoff := lm.retryBackoff * time.Duration(1<<(attempt-1))
+				time.Sleep(backoff)
+				slog.Warn("lease: retrying mark node offline",
+					"node_id", oldest.nodeID, "attempt", attempt, "max_retries", lm.maxRetries)
+			}
+			if err := lm.store.applyViaRaft(OpSet, oldest.key, data); err != nil {
+				lastErr = err
+				continue
+			}
+			lastErr = nil
+			break
+		}
+		if lastErr != nil {
+			slog.Error("lease: failed to mark node offline after retries",
+				"node_id", oldest.nodeID, "error", lastErr)
+			continue
+		}
+
+		slog.Warn("lease: node marked offline", "node_id", oldest.nodeID,
+			"offline_since", time.Since(time.Unix(0, oldest.lastSeen)))
+
+		if lm.events != nil {
+			eventData, _ := marshalValue(map[string]interface{}{
+				"node_id": oldest.nodeID,
+				"state":   "offline",
+			}, codecMsgpack)
+			lm.events.PublishOrBlock(Event{
+				Type:  EventSet,
+				Key:   oldest.key,
+				Value: eventData,
+			})
+		}
+	}
+}
+
+// popMin removes and returns the minimum element from the heap.
+func (lm *LeaseManager) popMin() *nodeExpiry {
+	if len(lm.sortedNodes) == 0 {
 		return nil
-	})
+	}
+	min := lm.sortedNodes[0]
+	delete(lm.nodesByLast, min.nodeID)
+
+	last := len(lm.sortedNodes) - 1
+	if last > 0 {
+		lm.sortedNodes[0] = lm.sortedNodes[last]
+		lm.sortedNodes[0].heapIdx = 0
+		lm.sortedNodes = lm.sortedNodes[:last]
+		lm.down(0, len(lm.sortedNodes))
+	} else {
+		lm.sortedNodes = lm.sortedNodes[:0]
+	}
+	return min
+}
+
+// UpdateNode updates a node's lastSeen time in the index.
+// Called when a heartbeat is received.
+func (lm *LeaseManager) UpdateNode(nodeID NodeID, key string, lastSeen int64) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	if existing, ok := lm.nodesByLast[nodeID]; ok {
+		existing.lastSeen = lastSeen
+		lm.up(existing.heapIdx)
+	} else {
+		n := &nodeExpiry{nodeID: nodeID, key: key, lastSeen: lastSeen}
+		lm.addNode(n)
+		// Bubble up since new node might have oldest lastSeen
+		lm.up(n.heapIdx)
+	}
 }
 
 // ============================================================
@@ -400,6 +531,7 @@ func (lm *LeaseManager) checkExpiredNodes() {
 type ChunkGC struct {
 	store   *PebbleStore
 	events  *EventBus
+	metrics *Metrics
 	dryRun  bool
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
@@ -407,12 +539,13 @@ type ChunkGC struct {
 }
 
 // NewChunkGC creates a chunk garbage collector.
-func NewChunkGC(store *PebbleStore, events *EventBus, dryRun bool) *ChunkGC {
+func NewChunkGC(store *PebbleStore, events *EventBus, metrics *Metrics, dryRun bool) *ChunkGC {
 	return &ChunkGC{
-		store:  store,
-		events: events,
-		dryRun: dryRun,
-		stopCh: make(chan struct{}),
+		store:   store,
+		events:  events,
+		metrics: metrics,
+		dryRun:  dryRun,
+		stopCh:  make(chan struct{}),
 	}
 }
 
@@ -426,34 +559,18 @@ type GCScanResult struct {
 }
 
 // Scan performs one pass of orphan chunk detection and cleanup.
-// Uses batch size limits to bound memory usage.
+// Uses a Bloom filter for memory-efficient reference tracking.
+// Phase 1 scans all chunks to count them. Phase 2 scans inodes to build
+// a Bloom filter of referenced chunks. Phase 3 scans chunks again and
+// deletes those not in the referenced set.
 func (gc *ChunkGC) Scan(ctx context.Context) (*GCScanResult, error) {
 	start := time.Now()
 	result := &GCScanResult{}
 
-	// Phase 1: Collect all chunk IDs referenced by inodes via streaming scan
-	referencedChunks := make(map[ChunkID]bool)
-	err := gc.store.scanPrefix(prefixInode, func(key, val []byte) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		var meta InodeMeta
-		if err := unmarshalValue(val, &meta); err != nil {
-			return nil
-		}
-		for _, ref := range meta.ChunkMap {
-			referencedChunks[ref.ID] = true
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("gc scan inodes: %w", err)
-	}
-
-	// Phase 2: Find orphan chunks — process in batches to limit memory
-	slog.Info("gc: phase 1 complete, referenced chunks", "count", len(referencedChunks))
-
-	err = gc.store.scanPrefix(prefixChunk, func(key, val []byte) error {
+	// Phase 1: Count total chunks and collect IDs for deletion check.
+	// We store chunk IDs in a slice (8 bytes each) for Phase 3 iteration.
+	var allChunkIDs []ChunkID
+	err := gc.store.scanPrefix(prefixChunk, func(key, val []byte) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -462,23 +579,81 @@ func (gc *ChunkGC) Scan(ctx context.Context) (*GCScanResult, error) {
 		if err := unmarshalValue(val, &chunk); err != nil {
 			return nil
 		}
-		if !referencedChunks[chunk.ID] {
-			// Delete orphan immediately rather than batching to limit memory
-			result.OrphanChunks++
-			if !gc.dryRun {
-				if delErr := gc.store.DeleteChunk(ctx, chunk.ID); delErr != nil {
-					slog.Error("gc: delete chunk failed", "chunk_id", chunk.ID, "error", delErr)
-					return nil
-				}
-			}
-			result.DeletedChunks++
-			result.FreedBytes += int64(chunk.Size)
-		}
+		allChunkIDs = append(allChunkIDs, chunk.ID)
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gc scan chunks: %w", err)
 	}
+	slog.Info("gc: phase 1 complete, total chunks", "count", len(allChunkIDs))
+
+	// Phase 2: Build a referenced chunk index by scanning inodes. Use an exact
+	// set for normal-sized scans so GC decisions are deterministic; fall back
+	// to Bloom for very large scans to cap memory.
+	const exactGCReferenceLimit = 1_000_000
+	useExact := len(allChunkIDs) <= exactGCReferenceLimit
+	referencedExact := make(map[ChunkID]struct{})
+	var referencedBloom *BloomFilter
+	if !useExact {
+		referencedBloom = NewBloomFilter(len(allChunkIDs), 0.01)
+	}
+	referencedCount := 0
+	err = gc.store.scanPrefix(prefixInode, func(key, val []byte) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var meta InodeMeta
+		if err := unmarshalValue(val, &meta); err != nil {
+			return nil
+		}
+		for _, ref := range meta.ChunkMap {
+			if useExact {
+				if _, ok := referencedExact[ref.ID]; !ok {
+					referencedExact[ref.ID] = struct{}{}
+					referencedCount++
+				}
+			} else {
+				var buf [8]byte
+				binary.BigEndian.PutUint64(buf[:], uint64(ref.ID))
+				referencedBloom.Add(buf[:])
+				referencedCount++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gc scan inodes: %w", err)
+	}
+	slog.Info("gc: phase 2 complete, referenced chunks", "count", referencedCount, "exact", useExact)
+
+	// Phase 3: Delete chunks not in the referenced Bloom filter.
+	// False positives cause us to keep some orphans (caught next cycle),
+	// but no false negatives (all truly referenced chunks are kept).
+	for _, chunkID := range allChunkIDs {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if useExact {
+			if _, ok := referencedExact[chunkID]; ok {
+				continue
+			}
+		} else {
+			var buf [8]byte
+			binary.BigEndian.PutUint64(buf[:], uint64(chunkID))
+			if referencedBloom.Contains(buf[:]) {
+				continue // probably referenced, skip
+			}
+		}
+		result.OrphanChunks++
+		if !gc.dryRun {
+			if delErr := gc.store.DeleteChunk(ctx, chunkID); delErr != nil {
+				slog.Error("gc: delete chunk failed", "chunk_id", chunkID, "error", delErr)
+				continue
+			}
+		}
+		result.DeletedChunks++
+	}
+	result.FreedBytes = -1 // Indicate not precisely tracked
 
 	result.ScanDuration = time.Since(start)
 	return result, nil
@@ -500,12 +675,18 @@ func (gc *ChunkGC) Start(interval time.Duration) {
 				result, err := gc.Scan(context.Background())
 				if err != nil {
 					slog.Error("gc: scan error", "error", err)
-				} else if result.OrphanChunks > 0 {
-					slog.Info("gc: found orphans",
-						"orphans", result.OrphanChunks,
-						"deleted", result.DeletedChunks,
-						"freed_bytes", result.FreedBytes,
-						"duration", result.ScanDuration)
+				} else {
+					// Update orphan chunks gauge for alerting
+					if gc.metrics != nil {
+						gc.metrics.GCOrphanChunks.Store(int64(result.OrphanChunks))
+					}
+					if result.OrphanChunks > 0 {
+						slog.Info("gc: found orphans",
+							"orphans", result.OrphanChunks,
+							"deleted", result.DeletedChunks,
+							"freed_bytes", result.FreedBytes,
+							"duration", result.ScanDuration)
+					}
 				}
 			case <-gc.stopCh:
 				return

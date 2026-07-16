@@ -195,6 +195,8 @@ type PebbleFSM struct {
 	store        *PebbleStore
 	syncStopCh   chan struct{}
 	syncInterval time.Duration
+	syncMu       sync.Mutex
+	syncWG       sync.WaitGroup
 }
 
 // Apply applies a committed Raft log entry to the Pebble store.
@@ -275,20 +277,28 @@ func (f *PebbleFSM) StartSync(interval time.Duration) {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
+	if f.syncStopCh != nil {
+		return
+	}
 	f.syncInterval = interval
 	f.syncStopCh = make(chan struct{})
+	stopCh := f.syncStopCh
+	f.syncWG.Add(1)
 	go func() {
+		defer f.syncWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				if err := f.store.db.LogData(nil, pebble.Sync); err != nil {
+				if err := f.logDataSync(); err != nil {
 					slog.Error("fsm: WAL sync error", "error", err)
 				}
-			case <-f.syncStopCh:
+			case <-stopCh:
 				// Final sync before exit
-				if err := f.store.db.LogData(nil, pebble.Sync); err != nil {
+				if err := f.logDataSync(); err != nil {
 					slog.Error("fsm: final WAL sync error", "error", err)
 				}
 				return
@@ -298,12 +308,24 @@ func (f *PebbleFSM) StartSync(interval time.Duration) {
 	slog.Info("fsm: periodic WAL sync started", "interval", interval)
 }
 
+func (f *PebbleFSM) logDataSync() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("pebble WAL sync panic: %v", r)
+		}
+	}()
+	return f.store.db.LogData(nil, pebble.Sync)
+}
+
 // StopSync stops the background WAL sync goroutine.
 func (f *PebbleFSM) StopSync() {
+	f.syncMu.Lock()
 	if f.syncStopCh != nil {
 		close(f.syncStopCh)
 		f.syncStopCh = nil
 	}
+	f.syncMu.Unlock()
+	f.syncWG.Wait()
 }
 
 // ============================================================
@@ -505,12 +527,19 @@ type RaftNode struct {
 
 // RaftNodeConfig configures a RaftNode.
 type RaftNodeConfig struct {
-	NodeID    string
-	BindAddr  string // e.g. "0.0.0.0:7000"
-	RaftDir   string
-	Bootstrap bool
-	JoinAddr  string
-	Peers     []string
+	NodeID   string
+	BindAddr string // e.g. "0.0.0.0:7000"
+	// AdvertiseAddr is the address peers use to reach this node. If empty,
+	// BindAddr is used for both bind and advertise.
+	AdvertiseAddr string
+	RaftDir       string
+	Bootstrap     bool
+	JoinAddr      string
+	Peers         []string
+	// BootstrapPeers defines the initial Raft voter set as explicit
+	// server ID/address pairs. Prefer this over Peers for production
+	// deployments where server IDs differ from network addresses.
+	BootstrapPeers []RaftPeer
 
 	// AdvertiseOpsAddr is the HTTP ops URL (e.g. "http://10.0.0.1:8091")
 	// that other metad nodes should use to reach this node's ops API.
@@ -544,6 +573,12 @@ type RaftNodeConfig struct {
 	// tiebreaker: higher-priority nodes use shorter election timeouts,
 	// making them more likely to win elections. Set to 0 (default) for no preference.
 	ElectionPriority uint8
+}
+
+// RaftPeer is an explicit server ID/address pair for Raft membership.
+type RaftPeer struct {
+	ID      string
+	Address string
 }
 
 // NewRaftNode creates and starts a new Raft node.
@@ -618,9 +653,13 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 	}
 
 	// Transport
-	addr, err := net.ResolveTCPAddr("tcp", cfg.BindAddr)
+	advertiseAddr := cfg.AdvertiseAddr
+	if advertiseAddr == "" {
+		advertiseAddr = cfg.BindAddr
+	}
+	addr, err := net.ResolveTCPAddr("tcp", advertiseAddr)
 	if err != nil {
-		return nil, fmt.Errorf("resolve addr %q: %w", cfg.BindAddr, err)
+		return nil, fmt.Errorf("resolve addr %q: %w", advertiseAddr, err)
 	}
 	transport, err := raft.NewTCPTransport(cfg.BindAddr, addr, 3, 10*time.Second, io.Discard)
 	if err != nil {
@@ -645,7 +684,16 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 	// Bootstrap
 	if cfg.Bootstrap {
 		servers := []raft.Server{
-			{ID: raft.ServerID(cfg.NodeID), Address: raft.ServerAddress(cfg.BindAddr)},
+			{ID: raft.ServerID(cfg.NodeID), Address: raft.ServerAddress(advertiseAddr)},
+		}
+		for _, peer := range cfg.BootstrapPeers {
+			if peer.ID == cfg.NodeID {
+				continue
+			}
+			servers = append(servers, raft.Server{
+				ID:      raft.ServerID(peer.ID),
+				Address: raft.ServerAddress(peer.Address),
+			})
 		}
 		for _, peer := range cfg.Peers {
 			servers = append(servers, raft.Server{
@@ -663,12 +711,14 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 	if peerOps == nil {
 		peerOps = make(map[string]string)
 	}
-	return &RaftNode{
+	node := &RaftNode{
 		raft: r, fsm: fsm, raftDir: cfg.RaftDir,
 		nodeID: cfg.NodeID, bindAddr: cfg.BindAddr,
 		advertiseOps: cfg.AdvertiseOpsAddr,
 		peerOps:      peerOps,
-	}, nil
+	}
+	store.SetRaftNode(node)
+	return node, nil
 }
 
 // IsLeader returns true if this node is the current leader.
@@ -689,6 +739,16 @@ func (n *RaftNode) LeaderAddr() string {
 
 // LeaderOpsAddr returns the HTTP ops URL of the current leader,
 // or empty string if this is a single-node deployment (Raft disabled).
+//
+// Resolution order:
+//  1. If we are the leader, use our own ops address
+//  2. Look up in the peerOps map (populated from --advertise-ops-addr flags)
+//  3. FSM lookup: each metad node stores its ops URL under /_raft/nodes/<serverID>
+//
+// Returns empty string if the leader's ops address cannot be determined.
+// Callers should handle empty strings as "leader unknown" rather than
+// falling back to the Raft bind address, which may not be reachable
+// on the ops HTTP port.
 func (n *RaftNode) LeaderOpsAddr() string {
 	addr, id := n.raft.LeaderWithID()
 	if addr == "" {
@@ -713,13 +773,15 @@ func (n *RaftNode) LeaderOpsAddr() string {
 			return string(data)
 		}
 	}
-	// Last-resort fallback: just use the Raft address with http:// prefix
-	return "http://" + string(addr)
+	// Leader's ops address is not yet registered. Return empty to signal
+	// "unknown" rather than guessing from the Raft bind address, which
+	// is the internal Raft port and may not be reachable on the ops HTTP port.
+	return ""
 }
 
 // StoreOpsURL submits this node's ops HTTP URL to the FSM via Raft,
 // making it discoverable by other nodes for auto-forwarding.
-// Must be called after Raft is initialized (may retry on transient errors).
+// Uses ApplyAutoForward so it works on both leaders and followers.
 func (n *RaftNode) StoreOpsURL(timeout time.Duration) error {
 	if n.advertiseOps == "" {
 		return nil
@@ -729,9 +791,7 @@ func (n *RaftNode) StoreOpsURL(timeout time.Duration) error {
 		Key:   []byte(metaNodeOpsKey(n.nodeID)),
 		Value: []byte(n.advertiseOps),
 	}
-	// Use the underlying raft.Raft.Apply (auto-forwards to leader)
-	f := n.raft.Apply(entry.Encode(), timeout)
-	return f.Error()
+	return n.ApplyAutoForward(entry, timeout)
 }
 
 // Apply sends a write through Raft consensus.
@@ -803,6 +863,9 @@ func (n *RaftNode) FollowerRead(timeout time.Duration, fn func() error) error {
 }
 
 // forwardToLeader sends a Raft log entry to the leader's ops HTTP endpoint.
+// When the leader returns a structured error (e.g. ErrVersionConflict),
+// the response includes an X-Raft-Error header so the follower can
+// reconstruct the correct sentinel error for errors.Is matching.
 func (n *RaftNode) forwardToLeader(entry *RaftLogEntry, leaderOps string, timeout time.Duration) error {
 	encoded := entry.Encode()
 
@@ -827,9 +890,38 @@ func (n *RaftNode) forwardToLeader(entry *RaftLogEntry, leaderOps string, timeou
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		// Check for structured error code in header — allows errors.Is to work
+		// across HTTP boundaries by mapping known error codes to sentinel errors.
+		if errCode := resp.Header.Get("X-Raft-Error"); errCode != "" {
+			if mapped := mapRaftError(errCode); mapped != nil {
+				return mapped
+			}
+		}
 		return fmt.Errorf("forward to %s: status %d: %s", url, resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// mapRaftError maps a structured error code from the X-Raft-Error header
+// to the corresponding sentinel error, enabling errors.Is matching across
+// HTTP forwarding boundaries.
+func mapRaftError(code string) error {
+	switch code {
+	case "ErrVersionConflict":
+		return ErrVersionConflict
+	case "ErrInodeNotFound":
+		return ErrInodeNotFound
+	case "ErrEntryExists":
+		return ErrEntryExists
+	case "ErrBucketNotFound":
+		return ErrBucketNotFound
+	case "ErrChunkNotFound":
+		return ErrChunkNotFound
+	case "ErrNodeNotFound":
+		return ErrNodeNotFound
+	default:
+		return nil
+	}
 }
 
 // ApplySet is a convenience method for a single key-value set.

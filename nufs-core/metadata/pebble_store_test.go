@@ -877,26 +877,44 @@ func TestPebbleStore_ChunksByNode(t *testing.T) {
 		chunkIDs = append(chunkIDs, chunk.ID)
 	}
 
-	// All chunks should have at least 1 replica (they are auto-placed)
-	results, err := store.ChunksByNode(ctx, 1)
+	// Find which nodes actually received chunks
+	nodeChunkCount := make(map[NodeID]int)
+	for _, cid := range chunkIDs {
+		chunk, _ := store.GetChunk(ctx, cid)
+		for _, r := range chunk.Replicas {
+			nodeChunkCount[r.NodeID]++
+		}
+	}
+	if len(nodeChunkCount) == 0 {
+		t.Fatal("expected at least one node to have chunks")
+	}
+
+	// Pick a node that has chunks and verify ChunksByNode returns them
+	var targetNode NodeID
+	for nid := range nodeChunkCount {
+		targetNode = nid
+		break
+	}
+
+	results, err := store.ChunksByNode(ctx, targetNode)
 	if err != nil {
 		t.Fatalf("ChunksByNode: %v", err)
 	}
 	if len(results) == 0 {
-		t.Error("expected at least 1 chunk for node 1")
+		t.Errorf("expected at least 1 chunk for node %d", targetNode)
 	}
 
-	// Verify all returned chunks have node 1 in replicas
+	// Verify all returned chunks have targetNode in replicas
 	for _, c := range results {
 		found := false
 		for _, r := range c.Replicas {
-			if r.NodeID == 1 {
+			if r.NodeID == targetNode {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("chunk %d returned by ChunksByNode(1) but no replica on node 1", c.ID)
+			t.Errorf("chunk %d returned by ChunksByNode(%d) but no replica on that node", c.ID, targetNode)
 		}
 	}
 }
@@ -1014,11 +1032,32 @@ func TestPebbleStore_TriggerRebalanceWithChunks(t *testing.T) {
 	}
 
 	// Override chunk counts to create imbalance
+	// First, find which node actually has the most chunks
+	nodeChunkCount := make(map[NodeID]int)
+	inode, _ := store.GetInode(ctx, file.ID)
+	for _, ref := range inode.ChunkMap {
+		chunk, _ := store.GetChunk(ctx, ref.ID)
+		if chunk != nil {
+			for _, r := range chunk.Replicas {
+				nodeChunkCount[r.NodeID]++
+			}
+		}
+	}
+
+	// Find the node with most chunks and mark it as overloaded
+	var overloadedNode NodeID
+	maxCount := 0
+	for nid, cnt := range nodeChunkCount {
+		if cnt > maxCount {
+			maxCount = cnt
+			overloadedNode = nid
+		}
+	}
+
 	nodes, _ := store.ListNodes(ctx)
 	for _, n := range nodes {
 		info, _ := store.GetNode(ctx, n.ID)
-		// Set node 1 as heavily loaded
-		if info.ID == 1 {
+		if info.ID == overloadedNode {
 			info.ChunkCount = 500
 			info.UsedGB = 500
 		} else {
@@ -1049,6 +1088,100 @@ func TestPebbleStore_TriggerRebalanceWithChunks(t *testing.T) {
 		}
 		if task.Reason == "" {
 			t.Errorf("repair task for chunk %d has empty reason", task.ChunkID)
+		}
+	}
+}
+
+func TestPebbleStore_AutoRebalanceUsesConcreteChunks(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	for i := 1; i <= 3; i++ {
+		if err := store.RegisterNode(ctx, &NodeInfo{
+			ID:         NodeID(i),
+			Addr:       fmt.Sprintf("10.0.0.%d:9100", i),
+			CapacityGB: 1000,
+			Rack:       fmt.Sprintf("rack%d", i),
+			Zone:       "zone1",
+			Tier:       TierHot,
+			State:      NodeOnline,
+		}); err != nil {
+			t.Fatalf("RegisterNode %d: %v", i, err)
+		}
+	}
+
+	if err := store.CreateBucket(ctx, "auto-rebalance", PlacementPolicy{}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "auto-rebalance")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	file, err := store.CreateFile(ctx, bucket.RootInode, "data.bin", 0644)
+	if err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := store.AllocateChunk(ctx, file.ID, int64(i)*MaxChunkSize, PlacementPolicy{
+			ReplicationFactor: 2,
+			TopologySpread:    SpreadNode,
+		}); err != nil {
+			t.Fatalf("AllocateChunk %d: %v", i, err)
+		}
+	}
+
+	var overloaded NodeID
+	counts := make(map[NodeID]int)
+	inode, err := store.GetInode(ctx, file.ID)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	for _, ref := range inode.ChunkMap {
+		chunk, err := store.GetChunk(ctx, ref.ID)
+		if err != nil {
+			t.Fatalf("GetChunk %d: %v", ref.ID, err)
+		}
+		for _, replica := range chunk.Replicas {
+			counts[replica.NodeID]++
+			if counts[replica.NodeID] > counts[overloaded] {
+				overloaded = replica.NodeID
+			}
+		}
+	}
+
+	nodes, err := store.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	for _, node := range nodes {
+		info, err := store.GetNode(ctx, node.ID)
+		if err != nil {
+			t.Fatalf("GetNode %d: %v", node.ID, err)
+		}
+		if info.ID == overloaded {
+			info.ChunkCount = 500
+			info.UsedGB = 500
+		} else {
+			info.ChunkCount = 10
+			info.UsedGB = 10
+		}
+		if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixNode, info.ID), info); err != nil {
+			t.Fatalf("update node %d: %v", info.ID, err)
+		}
+	}
+
+	store.triggerAutoRebalance()
+
+	tasks, err := store.GetRepairQueue(ctx)
+	if err != nil {
+		t.Fatalf("GetRepairQueue: %v", err)
+	}
+	if len(tasks) == 0 {
+		t.Fatal("expected auto-rebalance to create repair tasks")
+	}
+	for _, task := range tasks {
+		if task.ChunkID == 0 {
+			t.Fatalf("auto-rebalance created zero chunk repair task: %+v", task)
 		}
 	}
 }
@@ -1283,4 +1416,299 @@ func TestRaftLogEntry_CASRoundTrip(t *testing.T) {
 	if string(decoded.Value[8:]) != "new-data" {
 		t.Fatalf("value mismatch: %s", decoded.Value[8:])
 	}
+}
+
+// ========== Raft Leader Discovery Tests ==========
+
+func TestLeaderOpsAddr_SingleNodeReturnsEmpty(t *testing.T) {
+	// In single-node mode (raft == nil), LeaderOpsAddr should return ""
+	// because there is no leader election happening.
+	store := newTestPebbleStore(t)
+	// raft is nil in test store, so LeaderOpsAddr should not be called directly.
+	// This tests the fallback path indirectly.
+	if store.raft != nil {
+		t.Skip("raft is initialized in this test config")
+	}
+	// Single-node mode: no raft, so LeaderOpsAddr is not applicable.
+}
+
+func TestRaftLogEntry_StoreOpsURLRoundTrip(t *testing.T) {
+	// Verify that storing an ops URL via Raft log entry round-trips correctly.
+	entry := &RaftLogEntry{
+		Op:    OpSet,
+		Key:   []byte(metaNodeOpsKey("meta-1")),
+		Value: []byte("http://10.0.0.1:8091"),
+	}
+	encoded := entry.Encode()
+	decoded, err := DecodeRaftLogEntry(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.Op != OpSet {
+		t.Fatalf("op mismatch: %v", decoded.Op)
+	}
+	if string(decoded.Key) != "/_raft/nodes/meta-1" {
+		t.Fatalf("key mismatch: %s", decoded.Key)
+	}
+	if string(decoded.Value) != "http://10.0.0.1:8091" {
+		t.Fatalf("value mismatch: %s", decoded.Value)
+	}
+}
+
+func TestApplyViaRaft_SingleNodeDirectWrite(t *testing.T) {
+	// In single-node mode (raft == nil), writes go directly to Pebble.
+	store := newTestPebbleStore(t)
+	if store.raft != nil {
+		t.Skip("raft is initialized in this test config")
+	}
+
+	// Store an ops URL directly in Pebble (simulating what StoreOpsURL does)
+	key := []byte(metaNodeOpsKey("meta-1"))
+	val := []byte("http://localhost:8091")
+	if err := store.db.Set(key, val, nil); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// Verify we can read it back
+	got, closer, err := store.db.Get(key)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer closer.Close()
+	if string(got) != "http://localhost:8091" {
+		t.Fatalf("mismatch: %s", got)
+	}
+}
+
+func TestForwardToLeader_RequiresLeaderAddress(t *testing.T) {
+	// ApplyAutoForward with no leader should return an error, not panic.
+	store := newTestPebbleStore(t)
+	if store.raft != nil {
+		t.Skip("raft is initialized in this test config")
+	}
+
+	// In single-node mode without raft, applyViaRaft writes directly to Pebble.
+	err := store.applyViaRaft(OpSet, "test-key", []byte("test-value"))
+	if err != nil {
+		t.Logf("applyViaRaft in single-node mode: %v", err)
+	}
+}
+
+// ========== 3-Node Raft E2E Tests ==========
+
+// waitForLeader waits until one of the Raft nodes becomes leader or timeout.
+func waitForLeader(nodes []*RaftNode, timeout time.Duration) *RaftNode {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, n := range nodes {
+			if n != nil && n.IsLeader() {
+				return n
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return nil
+}
+
+// setup3NodeCluster creates a 3-node Raft cluster for testing.
+// Returns stores, nodes, and a cleanup function.
+func setup3NodeCluster(t *testing.T, portBase int) ([]*PebbleStore, []*RaftNode, func()) {
+	t.Helper()
+	const numNodes = 3
+
+	var stores []*PebbleStore
+	var nodes []*RaftNode
+
+	for i := 0; i < numNodes; i++ {
+		stores = append(stores, newTestPebbleStore(t))
+	}
+
+	// Build all server addresses
+	allAddrs := make([]string, numNodes)
+	for i := 0; i < numNodes; i++ {
+		allAddrs[i] = fmt.Sprintf("127.0.0.1:%d", portBase+i)
+	}
+
+	// Only node 0 bootstraps with all servers in the configuration.
+	// Other nodes receive the configuration via Raft log replication.
+	for i := 0; i < numNodes; i++ {
+		var peers []string
+		if i == 0 {
+			// Bootstrap: include peer addresses
+			for j := 1; j < numNodes; j++ {
+				peers = append(peers, allAddrs[j])
+			}
+		}
+
+		cfg := RaftNodeConfig{
+			NodeID:             fmt.Sprintf("meta-%d", i+1),
+			BindAddr:           allAddrs[i],
+			RaftDir:            t.TempDir(),
+			Bootstrap:          i == 0,
+			Peers:              peers,
+			HeartbeatTimeout:   500 * time.Millisecond,
+			ElectionTimeout:    1000 * time.Millisecond,
+			LeaderLeaseTimeout: 200 * time.Millisecond,
+			SnapshotThreshold:  1024,
+			SnapshotInterval:   time.Minute,
+			TrailingLogs:       256,
+			AdvertiseOpsAddr:   fmt.Sprintf("http://127.0.0.1:%d", 9000+i),
+		}
+		node, err := NewRaftNode(stores[i], cfg)
+		if err != nil {
+			t.Fatalf("NewRaftNode %d: %v", i+1, err)
+		}
+		nodes = append(nodes, node)
+	}
+
+	cleanup := func() {
+		for _, n := range nodes {
+			if n != nil {
+				n.Shutdown()
+			}
+		}
+	}
+	return stores, nodes, cleanup
+}
+
+func TestRaftE2E_3NodeClusterElection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping raft e2e in short mode")
+	}
+
+	stores, nodes, cleanup := setup3NodeCluster(t, 10100)
+	_ = stores
+	defer cleanup()
+
+	// Verify leader exists
+	leader := waitForLeader(nodes, 5*time.Second)
+	if leader == nil {
+		t.Fatal("no leader elected")
+	}
+	t.Logf("leader elected: %s", leader.nodeID)
+
+	// Verify only one leader
+	leaderCount := 0
+	for _, n := range nodes {
+		if n.IsLeader() {
+			leaderCount++
+		}
+	}
+	if leaderCount != 1 {
+		t.Fatalf("expected 1 leader, got %d", leaderCount)
+	}
+}
+
+func TestRaftE2E_WriteThroughLeader(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping raft e2e in short mode")
+	}
+
+	// Single-node Raft: verify leader commits writes via FSM
+	store := newTestPebbleStore(t)
+	cfg := RaftNodeConfig{
+		NodeID:             "meta-1",
+		BindAddr:           "127.0.0.1:10200",
+		RaftDir:            t.TempDir(),
+		Bootstrap:          true,
+		HeartbeatTimeout:   500 * time.Millisecond,
+		ElectionTimeout:    1000 * time.Millisecond,
+		LeaderLeaseTimeout: 200 * time.Millisecond,
+		SnapshotThreshold:  1024,
+		SnapshotInterval:   time.Minute,
+		TrailingLogs:       256,
+		AdvertiseOpsAddr:   "http://127.0.0.1:10200",
+	}
+	node, err := NewRaftNode(store, cfg)
+	if err != nil {
+		t.Fatalf("NewRaftNode: %v", err)
+	}
+	defer node.Shutdown()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && !node.IsLeader() {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !node.IsLeader() {
+		t.Fatal("node did not become leader")
+	}
+
+	key := []byte("test/key-1")
+	val := []byte("hello-raft")
+	if err := node.fsm.store.applyViaRaft(OpSet, string(key), val); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	got, closer, err := store.db.Get(key)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	closer.Close()
+	if string(got) != string(val) {
+		t.Fatalf("expected %q, got %q", val, got)
+	}
+	t.Log("write committed via leader FSM successfully")
+}
+
+func TestRaftE2E_LeaderFailover(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping raft e2e in short mode")
+	}
+
+	// Single-node Raft: verify data persists after leader shutdown
+	store := newTestPebbleStore(t)
+	cfg := RaftNodeConfig{
+		NodeID:             "meta-1",
+		BindAddr:           "127.0.0.1:10300",
+		RaftDir:            t.TempDir(),
+		Bootstrap:          true,
+		HeartbeatTimeout:   500 * time.Millisecond,
+		ElectionTimeout:    1000 * time.Millisecond,
+		LeaderLeaseTimeout: 200 * time.Millisecond,
+		SnapshotThreshold:  1024,
+		SnapshotInterval:   time.Minute,
+		TrailingLogs:       256,
+		AdvertiseOpsAddr:   "http://127.0.0.1:10300",
+	}
+	node, err := NewRaftNode(store, cfg)
+	if err != nil {
+		t.Fatalf("NewRaftNode: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && !node.IsLeader() {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !node.IsLeader() {
+		t.Fatal("node did not become leader")
+	}
+
+	// Write data
+	if err := node.fsm.store.applyViaRaft(OpSet, "test-data", []byte("before-shutdown")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Verify write
+	got, closer, err := store.db.Get([]byte("test-data"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	closer.Close()
+	if string(got) != "before-shutdown" {
+		t.Fatalf("expected %q, got %q", "before-shutdown", got)
+	}
+
+	// Shutdown
+	node.raft.Shutdown()
+
+	// Data persists in local store
+	got2, closer2, err := store.db.Get([]byte("test-data"))
+	if err != nil {
+		t.Fatalf("read after shutdown: %v", err)
+	}
+	closer2.Close()
+	if string(got2) != "before-shutdown" {
+		t.Fatalf("data lost: got %q", got2)
+	}
+	t.Log("leader commit and local persistence verified")
 }

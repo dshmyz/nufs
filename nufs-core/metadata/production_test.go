@@ -166,7 +166,7 @@ func TestChunkGC_FindsOrphans(t *testing.T) {
 	})
 
 	// Run GC
-	gc := NewChunkGC(store, nil, false)
+	gc := NewChunkGC(store, nil, nil, false)
 	result, err := gc.Scan(ctx)
 	if err != nil {
 		t.Fatalf("GC scan: %v", err)
@@ -306,6 +306,32 @@ func TestServiceBundle_Interface(t *testing.T) {
 	}
 	if len(buckets) != 1 {
 		t.Fatalf("expected 1 bucket, got %d", len(buckets))
+	}
+}
+
+func TestServiceBundle_StartsAutoBalancerWhenConfigured(t *testing.T) {
+	store := newTestPebbleStore(t)
+	bundle, err := NewPebbleServiceBundle(
+		store,
+		WithLeaseTTL(0),
+		WithGCInterval(0),
+		WithScrubInterval(0),
+		WithAutoBalanceInterval(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("NewPebbleServiceBundle: %v", err)
+	}
+	if bundle.AutoBalancer == nil {
+		t.Fatal("expected AutoBalancer to be configured")
+	}
+	if !bundle.AutoBalancer.running.Load() {
+		t.Fatal("expected AutoBalancer to be running")
+	}
+	if err := bundle.Close(); err != nil {
+		t.Fatalf("bundle close: %v", err)
+	}
+	if bundle.AutoBalancer.running.Load() {
+		t.Fatal("expected AutoBalancer to stop during bundle close")
 	}
 }
 
