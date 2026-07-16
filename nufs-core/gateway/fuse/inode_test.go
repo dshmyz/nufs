@@ -63,6 +63,16 @@ func newTestFile(meta metadata.MetadataService, cs gateway.ChunkStore, id metada
 	}
 }
 
+// newTestFileWithRecorder 同 newTestFile 但注入 MetricsRecorder。
+func newTestFileWithRecorder(meta metadata.MetadataService, cs gateway.ChunkStore, id metadata.InodeID, rec MetricsRecorder) *DFSFile {
+	return &DFSFile{
+		meta:       meta,
+		chunkStore: cs,
+		inodeID:    id,
+		recorder:   rec,
+	}
+}
+
 // ========== B1: Read returns real chunk data (was: always zero bytes) ==========
 
 // TestDFSFile_Read_EmptyFile_ReturnsZeros is the "freshly created

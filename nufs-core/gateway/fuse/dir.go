@@ -19,6 +19,9 @@ type DFSDir struct {
 
 	meta    metadata.MetadataService
 	inodeID metadata.InodeID
+
+	// recorder 记录 FUSE 操作指标。nil 时不打点。
+	recorder MetricsRecorder
 }
 
 var _ = (fs.NodeReaddirer)((*DFSDir)(nil))
@@ -36,9 +39,13 @@ var _ = (fs.NodeAccesser)((*DFSDir)(nil))
 
 // Readdir lists directory entries.
 func (d *DFSDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("readdir")
+
 	entries, err := d.meta.ReadDir(ctx, d.inodeID, 0, 10000)
 	if err != nil {
 		logf("readdir error: %v", err)
+		rec.IncOpError("readdir")
 		return nil, syscall.EIO
 	}
 
@@ -65,12 +72,17 @@ func (d *DFSDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 // Lookup looks up a child entry by name.
 func (d *DFSDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("lookup")
+
 	metaInode, err := d.meta.Lookup(ctx, d.inodeID, name)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
+			// ENOENT 不是错误（合法的"不存在"响应），不计入 errors
 			return nil, syscall.ENOENT
 		}
 		logf("lookup error: %v", err)
+		rec.IncOpError("lookup")
 		return nil, syscall.EIO
 	}
 
@@ -102,16 +114,21 @@ func rootFromInode(inode *fs.Inode) *DFSFileSystem {
 
 // Mkdir creates a new directory.
 func (d *DFSDir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("mkdir")
+
 	metaInode, err := d.meta.MkDir(ctx, d.inodeID, name, mode)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryExists) {
+			// EEXIST 不是错误（合法的"已存在"响应），不计入 errors
 			return nil, syscall.EEXIST
 		}
 		logf("mkdir error: %v", err)
+		rec.IncOpError("mkdir")
 		return nil, syscall.EIO
 	}
 
-	child := &DFSDir{meta: d.meta, inodeID: metaInode.ID}
+	child := &DFSDir{meta: d.meta, inodeID: metaInode.ID, recorder: rec}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{
@@ -125,6 +142,9 @@ func (d *DFSDir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.
 
 // Rmdir removes an empty directory.
 func (d *DFSDir) Rmdir(ctx context.Context, name string) syscall.Errno {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("rmdir")
+
 	err := d.meta.RmDir(ctx, d.inodeID, name)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) {
@@ -134,6 +154,7 @@ func (d *DFSDir) Rmdir(ctx context.Context, name string) syscall.Errno {
 			return syscall.ENOTEMPTY
 		}
 		logf("rmdir error: %v", err)
+		rec.IncOpError("rmdir")
 		return syscall.EIO
 	}
 	return 0
@@ -141,22 +162,27 @@ func (d *DFSDir) Rmdir(ctx context.Context, name string) syscall.Errno {
 
 // Create creates and opens a new file.
 func (d *DFSDir) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("create")
+
 	metaInode, err := d.meta.CreateFile(ctx, d.inodeID, name, mode)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryExists) {
 			// File exists — lookup and open it
 			metaInode, err = d.meta.Lookup(ctx, d.inodeID, name)
 			if err != nil {
+				rec.IncOpError("create")
 				return nil, nil, 0, syscall.EIO
 			}
 		} else {
 			logf("create error: %v", err)
+			rec.IncOpError("create")
 			return nil, nil, 0, syscall.EIO
 		}
 	}
 
 	dfs := rootFromInode(&d.Inode)
-	file := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
+	file := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, file, fs.StableAttr{
@@ -170,12 +196,16 @@ func (d *DFSDir) Create(ctx context.Context, name string, flags uint32, mode uin
 
 // Unlink removes a file entry.
 func (d *DFSDir) Unlink(ctx context.Context, name string) syscall.Errno {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("unlink")
+
 	err := d.meta.Unlink(ctx, d.inodeID, name)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) {
 			return syscall.ENOENT
 		}
 		logf("unlink error: %v", err)
+		rec.IncOpError("unlink")
 		return syscall.EIO
 	}
 	return 0
@@ -183,11 +213,15 @@ func (d *DFSDir) Unlink(ctx context.Context, name string) syscall.Errno {
 
 // Rename renames/moves a file or directory.
 func (d *DFSDir) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("rename")
+
 	var newParentDir *DFSDir
 	switch p := newParent.(type) {
 	case *DFSDir:
 		newParentDir = p
 	default:
+		rec.IncOpError("rename")
 		return syscall.EINVAL
 	}
 
@@ -197,6 +231,7 @@ func (d *DFSDir) Rename(ctx context.Context, name string, newParent fs.InodeEmbe
 			return syscall.ENOENT
 		}
 		logf("rename error: %v", err)
+		rec.IncOpError("rename")
 		return syscall.EIO
 	}
 	return 0
@@ -204,16 +239,20 @@ func (d *DFSDir) Rename(ctx context.Context, name string, newParent fs.InodeEmbe
 
 // Symlink creates a symbolic link.
 func (d *DFSDir) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("symlink")
+
 	metaInode, err := d.meta.Symlink(ctx, d.inodeID, name, target)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryExists) {
 			return nil, syscall.EEXIST
 		}
 		logf("symlink error: %v", err)
+		rec.IncOpError("symlink")
 		return nil, syscall.EIO
 	}
 
-	child := &DFSSymlink{meta: d.meta, inodeID: metaInode.ID}
+	child := &DFSSymlink{meta: d.meta, inodeID: metaInode.ID, recorder: rec}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{
@@ -227,22 +266,27 @@ func (d *DFSDir) Symlink(ctx context.Context, target, name string, out *fuse.Ent
 
 // Link creates a hard link.
 func (d *DFSDir) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("link")
+
 	var targetFile *DFSFile
 	switch t := target.(type) {
 	case *DFSFile:
 		targetFile = t
 	default:
+		rec.IncOpError("link")
 		return nil, syscall.EINVAL
 	}
 
 	metaInode, err := d.meta.Link(ctx, d.inodeID, name, targetFile.inodeID)
 	if err != nil {
 		logf("link error: %v", err)
+		rec.IncOpError("link")
 		return nil, syscall.EIO
 	}
 
 	dfs := rootFromInode(&d.Inode)
-	child := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
+	child := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{
@@ -256,8 +300,10 @@ func (d *DFSDir) Link(ctx context.Context, target fs.InodeEmbedder, name string,
 
 // Getattr returns the attributes of this directory inode.
 func (d *DFSDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	rec := recorderFor(d.recorder)
 	metaInode, err := d.meta.GetInode(ctx, d.inodeID)
 	if err != nil {
+		rec.IncOpError("getattr")
 		return syscall.EIO
 	}
 	out.Attr = inodeMetaToAttr(metaInode)
@@ -266,8 +312,10 @@ func (d *DFSDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOu
 
 // Setattr sets attributes on this directory inode.
 func (d *DFSDir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	rec := recorderFor(d.recorder)
 	metaInode, err := d.meta.GetInode(ctx, d.inodeID)
 	if err != nil {
+		rec.IncOpError("setattr")
 		return syscall.EIO
 	}
 
@@ -283,6 +331,7 @@ func (d *DFSDir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttr
 	metaInode.CTime = time.Now().UnixNano()
 
 	if err := d.meta.UpdateInode(ctx, metaInode); err != nil {
+		rec.IncOpError("setattr")
 		return syscall.EIO
 	}
 

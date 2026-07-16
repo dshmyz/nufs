@@ -36,6 +36,10 @@ type DFSFileSystem struct {
 	// chunkCache caches chunk payloads to avoid datanode round-trips.
 	chunkCache *ChunkCache
 
+	// recorder 记录 FUSE 操作指标。nil 时使用 noopMetricsRecorder。
+	// 子 inode (DFSFile/DFSDir/DFSSymlink) 通过 rootFromInode 获取引用。
+	recorder MetricsRecorder
+
 	// Inode cache: metadata.InodeID -> *fs.Inode
 	mu       sync.RWMutex
 	inodeMap map[metadata.InodeID]*fs.Inode
@@ -53,13 +57,22 @@ type chunkEventWatcher interface {
 // If cache is provided, it will be invalidated on chunk events received
 // from the metadata service; otherwise the gateway relies on TTL-based
 // expiry at the datanode layer.
-func NewDFSFileSystem(meta metadata.MetadataService, chunkStore gateway.ChunkStore, cache *ChunkCache) *DFSFileSystem {
+// recorder 用于指标打点，nil 时使用 noopMetricsRecorder（关闭指标）。
+func NewDFSFileSystem(meta metadata.MetadataService, chunkStore gateway.ChunkStore, cache *ChunkCache, recorder MetricsRecorder) *DFSFileSystem {
+	if recorder == nil {
+		recorder = noopMetricsRecorder{}
+	}
 	fsys := &DFSFileSystem{
 		meta:       meta,
 		chunkStore: chunkStore,
 		chunkCache: cache,
 		lockOwner:  fmt.Sprintf("fusegw-%d", os.Getpid()),
 		inodeMap:   make(map[metadata.InodeID]*fs.Inode),
+		recorder:   recorder,
+	}
+	// 把 recorder 注入到 chunkCache，统一缓存命中/未命中计数。
+	if cache != nil {
+		cache.recorder = recorder
 	}
 	// Kick off the event-driven cache invalidation loop if the metadata
 	// service supports streaming watches.
@@ -101,8 +114,9 @@ func parseChunkID(key string) (uint64, error) {
 }
 
 // Mount mounts the DFS filesystem at the given mountpoint.
-func Mount(mountpoint string, meta metadata.MetadataService, chunkStore gateway.ChunkStore, cache *ChunkCache, opts *fuse.MountOptions) (*fuse.Server, error) {
-	root := NewDFSFileSystem(meta, chunkStore, cache)
+// recorder 用于指标打点，nil 时使用 noopMetricsRecorder。
+func Mount(mountpoint string, meta metadata.MetadataService, chunkStore gateway.ChunkStore, cache *ChunkCache, recorder MetricsRecorder, opts *fuse.MountOptions) (*fuse.Server, error) {
+	root := NewDFSFileSystem(meta, chunkStore, cache, recorder)
 
 	if opts == nil {
 		opts = &fuse.MountOptions{
@@ -148,9 +162,13 @@ var _ = (fs.NodeStatfser)((*DFSFileSystem)(nil))
 // without requiring a separate mount per bucket (compare: s3gw
 // uses per-bucket RootInode; fusegw shares RootInodeID=1).
 func (dfs *DFSFileSystem) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	rec := recorderFor(dfs.recorder)
+	rec.IncOp("readdir")
+
 	buckets, err := dfs.meta.ListBuckets(ctx)
 	if err != nil {
 		logf("root readdir: %v", err)
+		rec.IncOpError("readdir")
 		return nil, syscall.EIO
 	}
 
@@ -171,16 +189,20 @@ func (dfs *DFSFileSystem) Readdir(ctx context.Context) (fs.DirStream, syscall.Er
 // under /mnt/dfs/foo go through the same metadata path that s3gw
 // would use for bucket "foo".
 func (dfs *DFSFileSystem) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	rec := recorderFor(dfs.recorder)
+	rec.IncOp("lookup")
+
 	bucket, err := dfs.meta.GetBucket(ctx, name)
 	if err != nil {
 		if errors.Is(err, metadata.ErrBucketNotFound) {
 			return nil, syscall.ENOENT
 		}
 		logf("root lookup %q: %v", name, err)
+		rec.IncOpError("lookup")
 		return nil, syscall.EIO
 	}
 
-	child := &DFSDir{meta: dfs.meta, inodeID: bucket.RootInode}
+	child := &DFSDir{meta: dfs.meta, inodeID: bucket.RootInode, recorder: dfs.recorder}
 	attr := fuse.Attr{
 		Ino:  uint64(bucket.RootInode),
 		Mode: fuse.S_IFDIR,
@@ -208,9 +230,13 @@ func (dfs *DFSFileSystem) Getattr(ctx context.Context, fh fs.FileHandle, out *fu
 
 // Statfs returns filesystem statistics from cluster-wide node capacity.
 func (dfs *DFSFileSystem) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	rec := recorderFor(dfs.recorder)
+	rec.IncOp("statfs")
+
 	nodes, err := dfs.meta.ListNodes(ctx)
 	if err != nil {
 		logf("statfs: %v", err)
+		// 保留原行为：statfs 错误不向调用方报错，仅 log
 		return 0
 	}
 
@@ -247,13 +273,13 @@ func (dfs *DFSFileSystem) Statfs(ctx context.Context, out *fuse.StatfsOut) sysca
 func newChildInode(dfs *DFSFileSystem, metaInode *metadata.InodeMeta) fs.InodeEmbedder {
 	switch metaInode.Type {
 	case metadata.FileDirectory:
-		return &DFSDir{meta: dfs.meta, inodeID: metaInode.ID}
+		return &DFSDir{meta: dfs.meta, inodeID: metaInode.ID, recorder: dfs.recorder}
 	case metadata.FileRegular:
-		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
+		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: dfs.recorder}
 	case metadata.FileSymlink:
-		return &DFSSymlink{meta: dfs.meta, inodeID: metaInode.ID}
+		return &DFSSymlink{meta: dfs.meta, inodeID: metaInode.ID, recorder: dfs.recorder}
 	default:
-		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner}
+		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: dfs.recorder}
 	}
 }
 

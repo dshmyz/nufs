@@ -54,6 +54,9 @@ func main() {
 		cacheDir = flag.String("cache-dir", "", "Cache directory (empty=memory only)")
 		logLevel = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON  = flag.Bool("log-json", false, "JSON log output")
+
+		// DFS metrics flag
+		dfsMetricsAddr = flag.String("dfs-metrics-addr", ":9901", "DFS: Metrics/health HTTP address (empty=disabled)")
 	)
 	_ = configPath
 	config.Preload()
@@ -75,7 +78,7 @@ func main() {
 	switch *backend {
 	case "dfs":
 		mountpoint := mountpointFromArgs(flag.Args())
-		runDFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir)
+		runDFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir, *dfsMetricsAddr)
 	case "s3":
 		runS3(log, flag.Args(), *cacheDir, *scanTTL, *readOnly, *cacheQuota, *metricsAddr, *insecure, *debug, *uid, *gid)
 	default:
@@ -95,7 +98,7 @@ func mountpointFromArgs(args []string) string {
 }
 
 // runDFS mounts the DFS distributed filesystem via FUSE.
-func runDFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string) {
+func runDFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir, metricsAddr string) {
 	if _, err := os.Stat(mountpoint); os.IsNotExist(err) {
 		if err := os.MkdirAll(mountpoint, 0755); err != nil {
 			log.Error("failed to create mountpoint", "mountpoint", mountpoint, "error", err)
@@ -131,7 +134,15 @@ func runDFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string) {
 		log.Info("chunk cache enabled", "dir", cacheDir)
 	}
 
-	server, err := gofuse.Mount(mountpoint, meta, chunkStore, chunkCache, nil)
+	// 启动 metrics HTTP 端点（/metrics + /healthz）。
+	// fuseMetrics 是 gofuse 包内的全局 FUSEMetrics 实例，实现 MetricsRecorder。
+	if metricsAddr != "" {
+		if srv := gofuse.StartMetricsServer(metricsAddr); srv != nil {
+			log.Info("metrics server started", "addr", metricsAddr)
+		}
+	}
+
+	server, err := gofuse.Mount(mountpoint, meta, chunkStore, chunkCache, gofuse.GlobalMetricsRecorder(), nil)
 	if err != nil {
 		log.Error("failed to mount", "error", err)
 		os.Exit(1)

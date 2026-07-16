@@ -17,9 +17,10 @@ type cacheStats struct {
 }
 
 type ChunkCache struct {
-	memory  *lru.Cache
-	diskDir string
-	stats   cacheStats
+	memory   *lru.Cache
+	diskDir  string
+	stats    cacheStats
+	recorder MetricsRecorder // 1.4 起统一走 recorder；stats 保留兼容旧 HitRate()
 }
 
 // NewChunkCache creates a chunk cache with optional disk directory.
@@ -45,8 +46,10 @@ func NewChunkCache(diskDir string, size ...int) (*ChunkCache, error) {
 }
 
 func (c *ChunkCache) Get(chunkID uint64) ([]byte, bool) {
+	rec := recorderFor(c.recorder)
 	if v, ok := c.memory.Get(chunkID); ok {
 		atomic.AddUint64(&c.stats.hit, 1)
+		rec.IncCacheHit()
 		return v.([]byte), true
 	}
 	if c.diskDir != "" {
@@ -54,10 +57,12 @@ func (c *ChunkCache) Get(chunkID uint64) ([]byte, bool) {
 		if err == nil {
 			c.memory.Add(chunkID, data)
 			atomic.AddUint64(&c.stats.hit, 1)
+			rec.IncCacheHit()
 			return data, true
 		}
 	}
 	atomic.AddUint64(&c.stats.miss, 1)
+	rec.IncCacheMiss()
 	return nil, false
 }
 

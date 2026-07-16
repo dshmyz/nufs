@@ -19,6 +19,9 @@ type DFSSymlink struct {
 
 	meta    metadata.MetadataService
 	inodeID metadata.InodeID
+
+	// recorder 记录 FUSE 操作指标。nil 时不打点。
+	recorder MetricsRecorder
 }
 
 var _ = (fs.NodeReadlinker)((*DFSSymlink)(nil))

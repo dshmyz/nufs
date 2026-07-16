@@ -21,6 +21,13 @@ type FUSEMetrics struct {
 	OpsRemove  uint64
 	OpsRename  uint64
 
+	// 扩展计数器：原 Snapshot 不暴露，通过 /metrics 的扩展输出展示
+	OpsOther     uint64 // symlink/link/statfs 等未在上述字段覆盖的 op
+	OpsErrors    uint64 // 所有 op 失败总数
+	OpsRetries   uint64 // retry.Do 触发的重试总次数
+	CacheEvicts  uint64 // chunk 缓存淘汰总次数
+	BreakerOpens uint64 // 熔断器开路总次数
+
 	CacheHits   uint64
 	CacheMisses uint64
 
@@ -28,6 +35,12 @@ type FUSEMetrics struct {
 }
 
 var fuseMetrics = &FUSEMetrics{startTime: time.Now()}
+
+// GlobalMetricsRecorder 返回全局 FUSEMetrics 作为 MetricsRecorder。
+// cmd/nufs-fuse 入口用这个把全局计数器注入到 DFSFileSystem。
+func GlobalMetricsRecorder() MetricsRecorder {
+	return fuseMetrics
+}
 
 func (m *FUSEMetrics) Snapshot() map[string]interface{} {
 	return map[string]interface{}{
@@ -44,11 +57,16 @@ func (m *FUSEMetrics) Snapshot() map[string]interface{} {
 			"mkdir":   atomic.LoadUint64(&m.OpsMkdir),
 			"remove":  atomic.LoadUint64(&m.OpsRemove),
 			"rename":  atomic.LoadUint64(&m.OpsRename),
+			"other":   atomic.LoadUint64(&m.OpsOther),
 		},
 		"cache": map[string]uint64{
-			"hits":  atomic.LoadUint64(&m.CacheHits),
+			"hits":   atomic.LoadUint64(&m.CacheHits),
 			"misses": atomic.LoadUint64(&m.CacheMisses),
+			"evicts": atomic.LoadUint64(&m.CacheEvicts),
 		},
+		"errors":    atomic.LoadUint64(&m.OpsErrors),
+		"retries":   atomic.LoadUint64(&m.OpsRetries),
+		"breaker":   atomic.LoadUint64(&m.BreakerOpens),
 	}
 }
 
@@ -75,8 +93,10 @@ func StartMetricsServer(addr string) *http.Server {
 		}
 
 		cache := snap["cache"].(map[string]uint64)
-		fmt.Fprintf(w, "\nfusegw_cache_hits_total %d\nfusegw_cache_misses_total %d\n",
-			cache["hits"], cache["misses"])
+		fmt.Fprintf(w, "\nfusegw_cache_hits_total %d\nfusegw_cache_misses_total %d\nfusegw_cache_evicts_total %d\n",
+			cache["hits"], cache["misses"], cache["evicts"])
+		fmt.Fprintf(w, "\nfusegw_ops_errors_total %d\nfusegw_ops_retries_total %d\nfusegw_breaker_opens_total %d\n",
+			snap["errors"], snap["retries"], snap["breaker"])
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -93,7 +113,7 @@ func writeFUSEOpenMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE fusegw_uptime_seconds gauge\n# UNIT fusegw_uptime_seconds seconds\nfusegw_uptime_seconds %g\n\n",
 		time.Since(fuseMetrics.startTime).Seconds())
 	fmt.Fprintf(w, "# TYPE fusegw_ops_total counter\n# UNIT fusegw_ops_total operations\n")
-	for _, op := range []string{"open", "read", "write", "flush", "release", "lookup", "readdir", "create", "mkdir", "remove", "rename"} {
+	for _, op := range []string{"open", "read", "write", "flush", "release", "lookup", "readdir", "create", "mkdir", "remove", "rename", "other"} {
 		var v uint64
 		switch op {
 		case "open":
@@ -118,10 +138,16 @@ func writeFUSEOpenMetrics(w io.Writer) {
 			v = atomic.LoadUint64(&fuseMetrics.OpsRemove)
 		case "rename":
 			v = atomic.LoadUint64(&fuseMetrics.OpsRename)
+		case "other":
+			v = atomic.LoadUint64(&fuseMetrics.OpsOther)
 		}
 		fmt.Fprintf(w, "fusegw_ops_total{op=%q} %d\n", op, v)
 	}
 	fmt.Fprintf(w, "\n# TYPE fusegw_cache_hits_total counter\n# UNIT fusegw_cache_hits_total hits\nfusegw_cache_hits_total %d\n", atomic.LoadUint64(&fuseMetrics.CacheHits))
 	fmt.Fprintf(w, "# TYPE fusegw_cache_misses_total counter\n# UNIT fusegw_cache_misses_total misses\nfusegw_cache_misses_total %d\n", atomic.LoadUint64(&fuseMetrics.CacheMisses))
+	fmt.Fprintf(w, "# TYPE fusegw_cache_evicts_total counter\n# UNIT fusegw_cache_evicts_total evictions\nfusegw_cache_evicts_total %d\n", atomic.LoadUint64(&fuseMetrics.CacheEvicts))
+	fmt.Fprintf(w, "# TYPE fusegw_ops_errors_total counter\nfusegw_ops_errors_total %d\n", atomic.LoadUint64(&fuseMetrics.OpsErrors))
+	fmt.Fprintf(w, "# TYPE fusegw_ops_retries_total counter\nfusegw_ops_retries_total %d\n", atomic.LoadUint64(&fuseMetrics.OpsRetries))
+	fmt.Fprintf(w, "# TYPE fusegw_breaker_opens_total counter\nfusegw_breaker_opens_total %d\n", atomic.LoadUint64(&fuseMetrics.BreakerOpens))
 	fmt.Fprintln(w, "# EOF")
 }

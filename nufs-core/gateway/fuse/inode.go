@@ -86,6 +86,9 @@ type DFSFile struct {
 	// — used in unit tests that have no lock manager.
 	lockOwner string
 
+	// recorder 记录 FUSE 操作指标。nil 时不打点（兼容旧测试）。
+	recorder MetricsRecorder
+
 	// Write buffer for small writes before flush
 	mu     sync.Mutex
 	dirty  bool
@@ -113,6 +116,9 @@ type DFSFileHandle struct {
 
 // Open opens the file.
 func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	rec := recorderFor(f.recorder)
+	rec.IncOp("open")
+
 	h := &DFSFileHandle{file: f}
 
 	// Acquire an advisory file lock.  O_WRONLY|O_RDWR → exclusive;
@@ -123,11 +129,13 @@ func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fus
 		if isWrite {
 			if err := f.meta.AdvisoryLock(ctx, f.inodeID, f.lockOwner); err != nil {
 				logf("open: advisory lock %d: %v", f.inodeID, err)
+				rec.IncOpError("open")
 				return nil, 0, syscall.EIO
 			}
 		} else {
 			if err := f.meta.AdvisoryLockShared(ctx, f.inodeID, f.lockOwner); err != nil {
 				logf("open: advisory shared lock %d: %v", f.inodeID, err)
+				rec.IncOpError("open")
 				return nil, 0, syscall.EIO
 			}
 		}
@@ -139,8 +147,12 @@ func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fus
 
 // Read reads data from the file.
 func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	rec := recorderFor(f.recorder)
+	rec.IncOp("read")
+
 	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
 	if err != nil {
+		rec.IncOpError("read")
 		return nil, syscall.EIO
 	}
 	// Clamp read to file size
@@ -188,10 +200,12 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 		if payload == nil {
 			chunk, err := f.meta.GetChunk(ctx, cref.ID)
 			if err != nil {
+				rec.IncOpError("read")
 				return nil, syscall.EIO
 			}
 			payload, err = f.chunkStore.ReadChunk(ctx, chunk)
 			if err != nil {
+				rec.IncOpError("read")
 				return nil, syscall.EIO
 			}
 			if f.cache != nil {
@@ -231,6 +245,9 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 // happens in Flush, not here, so the kernel can coalesce many small
 // pwrite(2) calls into one chunk allocation.
 func (f *DFSFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	rec := recorderFor(f.recorder)
+	rec.IncOp("write")
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -261,6 +278,9 @@ func (f *DFSFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off 
 // in commit 1.2 / the cache commit alongside an mmap-style write
 // buffer.
 func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
+	rec := recorderFor(f.recorder)
+	rec.IncOp("flush")
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -272,11 +292,13 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	// 1.1 only knows the single-chunk code path.)
 	if int64(len(f.buffer)) > MaxChunkPayload {
 		logf("flush: file %d size %d exceeds single-chunk limit %d (multi-chunk write is commit 1.2)", f.inodeID, len(f.buffer), MaxChunkPayload)
+		rec.IncOpError("flush")
 		return syscall.EFBIG
 	}
 
 	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
 	if err != nil {
+		rec.IncOpError("flush")
 		return syscall.EIO
 	}
 
@@ -299,6 +321,7 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	chunk, err := f.meta.AllocateChunk(ctx, f.inodeID, 0, policy)
 	if err != nil {
 		logf("flush: allocate chunk: %v", err)
+		rec.IncOpError("flush")
 		return syscall.EIO
 	}
 	_ = existingChunkID // currently unused; future work lets us
@@ -308,11 +331,13 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 
 	if err := f.chunkStore.WriteChunk(ctx, chunk, f.buffer); err != nil {
 		logf("flush: write chunk %d: %v", chunk.ID, err)
+		rec.IncOpError("flush")
 		return syscall.EIO
 	}
 	checksum := crc32.ChecksumIEEE(f.buffer)
 	if err := f.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
 		logf("flush: commit chunk %d: %v", chunk.ID, err)
+		rec.IncOpError("flush")
 		return syscall.EIO
 	}
 	if err := f.meta.SealChunk(ctx, chunk.ID); err != nil {
@@ -325,6 +350,7 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	// Read can trim the payload to the data window.
 	metaInode, err = f.meta.GetInode(ctx, f.inodeID)
 	if err != nil {
+		rec.IncOpError("flush")
 		return syscall.EIO
 	}
 	for i := range metaInode.ChunkMap {
@@ -341,6 +367,7 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	metaInode.MTime = time.Now().UnixNano()
 
 	if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+		rec.IncOpError("flush")
 		return syscall.EIO
 	}
 
@@ -356,6 +383,9 @@ func (f *DFSFile) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sys
 
 // Release is called when the last reference to the file handle is dropped.
 func (f *DFSFile) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
+	rec := recorderFor(f.recorder)
+	rec.IncOp("release")
+
 	// Flush first so buffered data hits the chunk store before we
 	// release the advisory lock.
 	if err := f.Flush(ctx, fh); err != 0 {
@@ -376,8 +406,10 @@ func (f *DFSFile) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 
 // Getattr returns file attributes.
 func (f *DFSFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	rec := recorderFor(f.recorder)
 	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
 	if err != nil {
+		rec.IncOpError("getattr")
 		return syscall.EIO
 	}
 	out.Attr = inodeMetaToAttr(metaInode)
@@ -386,8 +418,10 @@ func (f *DFSFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrO
 
 // Setattr sets file attributes (truncate, chmod, etc.).
 func (f *DFSFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	rec := recorderFor(f.recorder)
 	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
 	if err != nil {
+		rec.IncOpError("setattr")
 		return syscall.EIO
 	}
 
@@ -418,6 +452,7 @@ func (f *DFSFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 	metaInode.CTime = time.Now().UnixNano()
 
 	if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+		rec.IncOpError("setattr")
 		return syscall.EIO
 	}
 
