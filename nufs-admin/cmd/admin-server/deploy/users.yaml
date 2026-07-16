@@ -1,0 +1,3 @@
+- username: admin
+  # bcrypt hash of "admin123"
+  password_hash: "$2a$10$eW/hBcG6qDqf3y4xeq/OxOqCE.y6Q0zqEcQvbZUXZUK4spUnPHwPG"

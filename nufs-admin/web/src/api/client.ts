@@ -1,0 +1,214 @@
+import axios from 'axios'
+
+const baseURL = '/api/v1'
+
+export const api = axios.create({
+  baseURL,
+  timeout: 5000,
+})
+
+// Auto-attach JWT token from localStorage
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token')
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// Handle 401 (token expired) → redirect to login
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem('token')
+      window.location.reload()
+    }
+    return Promise.reject(error)
+  }
+)
+
+// Auth
+export async function login(username: string, password: string): Promise<string> {
+  const resp = await api.post('/auth/login', { username, password })
+  return resp.data.token
+}
+
+// Clusters
+export async function listClusters(): Promise<ClusterInfo[]> {
+  const resp = await api.get('/clusters')
+  return resp.data
+}
+
+export async function getGlobalOverview(): Promise<AggregatedResult> {
+  const resp = await api.get('/clusters/all/overview')
+  return resp.data
+}
+
+export async function getClusterOverview(clusterId: string): Promise<any> {
+  const resp = await api.get(`/clusters/${clusterId}`)
+  return resp.data
+}
+
+// Cluster management (dynamic add/remove via UI)
+export async function addCluster(cluster: {
+  id: string
+  region: string
+  metad_ops_url: string
+  description: string
+}): Promise<void> {
+  await api.post('/admin/clusters', cluster)
+}
+
+export async function removeCluster(id: string): Promise<void> {
+  await api.delete(`/admin/clusters/${id}`)
+}
+
+export async function getClusterAuditLogs(limit = 50): Promise<ClusterAuditLog[]> {
+  const resp = await api.get('/admin/clusters/audit', { params: { limit } })
+  return resp.data
+}
+
+// Nodes
+export async function getNodes(clusterId: string): Promise<NodeInfo[]> {
+  const resp = await api.get(`/clusters/${clusterId}/nodes`)
+  return resp.data
+}
+
+export async function decommissionNode(clusterId: string, nodeId: string): Promise<void> {
+  await api.post(`/clusters/${clusterId}/nodes/${nodeId}/decommission`)
+}
+
+// Buckets
+export async function getBuckets(clusterId: string): Promise<BucketInfo[]> {
+  const resp = await api.get(`/clusters/${clusterId}/buckets`)
+  return resp.data
+}
+
+export async function createBucket(clusterId: string, bucket: CreateBucketRequest): Promise<void> {
+  await api.post(`/clusters/${clusterId}/buckets`, bucket)
+}
+
+export async function deleteBucket(clusterId: string, bucketName: string): Promise<void> {
+  await api.delete(`/clusters/${clusterId}/buckets/${bucketName}`)
+}
+
+// Chunks
+export async function getChunk(clusterId: string, chunkId: string): Promise<ChunkInfo> {
+  const resp = await api.get(`/clusters/${clusterId}/chunks/${chunkId}`)
+  return resp.data
+}
+
+export async function verifyChunk(clusterId: string, chunkId: string): Promise<void> {
+  await api.post(`/clusters/${clusterId}/chunks/${chunkId}/verify`)
+}
+
+// Repair
+export async function triggerRepair(clusterId: string): Promise<void> {
+  await api.post(`/clusters/${clusterId}/repair/trigger`)
+}
+
+export async function getRepairQueue(clusterId: string): Promise<RepairQueue> {
+  const resp = await api.get(`/clusters/${clusterId}/repair/queue`)
+  return resp.data
+}
+
+// GC
+export async function triggerGC(clusterId: string): Promise<void> {
+  await api.post(`/clusters/${clusterId}/gc/scan`)
+}
+
+// Rebalance
+export async function triggerRebalance(clusterId: string): Promise<void> {
+  await api.post(`/clusters/${clusterId}/rebalance/trigger`)
+}
+
+// Raft
+export async function getRaftStatus(clusterId: string): Promise<RaftStatus> {
+  const resp = await api.get(`/clusters/${clusterId}/raft/status`)
+  return resp.data
+}
+
+// Audit
+export async function getAuditLogs(clusterId: string, params?: { limit?: number; offset?: number }): Promise<AuditLog[]> {
+  const resp = await api.get(`/clusters/${clusterId}/audit`, { params })
+  return resp.data
+}
+
+// Types
+export interface ClusterInfo {
+  name: string
+  region: string
+  description: string
+  health: 'healthy' | 'unhealthy' | 'unknown'
+  lastCheck: string
+}
+
+export interface AggregatedResult {
+  results: Record<string, any>
+  failures: Record<string, string>
+}
+
+export interface NodeInfo {
+  id: string
+  cluster: string
+  address: string
+  status: 'online' | 'offline'
+  capacity: number
+  used: number
+}
+
+export interface BucketInfo {
+  name: string
+  cluster: string
+  created: string
+  policy: {
+    replicationFactor: number
+    storageTier: string
+  }
+  usage: {
+    size: number
+    objects: number
+  }
+}
+
+export interface CreateBucketRequest {
+  name: string
+  policy: {
+    replicationFactor: number
+    storageTier: string
+  }
+}
+
+export interface ChunkInfo {
+  id: string
+  cluster: string
+  bucket: string
+  size: number
+  replicas: string[]
+  status: string
+}
+
+export interface RepairQueue {
+  cluster: string
+  pending: number
+  inProgress: number
+  completed: number
+}
+
+export interface RaftStatus {
+  cluster: string
+  leader: string
+  term: number
+  commit: number
+  applied: number
+}
+
+export interface AuditLog {
+  cluster: string
+  timestamp: string
+  user: string
+  action: string
+  resource: string
+  result: string
+}

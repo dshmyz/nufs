@@ -65,6 +65,8 @@ nufs-core/metadata/raft-checkpoint-*/
 
 # Build output for nufs-admin
 nufs-admin/bin/
+nufs-admin/web/node_modules/
+nufs-admin/web/dist/
 
 # Personal documents (kept in workspace, not committed)
 *.docx

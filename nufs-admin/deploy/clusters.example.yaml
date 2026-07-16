@@ -1,0 +1,30 @@
+# NUFS Admin 集群配置示例
+# 每个集群对应一个区域的数据中心
+
+clusters:
+  - name: bj-prod
+    region: beijing
+    metad_ops_url: "http://10.0.1.3:8091"
+    description: "北京生产集群"
+
+  - name: sh-prod
+    region: shanghai
+    metad_ops_url: "http://10.0.2.3:8091"
+    description: "上海生产集群"
+
+  - name: sz-prod
+    region: shenzhen
+    metad_ops_url: "http://10.0.3.3:8091"
+    description: "深圳生产集群"
+
+server:
+  listen: ":8090"
+  jwt_secret: "your-secret-change-in-production"
+
+auth:
+  users_file: "deploy/users.yaml"
+
+# MySQL 数据库配置（可选，用于动态集群管理）
+# 留空则使用纯 YAML 配置模式，配置后则支持 UI 动态增删集群
+database:
+  dsn: "nufs:nufs_password@tcp(127.0.0.1:3306)/nufs_admin?parseTime=true&charset=utf8mb4"

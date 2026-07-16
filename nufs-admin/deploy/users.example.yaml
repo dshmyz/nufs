@@ -1,0 +1,8 @@
+# 用户配置示例
+# password_hash 使用 bcrypt 生成，例如：
+#   htpasswd -nbB admin password
+# 或用 Go 代码：
+#   bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
+
+- username: admin
+  password_hash: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"

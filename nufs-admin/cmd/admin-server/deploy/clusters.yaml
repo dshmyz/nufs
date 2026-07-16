@@ -1,0 +1,16 @@
+clusters:
+  - name: local-dev
+    region: local
+    metad_ops_url: "http://127.0.0.1:8091"
+    description: "本地开发集群"
+
+server:
+  listen: ":8090"
+  jwt_secret: "dev-secret-change-in-production"
+
+auth:
+  users_file: "deploy/users.yaml"
+
+# 留空则使用纯 YAML 模式
+database:
+  dsn: ""
