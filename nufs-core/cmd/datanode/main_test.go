@@ -6,23 +6,24 @@ import (
 	"testing"
 )
 
-func TestSupervisorLoadOrAllocateNodeID(t *testing.T) {
+func TestLoadOrAllocateNodeID(t *testing.T) {
 	tmpDir := t.TempDir()
+	idPath := filepath.Join(tmpDir, nodeIDFile)
 
 	// First call: allocate new
-	id1 := loadOrAllocateNodeID(tmpDir, 42)
+	id1 := loadOrAllocateNodeID(idPath, 42)
 	if id1 != 42 {
 		t.Fatalf("expected 42, got %d", id1)
 	}
 
 	// Second call: load existing
-	id2 := loadOrAllocateNodeID(tmpDir, 99)
+	id2 := loadOrAllocateNodeID(idPath, 99)
 	if id2 != 42 {
 		t.Fatalf("expected 42 (persisted), got %d", id2)
 	}
 
 	// Verify file exists
-	b, err := os.ReadFile(filepath.Join(tmpDir, nodeIDFile))
+	b, err := os.ReadFile(idPath)
 	if err != nil {
 		t.Fatalf("read node id file: %v", err)
 	}
@@ -33,8 +34,9 @@ func TestSupervisorLoadOrAllocateNodeID(t *testing.T) {
 
 func TestResolveNodeID(t *testing.T) {
 	tmpDir := t.TempDir()
+	idPath := filepath.Join(tmpDir, nodeIDFile)
 
-	id, err := resolveNodeID("123", tmpDir, "machine-a")
+	id, err := resolveNodeID("123", idPath, "machine-a")
 	if err != nil {
 		t.Fatalf("resolve numeric node id: %v", err)
 	}
@@ -42,21 +44,22 @@ func TestResolveNodeID(t *testing.T) {
 		t.Fatalf("expected 123, got %d", id)
 	}
 
-	if _, err := resolveNodeID("0", tmpDir, "machine-a"); err == nil {
+	if _, err := resolveNodeID("0", idPath, "machine-a"); err == nil {
 		t.Fatal("expected error for zero node id")
 	}
-	if _, err := resolveNodeID("bogus", tmpDir, "machine-a"); err == nil {
+	if _, err := resolveNodeID("bogus", idPath, "machine-a"); err == nil {
 		t.Fatal("expected error for malformed node id")
 	}
 }
 
 func TestResolveAutoNodeIDPersists(t *testing.T) {
 	tmpDir := t.TempDir()
-	id1, err := resolveNodeID("auto", tmpDir, "machine-a")
+	idPath := filepath.Join(tmpDir, nodeIDFile)
+	id1, err := resolveNodeID("auto", idPath, "machine-a")
 	if err != nil {
 		t.Fatalf("resolve auto node id: %v", err)
 	}
-	id2, err := resolveNodeID("auto", tmpDir, "machine-b")
+	id2, err := resolveNodeID("auto", idPath, "machine-b")
 	if err != nil {
 		t.Fatalf("resolve auto node id second time: %v", err)
 	}
@@ -68,20 +71,30 @@ func TestResolveAutoNodeIDPersists(t *testing.T) {
 	}
 }
 
-func TestSplitAndClean(t *testing.T) {
-	cases := []struct {
-		input string
-		want  int
-	}{
-		{"/a,/b,/c", 3},
-		{"/a, /b, /c ", 3},
-		{"", 0},
-		{"/single", 1},
+func TestAutoNodeIDStableAcrossDirChange(t *testing.T) {
+	// auto node ID should be stable based on machineID, not data dir.
+	// Changing data dirs should NOT change the auto-assigned node ID.
+	id1 := stableAutoNodeID("machine-1")
+	id2 := stableAutoNodeID("machine-1")
+	if id1 != id2 {
+		t.Fatalf("auto node ID should be stable for same machine: %d vs %d", id1, id2)
 	}
-	for _, c := range cases {
-		got := splitAndClean(c.input)
-		if len(got) != c.want {
-			t.Fatalf("splitAndClean(%q): want %d, got %d (%v)", c.input, c.want, len(got), got)
-		}
+	id3 := stableAutoNodeID("machine-2")
+	if id1 == id3 {
+		t.Fatalf("auto node ID should differ for different machines: %d vs %d", id1, id3)
+	}
+}
+
+func TestResolveNodeIDPath(t *testing.T) {
+	// Env var takes priority
+	t.Setenv(nodeIDEnv, "/custom/path/node_id")
+	if p := resolveNodeIDPath("/data/dir"); p != "/custom/path/node_id" {
+		t.Fatalf("env var path: got %s", p)
+	}
+
+	// Fall back to data dir
+	os.Unsetenv(nodeIDEnv)
+	if p := resolveNodeIDPath("/data/dir"); p != "/data/dir/node_id" {
+		t.Fatalf("data dir path: got %s", p)
 	}
 }

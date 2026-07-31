@@ -105,6 +105,8 @@ func (ms *managementServer) handleConn(conn net.Conn) {
 		ms.handleAdopt(conn, msg.Path)
 	case "retire":
 		ms.handleRetire(conn, msg.Path)
+	case "migrate":
+		ms.handleMigrate(conn, msg.Path)
 	default:
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "unknown command"})
 	}
@@ -173,11 +175,48 @@ func (ms *managementServer) handleRetire(conn net.Conn, dir string) {
 	}
 	for _, di := range ms.store.DiskInfos() {
 		if di.Dir == dir {
+			if di.Failed {
+				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk already retired"})
+				return
+			}
+			// Phase 1: mark failed so no new writes target this disk.
 			if err := ms.store.RemoveDisk(di.Index); err != nil {
 				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
 				return
 			}
-			json.NewEncoder(conn).Encode(sockResp{Status: "ok"})
+			// Phase 2: migrate all chunks to other disks.
+			migrated, migErr := ms.store.MigrateDisk(di.Index)
+			if migErr != nil {
+				json.NewEncoder(conn).Encode(sockResp{
+					Status: "error",
+					Error:  fmt.Sprintf("migration incomplete: %d/%d migrated, error: %v", migrated, -1, migErr),
+				})
+				return
+			}
+			json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{
+				"dir":      dir,
+				"migrated": migrated,
+			}})
+			return
+		}
+	}
+	json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
+}
+
+// handleMigrate migrates chunks from one disk to others without retiring.
+func (ms *managementServer) handleMigrate(conn net.Conn, dir string) {
+	if dir == "" {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "path required"})
+		return
+	}
+	for _, di := range ms.store.DiskInfos() {
+		if di.Dir == dir {
+			migrated, err := ms.store.MigrateDisk(di.Index)
+			if err != nil {
+				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: fmt.Sprintf("migration error: %v (migrated %d)", err, migrated)})
+				return
+			}
+			json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{"dir": dir, "migrated": migrated}})
 			return
 		}
 	}
@@ -207,7 +246,7 @@ func runManagementCommand(cmd string, args []string) {
 	defer conn.Close()
 
 	msg := sockMsg{Cmd: cmd}
-	if (cmd == "adopt" || cmd == "retire") && len(args) > 0 {
+	if (cmd == "adopt" || cmd == "retire" || cmd == "migrate") && len(args) > 0 {
 		msg.Path = args[0]
 	}
 

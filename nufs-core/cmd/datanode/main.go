@@ -26,7 +26,7 @@ func main() {
 	// Management subcommands — skip flag.Parse entirely.
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
-		case "status", "adopt", "retire":
+		case "status", "adopt", "retire", "migrate":
 			runManagementCommand(os.Args[1], os.Args[2:])
 			return
 		}
@@ -90,7 +90,7 @@ func main() {
 	}
 
 	log.Info("starting", "node_id", *nodeID, "addr", *listenAddr, "disks", dirs, "machine", mid)
-	nid, err := resolveNodeID(*nodeID, dirs[0], mid)
+	nid, err := resolveNodeID(*nodeID, resolveNodeIDPath(dirs[0]), mid)
 	if err != nil {
 		log.Error("invalid node-id", "node_id", *nodeID, "error", err)
 		os.Exit(1)
@@ -130,11 +130,11 @@ func main() {
 	})
 }
 
-func resolveNodeID(raw, dataDir, machineID string) (metadata.NodeID, error) {
+func resolveNodeID(raw, idPath, machineID string) (metadata.NodeID, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || strings.EqualFold(raw, "auto") {
-		fallback := stableAutoNodeID(machineID, dataDir)
-		return loadOrAllocateNodeID(dataDir, fallback), nil
+		fallback := stableAutoNodeID(machineID)
+		return loadOrAllocateNodeID(idPath, fallback), nil
 	}
 	id, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil || id == 0 {
@@ -146,11 +146,12 @@ func resolveNodeID(raw, dataDir, machineID string) (metadata.NodeID, error) {
 	return metadata.NodeID(id), nil
 }
 
-func stableAutoNodeID(machineID, dataDir string) metadata.NodeID {
+// stableAutoNodeID derives a deterministic node ID from the machine ID.
+// It no longer depends on the data directory path, so reordering or
+// changing data dirs does not change the auto-assigned node ID.
+func stableAutoNodeID(machineID string) metadata.NodeID {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(machineID))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(filepath.Clean(dataDir)))
 	id := h.Sum64()
 	if id == 0 {
 		id = 1
