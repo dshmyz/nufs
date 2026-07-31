@@ -105,6 +105,8 @@ func (ms *managementServer) handleConn(conn net.Conn) {
 		ms.handleAdopt(conn, msg.Path)
 	case "retire":
 		ms.handleRetire(conn, msg.Path)
+	case "decommission":
+		ms.handleDecommission(conn, msg.Path)
 	case "migrate":
 		ms.handleMigrate(conn, msg.Path)
 	default:
@@ -179,18 +181,44 @@ func (ms *managementServer) handleRetire(conn net.Conn, dir string) {
 				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk already retired"})
 				return
 			}
-			// Phase 1: mark failed so no new writes target this disk.
 			if err := ms.store.RemoveDisk(di.Index); err != nil {
 				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
 				return
 			}
-			// Phase 2: migrate all chunks to other disks.
+			json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{
+				"dir": dir,
+			}})
+			return
+		}
+	}
+	json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
+}
+
+// handleDecommission migrates data off a readable disk, then marks it
+// failed. For disks that are already unreadable, use "retire" instead.
+func (ms *managementServer) handleDecommission(conn net.Conn, dir string) {
+	if dir == "" {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "path required"})
+		return
+	}
+	for _, di := range ms.store.DiskInfos() {
+		if di.Dir == dir {
+			if di.Failed {
+				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk already retired"})
+				return
+			}
+			// Phase 1: migrate data to other disks.
 			migrated, migErr := ms.store.MigrateDisk(di.Index)
 			if migErr != nil {
 				json.NewEncoder(conn).Encode(sockResp{
 					Status: "error",
-					Error:  fmt.Sprintf("migration incomplete: %d/%d migrated, error: %v", migrated, -1, migErr),
+					Error:  fmt.Sprintf("disk may be unreadable; use retire instead (migrated %d, error: %v)", migrated, migErr),
 				})
+				return
+			}
+			// Phase 2: mark failed after successful migration.
+			if err := ms.store.RemoveDisk(di.Index); err != nil {
+				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
 				return
 			}
 			json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{
@@ -246,7 +274,7 @@ func runManagementCommand(cmd string, args []string) {
 	defer conn.Close()
 
 	msg := sockMsg{Cmd: cmd}
-	if (cmd == "adopt" || cmd == "retire" || cmd == "migrate") && len(args) > 0 {
+	if (cmd == "adopt" || cmd == "retire" || cmd == "decommission" || cmd == "migrate") && len(args) > 0 {
 		msg.Path = args[0]
 	}
 

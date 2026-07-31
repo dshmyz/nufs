@@ -26,7 +26,7 @@ func main() {
 	// Management subcommands — skip flag.Parse entirely.
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
-		case "status", "adopt", "retire", "migrate":
+		case "status", "adopt", "retire", "decommission", "migrate":
 			runManagementCommand(os.Args[1], os.Args[2:])
 			return
 		}
