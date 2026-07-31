@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/example/dfs/datanode"
 )
@@ -109,6 +111,12 @@ func (ms *managementServer) handleConn(conn net.Conn) {
 		ms.handleDecommission(conn, msg.Path)
 	case "migrate":
 		ms.handleMigrate(conn, msg.Path)
+	case "drain":
+		ms.handleDrain(conn)
+	case "verify":
+		ms.handleVerify(conn, msg.Path)
+	case "config":
+		ms.handleConfig(conn)
 	default:
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "unknown command"})
 	}
@@ -251,6 +259,58 @@ func (ms *managementServer) handleMigrate(conn net.Conn, dir string) {
 	json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
 }
 
+func (ms *managementServer) handleDrain(conn net.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := ms.store.DrainWrites(ctx); err != nil {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
+		return
+	}
+	json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{"status": "drained"}})
+}
+
+func (ms *managementServer) handleVerify(conn net.Conn, dir string) {
+	if dir == "" {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "path required"})
+		return
+	}
+	targetIdx := -1
+	for _, di := range ms.store.DiskInfos() {
+		if di.Dir == dir {
+			targetIdx = di.Index
+			break
+		}
+	}
+	if targetIdx < 0 {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
+		return
+	}
+	var verified, corrupted, failed int
+	for _, info := range ms.store.ListChunks() {
+		if info.DiskIndex != targetIdx {
+			continue
+		}
+		valid, _, err := ms.store.VerifyChunkData(info.ChunkID)
+		if err != nil {
+			failed++
+		} else if valid {
+			verified++
+		} else {
+			corrupted++
+		}
+	}
+	json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{
+		"dir": dir, "verified": verified, "corrupted": corrupted, "failed": failed,
+	}})
+}
+
+func (ms *managementServer) handleConfig(conn net.Conn) {
+	json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{
+		"message": "config is managed by the metadata service",
+		"hint":    "use admin API to update config at runtime",
+	}})
+}
+
 // ============================================================
 // CLI client — runManagementCommand + findSockPath
 // ============================================================
@@ -274,7 +334,7 @@ func runManagementCommand(cmd string, args []string) {
 	defer conn.Close()
 
 	msg := sockMsg{Cmd: cmd}
-	if (cmd == "adopt" || cmd == "retire" || cmd == "decommission" || cmd == "migrate") && len(args) > 0 {
+	if (cmd == "adopt" || cmd == "retire" || cmd == "decommission" || cmd == "migrate" || cmd == "verify") && len(args) > 0 {
 		msg.Path = args[0]
 	}
 

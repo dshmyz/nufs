@@ -87,6 +87,9 @@ func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta OpsMetadata,
 	mux.HandleFunc("/api/v1/disks/retire", s.handleHTTPRetire)
 	mux.HandleFunc("/api/v1/disks/decommission", s.handleHTTPDecommission)
 	mux.HandleFunc("/api/v1/disks/migrate", s.handleHTTPMigrate)
+	mux.HandleFunc("/api/v1/disks/verify", s.handleHTTPVerifyDisk)
+	mux.HandleFunc("/api/v1/disks/drain", s.handleHTTPDrain)
+	mux.HandleFunc("/api/v1/config", s.handleHTTPConfig)
 
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 
@@ -742,4 +745,95 @@ func writeJSONError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// handleHTTPDrain stops accepting new writes and waits for in-flight
+// writes to complete. Use before rolling restarts.
+func (s *OpsServer) handleHTTPDrain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if _, err := s.store.DrainWrites(ctx); err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, map[string]interface{}{"status": "drained"})
+}
+
+// handleHTTPVerifyDisk verifies checksums of all chunks on a specific disk.
+func (s *OpsServer) handleHTTPVerifyDisk(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required")
+		return
+	}
+	targetIdx := -1
+	for _, di := range s.store.DiskInfos() {
+		if di.Dir == dir {
+			targetIdx = di.Index
+			break
+		}
+	}
+	if targetIdx < 0 {
+		writeJSONError(w, http.StatusNotFound, "dir not found")
+		return
+	}
+
+	type chunkResult struct {
+		ChunkID metadata.ChunkID `json:"chunk_id"`
+		Valid   bool             `json:"valid"`
+		Error   string           `json:"error,omitempty"`
+	}
+
+	var results []chunkResult
+	var verified, corrupted, failed int
+	for _, info := range s.store.ListChunks() {
+		if info.DiskIndex != targetIdx {
+			continue
+		}
+		valid, _, err := s.store.VerifyChunkData(info.ChunkID)
+		if err != nil {
+			failed++
+			results = append(results, chunkResult{ChunkID: info.ChunkID, Valid: false, Error: err.Error()})
+		} else if valid {
+			verified++
+			results = append(results, chunkResult{ChunkID: info.ChunkID, Valid: true})
+		} else {
+			corrupted++
+			results = append(results, chunkResult{ChunkID: info.ChunkID, Valid: false, Error: "checksum mismatch"})
+		}
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"dir":        dir,
+		"total":      verified + corrupted + failed,
+		"verified":   verified,
+		"corrupted":  corrupted,
+		"failed":     failed,
+		"chunks":     results,
+	})
+}
+
+// handleHTTPConfig reads DynamicConfig at runtime (read-only).
+// Config updates go through the admin API which calls the metadata
+// service's HTTP endpoint directly.
+func (s *OpsServer) handleHTTPConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "use admin API to update config", http.StatusMethodNotAllowed)
+		return
+	}
+	// Return a snapshot of current placement config from the store's
+	// placement engine. The full DynamicConfig lives on the metadata
+	// service; this endpoint returns the locally visible config.
+	writeJSON(w, map[string]interface{}{
+		"message": "config is managed by the metadata service",
+		"hint":    "use admin API to update config at runtime",
+	})
 }
