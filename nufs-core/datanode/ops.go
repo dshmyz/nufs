@@ -81,6 +81,13 @@ func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta OpsMetadata,
 	}
 
 	// Cluster status
+	// Disk lifecycle management (HTTP endpoints)
+	mux.HandleFunc("/api/v1/disks", s.handleDisks)
+	mux.HandleFunc("/api/v1/disks/adopt", s.handleHTTPAdopt)
+	mux.HandleFunc("/api/v1/disks/retire", s.handleHTTPRetire)
+	mux.HandleFunc("/api/v1/disks/decommission", s.handleHTTPDecommission)
+	mux.HandleFunc("/api/v1/disks/migrate", s.handleHTTPMigrate)
+
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 
 	// Node management
@@ -579,4 +586,160 @@ func (s *OpsServer) writeJSON(w http.ResponseWriter, v interface{}, status ...in
 // OpsListenAddr is added to Config
 func init() {
 	// Default ops port is 8091
+}
+
+// ============================================================
+// Disk lifecycle management — HTTP endpoints
+// ============================================================
+
+func (s *OpsServer) handleDisks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	totalBytes, chunkCount := s.store.Stats()
+	infos := s.store.DiskInfos()
+
+	type diskJSON struct {
+		Index  int    `json:"index"`
+		Dir    string `json:"dir"`
+		Failed bool   `json:"failed"`
+		Chunks int64  `json:"chunks"`
+		Bytes  int64  `json:"bytes"`
+	}
+
+	chunksPerDisk := make(map[int]struct{ count, bytes int64 })
+	for _, info := range s.store.ListChunks() {
+		v := chunksPerDisk[info.DiskIndex]
+		v.count++
+		v.bytes += info.Size
+		chunksPerDisk[info.DiskIndex] = v
+	}
+
+	disks := make([]diskJSON, 0, len(infos))
+	for _, di := range infos {
+		v := chunksPerDisk[di.Index]
+		disks = append(disks, diskJSON{
+			Index: di.Index, Dir: di.Dir, Failed: di.Failed,
+			Chunks: v.count, Bytes: v.bytes,
+		})
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"disks": disks, "total_chunks": chunkCount, "total_bytes": totalBytes,
+	})
+}
+
+func (s *OpsServer) handleHTTPAdopt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required")
+		return
+	}
+	idx, err := s.store.AddDisk(dir, 8, 8, nil)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]interface{}{"dir": dir, "index": idx})
+}
+
+func (s *OpsServer) handleHTTPRetire(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required")
+		return
+	}
+	for _, di := range s.store.DiskInfos() {
+		if di.Dir == dir {
+			if di.Failed {
+				writeJSONError(w, http.StatusConflict, "disk already retired")
+				return
+			}
+			if err := s.store.RemoveDisk(di.Index); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, map[string]interface{}{"dir": dir})
+			return
+		}
+	}
+	writeJSONError(w, http.StatusNotFound, "dir not found")
+}
+
+func (s *OpsServer) handleHTTPDecommission(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required")
+		return
+	}
+	for _, di := range s.store.DiskInfos() {
+		if di.Dir == dir {
+			if di.Failed {
+				writeJSONError(w, http.StatusConflict, "disk already retired")
+				return
+			}
+			migrated, migErr := s.store.MigrateDisk(di.Index)
+			if migErr != nil {
+				writeJSONError(w, http.StatusInternalServerError,
+					fmt.Sprintf("disk may be unreadable; use retire instead (migrated %d, error: %v)", migrated, migErr))
+				return
+			}
+			if err := s.store.RemoveDisk(di.Index); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, map[string]interface{}{"dir": dir, "migrated": migrated})
+			return
+		}
+	}
+	writeJSONError(w, http.StatusNotFound, "dir not found")
+}
+
+func (s *OpsServer) handleHTTPMigrate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required")
+		return
+	}
+	for _, di := range s.store.DiskInfos() {
+		if di.Dir == dir {
+			migrated, err := s.store.MigrateDisk(di.Index)
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError,
+					fmt.Sprintf("error: %v (migrated %d)", err, migrated))
+				return
+			}
+			writeJSON(w, map[string]interface{}{"dir": dir, "migrated": migrated})
+			return
+		}
+	}
+	writeJSONError(w, http.StatusNotFound, "dir not found")
+}
+
+func writeJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func writeJSONError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
