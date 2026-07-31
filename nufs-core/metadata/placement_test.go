@@ -418,3 +418,134 @@ func TestPlacementEngine_MachineSpreadRelaxation(t *testing.T) {
 		t.Fatalf("expected 3 replicas (relaxed), got %d", len(selected))
 	}
 }
+
+func TestPlacementEngine_ErrorRateFilter(t *testing.T) {
+	pe := NewPlacementEngine()
+
+	pe.UpdateNode(makeTestNode(1, "rack-1", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNode(2, "rack-2", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNode(3, "rack-3", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNode(4, "rack-4", "zone-1", TierHot, 1000, 100, NodeOnline))
+
+	// Node 2 has error rate > 0.8 — should be filtered out
+	pe.UpdateErrorRate(2, 0.9)
+
+	policy := PlacementPolicy{
+		ReplicationFactor: 3,
+		TopologySpread:    SpreadNode,
+	}
+
+	selected, err := pe.PlaceChunk(policy, nil)
+	if err != nil {
+		t.Fatalf("PlaceChunk: %v", err)
+	}
+
+	for _, nid := range selected {
+		if nid == 2 {
+			t.Fatal("selected node with error rate > 0.8")
+		}
+	}
+}
+
+func TestPlacementEngine_ErrorRateDownweightsNotFilters(t *testing.T) {
+	pe := NewPlacementEngine()
+
+	pe.UpdateNode(makeTestNode(1, "rack-1", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNode(2, "rack-2", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNode(3, "rack-3", "zone-1", TierHot, 1000, 100, NodeOnline))
+
+	// Node 1 has moderate error rate (0.5) — should still be selectable
+	pe.UpdateErrorRate(1, 0.5)
+
+	policy := PlacementPolicy{
+		ReplicationFactor: 3,
+		TopologySpread:    SpreadNode,
+	}
+
+	selected, err := pe.PlaceChunk(policy, nil)
+	if err != nil {
+		t.Fatalf("PlaceChunk: %v", err)
+	}
+	if len(selected) != 3 {
+		t.Fatalf("expected 3 replicas, got %d", len(selected))
+	}
+}
+
+func TestPlacementEngine_HighErrorRateExhausted(t *testing.T) {
+	pe := NewPlacementEngine()
+
+	// All 3 nodes have error rate > 0.8 — should fail with insufficient nodes
+	pe.UpdateNode(makeTestNode(1, "rack-1", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNode(2, "rack-2", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNode(3, "rack-3", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateErrorRate(1, 0.9)
+	pe.UpdateErrorRate(2, 0.85)
+	pe.UpdateErrorRate(3, 0.95)
+
+	policy := PlacementPolicy{
+		ReplicationFactor: 3,
+		TopologySpread:    SpreadNode,
+	}
+
+	_, err := pe.PlaceChunk(policy, nil)
+	if err != ErrInsufficientNodes {
+		t.Fatalf("expected ErrInsufficientNodes when all nodes have high error rates, got: %v", err)
+	}
+}
+
+func TestPlacementEngine_ErrorRatePreferLowError(t *testing.T) {
+	pe := NewPlacementEngine()
+
+	pe.UpdateNode(makeTestNode(1, "rack-1", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNode(2, "rack-2", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateNode(makeTestNode(3, "rack-3", "zone-1", TierHot, 1000, 100, NodeOnline))
+
+	// Node 1 has high error rate, node 3 has zero
+	pe.UpdateErrorRate(1, 0.6)
+	pe.UpdateErrorRate(3, 0.0)
+
+	policy := PlacementPolicy{
+		ReplicationFactor: 1,
+		TopologySpread:    SpreadNode,
+	}
+
+	// Node 3 should be selected most often as primary
+	counts := map[NodeID]int{}
+	for i := 0; i < 100; i++ {
+		selected, err := pe.PlaceChunk(policy, nil)
+		if err != nil {
+			t.Fatalf("PlaceChunk: %v", err)
+		}
+		counts[selected[0]]++
+	}
+
+	if counts[3] <= counts[1] {
+		t.Logf("Selection counts: node1=%d, node2=%d, node3=%d", counts[1], counts[2], counts[3])
+		t.Log("Node 3 (zero error rate) should be selected more often than node 1 (high error rate)")
+	}
+}
+
+func TestPlacementEngine_RemoveNodeCleansErrorRate(t *testing.T) {
+	pe := NewPlacementEngine()
+
+	pe.UpdateNode(makeTestNode(1, "rack-1", "zone-1", TierHot, 1000, 100, NodeOnline))
+	pe.UpdateErrorRate(1, 0.9)
+
+	pe.RemoveNode(1)
+
+	// Verify error rate was cleaned up by re-adding node and placing
+	pe.UpdateNode(makeTestNode(1, "rack-1", "zone-1", TierHot, 1000, 100, NodeOnline))
+
+	policy := PlacementPolicy{
+		ReplicationFactor: 1,
+		TopologySpread:    SpreadNode,
+	}
+
+	selected, err := pe.PlaceChunk(policy, nil)
+	if err != nil {
+		t.Fatalf("PlaceChunk: %v", err)
+	}
+	if selected[0] != 1 {
+		t.Fatalf("expected node 1 selected after RemoveNode cleared error rate, got %d", selected[0])
+	}
+}

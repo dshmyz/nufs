@@ -24,7 +24,14 @@ type Config struct {
 	OpsListenAddr string
 
 	// DataDir is the root directory for chunk storage on local disk.
+	// Used for single-disk deployments. Ignored when DataDirs is non-empty.
 	DataDir string
+
+	// DataDirs is the list of root directories for JBOD multi-disk storage.
+	// When set, the datanode manages all disks in one process (writes spread
+	// across disks, single-disk failure is isolated). Empty = single disk
+	// (use DataDir).
+	DataDirs []string
 
 	// MetadataAddr is the address of the metadata service (e.g., "localhost:8091").
 	MetadataAddr string
@@ -210,6 +217,10 @@ type LocalChunkInfo struct {
 	WrittenAt   time.Time            `json:"written_at"`
 	LastAccess  time.Time            `json:"last_access"`
 	AccessCount int64                `json:"access_count"`
+	// DiskIndex identifies which disk in the JBOD set holds this chunk.
+	// Reconstructed at startup from which disk's directory the file is
+	// scanned from; not persisted in the chunk file header.
+	DiskIndex int `json:"disk_index,omitempty"`
 }
 
 // LocalChunkState tracks the write lifecycle on the local node.

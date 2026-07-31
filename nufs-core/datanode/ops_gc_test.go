@@ -75,6 +75,33 @@ func TestGCScan_DeletesOnChunkNotFound(t *testing.T) {
 	}
 }
 
+func TestChunkStoreDeleteDiscardsDescriptorOpenedBeforeUnlink(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+	chunkID := metadata.ChunkID(88991)
+	if err := cs.Write(chunkID, []byte("descriptor race")); err != nil {
+		t.Fatal(err)
+	}
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	cs.disks[0].getFdBeforeInsert = func() { close(reached); <-release }
+	readDone := make(chan error, 1)
+	go func() { _, _, err := cs.Read(chunkID, 0, 0); readDone <- err }()
+	<-reached
+	if err := cs.Delete(chunkID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-readDone; err == nil {
+		t.Fatal("read succeeded through descriptor opened before delete")
+	}
+	cs.disks[0].fdMu.RLock()
+	_, cached := cs.disks[0].fdCache[chunkID]
+	cs.disks[0].fdMu.RUnlock()
+	if cached {
+		t.Fatal("deleted chunk descriptor remained cached")
+	}
+}
+
 func TestGCScan_SkipsOnContextCancelled(t *testing.T) {
 	cs, _ := newTestChunkStore(t)
 

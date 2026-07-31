@@ -96,12 +96,16 @@ func (r *Router) handleClusterRoutes(w http.ResponseWriter, req *http.Request) {
 		r.handleChunks(w, req, clusterID, parts[5:])
 	case "repair":
 		r.handleRepair(w, req, clusterID, parts[5:])
+	case "write-ops":
+		r.handleWriteOps(w, req, clusterID, parts[5:])
 	case "gc":
 		r.handleGC(w, req, clusterID, parts[5:])
 	case "rebalance":
 		r.handleRebalance(w, req, clusterID, parts[5:])
 	case "raft":
 		r.handleRaft(w, req, clusterID, parts[5:])
+	case "readiness":
+		r.handleClusterReadiness(w, req, clusterID)
 	case "audit":
 		r.handleAudit(w, req, clusterID, parts[5:])
 	default:

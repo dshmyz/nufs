@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -608,7 +609,7 @@ func TestFSM_ApplyAndRestore(t *testing.T) {
 		count++
 	}
 	iter.Close()
-	// 100 keys + 1 root inode
+	// 100 keys + 1 root inode (epoch key removed).
 	if count != 101 {
 		t.Fatalf("expected 101 keys after restore, got %d", count)
 	}
@@ -694,6 +695,88 @@ func TestFSM_ApplyAndRestore_Checkpoint(t *testing.T) {
 	if count != 101 {
 		t.Fatalf("expected 101 keys after checkpoint restore, got %d", count)
 	}
+}
+
+func newCheckpointStore(t *testing.T) *PebbleStore {
+	t.Helper()
+	store, err := NewPebbleStore(PebbleStoreConfig{
+		Dir:    filepath.Join(t.TempDir(), "db"),
+		NodeID: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil && err != ErrServiceClosed {
+			t.Errorf("close checkpoint store: %v", err)
+		}
+	})
+	return store
+}
+
+func putTestKey(t *testing.T, store *PebbleStore, key, value string) {
+	t.Helper()
+	if err := store.db.Set([]byte(key), []byte(value), nil); err != nil {
+		t.Fatalf("set %q: %v", key, err)
+	}
+}
+
+func persistSnapshotToBytes(t *testing.T, snapshot raft.FSMSnapshot) []byte {
+	t.Helper()
+	defer snapshot.Release()
+
+	var buf bytes.Buffer
+	if err := snapshot.Persist(&testSnapshotSink{buf: &buf}); err != nil {
+		t.Fatalf("persist snapshot: %v", err)
+	}
+	return append([]byte(nil), buf.Bytes()...)
+}
+
+func restoreSnapshotBytes(t *testing.T, data []byte) *PebbleStore {
+	t.Helper()
+	store := newCheckpointStore(t)
+	if err := (&PebbleFSM{store: store}).Restore(io.NopCloser(bytes.NewReader(data))); err != nil {
+		t.Fatalf("restore snapshot: %v", err)
+	}
+	return store
+}
+
+func assertTestKey(t *testing.T, store *PebbleStore, key, want string) {
+	t.Helper()
+	value, closer, err := store.db.Get([]byte(key))
+	if err != nil {
+		t.Fatalf("get %q: %v", key, err)
+	}
+	defer closer.Close()
+	if got := string(value); got != want {
+		t.Fatalf("get %q = %q, want %q", key, got, want)
+	}
+}
+
+func assertTestKeyMissing(t *testing.T, store *PebbleStore, key string) {
+	t.Helper()
+	_, closer, err := store.db.Get([]byte(key))
+	if err == nil {
+		closer.Close()
+		t.Fatalf("key %q unexpectedly exists", key)
+	}
+}
+
+func TestPebbleSnapshotDoesNotIncludeWritesAfterSnapshot(t *testing.T) {
+	store := newCheckpointStore(t)
+	putTestKey(t, store, "before", "one")
+	fsm := &PebbleFSM{store: store}
+
+	snapshot, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	putTestKey(t, store, "after", "two")
+
+	data := persistSnapshotToBytes(t, snapshot)
+	restored := restoreSnapshotBytes(t, data)
+	assertTestKey(t, restored, "before", "one")
+	assertTestKeyMissing(t, restored, "after")
 }
 
 func TestPebbleStore_RemoveRepairTask(t *testing.T) {

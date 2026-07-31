@@ -4,13 +4,16 @@ import {
   addCluster,
   removeCluster,
   getClusterAuditLogs,
+  getWriteOpsStatus,
   ClusterInfo,
   ClusterAuditLog,
+  WriteOpsStatus,
 } from '../../api/client'
 
 export default function Clusters() {
   const [clusters, setClusters] = useState<ClusterInfo[]>([])
   const [logs, setLogs] = useState<ClusterAuditLog[]>([])
+  const [writeOps, setWriteOps] = useState<Record<string, WriteOpsStatus | { error: string }>>({})
   const [loading, setLoading] = useState(true)
   const [showAdd, setShowAdd] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -29,6 +32,20 @@ export default function Clusters() {
       ])
       setClusters(clusterData)
       setLogs(logData)
+      const statuses = await Promise.all(
+        clusterData.map(async cluster => {
+          try {
+            return [cluster.name, await getWriteOpsStatus(cluster.name)] as const
+          } catch (err: any) {
+            const responseError = err.response?.data
+            const message = typeof responseError === 'string'
+              ? responseError
+              : responseError?.error || err.message || '状态不可用'
+            return [cluster.name, { error: message }] as const
+          }
+        })
+      )
+      setWriteOps(Object.fromEntries(statuses))
     } catch (err: any) {
       setError(err.response?.data?.error || err.message)
     } finally {
@@ -165,13 +182,98 @@ export default function Clusters() {
         </div>
       )}
 
+      {clusters.length > 0 && (
+        <div style={{
+          background: '#fff',
+          border: '1px solid #e2e6ec',
+          borderRadius: '10px',
+          padding: '20px',
+          marginBottom: '24px',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', marginBottom: '16px', flexWrap: 'wrap' }}>
+            <div>
+              <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '4px' }}>对象写入闭环</h3>
+              <div style={{ fontSize: '12px', color: '#6b7280' }}>recovery / GC worker</div>
+            </div>
+            <button
+              onClick={loadData}
+              style={{
+                padding: '7px 12px',
+                background: '#f8fafc',
+                color: '#334155',
+                border: '1px solid #cbd5e1',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '12px',
+              }}
+            >
+              刷新
+            </button>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '12px' }}>
+            {clusters.map(cluster => {
+              const status = writeOps[cluster.name]
+              const isError = !status || 'error' in status
+              const attempts = isError ? {} : status.attempts
+              const recoveryNeeded = attempts.recovery_needed || 0
+              const failed = attempts.failed || 0
+              const halfWritten = (attempts.pending || 0) + (attempts.chunks_allocated || 0)
+              const hasBacklog = recoveryNeeded + failed + halfWritten > 0
+
+              return (
+                <div key={cluster.name} style={{
+                  border: '1px solid #e2e6ec',
+                  borderRadius: '8px',
+                  padding: '14px',
+                  minWidth: 0,
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', alignItems: 'center', marginBottom: '12px' }}>
+                    <div style={{ fontWeight: 700, fontSize: '14px', overflow: 'hidden', textOverflow: 'ellipsis' }}>{cluster.name}</div>
+                    <span style={{
+                      flex: '0 0 auto',
+                      padding: '2px 8px',
+                      borderRadius: '4px',
+                      background: isError ? '#fee2e2' : hasBacklog ? '#fef3c7' : '#d1fae5',
+                      color: isError ? '#b91c1c' : hasBacklog ? '#92400e' : '#047857',
+                      fontSize: '12px',
+                      fontWeight: 600,
+                    }}>
+                      {isError ? '不可用' : hasBacklog ? '有积压' : '正常'}
+                    </span>
+                  </div>
+
+                  {isError ? (
+                    <div style={{ color: '#b91c1c', background: '#fef2f2', borderRadius: '6px', padding: '10px', fontSize: '12px', wordBreak: 'break-word' }}>
+                      {status?.error || '状态不可用'}
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '8px', marginBottom: '12px' }}>
+                        <WriteOpsMetric label="待恢复" value={recoveryNeeded} tone={recoveryNeeded > 0 ? 'warn' : 'ok'} />
+                        <WriteOpsMetric label="失败" value={failed} tone={failed > 0 ? 'bad' : 'ok'} />
+                        <WriteOpsMetric label="半写入" value={halfWritten} tone={halfWritten > 0 ? 'warn' : 'ok'} />
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '8px' }}>
+                        <WorkerState label="Recovery" state={status.recovery_task?.state || 'unknown'} error={status.recovery_task?.last_error} />
+                        <WorkerState label="GC" state={status.gc_task?.state || 'unknown'} error={status.gc_task?.last_error} />
+                      </div>
+                    </>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
       <div style={{ background: '#fff', border: '1px solid #e2e6ec', borderRadius: '10px', marginBottom: '24px', overflow: 'hidden' }}>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ background: '#f5f6f8' }}>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>名称</th>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>区域</th>
-              <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>Ops URL</th>
+              <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>描述</th>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>健康状态</th>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>来源</th>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>操作</th>
@@ -272,6 +374,49 @@ export default function Clusters() {
           </table>
         )}
       </div>
+    </div>
+  )
+}
+
+function WriteOpsMetric({ label, value, tone }: { label: string; value: number; tone: 'ok' | 'warn' | 'bad' }) {
+  const colors = {
+    ok: { background: '#f0fdf4', color: '#047857' },
+    warn: { background: '#fffbeb', color: '#92400e' },
+    bad: { background: '#fef2f2', color: '#b91c1c' },
+  }[tone]
+
+  return (
+    <div style={{ background: colors.background, borderRadius: '6px', padding: '10px', minWidth: 0 }}>
+      <div style={{ color: colors.color, fontSize: '18px', lineHeight: 1.2, fontWeight: 700 }}>{value}</div>
+      <div style={{ color: '#64748b', fontSize: '12px', marginTop: '4px' }}>{label}</div>
+    </div>
+  )
+}
+
+function WorkerState({ label, state, error }: { label: string; state: string; error?: string }) {
+  const isHealthy = state === 'succeeded' || state === 'leased' || state === 'queued'
+  return (
+    <div style={{ border: '1px solid #e2e6ec', borderRadius: '6px', padding: '10px', minWidth: 0 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '6px', alignItems: 'center', marginBottom: error ? '6px' : 0 }}>
+        <span style={{ fontSize: '12px', color: '#64748b' }}>{label}</span>
+        <span style={{
+          padding: '1px 6px',
+          borderRadius: '4px',
+          background: isHealthy ? '#eef2ff' : '#fef2f2',
+          color: isHealthy ? '#3730a3' : '#b91c1c',
+          fontSize: '11px',
+          fontWeight: 600,
+          maxWidth: '110px',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}>
+          {state}
+        </span>
+      </div>
+      {error && (
+        <div style={{ color: '#b91c1c', fontSize: '11px', wordBreak: 'break-word' }}>{error}</div>
+      )}
     </div>
   )
 }

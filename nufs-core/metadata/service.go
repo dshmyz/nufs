@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -16,6 +17,15 @@ type BucketService interface {
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
 	GetBucket(ctx context.Context, name string) (*BucketInfo, error)
 	GetBucketByRoot(ctx context.Context, rootInode InodeID) (*BucketInfo, error)
+}
+
+// BucketQuotaService defines quota configuration and admission checks for buckets.
+type BucketQuotaService interface {
+	GetBucketQuota(ctx context.Context, bucket string) (*BucketQuota, error)
+	SetBucketQuota(ctx context.Context, bucket string, quota *BucketQuota) error
+	DeleteBucketQuota(ctx context.Context, bucket string) error
+	CheckBucketQuota(ctx context.Context, bucket string, additionalBytes int64, additionalObjects int64) error
+	GetBucketUsage(ctx context.Context, bucket string) (*BucketUsage, error)
 }
 
 // NamespaceService defines directory and file namespace operations.
@@ -42,6 +52,8 @@ type InodeService interface {
 // ChunkService defines chunk lifecycle operations.
 type ChunkService interface {
 	AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error)
+	// AllocateChunksBatch atomically allocates up to MaxChunkAllocationBatch
+	// chunks and appends their references to the inode in one metadata commit.
 	AllocateChunksBatch(ctx context.Context, inodeID InodeID, offsets []int64, policy PlacementPolicy) ([]*ChunkMeta, error)
 	CommitChunk(ctx context.Context, chunkID ChunkID, checksum uint32) error
 	GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error)
@@ -74,6 +86,38 @@ type RepairService interface {
 	MigrateChunkReplica(ctx context.Context, chunkID ChunkID, fromNode, toNode NodeID) error
 }
 
+// WriteAttemptService records object write progress so interrupted writes can
+// be recovered or cleaned up by background workers.
+type WriteAttemptService interface {
+	PutWriteAttempt(ctx context.Context, attempt *ObjectWriteAttempt) error
+	GetWriteAttempt(ctx context.Context, id string) (*ObjectWriteAttempt, error)
+	ListWriteAttemptsByState(ctx context.Context, state WriteAttemptState, limit int) ([]ObjectWriteAttempt, error)
+	DeleteWriteAttempt(ctx context.Context, id string) error
+}
+
+// BackgroundTaskService coordinates durable background work across workers.
+type BackgroundTaskService interface {
+	PutBackgroundTask(ctx context.Context, task *BackgroundTask) error
+	GetBackgroundTask(ctx context.Context, id string) (*BackgroundTask, error)
+	LeaseBackgroundTask(ctx context.Context, taskType BackgroundTaskType, owner string, lease time.Duration) (*BackgroundTask, error)
+	CompleteBackgroundTask(ctx context.Context, id string) error
+	FailBackgroundTask(ctx context.Context, id string, lastErr string, maxAttempts int) error
+}
+
+// BackupMetadataService is the narrow durable state boundary used by backup,
+// restore-readiness, and tombstone workers.
+type BackupMetadataService interface {
+	PutBackupTask(context.Context, *BackupTask) error
+	GetBackupTask(context.Context, string) (*BackupTask, error)
+	ListBackupTasks(context.Context, int) ([]BackupTask, error)
+	ScanActiveBackupTasks(context.Context, func(BackupTask) error) error
+	ReplaceCommittedBackupCatalog(context.Context, []CommittedBackup, time.Time) error
+	GetBackupCatalogState(context.Context) (*BackupCatalogState, error)
+	PutRestorePendingMarker(context.Context, *RestorePendingMarker) error
+	GetRestorePendingMarker(context.Context) (*RestorePendingMarker, error)
+	ClearRestorePendingMarker(context.Context) error
+}
+
 // LockService defines advisory lock operations.
 type LockService interface {
 	AdvisoryLock(ctx context.Context, inode InodeID, owner string) error
@@ -99,11 +143,14 @@ type XAttrService interface {
 // testability and reduce coupling.
 type MetadataService interface {
 	BucketService
+	BucketQuotaService
 	NamespaceService
 	InodeService
 	ChunkService
 	NodeService
 	RepairService
+	WriteAttemptService
+	BackgroundTaskService
 	LockService
 	XAttrService
 	AccessControlService
@@ -113,6 +160,14 @@ type MetadataService interface {
 
 	// Lifecycle
 	Close() error
+
+	// OptimizedWrite combines CreateFile + AllocateChunksBatch +
+	// CommitChunk into a single atomic metadata operation, reducing
+	// lock contention from 4 acquisitions to 1. Used by the S3 gateway
+	// PutObject path for improved write latency.
+	// Returns the created inode and allocated chunks.
+	CreateObjectWithChunks(ctx context.Context, parent InodeID, name string,
+		mode uint32, offsets []int64, policy PlacementPolicy) (*InodeMeta, []*ChunkMeta, error)
 }
 
 // Compile-time interface check
@@ -141,6 +196,10 @@ type ServiceBundle struct {
 
 	// Ready channel: closed when all subsystems are initialized
 	Ready chan struct{}
+
+	restoreMu              sync.RWMutex
+	restoreReadinessClosed bool
+	restoreReadinessReport *RestoreReadinessReport
 }
 
 // Close shuts down all subsystems and the core service.
@@ -173,14 +232,60 @@ func (sb *ServiceBundle) Close() error {
 // IsReady returns true if the service bundle has completed initialization.
 func (sb *ServiceBundle) IsReady() bool {
 	if sb.Ready == nil {
-		return true
+		return !sb.restoreReadinessPending()
 	}
 	select {
 	case <-sb.Ready:
-		return true
+		return !sb.restoreReadinessPending()
 	default:
 		return false
 	}
+}
+
+// SetRestoreReadinessPending keeps a restored cluster out of readiness until
+// replica availability has been verified and the restore marker is cleared.
+func (sb *ServiceBundle) SetRestoreReadinessPending(report *RestoreReadinessReport) {
+	sb.restoreMu.Lock()
+	defer sb.restoreMu.Unlock()
+	sb.restoreReadinessClosed = false
+	sb.restoreReadinessReport = cloneRestoreReadinessReport(report)
+}
+
+// UpdateRestoreReadinessReport publishes the latest restore verification state.
+func (sb *ServiceBundle) UpdateRestoreReadinessReport(report *RestoreReadinessReport) {
+	sb.restoreMu.Lock()
+	defer sb.restoreMu.Unlock()
+	sb.restoreReadinessReport = cloneRestoreReadinessReport(report)
+}
+
+// CompleteRestoreReadiness opens readiness after restored replica verification succeeds.
+func (sb *ServiceBundle) CompleteRestoreReadiness(report *RestoreReadinessReport) {
+	sb.restoreMu.Lock()
+	defer sb.restoreMu.Unlock()
+	sb.restoreReadinessClosed = true
+	sb.restoreReadinessReport = cloneRestoreReadinessReport(report)
+}
+
+// RestoreReadinessReport returns the latest restored-cluster verification report.
+func (sb *ServiceBundle) RestoreReadinessReport() *RestoreReadinessReport {
+	sb.restoreMu.RLock()
+	defer sb.restoreMu.RUnlock()
+	return cloneRestoreReadinessReport(sb.restoreReadinessReport)
+}
+
+func (sb *ServiceBundle) restoreReadinessPending() bool {
+	sb.restoreMu.RLock()
+	defer sb.restoreMu.RUnlock()
+	return sb.restoreReadinessReport != nil && !sb.restoreReadinessClosed
+}
+
+func cloneRestoreReadinessReport(report *RestoreReadinessReport) *RestoreReadinessReport {
+	if report == nil {
+		return nil
+	}
+	out := *report
+	out.Issues = append([]RestoreChunkAvailabilityIssue(nil), report.Issues...)
+	return &out
 }
 
 // WaitForReady blocks until the service bundle is fully initialized.
@@ -207,6 +312,7 @@ func NewPebbleServiceBundle(store *PebbleStore, opts ...ServiceOption) (*Service
 
 	// Health checker
 	bundle.Health = NewHealthChecker(store, nil, bundle.Metrics, sopts.Version)
+	store.health = bundle.Health
 
 	// Lease manager
 	if sopts.LeaseTTL > 0 {

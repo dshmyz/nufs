@@ -9,15 +9,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/gateway"
-	"github.com/example/dfs/gateway/s3"
+	"github.com/example/dfs/chunkstore"
 	"github.com/example/dfs/metadata"
 )
 
 // ========== 集成测试：验证 ReliabilityWrapper 正确接入 Read/Flush 路径 ==========
 
 // newTestFileWithReliability 创建带 ReliabilityWrapper 的 DFSFile。
-func newTestFileWithReliability(meta metadata.MetadataService, cs gateway.ChunkStore, id metadata.InodeID, rec MetricsRecorder, rel *ReliabilityWrapper) *DFSFile {
+func newTestFileWithReliability(meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID, rec MetricsRecorder, rel *ReliabilityWrapper) *DFSFile {
 	return &DFSFile{
 		meta:        meta,
 		chunkStore:  cs,
@@ -32,7 +31,7 @@ func newTestFileWithReliability(meta metadata.MetadataService, cs gateway.ChunkS
 // 有误，数据将不匹配。
 func TestDFSFile_Read_WithReliability_Works(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	rel := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil))
 
@@ -59,7 +58,7 @@ func TestDFSFile_Read_WithReliability_Works(t *testing.T) {
 // Flush 路径仍然正确持久化数据，且路径锁不阻塞单实例 Flush。
 func TestDFSFile_Flush_WithReliability_Works(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	rel := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil))
 
@@ -86,7 +85,7 @@ func TestDFSFile_Flush_WithReliability_Works(t *testing.T) {
 // concurrencyTrackingChunkStore 包装 ChunkStore，跟踪 WriteChunk 的并发度。
 // 用于验证 Flush 路径锁是否正确串行化。
 type concurrencyTrackingChunkStore struct {
-	inner      gateway.ChunkStore
+	inner      chunkstore.ChunkStore
 	concurrent *int32
 	maxConc    *int32
 }
@@ -117,7 +116,7 @@ func (c *concurrencyTrackingChunkStore) ReadChunkRange(ctx context.Context, chun
 // 如果 LockInode 未接入 Flush，WriteChunk 将出现并发 >1。
 func TestDFSFile_Flush_SerializesConcurrent(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	rel := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil))
 
@@ -156,7 +155,7 @@ func TestDFSFile_Flush_SerializesConcurrent(t *testing.T) {
 // Flush 仍然正常工作（passthrough 模式），不 panic。
 func TestDFSFile_Flush_NilReliability_Passthrough(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 
 	// reliability=nil → passthrough

@@ -5,9 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
-	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,17 +32,13 @@ func NewShutdownDrain(timeout time.Duration) *ShutdownDrain {
 // Begin marks an operation as in-flight. Returns false if shutdown
 // has already been initiated (caller should reject the request).
 func (d *ShutdownDrain) Begin() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.shutdown.Load() {
 		return false
 	}
 	d.wg.Add(1)
 	d.counter.Add(1)
-	// Double-check after Add to avoid race with Shutdown
-	if d.shutdown.Load() {
-		d.wg.Done()
-		d.counter.Add(-1)
-		return false
-	}
 	return true
 }
 
@@ -61,7 +54,9 @@ func (d *ShutdownDrain) End() {
 // If operations remain after timeout, it logs a warning and returns
 // an error with the count of remaining operations.
 func (d *ShutdownDrain) Shutdown() error {
+	d.mu.Lock()
 	d.shutdown.Store(true)
+	d.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -106,37 +101,6 @@ func (d *ShutdownDrain) Middleware(publicPaths map[string]struct{}, next http.Ha
 	})
 }
 
-// ============================================================
-// BackupManager — Scheduled Pebble database backups
-// ============================================================
-
-// BackupConfig configures the backup manager.
-type BackupConfig struct {
-	// Dir is the directory to write backup files.
-	Dir string
-
-	// Interval is how often to create a backup.
-	Interval time.Duration
-
-	// MaxBackups is the maximum number of backup files to keep.
-	// Older backups are deleted. 0 = unlimited.
-	MaxBackups int
-
-	// DryRun if true, logs what would happen but doesn't write.
-	DryRun bool
-}
-
-// BackupManager creates periodic Pebble checkpoint backups.
-// When a RemoteStorage is configured, backups are also uploaded to the
-// remote backend after the local checkpoint is created.
-type BackupManager struct {
-	store  *PebbleStore
-	cfg    BackupConfig
-	remote RemoteStorage // optional remote upload backend
-	stopCh chan struct{}
-	done   chan struct{}
-}
-
 // RemoteStorage is the interface for uploading backup artifacts to a
 // remote object store (S3, OSS, GCS, etc.). Implementations handle
 // authentication, retry, and multipart upload internally.
@@ -144,128 +108,6 @@ type RemoteStorage interface {
 	// Upload copies the local backup directory to the remote store.
 	// The key parameter identifies the backup (e.g., "backup-20260608-120000").
 	Upload(ctx context.Context, key string, localDir string) error
-}
-
-// NewBackupManager creates a new backup manager.
-func NewBackupManager(store *PebbleStore, cfg BackupConfig) *BackupManager {
-	return &BackupManager{
-		store:  store,
-		cfg:    cfg,
-		stopCh: make(chan struct{}),
-		done:   make(chan struct{}),
-	}
-}
-
-// SetRemoteStorage configures a remote storage backend for backup uploads.
-func (bm *BackupManager) SetRemoteStorage(remote RemoteStorage) {
-	bm.remote = remote
-}
-
-// Start begins the backup loop. Returns immediately.
-func (bm *BackupManager) Start() {
-	go bm.loop()
-}
-
-// Stop stops the backup loop and waits for it to finish.
-func (bm *BackupManager) Stop() {
-	close(bm.stopCh)
-	<-bm.done
-}
-
-func (bm *BackupManager) loop() {
-	defer close(bm.done)
-
-	ticker := time.NewTicker(bm.cfg.Interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if err := bm.doBackup(); err != nil {
-				slog.Error("backup failed", "error", err)
-			}
-		case <-bm.stopCh:
-			return
-		}
-	}
-}
-
-// doBackup creates a single checkpoint backup and optionally uploads it.
-func (bm *BackupManager) doBackup() error {
-	if bm.cfg.DryRun {
-		slog.Info("backup dry-run: would create backup", "dir", bm.cfg.Dir)
-		return nil
-	}
-
-	start := time.Now()
-	backupName := fmt.Sprintf("backup-%s", time.Now().Format("20060102-150405"))
-	backupPath := fmt.Sprintf("%s/%s", bm.cfg.Dir, backupName)
-
-	// Use Pebble's checkpoint API for a consistent snapshot
-	if err := bm.store.db.Checkpoint(backupPath); err != nil {
-		return fmt.Errorf("checkpoint: %w", err)
-	}
-
-	slog.Info("backup completed", "duration", time.Since(start).Round(time.Millisecond), "path", backupPath)
-
-	// Upload to remote storage if configured
-	if bm.remote != nil {
-		uploadStart := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-
-		if err := bm.remote.Upload(ctx, backupName, backupPath); err != nil {
-			slog.Error("backup remote upload failed", "key", backupName, "error", err)
-		} else {
-			slog.Info("backup uploaded to remote",
-				"key", backupName, "duration", time.Since(uploadStart).Round(time.Millisecond))
-		}
-	}
-
-	// Prune old backups
-	if bm.cfg.MaxBackups > 0 {
-		bm.prune()
-	}
-	return nil
-}
-
-// prune removes old backup directories beyond MaxBackups.
-func (bm *BackupManager) prune() {
-	entries, err := readBackupDirs(bm.cfg.Dir)
-	if err != nil {
-		slog.Error("backup prune failed", "error", err)
-		return
-	}
-	for len(entries) > bm.cfg.MaxBackups {
-		oldest := entries[0]
-		entries = entries[1:]
-		if err := removeBackupDir(bm.cfg.Dir + "/" + oldest); err != nil {
-			slog.Error("backup prune remove failed", "dir", oldest, "error", err)
-		} else {
-			slog.Info("pruned old backup", "dir", oldest)
-		}
-	}
-}
-
-// readBackupDirs returns sorted list of backup subdirectories.
-func readBackupDirs(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	var dirs []string
-	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), "backup-") {
-			dirs = append(dirs, e.Name())
-		}
-	}
-	sort.Strings(dirs)
-	return dirs, nil
-}
-
-// removeBackupDir recursively removes a backup directory.
-func removeBackupDir(dir string) error {
-	return os.RemoveAll(dir)
 }
 
 // ============================================================
@@ -405,9 +247,20 @@ func (rl *RateLimiter) StartCleanup(interval time.Duration) (stop func()) {
 
 // BucketQuota defines resource limits for a bucket.
 type BucketQuota struct {
-	MaxSizeBytes  int64 // Maximum total size in bytes (0 = unlimited)
-	MaxObjects    int64 // Maximum number of objects (0 = unlimited)
-	MaxChunkCount int64 // Maximum number of chunks (0 = unlimited)
+	MaxSizeBytes  int64 `json:"max_bytes"`   // Maximum total size in bytes (0 = unlimited)
+	MaxObjects    int64 `json:"max_objects"` // Maximum number of objects (0 = unlimited)
+	MaxChunkCount int64 `json:"-"`           // Maximum number of chunks (0 = unlimited)
+}
+
+// Validate verifies that quota limits are non-negative.
+func (q *BucketQuota) Validate() error {
+	if q == nil {
+		return fmt.Errorf("quota: quota is required")
+	}
+	if q.MaxSizeBytes < 0 || q.MaxObjects < 0 || q.MaxChunkCount < 0 {
+		return fmt.Errorf("quota: negative limits are invalid")
+	}
+	return nil
 }
 
 // QuotaManager tracks per-bucket resource usage against quotas.
@@ -443,16 +296,17 @@ func (qm *QuotaManager) SetStore(store QuotaStore) {
 
 // SetQuota sets the quota for a bucket and persists it if a store is configured.
 func (qm *QuotaManager) SetQuota(bucket string, quota *BucketQuota) error {
-	qm.mu.Lock()
-	qm.quotas[bucket] = quota
+	qm.mu.RLock()
 	store := qm.store
-	qm.mu.Unlock()
-
+	qm.mu.RUnlock()
 	if store != nil {
 		if err := store.SaveQuota(bucket, quota); err != nil {
 			return fmt.Errorf("quota: persist quota for %s: %w", bucket, err)
 		}
 	}
+	qm.mu.Lock()
+	qm.quotas[bucket] = quota
+	qm.mu.Unlock()
 	return nil
 }
 
@@ -461,6 +315,24 @@ func (qm *QuotaManager) GetQuota(bucket string) *BucketQuota {
 	qm.mu.RLock()
 	defer qm.mu.RUnlock()
 	return qm.quotas[bucket]
+}
+
+// DeleteQuota removes a bucket quota and its persisted representation.
+func (qm *QuotaManager) DeleteQuota(bucket string) error {
+	qm.mu.RLock()
+	store := qm.store
+	qm.mu.RUnlock()
+	if store != nil {
+		if deleter, ok := store.(interface{ DeleteQuota(bucket string) error }); ok {
+			if err := deleter.DeleteQuota(bucket); err != nil {
+				return err
+			}
+		}
+	}
+	qm.mu.Lock()
+	delete(qm.quotas, bucket)
+	qm.mu.Unlock()
+	return nil
 }
 
 // CheckWrite checks if a write of the given size would exceed the quota.
@@ -475,41 +347,75 @@ func (qm *QuotaManager) CheckWrite(bucket string, sizeBytes int64) error {
 	u := qm.usage[bucket]
 
 	if q.MaxSizeBytes > 0 && u != nil && u.UsedBytes+sizeBytes > q.MaxSizeBytes {
-		return fmt.Errorf("quota: bucket %s would exceed size limit (%d + %d > %d)",
-			bucket, u.UsedBytes, sizeBytes, q.MaxSizeBytes)
+		return fmt.Errorf("%w: bucket %s would exceed size limit (%d + %d > %d)",
+			ErrQuotaExceeded, bucket, u.UsedBytes, sizeBytes, q.MaxSizeBytes)
 	}
 	if q.MaxObjects > 0 && u != nil && int64(u.Objects)+1 > q.MaxObjects {
-		return fmt.Errorf("quota: bucket %s would exceed object limit (%d + 1 > %d)",
-			bucket, u.Objects, q.MaxObjects)
+		return fmt.Errorf("%w: bucket %s would exceed object limit (%d + 1 > %d)",
+			ErrQuotaExceeded, bucket, u.Objects, q.MaxObjects)
+	}
+	return nil
+}
+
+// CheckWriteDelta checks whether applying actual byte and object deltas would
+// exceed a bucket quota.
+func (qm *QuotaManager) CheckWriteDelta(bucket string, additionalBytes int64, additionalObjects int64) error {
+	qm.mu.RLock()
+	defer qm.mu.RUnlock()
+
+	q := qm.quotas[bucket]
+	if q == nil {
+		return nil
+	}
+	u := qm.usage[bucket]
+	var usedBytes, objects int64
+	if u != nil {
+		usedBytes = u.UsedBytes
+		objects = int64(u.Objects)
+	}
+	if q.MaxSizeBytes > 0 && additionalBytes > 0 && usedBytes > q.MaxSizeBytes-additionalBytes {
+		return fmt.Errorf("%w: bucket %s would exceed size limit (%d + %d > %d)", ErrQuotaExceeded, bucket, usedBytes, additionalBytes, q.MaxSizeBytes)
+	}
+	if q.MaxObjects > 0 && additionalObjects > 0 && objects > q.MaxObjects-additionalObjects {
+		return fmt.Errorf("%w: bucket %s would exceed object limit (%d + %d > %d)", ErrQuotaExceeded, bucket, objects, additionalObjects, q.MaxObjects)
 	}
 	return nil
 }
 
 // UpdateUsage updates the tracked usage for a bucket and persists it.
 func (qm *QuotaManager) UpdateUsage(bucket string, usage *BucketUsage) error {
-	qm.mu.Lock()
-	qm.usage[bucket] = usage
+	qm.mu.RLock()
 	store := qm.store
-	qm.mu.Unlock()
-
+	qm.mu.RUnlock()
 	if store != nil {
 		if err := store.SaveUsage(bucket, usage); err != nil {
 			return fmt.Errorf("quota: persist usage for %s: %w", bucket, err)
 		}
 	}
+	qm.mu.Lock()
+	qm.usage[bucket] = usage
+	qm.mu.Unlock()
 	return nil
 }
 
 // LoadQuota loads a quota entry from persistence (called during startup).
 func (qm *QuotaManager) LoadQuota(bucket string, quota *BucketQuota) {
 	qm.mu.Lock()
-	qm.quotas[bucket] = quota
+	if quota == nil {
+		delete(qm.quotas, bucket)
+	} else {
+		qm.quotas[bucket] = quota
+	}
 	qm.mu.Unlock()
 }
 
 // LoadUsage loads a usage entry from persistence (called during startup).
 func (qm *QuotaManager) LoadUsage(bucket string, usage *BucketUsage) {
 	qm.mu.Lock()
-	qm.usage[bucket] = usage
+	if usage == nil {
+		delete(qm.usage, bucket)
+	} else {
+		qm.usage[bucket] = usage
+	}
 	qm.mu.Unlock()
 }

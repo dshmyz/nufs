@@ -31,10 +31,16 @@ type Server struct {
 	requestSeq atomic.Uint64
 
 	// Connection management
-	connSem          chan struct{}   // Semaphore limiting concurrent connections
-	activeConn       atomic.Int64   // Current active connection count
-	reqTimeout       time.Duration  // Per-request timeout (0 = no timeout)
-	slowReqThreshold time.Duration  // Log warnings for requests exceeding this duration
+	connSem          chan struct{} // Semaphore limiting concurrent connections
+	activeConn       atomic.Int64  // Current active connection count
+	reqTimeout       time.Duration // Per-request timeout (0 = no timeout)
+	slowReqThreshold time.Duration // Log warnings for requests exceeding this duration
+
+	// Active connection tracking for graceful shutdown. Stop() closes
+	// every live connection so blocked handleConn goroutines exit
+	// immediately instead of waiting for reqTimeout.
+	connMu sync.Mutex
+	conns  map[net.Conn]struct{}
 }
 
 // NewServer creates a new data node server.
@@ -53,6 +59,7 @@ func NewServer(cfg Config, store *ChunkStore) *Server {
 		connSem:          make(chan struct{}, maxConns),
 		reqTimeout:       reqTimeout,
 		slowReqThreshold: 500 * time.Millisecond, // Log slow requests > 500ms
+		conns:            make(map[net.Conn]struct{}),
 	}
 }
 
@@ -89,7 +96,10 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Stop gracefully shuts down the server.
+// Stop gracefully shuts down the server. It stops accepting new
+// connections, then actively closes every live connection so that
+// handleConn goroutines blocked reading the next request exit
+// immediately instead of waiting for reqTimeout.
 func (s *Server) Stop() {
 	if !s.running.Swap(false) {
 		return
@@ -97,8 +107,37 @@ func (s *Server) Stop() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
+	// Close all active connections to unblock handleConn goroutines.
+	s.connMu.Lock()
+	for c := range s.conns {
+		c.Close()
+	}
+	s.connMu.Unlock()
 	s.wg.Wait()
 	slog.Info("datanode: server stopped")
+}
+
+// registerConn tracks a live connection so Stop() can close it.
+func (s *Server) registerConn(conn net.Conn) {
+	s.connMu.Lock()
+	s.conns[conn] = struct{}{}
+	s.connMu.Unlock()
+}
+
+// unregisterConn removes a connection that has finished serving.
+func (s *Server) unregisterConn(conn net.Conn) {
+	s.connMu.Lock()
+	delete(s.conns, conn)
+	s.connMu.Unlock()
+}
+
+// Addr returns the address the server is listening on. It is only valid
+// after Start() returns successfully; before that it returns "".
+func (s *Server) Addr() string {
+	if s.listener == nil {
+		return ""
+	}
+	return s.listener.Addr().String()
 }
 
 func (s *Server) acceptLoop() {
@@ -125,6 +164,7 @@ func (s *Server) acceptLoop() {
 		}
 
 		s.activeConn.Add(1)
+		s.registerConn(conn)
 		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
@@ -133,6 +173,7 @@ func (s *Server) acceptLoop() {
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
+	defer s.unregisterConn(conn)
 	defer func() {
 		<-s.connSem // Release connection slot
 		s.activeConn.Add(-1)
@@ -418,7 +459,7 @@ type responseHeader struct {
 }
 
 const (
-	maxResponseHeaderLen = 64 * 1024  // 64KB
+	maxResponseHeaderLen = 64 * 1024         // 64KB
 	maxResponseDataLen   = 128 * 1024 * 1024 // 128MB
 )
 
@@ -510,162 +551,6 @@ func readResponse(r io.Reader) (*Response, error) {
 		Length:    hdr.Length,
 		Checksum:  hdr.Checksum,
 	}, nil
-}
-
-// ========== Client (for inter-node communication) ==========
-
-// Client is a data node client for inter-node chunk replication.
-type Client struct {
-	addr    string
-	conn    net.Conn
-	mu      sync.Mutex
-	seq     atomic.Uint64
-	timeout time.Duration
-	tlsCfg  *tls.Config // nil = plain TCP
-	closed  atomic.Bool
-}
-
-// NewClient creates a new data node client.
-func NewClient(addr string) *Client {
-	return &Client{addr: addr, timeout: 30 * time.Second}
-}
-
-// NewTLSClient creates a data node client that connects over TLS.
-func NewTLSClient(addr string, cfg tlsutil.Config) (*Client, error) {
-	tlsCfg, err := tlsutil.ClientConfig(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("datanode: tls client config: %w", err)
-	}
-	return &Client{addr: addr, timeout: 30 * time.Second, tlsCfg: tlsCfg}, nil
-}
-
-// SetTimeout sets the operation timeout for read/write operations.
-func (c *Client) SetTimeout(d time.Duration) {
-	c.timeout = d
-}
-
-// Connect establishes a TCP connection to the data node.
-// When the client was created with NewTLSClient, the connection
-// is upgraded to TLS automatically.
-func (c *Client) Connect() error {
-	if c.tlsCfg != nil {
-		conn, err := tls.DialWithDialer(
-			&net.Dialer{Timeout: 10 * time.Second},
-			"tcp", c.addr, c.tlsCfg,
-		)
-		if err != nil {
-			return fmt.Errorf("datanode: tls connect to %s: %w", c.addr, err)
-		}
-		c.conn = conn
-		return nil
-	}
-	// Use net.DialTimeout to avoid hanging on unreachable nodes
-	conn, err := net.DialTimeout("tcp", c.addr, 10*time.Second)
-	if err != nil {
-		return fmt.Errorf("datanode: connect to %s: %w", c.addr, err)
-	}
-	c.conn = conn
-	return nil
-}
-
-// Close closes the connection.
-func (c *Client) Close() error {
-	c.closed.Store(true)
-	if c.conn != nil {
-		return c.conn.Close()
-	}
-	return nil
-}
-
-// IsClosed reports whether the client has been closed.
-func (c *Client) IsClosed() bool {
-	return c.closed.Load()
-}
-
-// WriteChunk sends a chunk write request.
-func (c *Client) WriteChunk(chunkID metadata.ChunkID, data []byte) (*Response, error) {
-	header := &Header{
-		Type:      ReqWriteChunk,
-		ChunkID:   chunkID,
-		Length:    int32(len(data)),
-		Checksum:  crc32.ChecksumIEEE(data),
-		RequestID: c.seq.Add(1),
-	}
-	return c.sendRequest(header, data)
-}
-
-// ReadChunk sends a chunk read request.
-func (c *Client) ReadChunk(chunkID metadata.ChunkID, offset int64, length int32) (*Response, error) {
-	header := &Header{
-		Type:      ReqReadChunk,
-		ChunkID:   chunkID,
-		Offset:    offset,
-		Length:    length,
-		RequestID: c.seq.Add(1),
-	}
-	return c.sendRequest(header, nil)
-}
-
-// ReplicateChunk sends a chunk replication request.
-func (c *Client) ReplicateChunk(chunkID metadata.ChunkID, data []byte) (*Response, error) {
-	header := &Header{
-		Type:      ReqReplicateChunk,
-		ChunkID:   chunkID,
-		Length:    int32(len(data)),
-		Checksum:  crc32.ChecksumIEEE(data),
-		RequestID: c.seq.Add(1),
-	}
-	return c.sendRequest(header, data)
-}
-
-func (c *Client) sendRequest(header *Header, body []byte) (*Response, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return nil, fmt.Errorf("datanode: not connected")
-	}
-
-	// Apply deadline for the full operation
-	if c.timeout > 0 {
-		if err := c.conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
-			return nil, fmt.Errorf("datanode: set deadline: %w", err)
-		}
-		defer c.conn.SetDeadline(time.Time{})
-	}
-
-	// Write header
-	headerData, err := json.Marshal(header)
-	if err != nil {
-		return nil, err
-	}
-	if err := binary.Write(c.conn, binary.BigEndian, uint32(len(headerData))); err != nil {
-		return nil, fmt.Errorf("datanode: write header length: %w", err)
-	}
-	if _, err := c.conn.Write(headerData); err != nil {
-		return nil, fmt.Errorf("datanode: write header: %w", err)
-	}
-
-	// Write body
-	bodyLen := uint32(0)
-	if body != nil {
-		bodyLen = uint32(len(body))
-	}
-	if err := binary.Write(c.conn, binary.BigEndian, bodyLen); err != nil {
-		return nil, fmt.Errorf("datanode: write body length: %w", err)
-	}
-	if bodyLen > 0 {
-		if _, err := c.conn.Write(body); err != nil {
-			return nil, fmt.Errorf("datanode: write body: %w", err)
-		}
-	}
-
-	// Read response using binary framing (no base64 overhead)
-	resp, err := readResponse(c.conn)
-	if err != nil {
-		return nil, fmt.Errorf("datanode: read response: %w", err)
-	}
-	return resp, nil
 }
 
 func isChunkNotFound(err error) bool {

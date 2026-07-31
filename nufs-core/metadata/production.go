@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -185,9 +186,6 @@ func (s *PebbleStore) CASUpdateInode(ctx context.Context, expected MVCCVersion, 
 		return ErrInvalidArgument
 	}
 
-	// Invalidate cache before CAS
-	s.inCache.del(meta.ID)
-
 	meta.CTime = time.Now().UnixNano()
 	wrapper := InodeWithVersion{
 		InodeMeta: *meta,
@@ -214,7 +212,11 @@ func (s *PebbleStore) CASUpdateInode(ctx context.Context, expected MVCCVersion, 
 			Key:   []byte(key),
 			Value: casValue,
 		}
-		return s.raft.ApplyAutoForward(entry, 10*time.Second)
+		err := s.raft.applyTrustedAutoForward(entry, 10*time.Second)
+		if err == nil {
+			s.inCache.del(meta.ID)
+		}
+		return err
 	}
 
 	// Standalone mode: perform CAS locally (no Raft consensus needed).
@@ -241,7 +243,11 @@ func (s *PebbleStore) CASUpdateInode(ctx context.Context, expected MVCCVersion, 
 		return ErrVersionConflict
 	}
 
-	return s.db.Set([]byte(key), newData, pebble.NoSync)
+	err = applyReferenceAwareBatch(s.db, []BatchOp{{Key: []byte(key), Value: newData}}, pebble.NoSync)
+	if err == nil {
+		s.inCache.del(meta.ID)
+	}
+	return err
 }
 
 // GetInodeWithVersion reads an inode along with its MVCC version.
@@ -551,11 +557,17 @@ func NewChunkGC(store *PebbleStore, events *EventBus, metrics *Metrics, dryRun b
 
 // ScanResult holds the result of a GC scan.
 type GCScanResult struct {
-	TotalChunks   int
-	OrphanChunks  int
-	DeletedChunks int
-	FreedBytes    int64
-	ScanDuration  time.Duration
+	TotalChunks        int
+	OrphanChunks       int
+	DeletedChunks      int
+	FreedBytes         int64
+	TombstonesCreated  int
+	TombstonesRetained int
+	ChunksPurged       int
+	RetainedBytes      int64
+	EligibleTombstones int
+	EligibleBytes      int64
+	ScanDuration       time.Duration
 }
 
 // Scan performs one pass of orphan chunk detection and cleanup.
@@ -587,73 +599,82 @@ func (gc *ChunkGC) Scan(ctx context.Context) (*GCScanResult, error) {
 	}
 	slog.Info("gc: phase 1 complete, total chunks", "count", len(allChunkIDs))
 
-	// Phase 2: Build a referenced chunk index by scanning inodes. Use an exact
-	// set for normal-sized scans so GC decisions are deterministic; fall back
-	// to Bloom for very large scans to cap memory.
-	const exactGCReferenceLimit = 1_000_000
-	useExact := len(allChunkIDs) <= exactGCReferenceLimit
-	referencedExact := make(map[ChunkID]struct{})
-	var referencedBloom *BloomFilter
-	if !useExact {
-		referencedBloom = NewBloomFilter(len(allChunkIDs), 0.01)
-	}
-	referencedCount := 0
-	err = gc.store.scanPrefix(prefixInode, func(key, val []byte) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		var meta InodeMeta
-		if err := unmarshalValue(val, &meta); err != nil {
-			return nil
-		}
-		for _, ref := range meta.ChunkMap {
-			if useExact {
-				if _, ok := referencedExact[ref.ID]; !ok {
-					referencedExact[ref.ID] = struct{}{}
-					referencedCount++
-				}
-			} else {
-				var buf [8]byte
-				binary.BigEndian.PutUint64(buf[:], uint64(ref.ID))
-				referencedBloom.Add(buf[:])
-				referencedCount++
-			}
-		}
-		return nil
-	})
+	// Phase 2: Fence one complete inode scan with the durable reference epoch.
+	// The same snapshot is used for every Phase A candidate; no candidate can
+	// be tombstoned from a stale per-chunk reference check.
+	phaseAReferences, err := gc.store.stableInodeReferenceSnapshot(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("gc scan inodes: %w", err)
 	}
-	slog.Info("gc: phase 2 complete, referenced chunks", "count", referencedCount, "exact", useExact)
+	slog.Info("gc: phase 2 complete, referenced chunks", "count", len(phaseAReferences.references), "exact", true)
 
-	// Phase 3: Delete chunks not in the referenced Bloom filter.
+	// Phase 3: Tombstone chunks not in the referenced set. Their metadata and
+	// payload stay available until the backup-aware destructive phase approves
+	// the physical purge.
 	// False positives cause us to keep some orphans (caught next cycle),
 	// but no false negatives (all truly referenced chunks are kept).
 	for _, chunkID := range allChunkIDs {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if useExact {
-			if _, ok := referencedExact[chunkID]; ok {
-				continue
-			}
-		} else {
-			var buf [8]byte
-			binary.BigEndian.PutUint64(buf[:], uint64(chunkID))
-			if referencedBloom.Contains(buf[:]) {
-				continue // probably referenced, skip
-			}
+		if phaseAReferences.contains(chunkID) {
+			continue
 		}
 		result.OrphanChunks++
 		if !gc.dryRun {
-			if delErr := gc.store.DeleteChunk(ctx, chunkID); delErr != nil {
-				slog.Error("gc: delete chunk failed", "chunk_id", chunkID, "error", delErr)
-				continue
+			created, tombstoneErr := gc.store.tombstoneChunkWithReferences(ctx, chunkID, "orphaned by chunk GC", phaseAReferences)
+			if tombstoneErr != nil {
+				if errors.Is(tombstoneErr, ErrBackupMetadataConflict) {
+					continue
+				}
+				return nil, fmt.Errorf("gc tombstone chunk %d: %w", chunkID, tombstoneErr)
+			}
+			if created {
+				result.TombstonesCreated++
 			}
 		}
-		result.DeletedChunks++
 	}
-	result.FreedBytes = -1 // Indicate not precisely tracked
+
+	// Phase 4: Stream all tombstones. This deliberately avoids the public list
+	// limit so a large backlog cannot starve an eligible later tombstone.
+	phaseBReferences, snapshotErr := gc.store.stableInodeReferenceSnapshot(ctx)
+	if snapshotErr != nil {
+		return nil, fmt.Errorf("gc scan purge references: %w", snapshotErr)
+	}
+	err = gc.store.scanChunkTombstones(ctx, func(tombstone ChunkTombstone) error {
+		if gc.dryRun {
+			result.TombstonesRetained++
+			result.RetainedBytes += tombstone.Size
+			if !phaseBReferences.contains(tombstone.ChunkID) {
+				eligible, eligibilityErr := gc.store.CanPurgeChunk(ctx, tombstone, time.Now().UTC().Round(0))
+				if eligibilityErr == nil && eligible {
+					result.EligibleTombstones++
+					result.EligibleBytes += tombstone.Size
+				}
+			}
+			return nil
+		}
+		if phaseBReferences.contains(tombstone.ChunkID) {
+			result.TombstonesRetained++
+			result.RetainedBytes += tombstone.Size
+			return nil
+		}
+		if purgeErr := gc.store.purgeChunkIfEligible(ctx, tombstone.ChunkID, time.Now().UTC().Round(0), phaseBReferences); purgeErr != nil {
+			if errors.Is(purgeErr, ErrBackupMetadataConflict) || errors.Is(purgeErr, errChunkPurgeIneligible) {
+				result.TombstonesRetained++
+				result.RetainedBytes += tombstone.Size
+				return nil
+			}
+			return fmt.Errorf("gc purge chunk %d: %w", tombstone.ChunkID, purgeErr)
+		}
+		result.ChunksPurged++
+		result.DeletedChunks++
+		result.FreedBytes += tombstone.Size
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 
 	result.ScanDuration = time.Since(start)
 	return result, nil

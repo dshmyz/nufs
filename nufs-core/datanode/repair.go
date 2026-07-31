@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +46,12 @@ type RepairConfig struct {
 	Interval   time.Duration // How often to scan for repairs
 	Replicator *Replicator   // For cross-node chunk data copy
 	LocalAddr  string        // Local data node address
+}
+
+type unifiedRepairTaskMeta interface {
+	LeaseBackgroundTask(context.Context, metadata.BackgroundTaskType, string, time.Duration) (*metadata.BackgroundTask, error)
+	CompleteBackgroundTask(context.Context, string) error
+	FailBackgroundTask(context.Context, string, string, int) error
 }
 
 // NewRepairWorker creates a new chunk repair worker.
@@ -114,6 +122,12 @@ func (rw *RepairWorker) scanLoop(ctx context.Context) {
 }
 
 func (rw *RepairWorker) processRepairQueue(ctx context.Context) {
+	if unified, ok := rw.meta.(unifiedRepairTaskMeta); ok {
+		if rw.processUnifiedRepairTask(ctx, unified) {
+			return
+		}
+	}
+
 	tasks, err := rw.meta.GetRepairQueue(ctx)
 	if err != nil {
 		slog.Error("repair: failed to get repair queue", "error", err)
@@ -145,6 +159,54 @@ func (rw *RepairWorker) processRepairQueue(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (rw *RepairWorker) processUnifiedRepairTask(ctx context.Context, meta unifiedRepairTaskMeta) bool {
+	task, err := meta.LeaseBackgroundTask(ctx, metadata.TaskRepair, rw.repairTaskOwner(), rw.interval)
+	if err != nil {
+		return false
+	}
+
+	chunkID, err := repairChunkIDFromTarget(task.Target)
+	if err != nil {
+		_ = meta.FailBackgroundTask(ctx, task.ID, err.Error(), 3)
+		return true
+	}
+
+	repairTask := metadata.RepairTask{ChunkID: chunkID, Reason: string(task.Type), Priority: 1}
+	if err := rw.repairChunk(ctx, repairTask); err != nil {
+		slog.Error("repair: unified task failed", "taskID", task.ID, "chunkID", chunkID, "error", err)
+		_ = meta.FailBackgroundTask(ctx, task.ID, err.Error(), 3)
+		rw.mu.Lock()
+		rw.failed++
+		rw.mu.Unlock()
+		return true
+	}
+
+	if err := meta.CompleteBackgroundTask(ctx, task.ID); err != nil {
+		slog.Error("repair: complete unified task failed", "taskID", task.ID, "error", err)
+		return true
+	}
+	rw.mu.Lock()
+	rw.repaired++
+	rw.mu.Unlock()
+	return true
+}
+
+func (rw *RepairWorker) repairTaskOwner() string {
+	return fmt.Sprintf("repair-worker-%d", rw.nodeID)
+}
+
+func repairChunkIDFromTarget(target string) (metadata.ChunkID, error) {
+	const prefix = "chunk:"
+	if !strings.HasPrefix(target, prefix) {
+		return 0, fmt.Errorf("invalid repair target %q", target)
+	}
+	id, err := strconv.ParseUint(strings.TrimPrefix(target, prefix), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid repair chunk target %q: %w", target, err)
+	}
+	return metadata.ChunkID(id), nil
 }
 
 func (rw *RepairWorker) repairChunk(ctx context.Context, task metadata.RepairTask) error {
@@ -287,6 +349,12 @@ func (rw *RepairWorker) recordReplacementReplica(chunk *metadata.ChunkMeta, targ
 		NodeID: targetNode.ID,
 		Addr:   targetNode.Addr,
 		State:  metadata.ReplicaSyncing,
+	}
+	for i := range chunk.Replicas {
+		if chunk.Replicas[i].NodeID == targetNode.ID {
+			chunk.Replicas[i] = replacement
+			return
+		}
 	}
 	for i := range chunk.Replicas {
 		if chunk.Replicas[i].State == metadata.ReplicaFailed || chunk.Replicas[i].State == metadata.ReplicaStale {

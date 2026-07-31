@@ -4,10 +4,12 @@ package server
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,19 +22,50 @@ type Server struct {
 }
 
 // New creates a server with router on specified address.
-func New(addr string, router *api.Router) *Server {
+func New(addr string, router *api.Router, staticFS ...fs.FS) *Server {
 	mux := http.NewServeMux()
 	router.Setup(mux)
 
-	// SPA fallback: serve embedded static files for non-API paths
-	// This will be implemented when web/dist is available
+	var handler http.Handler = mux
+	if len(staticFS) > 0 && staticFS[0] != nil {
+		handler = withSPAFallback(mux, staticFS[0])
+	}
 
 	return &Server{
 		http: &http.Server{
 			Addr:    addr,
-			Handler: mux,
+			Handler: handler,
 		},
 	}
+}
+
+func withSPAFallback(apiHandler http.Handler, static fs.FS) http.Handler {
+	fileServer := http.FileServer(http.FS(static))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			apiHandler.ServeHTTP(w, r)
+			return
+		}
+
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path != "" && fs.ValidPath(path) {
+			if f, err := static.Open(path); err == nil {
+				_ = f.Close()
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		index, err := fs.ReadFile(static, "index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(index)
+	})
 }
 
 // Run starts the server and handles graceful shutdown.

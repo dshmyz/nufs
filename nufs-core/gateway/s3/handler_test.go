@@ -13,28 +13,38 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/dfs/chunkstore"
+	"fmt"
 	"github.com/example/dfs/metadata"
 )
 
 // ========== Mock MetadataService ==========
 
 type mockMetaService struct {
-	mu      sync.RWMutex
-	buckets map[string]*metadata.BucketInfo
-	inodes  map[metadata.InodeID]*metadata.InodeMeta
-	entries map[string]map[string]*metadata.InodeMeta // parentID -> name -> inode
-	nodes   []metadata.NodeInfo
-	chunks  map[metadata.ChunkID]*metadata.ChunkMeta
-	nextID  uint64
+	mu                 sync.RWMutex
+	buckets            map[string]*metadata.BucketInfo
+	inodes             map[metadata.InodeID]*metadata.InodeMeta
+	entries            map[string]map[string]*metadata.InodeMeta // parentID -> name -> inode
+	nodes              []metadata.NodeInfo
+	chunks             map[metadata.ChunkID]*metadata.ChunkMeta
+	attempts           map[string]*metadata.ObjectWriteAttempt
+	tasks              map[string]*metadata.BackgroundTask
+	nextID             uint64
+	lookupHook         func(context.Context, metadata.InodeID, string) (*metadata.InodeMeta, error)
+	unlinkHook         func(context.Context, metadata.InodeID, string) error
+	advisoryLockHook   func(context.Context, metadata.InodeID, string) error
+	advisoryUnlockHook func(context.Context, metadata.InodeID, string) error
 }
 
 func newMockMetaService() *mockMetaService {
 	m := &mockMetaService{
-		buckets: make(map[string]*metadata.BucketInfo),
-		inodes:  make(map[metadata.InodeID]*metadata.InodeMeta),
-		entries: make(map[string]map[string]*metadata.InodeMeta),
-		chunks:  make(map[metadata.ChunkID]*metadata.ChunkMeta),
-		nextID:  100,
+		buckets:  make(map[string]*metadata.BucketInfo),
+		inodes:   make(map[metadata.InodeID]*metadata.InodeMeta),
+		entries:  make(map[string]map[string]*metadata.InodeMeta),
+		chunks:   make(map[metadata.ChunkID]*metadata.ChunkMeta),
+		attempts: make(map[string]*metadata.ObjectWriteAttempt),
+		tasks:    make(map[string]*metadata.BackgroundTask),
+		nextID:   100,
 	}
 	return m
 }
@@ -231,7 +241,12 @@ func (m *mockMetaService) CreateFile(_ context.Context, parent metadata.InodeID,
 	return inode, nil
 }
 
-func (m *mockMetaService) Unlink(_ context.Context, parent metadata.InodeID, name string) error {
+func (m *mockMetaService) Unlink(ctx context.Context, parent metadata.InodeID, name string) error {
+	if m.unlinkHook != nil {
+		if err := m.unlinkHook(ctx, parent, name); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	pk := m.parentKey(parent)
@@ -247,7 +262,10 @@ func (m *mockMetaService) Unlink(_ context.Context, parent metadata.InodeID, nam
 	return nil
 }
 
-func (m *mockMetaService) Lookup(_ context.Context, parent metadata.InodeID, name string) (*metadata.InodeMeta, error) {
+func (m *mockMetaService) Lookup(ctx context.Context, parent metadata.InodeID, name string) (*metadata.InodeMeta, error) {
+	if m.lookupHook != nil {
+		return m.lookupHook(ctx, parent, name)
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	pk := m.parentKey(parent)
@@ -271,7 +289,11 @@ func (m *mockMetaService) GetInode(_ context.Context, id metadata.InodeID) (*met
 func (m *mockMetaService) UpdateInode(_ context.Context, meta *metadata.InodeMeta) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.inodes[meta.ID] = meta
+	if existing, ok := m.inodes[meta.ID]; ok {
+		*existing = *meta
+	} else {
+		m.inodes[meta.ID] = meta
+	}
 	return nil
 }
 
@@ -370,14 +392,140 @@ func (m *mockMetaService) SealChunk(_ context.Context, chunkID metadata.ChunkID)
 }
 
 func (m *mockMetaService) ListChunks(_ context.Context, inodeID metadata.InodeID) ([]metadata.ChunkRef, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	inode, ok := m.inodes[inodeID]
+	if !ok {
+		return nil, metadata.ErrInodeNotFound
+	}
+	refs := make([]metadata.ChunkRef, len(inode.ChunkMap))
+	copy(refs, inode.ChunkMap)
+	return refs, nil
 }
 
 func (m *mockMetaService) DeleteChunk(_ context.Context, chunkID metadata.ChunkID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.chunks[chunkID]; !ok {
+		return metadata.ErrChunkNotFound
+	}
+	delete(m.chunks, chunkID)
 	return nil
 }
 
 func (m *mockMetaService) ReportChunkState(_ context.Context, nodeID metadata.NodeID, states map[metadata.ChunkID]metadata.ReplicaState) error {
+	return nil
+}
+
+// ---- Write attempt operations ----
+
+func (m *mockMetaService) PutWriteAttempt(_ context.Context, attempt *metadata.ObjectWriteAttempt) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := *attempt
+	m.attempts[attempt.ID] = &cp
+	return nil
+}
+
+func (m *mockMetaService) GetWriteAttempt(_ context.Context, id string) (*metadata.ObjectWriteAttempt, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	attempt, ok := m.attempts[id]
+	if !ok {
+		return nil, metadata.ErrEntryNotFound
+	}
+	cp := *attempt
+	return &cp, nil
+}
+
+func (m *mockMetaService) ListWriteAttemptsByState(_ context.Context, state metadata.WriteAttemptState, limit int) ([]metadata.ObjectWriteAttempt, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	result := make([]metadata.ObjectWriteAttempt, 0)
+	for _, attempt := range m.attempts {
+		if attempt.State != state {
+			continue
+		}
+		result = append(result, *attempt)
+		if len(result) >= limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (m *mockMetaService) DeleteWriteAttempt(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.attempts, id)
+	return nil
+}
+
+// ---- Background task operations ----
+
+func (m *mockMetaService) PutBackgroundTask(_ context.Context, task *metadata.BackgroundTask) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := *task
+	m.tasks[task.ID] = &cp
+	return nil
+}
+
+func (m *mockMetaService) GetBackgroundTask(_ context.Context, id string) (*metadata.BackgroundTask, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	task, ok := m.tasks[id]
+	if !ok {
+		return nil, metadata.ErrEntryNotFound
+	}
+	cp := *task
+	return &cp, nil
+}
+
+func (m *mockMetaService) LeaseBackgroundTask(_ context.Context, taskType metadata.BackgroundTaskType, owner string, lease time.Duration) (*metadata.BackgroundTask, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, task := range m.tasks {
+		if task.Type != taskType || task.State != metadata.TaskQueued {
+			continue
+		}
+		task.State = metadata.TaskLeased
+		task.LeaseOwner = owner
+		task.NextRunAt = time.Now().Add(lease).UnixNano()
+		cp := *task
+		return &cp, nil
+	}
+	return nil, metadata.ErrEntryNotFound
+}
+
+func (m *mockMetaService) CompleteBackgroundTask(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	task, ok := m.tasks[id]
+	if !ok {
+		return metadata.ErrEntryNotFound
+	}
+	task.State = metadata.TaskSucceeded
+	return nil
+}
+
+func (m *mockMetaService) FailBackgroundTask(_ context.Context, id string, lastErr string, maxAttempts int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	task, ok := m.tasks[id]
+	if !ok {
+		return metadata.ErrEntryNotFound
+	}
+	task.LastError = lastErr
+	task.AttemptCount++
+	if maxAttempts > 0 && task.AttemptCount >= maxAttempts {
+		task.State = metadata.TaskDeadLetter
+	} else {
+		task.State = metadata.TaskRetrying
+	}
 	return nil
 }
 
@@ -440,17 +588,19 @@ func (m *mockMetaService) MigrateChunkReplica(_ context.Context, _ metadata.Chun
 	return nil
 }
 
-// Advisory lock stubs — s3gw does not currently take file locks in
-// tests, so these are no-ops. Production wire-up lives in the
-// PutObject / GetObject path via a future commit.
-
-func (m *mockMetaService) AdvisoryLock(_ context.Context, _ metadata.InodeID, _ string) error {
+func (m *mockMetaService) AdvisoryLock(ctx context.Context, inodeID metadata.InodeID, owner string) error {
+	if m.advisoryLockHook != nil {
+		return m.advisoryLockHook(ctx, inodeID, owner)
+	}
 	return nil
 }
 func (m *mockMetaService) AdvisoryLockShared(_ context.Context, _ metadata.InodeID, _ string) error {
 	return nil
 }
-func (m *mockMetaService) AdvisoryUnlock(_ context.Context, _ metadata.InodeID, _ string) error {
+func (m *mockMetaService) AdvisoryUnlock(ctx context.Context, inodeID metadata.InodeID, owner string) error {
+	if m.advisoryUnlockHook != nil {
+		return m.advisoryUnlockHook(ctx, inodeID, owner)
+	}
 	return nil
 }
 func (m *mockMetaService) AdvisoryListLocks(_ context.Context, _ metadata.InodeID) ([]metadata.LockInfo, error) {
@@ -491,6 +641,10 @@ func (m *mockMetaService) RollingUpgradePlan(_ context.Context) ([]metadata.Node
 	return nil, nil
 }
 
+func (m *mockMetaService) CreateObjectWithChunks(_ context.Context, _ metadata.InodeID, _ string, _ uint32, _ []int64, _ metadata.PlacementPolicy) (*metadata.InodeMeta, []*metadata.ChunkMeta, error) {
+	return nil, nil, fmt.Errorf("not implemented in mock")
+}
+
 func (m *mockMetaService) ComputeAllBucketUsage(_ context.Context) ([]metadata.BucketUsage, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -528,13 +682,13 @@ func (m *mockMetaService) mockBucketUsage(dirInode metadata.InodeID) (int64, int
 
 func newTestGateway(t *testing.T) (*Gateway, *httptest.Server, *mockMetaService) {
 	t.Helper()
-	return newTestGatewayWithStore(t, NewMemoryChunkStore())
+	return newTestGatewayWithStore(t, chunkstore.NewMemoryChunkStore())
 }
 
 // newTestGatewayWithStore allows tests to inject a custom ChunkStore.
 // When store is nil a DatanodeChunkStore is used (only suitable for
 // tests that bring up a real datanode).
-func newTestGatewayWithStore(t *testing.T, store ChunkStore) (*Gateway, *httptest.Server, *mockMetaService) {
+func newTestGatewayWithStore(t *testing.T, store chunkstore.ChunkStore) (*Gateway, *httptest.Server, *mockMetaService) {
 	t.Helper()
 	meta := newMockMetaService()
 	gw := NewGateway(GatewayConfig{
@@ -806,6 +960,244 @@ func TestDeleteObject_Nonexistent(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+}
+
+func TestDeleteObject_AcquiresExclusiveLockAndReleasesBeforeReturning(t *testing.T) {
+	gw, ts, meta := newTestGateway(t)
+	defer ts.Close()
+
+	if err := meta.CreateBucket(context.Background(), "locked-delete", metadata.PlacementPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	bucket, err := meta.GetBucket(context.Background(), "locked-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inode, err := meta.CreateFile(context.Background(), bucket.RootInode, "object", 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var lockOwner string
+	meta.advisoryLockHook = func(_ context.Context, gotID metadata.InodeID, owner string) error {
+		if gotID != inode.ID {
+			t.Fatalf("lock inode = %d, want %d", gotID, inode.ID)
+		}
+		if !strings.HasPrefix(owner, "s3gw-delete-") {
+			t.Fatalf("lock owner %q does not use s3gw-delete prefix", owner)
+		}
+		lockOwner = owner
+		events = append(events, "lock")
+		return nil
+	}
+	meta.unlinkHook = func(_ context.Context, parent metadata.InodeID, name string) error {
+		if parent != bucket.RootInode || name != "object" {
+			t.Fatalf("unlink = (%d, %q), want (%d, %q)", parent, name, bucket.RootInode, "object")
+		}
+		events = append(events, "unlink")
+		return nil
+	}
+	meta.advisoryUnlockHook = func(_ context.Context, gotID metadata.InodeID, owner string) error {
+		if gotID != inode.ID || owner != lockOwner {
+			t.Fatalf("unlock = (%d, %q), want (%d, %q)", gotID, owner, inode.ID, lockOwner)
+		}
+		events = append(events, "unlock")
+		return errors.New("injected unlock failure")
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/locked-delete/object", nil)
+	gw.handleDeleteObject(rec, req, "locked-delete", "object", "delete-request")
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if got, want := strings.Join(events, ","), "lock,unlink,unlock"; got != want {
+		t.Fatalf("events = %q, want %q", got, want)
+	}
+}
+
+func TestDeleteObject_LockFailureReturnsSlowDownWithoutUnlink(t *testing.T) {
+	gw, ts, meta := newTestGateway(t)
+	defer ts.Close()
+
+	if err := meta.CreateBucket(context.Background(), "busy-delete", metadata.PlacementPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	bucket, err := meta.GetBucket(context.Background(), "busy-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := meta.CreateFile(context.Background(), bucket.RootInode, "object", 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	unlinkCalls := 0
+	meta.advisoryLockHook = func(context.Context, metadata.InodeID, string) error {
+		return metadata.ErrLockBusy
+	}
+	meta.unlinkHook = func(context.Context, metadata.InodeID, string) error {
+		unlinkCalls++
+		return nil
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/busy-delete/object", nil)
+	gw.handleDeleteObject(rec, req, "busy-delete", "object", "delete-request")
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	var response ErrorResponse
+	if err := xml.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode XML error: %v", err)
+	}
+	if response.Code != ErrCodeSlowDown {
+		t.Fatalf("error code = %q, want %q", response.Code, ErrCodeSlowDown)
+	}
+	if unlinkCalls != 0 {
+		t.Fatalf("unlink calls = %d, want 0", unlinkCalls)
+	}
+}
+
+func TestDeleteObject_SameIDWithDifferentCTimeIsNotUnlinked(t *testing.T) {
+	gw, ts, meta := newTestGateway(t)
+	defer ts.Close()
+
+	if err := meta.CreateBucket(context.Background(), "replaced-delete", metadata.PlacementPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	bucket, err := meta.GetBucket(context.Background(), "replaced-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := meta.CreateFile(context.Background(), bucket.RootInode, "object", 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := *original
+	replacement.CTime++
+
+	unlinkCalls := 0
+	unlockCalls := 0
+	meta.advisoryLockHook = func(context.Context, metadata.InodeID, string) error {
+		meta.mu.Lock()
+		defer meta.mu.Unlock()
+		meta.entries[meta.parentKey(bucket.RootInode)]["object"] = &replacement
+		meta.inodes[replacement.ID] = &replacement
+		return nil
+	}
+	meta.unlinkHook = func(context.Context, metadata.InodeID, string) error {
+		unlinkCalls++
+		return nil
+	}
+	meta.advisoryUnlockHook = func(context.Context, metadata.InodeID, string) error {
+		unlockCalls++
+		return nil
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/replaced-delete/object", nil)
+	gw.handleDeleteObject(rec, req, "replaced-delete", "object", "delete-request")
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	var response ErrorResponse
+	if err := xml.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode XML error: %v", err)
+	}
+	if response.Code != ErrCodeSlowDown {
+		t.Fatalf("error code = %q, want %q", response.Code, ErrCodeSlowDown)
+	}
+	if unlinkCalls != 0 {
+		t.Fatalf("unlink calls = %d, want 0", unlinkCalls)
+	}
+	if unlockCalls != 1 {
+		t.Fatalf("unlock calls = %d, want 1", unlockCalls)
+	}
+	got, err := meta.Lookup(context.Background(), bucket.RootInode, "object")
+	if err != nil {
+		t.Fatalf("replacement lookup: %v", err)
+	}
+	if got.ID != replacement.ID || got.CTime != replacement.CTime {
+		t.Fatalf("replacement identity = (%d, %d), want (%d, %d)", got.ID, got.CTime, replacement.ID, replacement.CTime)
+	}
+}
+
+func TestDeleteObject_DisappearsAfterLockReturnsNoContentWithoutUnlink(t *testing.T) {
+	gw, ts, meta := newTestGateway(t)
+	defer ts.Close()
+
+	if err := meta.CreateBucket(context.Background(), "vanished-delete", metadata.PlacementPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	bucket, err := meta.GetBucket(context.Background(), "vanished-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := meta.CreateFile(context.Background(), bucket.RootInode, "object", 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	unlinkCalls := 0
+	unlockCalls := 0
+	meta.advisoryLockHook = func(context.Context, metadata.InodeID, string) error {
+		meta.mu.Lock()
+		defer meta.mu.Unlock()
+		delete(meta.entries[meta.parentKey(bucket.RootInode)], "object")
+		return nil
+	}
+	meta.unlinkHook = func(context.Context, metadata.InodeID, string) error {
+		unlinkCalls++
+		return nil
+	}
+	meta.advisoryUnlockHook = func(context.Context, metadata.InodeID, string) error {
+		unlockCalls++
+		return nil
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/vanished-delete/object", nil)
+	gw.handleDeleteObject(rec, req, "vanished-delete", "object", "delete-request")
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if unlinkCalls != 0 {
+		t.Fatalf("unlink calls = %d, want 0", unlinkCalls)
+	}
+	if unlockCalls != 1 {
+		t.Fatalf("unlock calls = %d, want 1", unlockCalls)
+	}
+}
+
+func TestDeleteObject_InitialLookupFailureIsMapped(t *testing.T) {
+	gw, ts, meta := newTestGateway(t)
+	defer ts.Close()
+
+	if err := meta.CreateBucket(context.Background(), "lookup-delete", metadata.PlacementPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	meta.lookupHook = func(context.Context, metadata.InodeID, string) (*metadata.InodeMeta, error) {
+		return nil, metadata.ErrServiceClosed
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/lookup-delete/object", nil)
+	gw.handleDeleteObject(rec, req, "lookup-delete", "object", "delete-request")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	var response ErrorResponse
+	if err := xml.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode XML error: %v", err)
+	}
+	if response.Code != ErrCodeInternalError {
+		t.Fatalf("error code = %q, want %q", response.Code, ErrCodeInternalError)
 	}
 }
 

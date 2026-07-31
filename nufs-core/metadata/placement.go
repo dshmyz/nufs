@@ -29,10 +29,14 @@ type scoredNode struct {
 // It can subscribe to an EventBus to automatically sync node state changes,
 // eliminating the need for external callers to manually call UpdateNode/RemoveNode.
 type PlacementEngine struct {
-	mu        sync.RWMutex
-	nodes     map[NodeID]*NodeInfo
-	loadIndex map[NodeID]float64 // 0.0 - 1.0, disk/IO load
-	rng       *rand.Rand
+	mu         sync.RWMutex
+	nodes      map[NodeID]*NodeInfo
+	loadIndex  map[NodeID]float64 // 0.0 - 1.0, disk/IO load
+	errorRates map[NodeID]float64 // 0.0 - 1.0, rolling write error rate
+	rng        *rand.Rand
+
+	// Dynamic config provider — called on each PlaceChunk for live thresholds.
+	cfgFn func() *DynamicConfig
 
 	// Optional: auto-sync via EventBus
 	events  *EventBus
@@ -42,9 +46,10 @@ type PlacementEngine struct {
 // NewPlacementEngine creates a new placement engine instance.
 func NewPlacementEngine() *PlacementEngine {
 	return &PlacementEngine{
-		nodes:     make(map[NodeID]*NodeInfo),
-		loadIndex: make(map[NodeID]float64),
-		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		nodes:      make(map[NodeID]*NodeInfo),
+		loadIndex:  make(map[NodeID]float64),
+		errorRates: make(map[NodeID]float64),
+		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -53,9 +58,10 @@ func NewPlacementEngine() *PlacementEngine {
 // inputs, which is critical for reproducible placement across leader failover.
 func NewPlacementEngineWithSeed(seed int64) *PlacementEngine {
 	return &PlacementEngine{
-		nodes:     make(map[NodeID]*NodeInfo),
-		loadIndex: make(map[NodeID]float64),
-		rng:       rand.New(rand.NewSource(seed)),
+		nodes:      make(map[NodeID]*NodeInfo),
+		loadIndex:  make(map[NodeID]float64),
+		errorRates: make(map[NodeID]float64),
+		rng:        rand.New(rand.NewSource(seed)),
 	}
 }
 
@@ -97,12 +103,57 @@ func (p *PlacementEngine) UpdateLoad(nodeID NodeID, load float64) {
 	p.loadIndex[nodeID] = load
 }
 
+// UpdateErrorRate updates the write error rate for a node.
+// rate is 0.0 (no errors) to 1.0 (all writes fail).
+func (p *PlacementEngine) UpdateErrorRate(nodeID NodeID, rate float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.errorRates[nodeID] = rate
+}
+
+// SetConfigProvider sets a function that returns the current DynamicConfig.
+// Called on each PlaceChunk to read live thresholds.
+func (p *PlacementEngine) SetConfigProvider(fn func() *DynamicConfig) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cfgFn = fn
+}
+
 // RemoveNode removes a node from the placement engine.
 func (p *PlacementEngine) RemoveNode(nodeID NodeID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.nodes, nodeID)
 	delete(p.loadIndex, nodeID)
+	delete(p.errorRates, nodeID)
+}
+
+// NodeMetrics holds per-node runtime metrics tracked by the placement engine.
+type NodeMetrics struct {
+	NodeID      NodeID
+	ErrorRate   float64 // 0.0 - 1.0
+	LoadIndex   float64 // 0.0 - 1.0
+	CapacityGB  int64
+	UsedGB      int64
+	ChunkCount  int64
+}
+
+// GetNodeMetrics returns runtime metrics for all known nodes.
+func (p *PlacementEngine) GetNodeMetrics() []NodeMetrics {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]NodeMetrics, 0, len(p.nodes))
+	for id, n := range p.nodes {
+		result = append(result, NodeMetrics{
+			NodeID:     id,
+			ErrorRate:  p.errorRates[id],
+			LoadIndex:  p.loadIndex[id],
+			CapacityGB: n.CapacityGB,
+			UsedGB:     n.UsedGB,
+			ChunkCount: n.ChunkCount,
+		})
+	}
+	return result
 }
 
 // PlaceChunk selects optimal nodes for a new chunk based on the placement policy.
@@ -119,6 +170,14 @@ func (p *PlacementEngine) PlaceChunk(
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	// Read live config thresholds.
+	cfg := p.currentConfig()
+	errFilter := cfg.PlacementErrorRateFilter
+	wCapacity := cfg.PlacementWeightCapacity
+	wLoad := cfg.PlacementWeightLoad
+	wTier := cfg.PlacementWeightTier
+	wHealth := cfg.PlacementWeightHealth
+
 	// 1. Filter candidates
 	var candidates []*NodeInfo
 	for _, n := range p.nodes {
@@ -131,10 +190,14 @@ func (p *PlacementEngine) PlaceChunk(
 		if n.CapacityGB > 0 && n.UsedGB >= n.CapacityGB*95/100 {
 			continue
 		}
-		// Tier filter: skip when policy tier is unset (zero value)
-		if policy.StorageTier != StorageTierAny && n.Tier != policy.StorageTier {
+		// Skip nodes with write error rate above configurable threshold.
+		if p.errorRates[n.ID] > errFilter {
 			continue
 		}
+		// Tier: soft preference, not hard filter. All nodes are candidates;
+		// tier match is scored as a gradient so the placement engine prefers
+		// the requested tier but can degrade to adjacent tiers when the
+		// preferred tier is full.
 		candidates = append(candidates, n)
 	}
 
@@ -152,12 +215,32 @@ func (p *PlacementEngine) PlaceChunk(
 		load := p.loadIndex[n.ID]
 		lowLoad := 1.0 - load
 
-		tierMatch := 0.3
-		if policy.StorageTier == StorageTierAny || n.Tier == policy.StorageTier {
+		// Tier scoring: gradient match instead of hard filter.
+		// Exact match = 1.0, adjacent tier = 0.7, two tiers = 0.4, far = 0.1.
+		// TierAny = 1.0 for all (no preference).
+		var tierMatch float64
+		if policy.StorageTier == StorageTierAny {
 			tierMatch = 1.0
+		} else {
+			diff := int(n.Tier) - int(policy.StorageTier)
+			if diff < 0 {
+				diff = -diff
+			}
+			switch diff {
+			case 0:
+				tierMatch = 1.0
+			case 1:
+				tierMatch = 0.7
+			case 2:
+				tierMatch = 0.4
+			default:
+				tierMatch = 0.1
+			}
 		}
 
-		score := freeCapacity*0.4 + lowLoad*0.3 + tierMatch*0.3
+		healthScore := 1.0 - p.errorRates[n.ID]
+
+		score := freeCapacity*wCapacity + lowLoad*wLoad + tierMatch*wTier + healthScore*wHealth
 		// Deterministic jitter based on node ID to avoid thundering herd
 		// while ensuring reproducible placement across leader failover.
 		score += float64(n.ID%100) * 0.0005
@@ -235,6 +318,17 @@ func (p *PlacementEngine) spreadSelect(
 	}
 
 	return result
+}
+
+// currentConfig returns the current DynamicConfig, or defaults if no provider is set.
+// Must be called with p.mu held (at least RLock).
+func (p *PlacementEngine) currentConfig() DynamicConfig {
+	if p.cfgFn != nil {
+		if cfg := p.cfgFn(); cfg != nil {
+			return *cfg
+		}
+	}
+	return DefaultDynamicConfig()
 }
 
 // getDomain returns the topology domain key for a node based on spread level.

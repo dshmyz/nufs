@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/klauspost/compress/zstd"
@@ -23,6 +26,111 @@ import (
 //     [data_len:8][zstd compressed file data]
 //
 // No terminator or total count needed — the file_count tells us when to stop.
+
+// PortableCheckpoint is an immutable Pebble checkpoint and its Raft position.
+type PortableCheckpoint struct {
+	Dir          string
+	Term         uint64
+	AppliedIndex uint64
+
+	releaseOnce sync.Once
+	releaseErr  error
+}
+
+// Release removes the checkpoint directory. It is safe to call more than once.
+func (c *PortableCheckpoint) Release() error {
+	if c == nil {
+		return nil
+	}
+	c.releaseOnce.Do(func() {
+		c.releaseErr = os.RemoveAll(c.Dir)
+	})
+	return c.releaseErr
+}
+
+func lockSnapshotWithContext(ctx context.Context, mu *sync.RWMutex) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if mu.TryLock() {
+		return nil
+	}
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if mu.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
+func createCheckpointDir(ctx context.Context, store *PebbleStore, parentDir, pattern string) (dir string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if parentDir == "" {
+		return "", fmt.Errorf("checkpoint parent directory is required")
+	}
+	if store.cfg.UseInMemory {
+		return "", fmt.Errorf("checkpoint directory is unavailable for an in-memory store")
+	}
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return "", fmt.Errorf("create checkpoint parent %s: %w", parentDir, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := store.db.Flush(); err != nil {
+		return "", fmt.Errorf("pebble flush before checkpoint: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	dir, err = os.MkdirTemp(parentDir, pattern)
+	if err != nil {
+		return "", fmt.Errorf("reserve checkpoint directory: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(dir)
+		}
+	}()
+	if err = os.Remove(dir); err != nil {
+		return "", fmt.Errorf("prepare checkpoint directory %s: %w", dir, err)
+	}
+	if err = ctx.Err(); err != nil {
+		return "", err
+	}
+
+	if err = store.db.Checkpoint(dir); err != nil {
+		return "", fmt.Errorf("pebble checkpoint: %w", err)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+		return "", err
+	}
+	return dir, nil
+}
+
+// CreateStandaloneCheckpoint creates an immutable checkpoint without a Raft
+// position. It is intended for stores running without Raft.
+func (s *PebbleStore) CreateStandaloneCheckpoint(ctx context.Context, parentDir string) (*PortableCheckpoint, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	dir, err := createCheckpointDir(ctx, s, parentDir, "standalone-checkpoint-*")
+	if err != nil {
+		return nil, fmt.Errorf("create standalone checkpoint: %w", err)
+	}
+	return &PortableCheckpoint{Dir: dir}, nil
+}
 
 // checkpointWriteDir writes the files in dir to sink in PBL3 format.
 func checkpointWriteDir(dir string, sink io.Writer) error {
@@ -295,6 +403,7 @@ func restorePBL1(fsm *PebbleFSM, rc io.Reader, magic []byte) error {
 		return err
 	}
 	batch.Close()
+	fsm.store.inCache.clear()
 
 	slog.Info("fsm: restored keys from legacy snapshot", "count", count)
 	return nil

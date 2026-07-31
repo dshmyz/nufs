@@ -176,8 +176,8 @@ func TestChunkGC_FindsOrphans(t *testing.T) {
 	if result.OrphanChunks != 2 {
 		t.Fatalf("expected 2 orphans, got %d (total: %d)", result.OrphanChunks, result.TotalChunks)
 	}
-	if result.DeletedChunks != 2 {
-		t.Fatalf("expected 2 deleted, got %d", result.DeletedChunks)
+	if result.TombstonesCreated != 2 || result.DeletedChunks != 0 || result.ChunksPurged != 0 {
+		t.Fatalf("expected 2 tombstones and no physical purge, got %+v", result)
 	}
 
 	// Verify referenced chunk still exists
@@ -186,10 +186,13 @@ func TestChunkGC_FindsOrphans(t *testing.T) {
 		t.Fatalf("referenced chunk should still exist: %v", err)
 	}
 
-	// Verify orphans are gone
-	_, err = store.GetChunk(ctx, ChunkID(99901))
-	if err != ErrChunkNotFound {
-		t.Fatalf("orphan should be deleted")
+	// Verify orphan metadata remains readable through quarantine.
+	if _, err = store.GetChunk(ctx, ChunkID(99901)); err != nil {
+		t.Fatalf("orphan must remain through quarantine: %v", err)
+	}
+	tombstones, err := store.ListChunkTombstones(ctx, 0)
+	if err != nil || len(tombstones) != 2 {
+		t.Fatalf("tombstones = (%v, %v), want two", tombstones, err)
 	}
 }
 

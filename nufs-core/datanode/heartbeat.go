@@ -29,6 +29,10 @@ type HeartbeatReporter struct {
 	wg         sync.WaitGroup
 	lastDiskIO float64
 
+	// Disk I/O sampling: track bytes since last heartbeat to compute
+	// utilization as (delta_bytes / interval) normalized to 0.0-1.0.
+	lastIOBytes int64
+
 	// Delta tracking: lastKnownState maps ChunkID → state we last
 	// reported to the metadata service. On each heartbeat, we compute
 	// the diff between current state and lastKnownState; only changed
@@ -99,6 +103,22 @@ func (h *HeartbeatReporter) send() {
 	totalBytes, chunkCount := h.chunkSt.Stats()
 	usedGB := totalBytes / (1024 * 1024 * 1024)
 
+	// Sample disk I/O utilization from DiskManager counters.
+	// Computes bytes/sec since last heartbeat, normalized to 0.0-1.0
+	// where 1.0 = 200 MB/s (a reasonable SSD sustained throughput).
+	if dm := h.chunkSt.DiskManager(); dm != nil {
+		stats := dm.Stats()
+		currentIO := stats.ReadBytes + stats.WriteBytes
+		delta := currentIO - h.lastIOBytes
+		h.lastIOBytes = currentIO
+		bytesPerSec := float64(delta) / h.interval.Seconds()
+		util := bytesPerSec / (200 * 1024 * 1024) // 200 MB/s = 1.0
+		if util > 1.0 {
+			util = 1.0
+		}
+		h.lastDiskIO = util
+	}
+
 	// Collect current chunk states
 	currentStates := make(map[metadata.ChunkID]metadata.ReplicaState)
 	for _, info := range h.chunkSt.ListChunks() {
@@ -156,10 +176,25 @@ func (h *HeartbeatReporter) send() {
 	}
 
 	report := &metadata.NodeReport{
-		UsedGB:      usedGB,
-		ChunkCount:  chunkCount,
-		DiskIO:      h.lastDiskIO,
-		ChunkStates: chunkStates,
+		UsedGB:         usedGB,
+		ChunkCount:     chunkCount,
+		DiskIO:         h.lastDiskIO,
+		WriteErrorRate: h.chunkSt.WriteErrorRate(),
+		ChunkStates:    chunkStates,
+	}
+
+	// Per-disk stats for JBOD multi-disk deployments.
+	if ds := h.chunkSt.DiskStats(); len(ds) > 1 {
+		diskReports := make([]metadata.DiskReport, len(ds))
+		for i, d := range ds {
+			diskReports[i] = metadata.DiskReport{
+				Index:      d.Index,
+				UsedBytes:  d.UsedBytes,
+				ChunkCount: d.ChunkCount,
+				Failed:     d.Failed,
+			}
+		}
+		report.DiskStats = diskReports
 	}
 
 	if err := h.meta.Heartbeat(h.ctx, h.cfg.NodeID, report); err != nil {

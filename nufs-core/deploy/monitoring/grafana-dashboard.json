@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "NUFS distributed storage system overview dashboard",
+  "description": "NUFS 分布式文件系统生产监控面板",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -219,18 +219,248 @@
         { "expr": "rate(nufs_gc_scanned_chunks[5m])", "legendFormat": "Scanned/s" },
         { "expr": "rate(nufs_gc_deleted_chunks[5m])", "legendFormat": "Deleted/s" }
       ]
+    },
+    {
+      "title": "生产就绪状态",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 46 }
+    },
+    {
+      "title": "集群就绪状态",
+      "description": "0=未就绪 1=降级 2=就绪",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 47 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_cluster_readiness", "legendFormat": "readiness", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "❌ 未就绪", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "⚠️ 降级", "color": "yellow" } } },
+            { "type": "value", "options": { "2": { "text": "✅ 就绪", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 2 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Leader 状态",
+      "description": "1=稳定 0=不稳定",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 47 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_cluster_leader_stable", "legendFormat": "leader", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "❌ 不稳定", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "✅ 稳定", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      }
+    },
+    {
+      "title": "最大可支撑 RF",
+      "description": "当前集群可满足的最大副本因子",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 47 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_cluster_can_write_rf", "legendFormat": "can_write_rf", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 2 }, { "color": "green", "value": 3 }] }
+        }
+      }
+    },
+    {
+      "title": "副本不足 Chunk 数",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 47 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_cluster_chunks_under_replicated", "legendFormat": "under-replicated", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 100 }] }
+        }
+      }
+    },
+    {
+      "title": "节点写错误率",
+      "description": "每个 datanode 的滚动写错误率 (0.0–1.0)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_node_write_error_rate", "legendFormat": "node {{ node_id }}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.2 }, { "color": "red", "value": 0.5 }] }
+        }
+      }
+    },
+    {
+      "title": "节点磁盘 I/O",
+      "description": "每个 datanode 的磁盘 I/O 利用率 (0.0–1.0)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_node_disk_io", "legendFormat": "node {{ node_id }}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "节点存储用量",
+      "description": "每个节点的已用 / 总容量",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 59 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_node_used_bytes / nufs_node_capacity_bytes", "legendFormat": "node {{ node_id }}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.85 }, { "color": "red", "value": 0.95 }] }
+        }
+      }
+    },
+    {
+      "title": "Bucket 配额用量",
+      "description": "每个 bucket 的字节/对象配额使用率",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 59 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_bucket_quota_used_ratio", "legendFormat": "{{ bucket }} ({{ resource }})", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.80 }, { "color": "red", "value": 0.95 }] }
+        }
+      }
+    },
+    {
+      "title": "Object Write 状态分布",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_object_write_attempts", "legendFormat": "{{ state }}", "refId": "A" }
+      ]
+    },
+    {
+      "title": "修复队列",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 67 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "metad_repair_tasks_queued", "legendFormat": "queued", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] }
+        }
+      }
+    },
+    {
+      "title": "备份状态",
+      "description": "最近一次成功备份的时间戳",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 67 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_backup_last_success_timestamp_seconds", "legendFormat": "last backup", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeAsSystem",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      }
+    },
+    {
+      "title": "Chunk Tombstone 积压",
+      "description": "最老 tombstone 的年龄（秒）",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 71 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "nufs_chunk_tombstone_oldest_age_seconds", "legendFormat": "oldest age", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 36000 }, { "color": "red", "value": 93600 }] }
+        }
+      }
+    },
+    {
+      "title": "重平衡字节迁移",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 71 },
+      "datasource": { "type": "prometheus", "uid": "${prometheus}" },
+      "targets": [
+        { "expr": "metad_rebalance_bytes_moved", "legendFormat": "bytes moved", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      }
     }
   ],
   "refresh": "30s",
   "schemaVersion": 39,
   "tags": ["nufs", "storage"],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Prometheus",
+        "multi": false,
+        "name": "prometheus",
+        "options": [],
+        "query": "prometheus",
+        "type": "datasource"
+      }
+    ]
   },
-  "time": { "from": "now-1h", "to": "now" },
+  "time": { "from": "now-6h", "to": "now" },
   "timepicker": {},
-  "timezone": "",
-  "title": "NUFS Storage Overview",
-  "uid": "nufs-overview",
+  "timezone": "browser",
+  "title": "NUFS 生产监控",
+  "uid": "nufs-production",
   "version": 1
 }

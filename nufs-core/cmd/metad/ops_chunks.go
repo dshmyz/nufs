@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -32,8 +33,8 @@ func (h *opsHandlers) handleChunks(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		// Allocate chunk
 		var req struct {
-			InodeID metadata.InodeID        `json:"inode_id"`
-			Offset  int64                   `json:"offset"`
+			InodeID metadata.InodeID         `json:"inode_id"`
+			Offset  int64                    `json:"offset"`
 			Policy  metadata.PlacementPolicy `json:"policy"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -42,7 +43,7 @@ func (h *opsHandlers) handleChunks(w http.ResponseWriter, r *http.Request) {
 		}
 		chunk, err := h.store.AllocateChunk(r.Context(), req.InodeID, req.Offset, req.Policy)
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeChunkAllocationError(w, err)
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
@@ -157,7 +158,7 @@ func (h *opsHandlers) handleReportChunkState(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var req struct {
-		NodeID metadata.NodeID                           `json:"node_id"`
+		NodeID metadata.NodeID                            `json:"node_id"`
 		States map[metadata.ChunkID]metadata.ReplicaState `json:"states"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -177,8 +178,8 @@ func (h *opsHandlers) handleChunksBatch(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req struct {
-		InodeID metadata.InodeID        `json:"inode_id"`
-		Offsets []int64                 `json:"offsets"`
+		InodeID metadata.InodeID         `json:"inode_id"`
+		Offsets []int64                  `json:"offsets"`
 		Policy  metadata.PlacementPolicy `json:"policy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -187,9 +188,17 @@ func (h *opsHandlers) handleChunksBatch(w http.ResponseWriter, r *http.Request) 
 	}
 	chunks, err := h.store.AllocateChunksBatch(r.Context(), req.InodeID, req.Offsets, req.Policy)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeChunkAllocationError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
 	writeJSON(w, chunks)
+}
+
+func writeChunkAllocationError(w http.ResponseWriter, err error) {
+	if errors.Is(err, metadata.ErrRaftConditionalOutcomeUnknown) {
+		writeJSONErrorC(w, http.StatusConflict, "allocation_outcome_unknown", err.Error())
+		return
+	}
+	writeJSONError(w, http.StatusInternalServerError, err.Error())
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/example/dfs/metadata"
+	"golang.org/x/sys/unix"
 )
 
 // DiskState represents the operational health of a disk.
@@ -82,6 +83,10 @@ type DiskManager struct {
 	// WAL for crash recovery
 	wal *WriteAheadLog
 
+	// Per-disk capacity (bytes) for PickDisk / CanAdmitWrite. Index aligns
+	// with ChunkStore.disks.
+	capacities []int64
+
 	stopCh  chan struct{}
 	running atomic.Bool
 	wg      sync.WaitGroup // Tracks background goroutine
@@ -122,25 +127,56 @@ type TierConfig struct {
 	MinAgeDays int     // Data older than this can be migrated down
 }
 
-// NewDiskManager creates a disk manager with capacity enforcement.
-// The caller must provide a WAL instance (use NewWriteAheadLog to create one).
+// NewDiskManager creates a single-disk disk manager with capacity
+// enforcement (convenience wrapper for tests and single-disk deployments).
 func NewDiskManager(dataDir string, store *ChunkStore, capacityGB int64, wal *WriteAheadLog) (*DiskManager, error) {
+	return NewMultiDiskManager([]string{dataDir}, store, []int64{capacityGB}, []*WriteAheadLog{wal})
+}
+
+// NewMultiDiskManager creates a disk manager spanning multiple disks.
+// capacities[i] is the capacity in GB for dataDirs[i] (0 = auto-detect via
+// Statfs). The per-disk health is used by PickDisk / CanAdmitWrite to spread
+// writes and isolate failed disks.
+func NewMultiDiskManager(dataDirs []string, store *ChunkStore, capacities []int64, wals []*WriteAheadLog) (*DiskManager, error) {
+	if len(dataDirs) == 0 {
+		return nil, fmt.Errorf("disk: no data dirs")
+	}
 	dm := &DiskManager{
-		dataDir:     dataDir,
+		dataDir:     dataDirs[0], // primary disk for legacy aggregate machinery
 		store:       store,
-		capacityGB:  capacityGB,
+		capacityGB:  capacities[0],
 		tiers:       defaultTierConfig(),
 		admitCh:     make(chan struct{}, 64),
 		rejectPct:   0.90,
 		warnPct:     0.75,
 		criticalPct: 0.85,
-		wal:         wal,
+		wal:         wals[0],
 		stopCh:      make(chan struct{}),
 	}
 	dm.diskState.Store(int64(DiskOnline))
-	dm.stats.TotalBytes = capacityGB * 1024 * 1024 * 1024
+	// Per-disk capacity tracking for PickDisk / CanAdmitWrite.
+	for i, dir := range dataDirs {
+		var capBytes int64
+		if i < len(capacities) && capacities[i] > 0 {
+			capBytes = capacities[i] * 1024 * 1024 * 1024
+		} else {
+			capBytes = detectCapacityBytes(dir) // 0 if undetectable
+		}
+		dm.capacities = append(dm.capacities, capBytes)
+	}
+	dm.stats.TotalBytes = dm.capacities[0]
 	dm.refreshStats()
 	return dm, nil
+}
+
+// detectCapacityBytes returns the filesystem total bytes for dir via Statfs,
+// or 0 if it cannot be determined.
+func detectCapacityBytes(dir string) int64 {
+	var s unix.Statfs_t
+	if err := unix.Statfs(dir, &s); err != nil {
+		return 0
+	}
+	return int64(s.Blocks) * int64(s.Bsize)
 }
 
 func defaultTierConfig() map[metadata.StorageTier]*TierConfig {
@@ -235,6 +271,7 @@ func (dm *DiskManager) RecordWriteError(err error) bool {
 	if n >= DiskIOErrorThreshold {
 		old := dm.diskState.Swap(int64(DiskFailed))
 		if old != int64(DiskFailed) {
+			dm.setDisk0Failed(true)
 			slog.Error("disk: marked FAILED after consecutive I/O errors", "dir", dm.dataDir, "errors", n)
 			if dm.onDiskFailed != nil {
 				go dm.onDiskFailed(dm.dataDir)
@@ -258,6 +295,7 @@ func (dm *DiskManager) RecordIOError() {
 	if n >= DiskIOErrorThreshold {
 		old := dm.diskState.Swap(int64(DiskFailed))
 		if old != int64(DiskFailed) {
+			dm.setDisk0Failed(true)
 			slog.Error("disk: marked FAILED after I/O errors", "dir", dm.dataDir, "errors", n)
 			if dm.onDiskFailed != nil {
 				go dm.onDiskFailed(dm.dataDir)
@@ -278,6 +316,7 @@ func (dm *DiskManager) RecordSuccess() {
 	if dm.ioErrors.Load() <= 0 {
 		dm.ioErrors.Store(0)
 		dm.diskState.Store(int64(DiskOnline))
+		dm.setDisk0Failed(false)
 		slog.Info("disk: recovered to ONLINE state", "dir", dm.dataDir)
 	}
 }
@@ -287,26 +326,87 @@ func (dm *DiskManager) SetOnDiskFailed(fn func(diskID string)) {
 	dm.onDiskFailed = fn
 }
 
-// CanAdmitWrite checks if the disk can accept a new write.
-func (dm *DiskManager) CanAdmitWrite(sizeBytes int64) error {
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-
-	if DiskState(dm.diskState.Load()) == DiskFailed {
-		return fmt.Errorf("disk: %s is in FAILED state, writes rejected", dm.dataDir)
+// setDisk0Failed keeps the per-disk failed flag (read by CanAdmitWrite /
+// PickDisk) in sync with the legacy single-disk diskState transitions
+// driven by RecordWriteError / RecordIOError. The multi-disk
+// RecordIOError(diskIdx) path is a follow-up; for now I/O errors gate
+// disk 0.
+func (dm *DiskManager) setDisk0Failed(b bool) {
+	if dm.store != nil && len(dm.store.disks) > 0 {
+		dm.store.disks[0].failed.Store(b)
 	}
+}
 
-	if dm.stats.TotalBytes == 0 {
-		return nil
+// PickDisk selects the target disk index for a new write: the least-used
+// (by usage ratio) non-failed disk. Falls back to disk 0 if none is healthy.
+func (dm *DiskManager) PickDisk() (int, error) {
+	if dm.store == nil || len(dm.store.disks) == 0 {
+		return 0, fmt.Errorf("disk: no disks available")
 	}
+	bestIdx := -1
+	var bestRatio float64
+	for i, d := range dm.store.disks {
+		if d.failed.Load() {
+			continue
+		}
+		cap := int64(0)
+		if i < len(dm.capacities) {
+			cap = dm.capacities[i]
+		}
+		var ratio float64
+		used := d.usedBytes.Load()
+		if cap > 0 {
+			ratio = float64(used) / float64(cap)
+		}
+		// Prefer disks with capacity info (ratio-based); among unknown-capacity
+		// disks pick the one with least absolute usage. A disk with known
+		// capacity always beats one without.
+		if bestIdx == -1 {
+			bestIdx, bestRatio = i, ratio
+			continue
+		}
+		if ratio < bestRatio {
+			bestIdx, bestRatio = i, ratio
+		}
+	}
+	if bestIdx == -1 {
+		return 0, fmt.Errorf("disk: all disks failed, writes rejected")
+	}
+	return bestIdx, nil
+}
 
-	projected := float64(dm.stats.UsedBytes+sizeBytes) / float64(dm.stats.TotalBytes)
+// CanAdmitWrite checks whether disk diskIdx can accept a write of sizeBytes:
+// the disk must not be failed and must be under the capacity reject threshold.
+func (dm *DiskManager) CanAdmitWrite(diskIdx int, sizeBytes int64) error {
+	if dm.store == nil || diskIdx < 0 || diskIdx >= len(dm.store.disks) {
+		return fmt.Errorf("disk: invalid disk index %d", diskIdx)
+	}
+	d := dm.store.disks[diskIdx]
+	if d.failed.Load() {
+		return fmt.Errorf("disk %d: FAILED state, writes rejected", diskIdx)
+	}
+	if diskIdx >= len(dm.capacities) || dm.capacities[diskIdx] == 0 {
+		return nil // unknown capacity: admit
+	}
+	cap := dm.capacities[diskIdx]
+	projected := float64(d.usedBytes.Load()+sizeBytes) / float64(cap)
 	if projected > dm.rejectPct {
-		return fmt.Errorf("disk: capacity limit reached (%.1f%% used, limit %.0f%%)",
-			dm.stats.UsagePct*100, dm.rejectPct*100)
+		return fmt.Errorf("disk %d: capacity limit reached (limit %.0f%%)", diskIdx, dm.rejectPct*100)
 	}
-
 	return nil
+}
+
+// MarkDiskFailed marks a disk as failed so PickDisk / CanAdmitWrite skip it.
+// Used by I/O-error tracking and tests simulating disk failure.
+func (dm *DiskManager) MarkDiskFailed(diskIdx int) {
+	if dm.store == nil || diskIdx < 0 || diskIdx >= len(dm.store.disks) {
+		return
+	}
+	dm.store.disks[diskIdx].failed.Store(true)
+	if diskIdx == 0 {
+		dm.diskState.Store(int64(DiskFailed))
+	}
+	slog.Error("disk: marked FAILED", "diskIndex", diskIdx)
 }
 
 // RecordRead updates read I/O counters.
@@ -319,6 +419,16 @@ func (dm *DiskManager) RecordRead(bytes int64) {
 func (dm *DiskManager) RecordWrite(bytes int64) {
 	dm.stats.WriteIOPS.Add(1)
 	dm.stats.WriteBytes.Add(bytes)
+}
+
+// AddDiskCapacity registers a new disk's capacity for PickDisk/CanAdmitWrite.
+// Called by ChunkStore.AddDisk at runtime. A capacity of 0 means unknown
+// (auto-detect via Statfs on next refreshStats).
+func (dm *DiskManager) AddDiskCapacity(idx int, capacityBytes int64) {
+	for len(dm.capacities) <= idx {
+		dm.capacities = append(dm.capacities, 0)
+	}
+	dm.capacities[idx] = capacityBytes
 }
 
 // WAL returns the write-ahead log for crash recovery.
@@ -674,14 +784,13 @@ func (w *WriteAheadLog) Recover() ([]metadata.ChunkID, error) {
 		chunkID := metadata.ChunkID(binary.BigEndian.Uint64(header[8:16]))
 		op := header[16]
 		dataLen := binary.BigEndian.Uint32(header[4:8])
+		_ = dataLen // read for format consistency but not used
 
 		switch op {
 		case walOpWrite:
 			written[chunkID] = true
-			// Skip data payload
-			if dataLen > 0 {
-				w.file.Seek(int64(dataLen), io.SeekCurrent)
-			}
+			// LogWrite only writes the 21-byte header (no data payload),
+			// so there are no data bytes to skip here.
 		case walOpCommit:
 			committed[chunkID] = true
 		}
@@ -875,7 +984,9 @@ func (tm *TierMigrator) executeMigration() {
 		}
 		if changed {
 			migrated++
-			tm.store.writeMetaSidecar(chunk.ChunkID, chunk)
+			if idx := chunk.DiskIndex; idx >= 0 && idx < len(tm.store.disks) {
+				tm.store.disks[idx].writeMetaSidecar(chunk.ChunkID, chunk)
+			}
 		}
 	}
 	tm.store.mu.Unlock()

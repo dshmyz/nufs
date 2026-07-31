@@ -254,6 +254,15 @@ func (ss *ShardedStore) ShardForKey(key string) ShardID {
 	return ss.ring.Route(key)
 }
 
+// CreateObjectWithChunks delegates to the shard that owns the parent's namespace.
+func (ss *ShardedStore) CreateObjectWithChunks(ctx context.Context, parent InodeID, name string, mode uint32, offsets []int64, policy PlacementPolicy) (*InodeMeta, []*ChunkMeta, error) {
+	store, err := ss.GetShard(fmt.Sprintf("%d/%s", parent, name))
+	if err != nil {
+		return nil, nil, err
+	}
+	return store.CreateObjectWithChunks(ctx, parent, name, mode, offsets, policy)
+}
+
 // AllShards returns all registered shard stores.
 func (ss *ShardedStore) AllShards() map[ShardID]*PebbleStore {
 	ss.mu.RLock()
@@ -522,6 +531,14 @@ func shardKeyForNode(id NodeID) string {
 	return fmt.Sprintf("node:%d", id)
 }
 
+func shardKeyForWriteAttempt(id string) string {
+	return "write-attempt:" + id
+}
+
+func shardKeyForBackgroundTask(id string) string {
+	return "background-task:" + id
+}
+
 // routeToShard returns the shard store for the given routing key.
 func (ss *ShardedStore) routeToShard(key string) (*PebbleStore, error) {
 	ss.mu.RLock()
@@ -587,6 +604,50 @@ func (ss *ShardedStore) GetBucketByRoot(ctx context.Context, rootInode InodeID) 
 	for _, store := range ss.shards {
 		ss.mu.RUnlock()
 		return store.GetBucketByRoot(ctx, rootInode)
+	}
+	ss.mu.RUnlock()
+	return nil, fmt.Errorf("sharded store: no shards available")
+}
+
+// --- BucketQuotaService ---
+
+func (ss *ShardedStore) GetBucketQuota(ctx context.Context, bucket string) (*BucketQuota, error) {
+	ss.mu.RLock()
+	for _, store := range ss.shards {
+		ss.mu.RUnlock()
+		return store.GetBucketQuota(ctx, bucket)
+	}
+	ss.mu.RUnlock()
+	return nil, fmt.Errorf("sharded store: no shards available")
+}
+
+func (ss *ShardedStore) SetBucketQuota(ctx context.Context, bucket string, quota *BucketQuota) error {
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.SetBucketQuota(ctx, bucket, quota)
+	})
+}
+
+func (ss *ShardedStore) DeleteBucketQuota(ctx context.Context, bucket string) error {
+	return ss.forEachShard(func(s *PebbleStore) error {
+		return s.DeleteBucketQuota(ctx, bucket)
+	})
+}
+
+func (ss *ShardedStore) CheckBucketQuota(ctx context.Context, bucket string, additionalBytes int64, additionalObjects int64) error {
+	ss.mu.RLock()
+	for _, store := range ss.shards {
+		ss.mu.RUnlock()
+		return store.CheckBucketQuota(ctx, bucket, additionalBytes, additionalObjects)
+	}
+	ss.mu.RUnlock()
+	return fmt.Errorf("sharded store: no shards available")
+}
+
+func (ss *ShardedStore) GetBucketUsage(ctx context.Context, bucket string) (*BucketUsage, error) {
+	ss.mu.RLock()
+	for _, store := range ss.shards {
+		ss.mu.RUnlock()
+		return store.GetBucketUsage(ctx, bucket)
 	}
 	ss.mu.RUnlock()
 	return nil, fmt.Errorf("sharded store: no shards available")
@@ -714,6 +775,9 @@ func (ss *ShardedStore) AllocateChunk(ctx context.Context, inodeID InodeID, offs
 }
 
 func (ss *ShardedStore) AllocateChunksBatch(ctx context.Context, inodeID InodeID, offsets []int64, policy PlacementPolicy) ([]*ChunkMeta, error) {
+	if len(offsets) > MaxChunkAllocationBatch {
+		return nil, fmt.Errorf("max chunk allocation batch is %d", MaxChunkAllocationBatch)
+	}
 	store, err := ss.routeToShard(shardKeyForInode(inodeID))
 	if err != nil {
 		return nil, err
@@ -925,6 +989,116 @@ func (ss *ShardedStore) MigrateChunkReplica(ctx context.Context, chunkID ChunkID
 		return err
 	}
 	return store.MigrateChunkReplica(ctx, chunkID, fromNode, toNode)
+}
+
+// --- WriteAttemptService ---
+
+func (ss *ShardedStore) PutWriteAttempt(ctx context.Context, attempt *ObjectWriteAttempt) error {
+	if attempt == nil {
+		return ErrInvalidArgument
+	}
+	store, err := ss.routeToShard(shardKeyForWriteAttempt(attempt.ID))
+	if err != nil {
+		return err
+	}
+	return store.PutWriteAttempt(ctx, attempt)
+}
+
+func (ss *ShardedStore) GetWriteAttempt(ctx context.Context, id string) (*ObjectWriteAttempt, error) {
+	store, err := ss.routeToShard(shardKeyForWriteAttempt(id))
+	if err != nil {
+		return nil, err
+	}
+	return store.GetWriteAttempt(ctx, id)
+}
+
+func (ss *ShardedStore) ListWriteAttemptsByState(ctx context.Context, state WriteAttemptState, limit int) ([]ObjectWriteAttempt, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	attempts := make([]ObjectWriteAttempt, 0)
+	err := ss.forEachShard(func(s *PebbleStore) error {
+		if len(attempts) >= limit {
+			return nil
+		}
+		shardAttempts, err := s.ListWriteAttemptsByState(ctx, state, limit-len(attempts))
+		if err != nil {
+			return err
+		}
+		attempts = append(attempts, shardAttempts...)
+		return nil
+	})
+	return attempts, err
+}
+
+func (ss *ShardedStore) DeleteWriteAttempt(ctx context.Context, id string) error {
+	store, err := ss.routeToShard(shardKeyForWriteAttempt(id))
+	if err != nil {
+		return err
+	}
+	return store.DeleteWriteAttempt(ctx, id)
+}
+
+// --- BackgroundTaskService ---
+
+func (ss *ShardedStore) PutBackgroundTask(ctx context.Context, task *BackgroundTask) error {
+	if task == nil {
+		return ErrInvalidArgument
+	}
+	store, err := ss.routeToShard(shardKeyForBackgroundTask(task.ID))
+	if err != nil {
+		return err
+	}
+	return store.PutBackgroundTask(ctx, task)
+}
+
+func (ss *ShardedStore) GetBackgroundTask(ctx context.Context, id string) (*BackgroundTask, error) {
+	store, err := ss.routeToShard(shardKeyForBackgroundTask(id))
+	if err != nil {
+		return nil, err
+	}
+	return store.GetBackgroundTask(ctx, id)
+}
+
+func (ss *ShardedStore) LeaseBackgroundTask(ctx context.Context, taskType BackgroundTaskType, owner string, lease time.Duration) (*BackgroundTask, error) {
+	var leased *BackgroundTask
+	err := ss.forEachShard(func(s *PebbleStore) error {
+		if leased != nil {
+			return nil
+		}
+		task, err := s.LeaseBackgroundTask(ctx, taskType, owner, lease)
+		if err == ErrEntryNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		leased = task
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if leased == nil {
+		return nil, ErrEntryNotFound
+	}
+	return leased, nil
+}
+
+func (ss *ShardedStore) CompleteBackgroundTask(ctx context.Context, id string) error {
+	store, err := ss.routeToShard(shardKeyForBackgroundTask(id))
+	if err != nil {
+		return err
+	}
+	return store.CompleteBackgroundTask(ctx, id)
+}
+
+func (ss *ShardedStore) FailBackgroundTask(ctx context.Context, id string, lastErr string, maxAttempts int) error {
+	store, err := ss.routeToShard(shardKeyForBackgroundTask(id))
+	if err != nil {
+		return err
+	}
+	return store.FailBackgroundTask(ctx, id, lastErr, maxAttempts)
 }
 
 // --- LockService ---

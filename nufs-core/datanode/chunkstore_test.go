@@ -312,7 +312,7 @@ func TestChunkStore_Seal_PersistsCRC(t *testing.T) {
 	}
 
 	// Create a new ChunkStore from the same directory to verify CRC persists on disk
-	cs2, err := NewChunkStore(cs.dataDir, 8, 8, nil)
+	cs2, err := NewChunkStore(cs.disks[0].dataDir, 8, 8, nil)
 	if err != nil {
 		t.Fatalf("NewChunkStore: %v", err)
 	}
@@ -341,15 +341,15 @@ func TestChunkStore_DrainWritesReleasesSlots(t *testing.T) {
 	}
 
 	select {
-	case cs.writeSem <- struct{}{}:
+	case cs.disks[0].writeSem <- struct{}{}:
 		t.Fatal("write semaphore should be full while drained")
 	default:
 	}
 	release()
 
 	select {
-	case cs.writeSem <- struct{}{}:
-		<-cs.writeSem
+	case cs.disks[0].writeSem <- struct{}{}:
+		<-cs.disks[0].writeSem
 	case <-time.After(time.Second):
 		t.Fatal("write semaphore slot was not released")
 	}
@@ -357,12 +357,12 @@ func TestChunkStore_DrainWritesReleasesSlots(t *testing.T) {
 
 func TestChunkStore_DrainWritesTimeout(t *testing.T) {
 	cs, _ := newTestChunkStore(t)
-	for i := 0; i < cap(cs.writeSem); i++ {
-		cs.writeSem <- struct{}{}
+	for i := 0; i < cap(cs.disks[0].writeSem); i++ {
+		cs.disks[0].writeSem <- struct{}{}
 	}
 	defer func() {
-		for i := 0; i < cap(cs.writeSem); i++ {
-			<-cs.writeSem
+		for i := 0; i < cap(cs.disks[0].writeSem); i++ {
+			<-cs.disks[0].writeSem
 		}
 	}()
 
@@ -452,19 +452,19 @@ func TestChunkStore_CloseClosesFdCache(t *testing.T) {
 	if _, _, err := cs.Read(chunkID, 0, 0); err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	cs.fdMu.RLock()
-	cached := len(cs.fdCache)
-	cs.fdMu.RUnlock()
+	cs.disks[0].fdMu.RLock()
+	cached := len(cs.disks[0].fdCache)
+	cs.disks[0].fdMu.RUnlock()
 	if cached == 0 {
 		t.Fatal("expected fd cache to contain entry after read")
 	}
 	if err := cs.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	cs.fdMu.RLock()
-	defer cs.fdMu.RUnlock()
-	if len(cs.fdCache) != 0 {
-		t.Fatalf("expected fd cache to be empty, got %d", len(cs.fdCache))
+	cs.disks[0].fdMu.RLock()
+	defer cs.disks[0].fdMu.RUnlock()
+	if len(cs.disks[0].fdCache) != 0 {
+		t.Fatalf("expected fd cache to be empty, got %d", len(cs.disks[0].fdCache))
 	}
 }
 

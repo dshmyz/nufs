@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -209,7 +210,7 @@ func TestQuotaManager_SizeLimit(t *testing.T) {
 		t.Fatalf("write within quota should succeed: %v", err)
 	}
 
-	if err := qm.CheckWrite("bucket1", 600); err == nil {
+	if err := qm.CheckWrite("bucket1", 600); err == nil || !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatal("write exceeding quota should fail")
 	}
 }
@@ -224,7 +225,7 @@ func TestQuotaManager_ObjectLimit(t *testing.T) {
 		t.Fatalf("UpdateUsage: %v", err)
 	}
 
-	if err := qm.CheckWrite("bucket1", 100); err == nil {
+	if err := qm.CheckWrite("bucket1", 100); err == nil || !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatal("write exceeding object limit should fail")
 	}
 }
@@ -242,30 +243,5 @@ func TestQuotaManager_SetGetQuota(t *testing.T) {
 	q := qm.GetQuota("bucket1")
 	if q == nil || q.MaxSizeBytes != 1000 {
 		t.Fatal("GetQuota should return the set quota")
-	}
-}
-
-// ============================================================
-// BackupManager Tests (unit-level, no actual Pebble)
-// ============================================================
-
-func TestBackupConfig_Fields(t *testing.T) {
-	cfg := BackupConfig{
-		Dir:        "/tmp/backup",
-		Interval:   1 * time.Hour,
-		MaxBackups: 7,
-		DryRun:     true,
-	}
-	if cfg.Dir != "/tmp/backup" {
-		t.Fatal("Dir mismatch")
-	}
-	if cfg.Interval != 1*time.Hour {
-		t.Fatal("Interval mismatch")
-	}
-	if cfg.MaxBackups != 7 {
-		t.Fatal("MaxBackups mismatch")
-	}
-	if !cfg.DryRun {
-		t.Fatal("DryRun should be true")
 	}
 }

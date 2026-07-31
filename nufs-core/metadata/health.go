@@ -1,11 +1,12 @@
 package metadata
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"net/http"
+	"sort"
 	"sync/atomic"
 	"time"
 )
@@ -287,6 +288,166 @@ func (h *LatencyHistogram) Percentile(p int) int64 {
 // ============================================================
 // Health Check — HTTP probe for k8s/load balancer
 // ============================================================
+
+// ============================================================
+// Cluster Readiness — aggregated cluster health
+// ============================================================
+
+// ClusterReadiness describes the cluster's overall ability to serve requests.
+type ClusterReadiness struct {
+	// Status is "ready", "degraded", or "not_ready".
+	Status string `json:"status"`
+
+	// CanWriteRF is the maximum replication factor the cluster can
+	// currently satisfy (number of online nodes).
+	CanWriteRF int `json:"can_write_rf"`
+
+	// Node counts.
+	NodesOnline int `json:"nodes_online"`
+	NodesTotal  int `json:"nodes_total"`
+
+	// LeaderStable is true when a Raft leader is elected and reachable.
+	LeaderStable bool `json:"leader_stable"`
+
+	// DegradationState reports the PebbleStore's operational mode
+	// (Normal, ReadOnly, Degraded, Unavailable).
+	DegradationState string `json:"degradation_state"`
+
+	// ChunksTotal is the number of tracked chunks.
+	ChunksTotal int64 `json:"chunks_total"`
+
+	// ChunksUnderReplicated counts chunks with fewer Ready replicas
+	// than replicas in the set.
+	ChunksUnderReplicated int64 `json:"chunks_under_replicated"`
+
+	// RepairQueueDepth is the number of pending repair tasks.
+	RepairQueueDepth int64 `json:"repair_queue_depth"`
+
+	// Checks holds per-subsystem verdict strings.
+	Checks map[string]string `json:"checks"`
+
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// ComputeClusterReadiness evaluates the cluster's overall health.
+// It is safe to call from an HTTP handler but may take a few hundred
+// milliseconds on large clusters due to the chunk scan.
+func (hc *HealthChecker) ComputeClusterReadiness() ClusterReadiness {
+	r := ClusterReadiness{
+		Status:    "ready",
+		Checks:    make(map[string]string),
+		Timestamp: time.Now(),
+	}
+
+	// --- Node counts and quorum ---
+	if hc.store != nil {
+		nodes, err := hc.store.ListNodes(context.Background())
+		if err != nil {
+			r.Checks["nodes"] = fmt.Sprintf("error: %v", err)
+			r.Status = "not_ready"
+		} else {
+			r.NodesTotal = len(nodes)
+			for _, n := range nodes {
+				if n.State == NodeOnline {
+					r.NodesOnline++
+				}
+			}
+			r.CanWriteRF = r.NodesOnline
+			if r.NodesOnline < (r.NodesTotal/2)+1 {
+				r.Checks["quorum"] = fmt.Sprintf("at risk: %d/%d online", r.NodesOnline, r.NodesTotal)
+				r.Status = "not_ready"
+			} else {
+				r.Checks["quorum"] = "ok"
+			}
+		}
+	}
+
+	// --- Raft leader stability ---
+	if hc.raftNode != nil {
+		if hc.raftNode.IsLeader() {
+			r.LeaderStable = true
+			r.Checks["leader"] = "stable"
+		} else {
+			addr := hc.raftNode.LeaderAddr()
+			if addr == "" {
+				r.LeaderStable = false
+				r.Checks["leader"] = "no leader"
+				if r.Status != "not_ready" {
+					r.Status = "degraded"
+				}
+			} else {
+				r.LeaderStable = true
+				r.Checks["leader"] = "follower (leader at " + addr + ")"
+			}
+		}
+	} else {
+		r.LeaderStable = true // standalone mode — no Raft
+		r.Checks["leader"] = "standalone"
+	}
+
+	// --- Degradation state ---
+	if hc.store != nil {
+		dm := hc.store.GetDegradationManager()
+		r.DegradationState = dm.State().String()
+		if dm.State() == DegStateUnavailable {
+			r.Status = "not_ready"
+			r.Checks["degradation"] = "unavailable"
+		} else if dm.State() != DegStateNormal {
+			if r.Status != "not_ready" {
+				r.Status = "degraded"
+			}
+			r.Checks["degradation"] = dm.State().String()
+		} else {
+			r.Checks["degradation"] = "normal"
+		}
+	}
+
+	// --- Chunk replication health (lightweight scan) ---
+	if hc.store != nil {
+		var total, underReplicated int64
+		err := hc.store.ScrubAllChunks(func(_ ChunkID, replicaCount, healthyCount int) {
+			total++
+			if healthyCount < replicaCount {
+				underReplicated++
+			}
+		})
+		if err != nil {
+			r.Checks["replication"] = fmt.Sprintf("scan error: %v", err)
+		} else {
+			r.ChunksTotal = total
+			r.ChunksUnderReplicated = underReplicated
+			if underReplicated > 0 {
+				r.Checks["replication"] = fmt.Sprintf("%d under-replicated / %d total", underReplicated, total)
+				if r.Status != "not_ready" {
+					r.Status = "degraded"
+				}
+			} else {
+				r.Checks["replication"] = "ok"
+			}
+		}
+	}
+
+	// --- Repair queue ---
+	if hc.metrics != nil {
+		r.RepairQueueDepth = hc.metrics.RepairTasksQueued.Load()
+		repairThreshold := int64(1000) // fallback default
+		if hc.store != nil {
+			if cfg := hc.store.GetDynamicConfig(); cfg != nil {
+				repairThreshold = cfg.ReadinessRepairQueueThreshold
+			}
+		}
+		if r.RepairQueueDepth > repairThreshold {
+			r.Checks["repair_queue"] = fmt.Sprintf("%d tasks queued (threshold %d)", r.RepairQueueDepth, repairThreshold)
+			if r.Status == "ready" {
+				r.Status = "degraded"
+			}
+		} else {
+			r.Checks["repair_queue"] = "ok"
+		}
+	}
+
+	return r
+}
 
 // HealthStatus represents the health of the metadata service.
 type HealthStatus struct {

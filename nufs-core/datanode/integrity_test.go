@@ -51,7 +51,7 @@ func TestChunkStore_ReadDetectsBitrot(t *testing.T) {
 	}
 
 	// Corrupt the data on disk (simulate bitrot)
-	chunkPath := cs.chunkPath(42)
+	chunkPath := cs.disks[0].chunkPath(42)
 	f, err := os.OpenFile(chunkPath, os.O_WRONLY, 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -65,9 +65,9 @@ func TestChunkStore_ReadDetectsBitrot(t *testing.T) {
 	f.Close()
 
 	// Invalidate fd cache so the corrupted file is re-opened
-	cs.fdMu.Lock()
-	delete(cs.fdCache, 42)
-	cs.fdMu.Unlock()
+	cs.disks[0].fdMu.Lock()
+	delete(cs.disks[0].fdCache, 42)
+	cs.disks[0].fdMu.Unlock()
 
 	// Read should detect the corruption
 	_, _, err = cs.Read(42, 0, 0)
@@ -118,7 +118,7 @@ func TestChunkStore_MetaSidecarContainsChecksum(t *testing.T) {
 	}
 
 	// Read the metadata sidecar
-	metaPath := cs.metaPath(200)
+	metaPath := cs.disks[0].metaPath(200)
 	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatalf("failed to read meta sidecar: %v", err)

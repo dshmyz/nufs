@@ -9,7 +9,6 @@ import Buckets from './pages/buckets/Buckets'
 import Integrity from './pages/integrity/Integrity'
 import Governance from './pages/governance/Governance'
 import Clusters from './pages/clusters/Clusters'
-import { api } from './api/client'
 
 function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem('token'))

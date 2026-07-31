@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 
 	"github.com/example/dfs/internal/version"
 	"github.com/example/dfs/metadata"
@@ -15,6 +16,9 @@ import (
 type opsHandlers struct {
 	store  *metadata.PebbleStore
 	bundle *metadata.ServiceBundle
+
+	backupCoordinator backupOpsCoordinator
+	backupRepository  backupVerifierRepository
 
 	// advertiseOpsAddr is our own ops HTTP URL (e.g. "http://10.0.0.1:8091").
 	// Followers that receive mutating requests return 307 to the leader's
@@ -35,16 +39,29 @@ func (h *opsHandlers) requireLeader(w http.ResponseWriter, r *http.Request) bool
 		writeJSONError(w, http.StatusServiceUnavailable, "no leader available")
 		return false
 	}
-	http.Redirect(w, r, leaderAddr+r.URL.Path, http.StatusTemporaryRedirect)
+	target := leaderRedirectTarget(leaderAddr, r.URL)
+	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 	return false
+}
+
+func leaderRedirectTarget(leaderAddr string, requestURL *url.URL) string {
+	target := leaderAddr + requestURL.EscapedPath()
+	if requestURL.RawQuery != "" {
+		target += "?" + requestURL.RawQuery
+	}
+	return target
 }
 
 // registerOpsHandlers wires every endpoint in the ops API. The list
 // is grouped by resource domain so that adding a new endpoint means
 // adding the route here and the handler in the matching ops_*.go
 // file.
-func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle *metadata.ServiceBundle, advertiseOpsAddr string) {
+func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle *metadata.ServiceBundle, advertiseOpsAddr string, backupDeps ...backupOpsDependency) {
 	s := &opsHandlers{store: store, bundle: bundle, advertiseOpsAddr: advertiseOpsAddr}
+	if len(backupDeps) > 0 {
+		s.backupCoordinator = backupDeps[0].coordinator
+		s.backupRepository = backupDeps[0].repository
+	}
 
 	// helper: wrap a handler with leader check
 	mut := func(fn http.HandlerFunc) http.HandlerFunc {
@@ -62,10 +79,17 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/ready", s.handleReady)
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
+	mux.HandleFunc("/api/v1/cluster/readiness", s.handleClusterReadiness)
 	mux.HandleFunc("/api/v1/metrics", s.handleMetrics)
 
 	// Admin — read-only, no leader check
 	mux.HandleFunc("/api/v1/admin/bucket-usage", s.handleComputeAllBucketUsage)
+
+	// Backups (GET routes work on followers; POST routes enter the leader boundary)
+	mux.HandleFunc("/api/v1/backups/status", s.handleBackupStatus)
+	mux.HandleFunc("/api/v1/backups/prune", mut(s.handleBackupPrune))
+	mux.HandleFunc("/api/v1/backups", s.handleBackups)
+	mux.HandleFunc("/api/v1/backups/", mut(s.handleBackupByID))
 
 	// Buckets (mutating: POST/PUT/DELETE; read: GET uses same handler that method-switches)
 	mux.HandleFunc("/api/v1/buckets", mut(s.handleBuckets))
@@ -104,6 +128,13 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/repair/trigger", mut(s.handleTriggerRepair))
 	mux.HandleFunc("/api/v1/repair/", mut(s.handleRepairByID))
 	mux.HandleFunc("/api/v1/rebalance/trigger", mut(s.handleTriggerRebalance))
+
+	// Object write recovery state and background task coordination
+	mux.HandleFunc("/api/v1/write-attempts", s.handleWriteAttempts)
+	mux.HandleFunc("/api/v1/write-attempts/", mut(s.handleWriteAttemptByID))
+	mux.HandleFunc("/api/v1/write-ops/status", s.handleWriteOpsStatus)
+	mux.HandleFunc("/api/v1/background-tasks/lease", mut(s.handleLeaseBackgroundTask))
+	mux.HandleFunc("/api/v1/background-tasks/", mut(s.handleBackgroundTaskByID))
 
 	// Advisory file locks (acquire/release are mutating, list is read-only)
 	mux.HandleFunc("/api/v1/locks/acquire", mut(s.handleAdvisoryAcquire))
@@ -146,9 +177,32 @@ func (h *opsHandlers) handleClusterStatus(w http.ResponseWriter, _ *http.Request
 	writeJSON(w, status)
 }
 
-func (h *opsHandlers) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+// handleClusterReadiness returns a comprehensive cluster readiness report
+// that answers: can the cluster serve writes, how many chunks are
+// under-replicated, and is the leader stable?
+func (h *opsHandlers) handleClusterReadiness(w http.ResponseWriter, _ *http.Request) {
+	if h.bundle.Health == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "health checker not configured")
+		return
+	}
+	r := h.bundle.Health.ComputeClusterReadiness()
+	w.Header().Set("Content-Type", "application/json")
+	if r.Status == "not_ready" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	json.NewEncoder(w).Encode(r)
+}
+
+func (h *opsHandlers) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if h.bundle.Metrics != nil {
-		writeJSON(w, h.bundle.Metrics.Snapshot())
+		data, _ := json.Marshal(h.bundle.Metrics.Snapshot())
+		var metrics map[string]interface{}
+		if err := json.Unmarshal(data, &metrics); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		metrics["object_write_ops"] = h.writeOpsStatus(r.Context())
+		writeJSON(w, metrics)
 	} else {
 		writeJSON(w, map[string]string{"status": "no metrics"})
 	}

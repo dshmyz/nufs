@@ -70,7 +70,8 @@ func TestPebbleStore_GetInode_CopyIsolationWithChunks(t *testing.T) {
 		t.Fatalf("CreateFile: %v", err)
 	}
 
-	// Use UpdateInode to set a chunk (this invalidates cache)
+	// Use UpdateInode to set a live chunk reference (this invalidates cache).
+	seedLiveChunk(t, store, 1, 100)
 	inode.ChunkMap = []ChunkRef{{ID: 1, Offset: 0, Length: 100}}
 	if err := store.UpdateInode(ctx, inode); err != nil {
 		t.Fatalf("UpdateInode: %v", err)

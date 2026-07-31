@@ -220,7 +220,7 @@ func TestChunkStore_WriteBatch_FileMode(t *testing.T) {
 	}
 
 	// Verify file exists and is readable
-	path := cs.chunkPath(metadata.ChunkID(900))
+	path := cs.disks[0].chunkPath(metadata.ChunkID(900))
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("Stat: %v", err)

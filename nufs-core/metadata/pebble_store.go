@@ -3,13 +3,16 @@ package metadata
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -223,6 +226,9 @@ type PebbleStore struct {
 	// Degradation manager for graceful degradation
 	degradation *DegradationManager
 
+	// Health checker (populated by ServiceBundle)
+	health *HealthChecker
+
 	// Metrics collector (populated by SetMetrics)
 	metrics *Metrics
 
@@ -243,6 +249,11 @@ type PebbleStore struct {
 	// Invalidated on UpdateInode and CASUpdateInode.
 	inCache inodeCache
 
+	// bucketCache caches GetBucket results to avoid repeated Pebble reads.
+	// Key: bucket name, Value: *BucketInfo. Entries are invalidated on
+	// CreateBucket / DeleteBucket.
+	bucketCache sync.Map
+
 	// Optional EventBus for publishing change notifications.
 	// Set by SetEventBus() after initialization.
 	events *EventBus
@@ -261,6 +272,15 @@ type PebbleStore struct {
 	// flooding during cluster topology changes. Nil-safe:
 	// when nil, throttling is disabled (test-harness default).
 	throttle *NodeRegistrationThrottle
+
+	// Test-only deterministic interleaving points for tombstone conditionals.
+	// They are nil in production and deliberately live beside the shared store
+	// mutex so standalone race tests exercise the real mutation paths.
+	chunkTombstoneBeforeConditional func()
+	chunkPurgeBeforeConditional     func()
+	chunkUpdateBeforeConditional    func()
+	conditionalBatchBeforeCommit    func() error
+	chunkIDNext                     func() ChunkID
 }
 
 // inodeCache is a read-through cache for GetInode.
@@ -327,8 +347,16 @@ type DynamicConfig struct {
 	RaftPreVoteEnabled bool `json:"raft_prevote_enabled"`
 
 	// Placement
-	PlacementSpreadEnabled  bool `json:"placement_spread_enabled"`
-	PlacementWeightedChoice bool `json:"placement_weighted_choice"`
+	PlacementSpreadEnabled       bool    `json:"placement_spread_enabled"`
+	PlacementWeightedChoice      bool    `json:"placement_weighted_choice"`
+	PlacementErrorRateFilter     float64 `json:"placement_error_rate_filter"`     // Filter nodes above this error rate (0.0-1.0)
+	PlacementWeightCapacity      float64 `json:"placement_weight_capacity"`       // Scoring weight for free capacity
+	PlacementWeightLoad          float64 `json:"placement_weight_load"`           // Scoring weight for low load
+	PlacementWeightTier          float64 `json:"placement_weight_tier"`           // Scoring weight for tier match
+	PlacementWeightHealth        float64 `json:"placement_weight_health"`         // Scoring weight for low error rate
+
+	// Readiness
+	ReadinessRepairQueueThreshold int64 `json:"readiness_repair_queue_threshold"` // Repair backlog above this → degraded
 }
 
 // DefaultDynamicConfig returns safe production defaults for all dynamic configs.
@@ -348,8 +376,14 @@ func DefaultDynamicConfig() DynamicConfig {
 		CacheEnabled:            true,
 		CacheMaxSize:            65536,
 		RaftPreVoteEnabled:      true,
-		PlacementSpreadEnabled:  true,
-		PlacementWeightedChoice: false,
+		PlacementSpreadEnabled:       true,
+		PlacementWeightedChoice:      false,
+		PlacementErrorRateFilter:     0.8,
+		PlacementWeightCapacity:      0.4,
+		PlacementWeightLoad:          0.25,
+		PlacementWeightTier:          0.2,
+		PlacementWeightHealth:        0.15,
+		ReadinessRepairQueueThreshold: 1000,
 	}
 }
 
@@ -418,12 +452,19 @@ func NewPebbleStore(cfg PebbleStoreConfig) (*PebbleStore, error) {
 	s.degradation = NewDegradationManager(s)
 	dcfg := DefaultDynamicConfig()
 	s.dynCfg.Store(&dcfg)
+	s.placement.SetConfigProvider(s.GetDynamicConfig)
 
 	if err := s.initRootInode(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	s.restoreFreeList()
+	if cfg.UseBucketStats {
+		if err := s.ensureBucketStats(context.Background()); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("pebble store: initialize bucket stats: %w", err)
+		}
+	}
 	return s, nil
 }
 
@@ -480,10 +521,8 @@ func (s *PebbleStore) GetNodeThrottle() *NodeRegistrationThrottle {
 	return s.throttle
 }
 
-// SetQuotaManager registers the quota manager for write admission control.
-// When set, AllocateChunk checks bucket quotas before allocating new chunks.
-// It also wires the PebbleStore as the QuotaStore backend so quota changes
-// are persisted to Pebble, and loads any previously saved quota data.
+// SetQuotaManager registers the quota manager and wires PebbleStore as its
+// persistence backend. Gateway committers use the manager for write admission.
 func (s *PebbleStore) SetQuotaManager(qm *QuotaManager) {
 	qm.SetStore(s)
 	s.quota = qm
@@ -1031,7 +1070,7 @@ func (s *PebbleStore) CreateBucket(ctx context.Context, name string, policy Plac
 	if s.closed.Load() {
 		return ErrServiceClosed
 	}
-	if len(name) == 0 || len(name) > MaxNameLength {
+	if len(name) == 0 || len(name) > MaxNameLength || strings.Contains(name, "/") {
 		return ErrInvalidArgument
 	}
 
@@ -1081,6 +1120,7 @@ func (s *PebbleStore) CreateBucket(ctx context.Context, name string, policy Plac
 	if err := s.applyBatchMsgpack(ops, nil); err != nil {
 		return err
 	}
+	s.bucketCache.Store(name, info)
 	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("bucket:%s", name)})
 	return nil
 }
@@ -1115,12 +1155,19 @@ func (s *PebbleStore) DeleteBucket(ctx context.Context, name string) error {
 		fmt.Sprintf("%s%d", prefixInode, info.RootInode),
 		fmt.Sprintf("%s%s", prefixPolicy, name),
 		fmt.Sprintf("%s%d", prefixBucketByRoot, info.RootInode),
+		prefixQuota + name,
+		prefixQuotaUsage + name,
 	}
 	if s.cfg.UseBucketStats {
 		deletes = append(deletes, s.bucketStatsKey(info.RootInode))
 	}
 	if err := s.applyBatchMsgpack(nil, deletes); err != nil {
 		return err
+	}
+	s.bucketCache.Delete(name)
+	if s.quota != nil {
+		s.quota.LoadQuota(name, nil)
+		s.quota.LoadUsage(name, nil)
 	}
 	s.publishEvent(Event{Type: EventDelete, Key: fmt.Sprintf("bucket:%s", name)})
 	return nil
@@ -1146,6 +1193,11 @@ func (s *PebbleStore) GetBucket(ctx context.Context, name string) (*BucketInfo, 
 	if s.closed.Load() {
 		return nil, ErrServiceClosed
 	}
+	// Check cache first (lock-free read).
+	if cached, ok := s.bucketCache.Load(name); ok {
+		b := *cached.(*BucketInfo) // copy to avoid sharing
+		return &b, nil
+	}
 	var info BucketInfo
 	exists, err := s.getJSON(prefixBucket+name, &info)
 	if err != nil {
@@ -1154,6 +1206,7 @@ func (s *PebbleStore) GetBucket(ctx context.Context, name string) (*BucketInfo, 
 	if !exists {
 		return nil, ErrBucketNotFound
 	}
+	s.bucketCache.Store(name, &info)
 	return &info, nil
 }
 
@@ -1634,9 +1687,6 @@ func (s *PebbleStore) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 	if meta == nil {
 		return ErrInvalidArgument
 	}
-	// Invalidate cache — next GetInode fetches fresh data
-	s.inCache.del(meta.ID)
-
 	meta.CTime = time.Now().UnixNano()
 	ops := []batchOp{
 		{Key: fmt.Sprintf("%s%d", prefixInode, meta.ID), Value: meta},
@@ -1654,6 +1704,8 @@ func (s *PebbleStore) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 	if err := s.applyBatchMsgpack(ops, nil); err != nil {
 		return err
 	}
+	// Invalidate only after the durable mutation succeeds.
+	s.inCache.del(meta.ID)
 	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", meta.ID)})
 	return nil
 }
@@ -1803,106 +1855,11 @@ func (s *PebbleStore) AllocateChunk(ctx context.Context, inodeID InodeID, offset
 		return nil, ErrServiceClosed
 	}
 
-	// Quota check: resolve bucket from inode and verify write is allowed
-	if s.quota != nil {
-		var meta InodeMeta
-		inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
-		exists, err := s.getJSON(inodeKey, &meta)
-		if err != nil {
-			return nil, err
-		}
-		if exists && meta.BucketRoot != 0 {
-			bucketName := s.bucketNameByRoot(meta.BucketRoot)
-			if bucketName != "" {
-				if err := s.quota.CheckWrite(bucketName, MaxChunkSize); err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	chunkID := s.chunkGen.Next()
-
-	// Determine replica count: EC uses K+M, replication uses ReplicationFactor
-	replicaCount := policy.ReplicationFactor
-	var ecGroup *ECGroupInfo
-	if policy.ECConfig != nil && policy.ECConfig.DataShards > 0 {
-		replicaCount = policy.ECConfig.TotalShards()
-		ecGroup = &ECGroupInfo{
-			GroupID:      fmt.Sprintf("ec-%d", chunkID),
-			DataShards:   policy.ECConfig.DataShards,
-			ParityShards: policy.ECConfig.ParityShards,
-		}
-	}
-	if replicaCount <= 0 {
-		return nil, fmt.Errorf("allocate chunk: invalid replica count (ReplicationFactor=%d, ECConfig=%v)", policy.ReplicationFactor, policy.ECConfig)
-	}
-
-	// Override ReplicationFactor for placement engine
-	ecPolicy := policy
-	ecPolicy.ReplicationFactor = replicaCount
-
-	nodeIDs, err := s.placement.PlaceChunk(ecPolicy, nil)
+	chunks, err := s.allocateChunksConditionally(ctx, inodeID, []int64{offset}, policy)
 	if err != nil {
 		return nil, err
 	}
-
-	// Batch-fetch node info from the placement engine's in-memory map
-	// instead of N separate Pebble Get calls. Fall back to GetNode for
-	// any ID not yet registered with the placement engine (e.g., a
-	// node that joined but whose heartbeat hasn't propagated).
-	nodeInfos := s.placement.GetNodeInfosBatch(nodeIDs)
-	replicas := make([]ReplicaInfo, 0, len(nodeIDs))
-	for i, nid := range nodeIDs {
-		var addr string
-		if info := nodeInfos[i]; info != nil {
-			addr = info.Addr
-		} else {
-			n, err := s.GetNode(ctx, nid)
-			if err != nil {
-				return nil, fmt.Errorf("allocate chunk: node %d not found: %w", nid, err)
-			}
-			addr = n.Addr
-		}
-		replica := ReplicaInfo{NodeID: nid, Addr: addr, State: ReplicaSyncing}
-		if ecGroup != nil {
-			replica.ShardIndex = i
-		}
-		replicas = append(replicas, replica)
-	}
-
-	chunk := &ChunkMeta{
-		ID:         chunkID,
-		Size:       MaxChunkSize,
-		State:      ChunkCreated,
-		Replicas:   replicas,
-		ECGroup:    ecGroup,
-		Tier:       policy.StorageTier,
-		CreateTime: time.Now().UnixNano(),
-	}
-
-	// Append to inode's chunk map
-	var meta InodeMeta
-	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
-	exists, err := s.getJSON(inodeKey, &meta)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, ErrInodeNotFound
-	}
-
-	ref := ChunkRef{ID: chunkID, Offset: offset, Length: 0, Version: time.Now().UnixNano()}
-	meta.ChunkMap = append(meta.ChunkMap, ref)
-	meta.MTime = time.Now().UnixNano()
-	ops := []batchOp{
-		{Key: fmt.Sprintf("%s%d", prefixChunk, chunkID), Value: chunk},
-		{Key: inodeKey, Value: &meta},
-	}
-	if err := s.applyBatchMsgpack(ops, nil); err != nil {
-		return nil, err
-	}
-	return chunk, nil
+	return chunks[0], nil
 }
 
 // AllocateChunksBatch allocates multiple chunks at once and updates the inode once.
@@ -1916,115 +1873,232 @@ func (s *PebbleStore) AllocateChunksBatch(ctx context.Context, inodeID InodeID, 
 	if len(offsets) == 0 {
 		return nil, nil
 	}
+	if len(offsets) > MaxChunkAllocationBatch {
+		return nil, fmt.Errorf("max chunk allocation batch is %d", MaxChunkAllocationBatch)
+	}
 
-	// Quota check
-	if s.quota != nil {
-		var meta InodeMeta
-		inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
-		exists, err := s.getJSON(inodeKey, &meta)
+	return s.allocateChunksConditionally(ctx, inodeID, offsets, policy)
+}
+
+const allocationConditionalAttempts = 8
+
+func (s *PebbleStore) allocateChunksConditionally(ctx context.Context, inodeID InodeID, offsets []int64, policy PlacementPolicy) ([]*ChunkMeta, error) {
+	if len(offsets) > MaxChunkAllocationBatch {
+		return nil, fmt.Errorf("max chunk allocation batch is %d", MaxChunkAllocationBatch)
+	}
+	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+	started := time.Now()
+	for attempt := 0; attempt < allocationConditionalAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		inodeRaw, found, err := s.readChunkTombstoneRaw(inodeKey)
+		if err != nil {
+			return nil, fmt.Errorf("allocate chunks: read inode: %w", err)
+		}
+		if !found {
+			return nil, ErrInodeNotFound
+		}
+		var inode InodeMeta
+		if err := unmarshalValue(inodeRaw, &inode); err != nil {
+			return nil, fmt.Errorf("allocate chunks: decode inode: %w", err)
+		}
+		if err := validateInodeKeyIdentity(inodeKey, inode.ID); err != nil {
+			return nil, err
+		}
+		chunks, err := s.buildAllocatedChunks(ctx, offsets, policy)
+		if err != nil {
+			if errors.Is(err, ErrBackupMetadataConflict) {
+				continue
+			}
+			return nil, err
+		}
+		next := inode
+		now := time.Now().UnixNano()
+		for i, chunk := range chunks {
+			next.ChunkMap = append(next.ChunkMap, ChunkRef{ID: chunk.ID, Offset: offsets[i], Version: now})
+		}
+		next.MTime = now
+		conditional, err := s.buildChunkAllocationConditional(inodeKey, inodeRaw, &next, chunks)
 		if err != nil {
 			return nil, err
 		}
-		if exists && meta.BucketRoot != 0 {
-			bucketName := s.bucketNameByRoot(meta.BucketRoot)
-			if bucketName != "" {
-				totalSize := int64(len(offsets)) * MaxChunkSize
-				if err := s.quota.CheckWrite(bucketName, totalSize); err != nil {
-					return nil, err
+		err = s.applyAllocationConditional(ctx, conditional)
+		if errors.Is(err, ErrRaftConditionalOutcomeUnknown) {
+			committed, reconcileErr := s.reconcileAllocation(inodeKey, &next, chunks, conditional)
+			if reconcileErr != nil {
+				return nil, reconcileErr
+			}
+			if committed {
+				if s.metrics != nil {
+					s.metrics.RecordWrite(time.Since(started))
 				}
+				return chunks, nil
+			}
+			return nil, err
+		}
+		if !errors.Is(err, ErrBackupMetadataConflict) {
+			if err == nil && s.metrics != nil {
+				s.metrics.RecordWrite(time.Since(started))
+			}
+			return chunks, err
+		}
+	}
+	return nil, fmt.Errorf("allocate chunks: %w after %d collision retries", ErrBackupMetadataConflict, allocationConditionalAttempts)
+}
+
+func (s *PebbleStore) applyAllocationConditional(ctx context.Context, conditional *ConditionalBatch) error {
+	if s.raft == nil {
+		return s.applyChunkTombstoneConditional(ctx, conditional)
+	}
+	if s.degradation.IsReadOnly() {
+		return ErrServiceClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := s.raft.applyConditionalAccepted(ctx, &RaftLogEntry{Op: OpConditionalBatch, Conditional: conditional}, 10*time.Second)
+	if errors.Is(err, ErrRaftConditionalConflict) {
+		return ErrBackupMetadataConflict
+	}
+	return err
+}
+
+func (s *PebbleStore) reconcileAllocation(inodeKey string, expected *InodeMeta, chunks []*ChunkMeta, conditional *ConditionalBatch) (bool, error) {
+	inodeRaw, found, err := s.readChunkTombstoneRaw(inodeKey)
+	if err != nil || !found {
+		return false, err
+	}
+	var inode InodeMeta
+	if err := unmarshalValue(inodeRaw, &inode); err != nil || !reflect.DeepEqual(inode.ChunkMap, expected.ChunkMap) {
+		return false, nil
+	}
+	for _, chunk := range chunks {
+		raw, found, err := s.readChunkTombstoneRaw(chunkMetadataKey(chunk.ID))
+		if err != nil || !found {
+			return false, err
+		}
+		want, _ := marshalValue(chunk, codecMsgpack)
+		if !bytes.Equal(raw, want) {
+			return false, nil
+		}
+		if _, tombstoneFound, err := s.readChunkTombstoneRaw(chunkTombstoneKey(chunk.ID)); err != nil || tombstoneFound {
+			return false, err
+		}
+	}
+	for _, mutation := range conditional.Mutations {
+		if string(mutation.Key) == keyInodeReferenceEpoch {
+			raw, found, err := s.readChunkTombstoneRaw(keyInodeReferenceEpoch)
+			if err != nil || !found || len(raw) != 8 || binary.BigEndian.Uint64(raw) < binary.BigEndian.Uint64(mutation.Value) {
+				return false, err
 			}
 		}
 	}
+	return true, nil
+}
 
-	// Determine replica count
+func (s *PebbleStore) buildAllocatedChunks(ctx context.Context, offsets []int64, policy PlacementPolicy) ([]*ChunkMeta, error) {
 	replicaCount := policy.ReplicationFactor
-	var ecGroup *ECGroupInfo
 	if policy.ECConfig != nil && policy.ECConfig.DataShards > 0 {
 		replicaCount = policy.ECConfig.TotalShards()
-		ecGroup = &ECGroupInfo{
-			GroupID:      fmt.Sprintf("ec-batch-%d", time.Now().UnixNano()),
-			DataShards:   policy.ECConfig.DataShards,
-			ParityShards: policy.ECConfig.ParityShards,
-		}
 	}
 	if replicaCount <= 0 {
-		return nil, fmt.Errorf("allocate chunk batch: invalid replica count")
+		return nil, fmt.Errorf("allocate chunk: invalid replica count (ReplicationFactor=%d, ECConfig=%v)", policy.ReplicationFactor, policy.ECConfig)
 	}
-
 	ecPolicy := policy
 	ecPolicy.ReplicationFactor = replicaCount
-
-	// Allocate all chunks
-	chunks := make([]*ChunkMeta, len(offsets))
-	ops := make([]batchOp, 0, len(offsets)+1)
-	for i := range offsets {
-		chunkID := s.chunkGen.Next()
-
+	ids := make([]ChunkID, len(offsets))
+	seenIDs := make(map[ChunkID]struct{}, len(offsets))
+	for i := range ids {
+		ids[i] = s.nextChunkID()
+		if ids[i] == 0 {
+			return nil, fmt.Errorf("allocate chunk: zero chunk id")
+		}
+		if _, duplicate := seenIDs[ids[i]]; duplicate {
+			return nil, ErrBackupMetadataConflict
+		}
+		seenIDs[ids[i]] = struct{}{}
+	}
+	groupID := ""
+	if policy.ECConfig != nil && policy.ECConfig.DataShards > 0 {
+		groupID = fmt.Sprintf("ec-%d", ids[0])
+		if len(ids) > 1 {
+			groupID = fmt.Sprintf("ec-batch-%d", ids[0])
+		}
+	}
+	chunks := make([]*ChunkMeta, len(ids))
+	for i, id := range ids {
 		nodeIDs, err := s.placement.PlaceChunk(ecPolicy, nil)
 		if err != nil {
 			return nil, err
 		}
-
-		// Batch-fetch node info from the placement engine's in-memory map
 		nodeInfos := s.placement.GetNodeInfosBatch(nodeIDs)
 		replicas := make([]ReplicaInfo, 0, len(nodeIDs))
-		for j, nid := range nodeIDs {
-			var addr string
-			if info := nodeInfos[j]; info != nil {
+		for shard, nodeID := range nodeIDs {
+			addr := ""
+			if info := nodeInfos[shard]; info != nil {
 				addr = info.Addr
 			} else {
-				n, err := s.GetNode(ctx, nid)
+				node, err := s.GetNode(ctx, nodeID)
 				if err != nil {
-					return nil, fmt.Errorf("allocate chunk batch: node %d not found: %w", nid, err)
+					return nil, fmt.Errorf("allocate chunk: node %d not found: %w", nodeID, err)
 				}
-				addr = n.Addr
+				addr = node.Addr
 			}
-			replica := ReplicaInfo{NodeID: nid, Addr: addr, State: ReplicaSyncing}
-			if ecGroup != nil {
-				replica.ShardIndex = j
+			replica := ReplicaInfo{NodeID: nodeID, Addr: addr, State: ReplicaSyncing}
+			if groupID != "" {
+				replica.ShardIndex = shard
 			}
 			replicas = append(replicas, replica)
 		}
-
-		chunk := &ChunkMeta{
-			ID:         chunkID,
-			Size:       MaxChunkSize,
-			State:      ChunkCreated,
-			Replicas:   replicas,
-			ECGroup:    ecGroup,
-			Tier:       policy.StorageTier,
-			CreateTime: time.Now().UnixNano(),
+		chunk := &ChunkMeta{ID: id, Size: MaxChunkSize, State: ChunkCreated, Replicas: replicas, Tier: policy.StorageTier, CreateTime: time.Now().UnixNano()}
+		if groupID != "" {
+			chunk.ECGroup = &ECGroupInfo{GroupID: groupID, DataShards: policy.ECConfig.DataShards, ParityShards: policy.ECConfig.ParityShards}
 		}
 		chunks[i] = chunk
-		ops = append(ops, batchOp{
-			Key:   fmt.Sprintf("%s%d", prefixChunk, chunkID),
-			Value: chunk,
-		})
 	}
+	return chunks, nil
+}
 
-	// Read inode once, append all chunk refs, write back once
-	var meta InodeMeta
-	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
-	exists, err := s.getJSON(inodeKey, &meta)
+func (s *PebbleStore) nextChunkID() ChunkID {
+	if s.chunkIDNext != nil {
+		return s.chunkIDNext()
+	}
+	return s.chunkGen.Next()
+}
+
+func (s *PebbleStore) buildChunkAllocationConditional(inodeKey string, inodeRaw []byte, next *InodeMeta, chunks []*ChunkMeta) (*ConditionalBatch, error) {
+	encodedInode, err := marshalValue(next, codecMsgpack)
 	if err != nil {
 		return nil, err
 	}
-	if !exists {
-		return nil, ErrInodeNotFound
+	ops := make([]BatchOp, 0, len(chunks)+1)
+	for _, chunk := range chunks {
+		encoded, err := marshalValue(chunk, codecMsgpack)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, BatchOp{Key: []byte(chunkMetadataKey(chunk.ID)), Value: encoded})
 	}
-
-	now := time.Now().UnixNano()
-	for i, offset := range offsets {
-		ref := ChunkRef{ID: chunks[i].ID, Offset: offset, Length: 0, Version: now}
-		meta.ChunkMap = append(meta.ChunkMap, ref)
-	}
-	meta.MTime = now
-	ops = append(ops, batchOp{Key: inodeKey, Value: &meta})
-
-	if err := s.applyBatchMsgpack(ops, nil); err != nil {
+	ops = append(ops, BatchOp{Key: []byte(inodeKey), Value: encodedInode})
+	// Removed inodeReferenceEpoch: per-inode CAS (inodeKey precondition)
+	// is sufficient for consistency. The global epoch caused CAS contention
+	// storms under concurrency without meaningful safety benefit — stale
+	// placement is already handled by the data-write failure path.
+	prepared, err := prepareReferenceAwareBatch(s.db, ops)
+	if err != nil {
 		return nil, err
 	}
-	return chunks, nil
+	preconditions := make([]ConditionalPrecondition, 0, 1+len(chunks)*2)
+	preconditions = append(preconditions, ConditionalPrecondition{Key: []byte(inodeKey), ExpectedValue: append([]byte(nil), inodeRaw...)})
+	// Per-chunk existence checks: each chunk must not already exist.
+	for _, chunk := range chunks {
+		preconditions = append(preconditions,
+			ConditionalPrecondition{Key: []byte(chunkMetadataKey(chunk.ID)), ExpectAbsent: true},
+			ConditionalPrecondition{Key: []byte(chunkTombstoneKey(chunk.ID)), ExpectAbsent: true},
+		)
+	}
+	return &ConditionalBatch{Version: chunkTombstoneFencedBatchVersion, Preconditions: preconditions, Mutations: prepared}, nil
 }
 
 func (s *PebbleStore) CommitChunk(ctx context.Context, chunkID ChunkID, checksum uint32) error {
@@ -2032,24 +2106,107 @@ func (s *PebbleStore) CommitChunk(ctx context.Context, chunkID ChunkID, checksum
 		return ErrServiceClosed
 	}
 	key := fmt.Sprintf("%s%d", prefixChunk, chunkID)
-	var chunk ChunkMeta
-	exists, err := s.getJSON(key, &chunk)
+	raw, exists, err := s.readChunkTombstoneRaw(key)
 	if err != nil {
 		return err
 	}
 	if !exists {
 		return ErrChunkNotFound
 	}
+	var chunk ChunkMeta
+	if err := unmarshalValue(raw, &chunk); err != nil {
+		return err
+	}
 	if chunk.State != ChunkCreated {
 		return ErrChunkAlreadySealed
 	}
 	chunk.State = ChunkSealed
 	chunk.Checksum = checksum
-	if err := s.putMsgpack(key, &chunk); err != nil {
+	if err := s.updateLiveChunkMetadata(ctx, raw, &chunk); err != nil {
 		return err
 	}
 	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("chunk:%d", chunkID)})
 	return nil
+}
+
+// CreateObjectWithChunks is an optimized write path that combines
+// CreateFile + AllocateChunksBatch + CommitChunk into a single atomic
+// metadata operation. This reduces lock contention from 4 acquisitions
+// to 1 by building one batch of Pebble operations and applying them
+// atomically.
+//
+// For new objects: creates inode + allocates chunks + sets ChunkMap.
+// The caller then writes data to datanodes (outside this lock).
+// Returns the created inode and allocated chunks.
+func (s *PebbleStore) CreateObjectWithChunks(ctx context.Context, parent InodeID, name string, mode uint32, offsets []int64, policy PlacementPolicy) (*InodeMeta, []*ChunkMeta, error) {
+	if s.closed.Load() {
+		return nil, nil, ErrServiceClosed
+	}
+	if len(name) > MaxNameLength {
+		return nil, nil, ErrNameTooLong
+	}
+	if len(offsets) == 0 {
+		return nil, nil, fmt.Errorf("no offsets provided")
+	}
+	if len(offsets) > MaxChunkAllocationBatch {
+		return nil, nil, fmt.Errorf("max chunk allocation batch is %d", MaxChunkAllocationBatch)
+	}
+
+	// 1. Check existence (same as CreateFile)
+	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
+	var existing DirEntry
+	exists, err := s.getJSON(nsKey, &existing)
+	if err != nil {
+		return nil, nil, err
+	}
+	if exists {
+		return nil, nil, ErrEntryExists
+	}
+
+	// 2. Generate inode
+	inodeID := s.nextInodeID()
+	now := time.Now().UnixNano()
+	bucketRoot := s.getBucketRoot(parent)
+
+	// 3. Place chunks (reuse existing placement logic)
+	chunks, err := s.buildAllocatedChunks(ctx, offsets, policy)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 4. Build inode with ChunkMap already set
+	chunkRefs := make([]ChunkRef, len(chunks))
+	for i, chunk := range chunks {
+		chunkRefs[i] = ChunkRef{ID: chunk.ID, Offset: offsets[i], Length: chunk.Size, Version: 1}
+	}
+	inode := &InodeMeta{
+		ID: inodeID, Type: FileRegular, Mode: mode, NLink: 1,
+		BucketRoot: bucketRoot, ChunkMap: chunkRefs,
+		CTime: now, MTime: now, ATime: now,
+	}
+
+	// 5. Build single atomic batch
+	entry := &DirEntry{InodeID: inodeID, Type: FileRegular, Name: name}
+	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+
+	ops := []batchOp{
+		{Key: nsKey, Value: entry},          // namespace entry
+		{Key: inodeKey, Value: inode},        // inode with ChunkMap
+	}
+	s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
+
+	// Add chunk metadata operations
+	for _, chunk := range chunks {
+		ops = append(ops, batchOp{Key: chunkMetadataKey(chunk.ID), Value: chunk})
+	}
+
+	// Single atomic write under one lock
+	if err := s.applyBatchMsgpack(ops, nil); err != nil {
+		return nil, nil, err
+	}
+
+	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", inodeID)})
+	return inode, chunks, nil
 }
 
 func (s *PebbleStore) GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error) {
@@ -2072,17 +2229,22 @@ func (s *PebbleStore) UpdateChunk(ctx context.Context, chunk *ChunkMeta) error {
 	if s.closed.Load() {
 		return ErrServiceClosed
 	}
+	if chunk == nil {
+		return ErrInvalidArgument
+	}
 	key := fmt.Sprintf("%s%d", prefixChunk, chunk.ID)
 	// Verify chunk exists before update
-	var existing ChunkMeta
-	exists, err := s.getJSON(key, &existing)
+	raw, exists, err := s.readChunkTombstoneRaw(key)
 	if err != nil {
 		return err
 	}
 	if !exists {
 		return ErrChunkNotFound
 	}
-	if err := s.putMsgpack(key, chunk); err != nil {
+	if hook := s.chunkUpdateBeforeConditional; hook != nil {
+		hook()
+	}
+	if err := s.updateLiveChunkMetadata(ctx, raw, chunk); err != nil {
 		return err
 	}
 	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("chunk:%d", chunk.ID)})
@@ -2094,13 +2256,16 @@ func (s *PebbleStore) SealChunk(ctx context.Context, chunkID ChunkID) error {
 		return ErrServiceClosed
 	}
 	key := fmt.Sprintf("%s%d", prefixChunk, chunkID)
-	var chunk ChunkMeta
-	exists, err := s.getJSON(key, &chunk)
+	raw, exists, err := s.readChunkTombstoneRaw(key)
 	if err != nil {
 		return err
 	}
 	if !exists {
 		return ErrChunkNotFound
+	}
+	var chunk ChunkMeta
+	if err := unmarshalValue(raw, &chunk); err != nil {
+		return err
 	}
 	if chunk.State == ChunkReady {
 		return nil
@@ -2109,7 +2274,7 @@ func (s *PebbleStore) SealChunk(ctx context.Context, chunkID ChunkID) error {
 		return ErrChunkNotSealed
 	}
 	chunk.State = ChunkReady
-	if err := s.putMsgpack(key, &chunk); err != nil {
+	if err := s.updateLiveChunkMetadata(ctx, raw, &chunk); err != nil {
 		return err
 	}
 	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("chunk:%d", chunkID)})
@@ -2132,13 +2297,13 @@ func (s *PebbleStore) ListChunks(ctx context.Context, inodeID InodeID) ([]ChunkR
 }
 
 func (s *PebbleStore) DeleteChunk(ctx context.Context, chunkID ChunkID) error {
-	if s.closed.Load() {
-		return ErrServiceClosed
-	}
-	if err := s.deleteKey(fmt.Sprintf("%s%d", prefixChunk, chunkID)); err != nil {
+	created, err := s.tombstoneChunk(ctx, chunkID, "deleted by metadata API")
+	if err != nil {
 		return err
 	}
-	s.publishEvent(Event{Type: EventDelete, Key: fmt.Sprintf("chunk:%d", chunkID)})
+	if created {
+		s.publishEvent(Event{Type: EventDelete, Key: fmt.Sprintf("chunk:%d", chunkID)})
+	}
 	return nil
 }
 
@@ -2149,7 +2314,7 @@ func (s *PebbleStore) ReportChunkState(ctx context.Context, nodeID NodeID, state
 	if len(states) == 0 {
 		return nil
 	}
-	return s.batchUpdateChunkStates(nodeID, states)
+	return s.batchUpdateChunkStatesCtx(ctx, nodeID, states)
 }
 
 const maxBatchOps = 1000
@@ -2158,6 +2323,10 @@ const maxBatchOps = 1000
 // It pre-fetches all chunk metadata in a single iterator pass instead of doing
 // one Get per chunk, which is O(N) seeks vs O(N log N) with sorted iteration (P2.10).
 func (s *PebbleStore) batchUpdateChunkStates(nodeID NodeID, states map[ChunkID]ReplicaState) error {
+	return s.batchUpdateChunkStatesCtx(context.Background(), nodeID, states)
+}
+
+func (s *PebbleStore) batchUpdateChunkStatesCtx(ctx context.Context, nodeID NodeID, states map[ChunkID]ReplicaState) error {
 	if len(states) == 0 {
 		return nil
 	}
@@ -2173,9 +2342,6 @@ func (s *PebbleStore) batchUpdateChunkStates(nodeID NodeID, states map[ChunkID]R
 	if err != nil {
 		return fmt.Errorf("batch update: prefetch: %w", err)
 	}
-
-	ops := make([]batchOp, 0, len(states))
-	deletes := make([]string, 0)
 
 	for chunkID, state := range states {
 		key := fmt.Sprintf("%s%d", prefixChunk, chunkID)
@@ -2201,19 +2367,12 @@ func (s *PebbleStore) batchUpdateChunkStates(nodeID NodeID, states map[ChunkID]R
 				State:  state,
 			})
 		}
-		ops = append(ops, batchOp{Key: key, Value: &chunk})
-
-		// Flush in batches to avoid oversized Raft entries
-		if len(ops) >= maxBatchOps {
-			if err := s.applyBatchMsgpack(ops, deletes); err != nil {
-				return err
+		if err := s.updateLiveChunkMetadata(ctx, raw, &chunk); err != nil {
+			if errors.Is(err, ErrBackupMetadataConflict) {
+				continue
 			}
-			ops = ops[:0]
+			return err
 		}
-	}
-
-	if len(ops) > 0 {
-		return s.applyBatchMsgpack(ops, deletes)
 	}
 	return nil
 }
@@ -2337,6 +2496,7 @@ func (s *PebbleStore) Heartbeat(ctx context.Context, nodeID NodeID, report *Node
 		info.UsedGB = report.UsedGB
 		info.ChunkCount = report.ChunkCount
 		s.placement.UpdateLoad(nodeID, report.DiskIO)
+		s.placement.UpdateErrorRate(nodeID, report.WriteErrorRate)
 	}
 	if err := s.putMsgpack(key, &info); err != nil {
 		return err
@@ -2503,9 +2663,43 @@ func (s *PebbleStore) GetDegradationManager() *DegradationManager {
 	return s.degradation
 }
 
+// GetHealthChecker returns the health checker for this store, or nil if not configured.
+func (s *PebbleStore) GetHealthChecker() *HealthChecker {
+	return s.health
+}
+
+// NodeMetrics returns per-node runtime metrics (error rate, load, capacity)
+// from the placement engine. Used by the Prometheus exporter.
+func (s *PebbleStore) NodeMetrics() []NodeMetrics {
+	return s.placement.GetNodeMetrics()
+}
+
 // SetMetrics attaches a metrics collector to this store.
 func (s *PebbleStore) SetMetrics(m *Metrics) {
 	s.metrics = m
+}
+
+// PebbleStats returns a snapshot of Pebble's internal metrics for
+// diagnosing compaction stalls and write pressure.
+type PebbleStatsSnapshot struct {
+	L0Files           int64  `json:"l0_files"`
+	L0Sublevels       int32  `json:"l0_sublevels"`
+	CompactionDebt    uint64 `json:"compaction_debt_bytes"`
+	CompactionPending int64  `json:"compaction_in_progress"`
+	MemTableSize      uint64 `json:"memtable_bytes"`
+	WALSize           uint64 `json:"wal_bytes"`
+}
+
+func (s *PebbleStore) PebbleStats() PebbleStatsSnapshot {
+	m := s.db.Metrics()
+	return PebbleStatsSnapshot{
+		L0Files:           m.Levels[0].NumFiles,
+		L0Sublevels:       m.Levels[0].Sublevels,
+		CompactionDebt:    m.Compact.EstimatedDebt,
+		CompactionPending: m.Compact.NumInProgress,
+		MemTableSize:      m.MemTable.Size,
+		WALSize:           m.WAL.Size,
+	}
 }
 
 // DynamicConfigHandler returns an HTTP handler for viewing and updating
@@ -2809,14 +3003,9 @@ func (s *PebbleStore) applyViaRaft(op RaftLogOp, key string, value []byte) error
 	start := time.Now()
 
 	if s.raft == nil {
-		if op == OpDelete {
-			err := s.db.Delete([]byte(key), pebble.Sync)
-			if err == nil && s.metrics != nil {
-				s.metrics.RecordWrite(time.Since(start))
-			}
-			return err
-		}
-		err := s.db.Set([]byte(key), value, pebble.Sync)
+		s.mu.Lock()
+		err := applyReferenceAwareBatch(s.db, []BatchOp{{Delete: op == OpDelete, Key: []byte(key), Value: value}}, pebble.NoSync)
+		s.mu.Unlock()
 		if err == nil && s.metrics != nil {
 			s.metrics.RecordWrite(time.Since(start))
 		}
@@ -2828,7 +3017,7 @@ func (s *PebbleStore) applyViaRaft(op RaftLogOp, key string, value []byte) error
 		Key:   []byte(key),
 		Value: value,
 	}
-	err := s.raft.ApplyAutoForward(entry, 10*time.Second)
+	err := s.raft.applyTrustedAutoForward(entry, 10*time.Second)
 	if err == nil && s.metrics != nil {
 		s.metrics.RecordWrite(time.Since(start))
 	}
@@ -2850,16 +3039,9 @@ func (s *PebbleStore) applyBatchViaRaft(ops []BatchOp) error {
 	start := time.Now()
 
 	if s.raft == nil {
-		batch := s.db.NewBatch()
-		defer batch.Close()
-		for _, op := range ops {
-			if op.Delete {
-				batch.Delete(op.Key, nil)
-			} else {
-				batch.Set(op.Key, op.Value, nil)
-			}
-		}
-		err := batch.Commit(pebble.Sync)
+		s.mu.Lock()
+		err := applyReferenceAwareBatch(s.db, ops, pebble.NoSync)
+		s.mu.Unlock()
 		if err == nil && s.metrics != nil {
 			s.metrics.RecordWrite(time.Since(start))
 		}
@@ -2870,11 +3052,248 @@ func (s *PebbleStore) applyBatchViaRaft(ops []BatchOp) error {
 		Op:    OpBatch,
 		Batch: ops,
 	}
-	err := s.raft.ApplyAutoForward(entry, 10*time.Second)
+	err := s.raft.applyTrustedAutoForward(entry, 10*time.Second)
 	if err == nil && s.metrics != nil {
 		s.metrics.RecordWrite(time.Since(start))
 	}
 	return err
+}
+
+// applyReferenceAwareBatch is the only non-conditional metadata mutation path.
+// It keeps inode-reference changes and their epoch in the same Pebble commit.
+func applyReferenceAwareBatch(db *pebble.DB, ops []BatchOp, sync *pebble.WriteOptions) error {
+	prepared, err := prepareReferenceAwareBatch(db, ops)
+	if err != nil {
+		return err
+	}
+	batch := db.NewBatch()
+	defer batch.Close()
+	for _, op := range prepared {
+		if op.Delete {
+			if err := batch.Delete(op.Key, nil); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := batch.Set(op.Key, op.Value, nil); err != nil {
+			return err
+		}
+	}
+	return batch.Commit(sync)
+}
+
+func prepareReferenceAwareBatch(db *pebble.DB, ops []BatchOp) ([]BatchOp, error) {
+	return prepareReferenceAwareBatchWithEpoch(db, ops, nil)
+}
+
+func prepareReferenceAwareBatchWithEpoch(db *pebble.DB, ops []BatchOp, epochOverride *rawReferenceValue) ([]BatchOp, error) {
+	prepared := append([]BatchOp(nil), ops...)
+	overlay := make(map[string]rawReferenceValue)
+	referencesChanged := false
+
+	readRaw := func(key string) (rawReferenceValue, error) {
+		if value, ok := overlay[key]; ok {
+			return value, nil
+		}
+		value, closer, err := db.Get([]byte(key))
+		if errors.Is(err, pebble.ErrNotFound) {
+			raw := rawReferenceValue{}
+			overlay[key] = raw
+			return raw, nil
+		}
+		if err != nil {
+			return rawReferenceValue{}, err
+		}
+		raw := rawReferenceValue{found: true, value: append([]byte(nil), value...)}
+		closer.Close()
+		overlay[key] = raw
+		return raw, nil
+	}
+
+	for _, op := range ops {
+		key := string(op.Key)
+		if key == keyInodeReferenceEpoch {
+			return nil, fmt.Errorf("inode reference epoch is internal")
+		}
+		if isInodeMetadataKey(key) {
+			oldRaw, err := readRaw(key)
+			if err != nil {
+				return nil, fmt.Errorf("inode reference epoch: read %q: %w", key, err)
+			}
+			oldMeta, oldFound, err := decodeReferencedInode(key, oldRaw)
+			if err != nil {
+				return nil, err
+			}
+
+			var newMeta InodeMeta
+			newFound := !op.Delete
+			if newFound {
+				if err := unmarshalValue(op.Value, &newMeta); err != nil {
+					return nil, fmt.Errorf("inode reference epoch: decode new inode %q: %w", key, err)
+				}
+				if err := validateInodeKeyIdentity(key, newMeta.ID); err != nil {
+					return nil, err
+				}
+			}
+
+			if chunkMapsDiffer(oldMeta, oldFound, newMeta, newFound) {
+				referencesChanged = true
+				for chunkID := range addedChunkReferences(oldMeta, oldFound, newMeta, newFound) {
+					chunkRaw, err := readRaw(chunkMetadataKey(chunkID))
+					if err != nil {
+						return nil, fmt.Errorf("inode reference epoch: read chunk %d: %w", chunkID, err)
+					}
+					tombstoneRaw, err := readRaw(chunkTombstoneKey(chunkID))
+					if err != nil {
+						return nil, fmt.Errorf("inode reference epoch: read tombstone %d: %w", chunkID, err)
+					}
+					if !chunkRaw.found || tombstoneRaw.found {
+						return nil, fmt.Errorf("inode reference epoch: chunk %d is unavailable for attachment", chunkID)
+					}
+				}
+			}
+			overlay[key] = rawReferenceValue{found: newFound, value: append([]byte(nil), op.Value...)}
+			continue
+		}
+
+		if isChunkMetadataKey(key) && !op.Delete {
+			chunkID, err := parseChunkTombstoneKey(key, prefixChunk)
+			if err != nil {
+				return nil, err
+			}
+			tombstoneRaw, err := readRaw(chunkTombstoneKey(chunkID))
+			if err != nil {
+				return nil, fmt.Errorf("chunk mutation: read tombstone %d: %w", chunkID, err)
+			}
+			if tombstoneRaw.found {
+				return nil, fmt.Errorf("chunk mutation: chunk %d is tombstoned", chunkID)
+			}
+		}
+		overlay[key] = rawReferenceValue{found: !op.Delete, value: append([]byte(nil), op.Value...)}
+	}
+
+	if !referencesChanged {
+		return prepared, nil
+	}
+	// Epoch handling removed: per-inode CAS is sufficient for
+	// allocation correctness; global epoch caused contention storms.
+	return prepared, nil
+}
+
+type rawReferenceValue struct {
+	found bool
+	value []byte
+}
+
+func decodeReferencedInode(key string, raw rawReferenceValue) (InodeMeta, bool, error) {
+	if !raw.found {
+		return InodeMeta{}, false, nil
+	}
+	var meta InodeMeta
+	if err := unmarshalValue(raw.value, &meta); err != nil {
+		return InodeMeta{}, false, fmt.Errorf("inode reference epoch: decode stored inode %q: %w", key, err)
+	}
+	if err := validateInodeKeyIdentity(key, meta.ID); err != nil {
+		return InodeMeta{}, false, err
+	}
+	return meta, true, nil
+}
+
+func isInodeMetadataKey(key string) bool {
+	return strings.HasPrefix(key, prefixInode) && validInodeMetadataKey(key)
+}
+
+func validInodeMetadataKey(key string) bool {
+	value := strings.TrimPrefix(key, prefixInode)
+	if value == "" {
+		return false
+	}
+	id, err := strconv.ParseUint(value, 10, 64)
+	return err == nil && prefixInode+strconv.FormatUint(id, 10) == key
+}
+
+func validateInodeKeyIdentity(key string, inodeID InodeID) error {
+	if !validInodeMetadataKey(key) {
+		return fmt.Errorf("inode reference epoch: invalid inode key %q", key)
+	}
+	id, _ := strconv.ParseUint(strings.TrimPrefix(key, prefixInode), 10, 64)
+	if inodeID != InodeID(id) {
+		return fmt.Errorf("inode reference epoch: inode key and value identities differ for %q", key)
+	}
+	return nil
+}
+
+func isChunkMetadataKey(key string) bool {
+	return strings.HasPrefix(key, prefixChunk) && validChunkMetadataKey(key)
+}
+
+func validChunkMetadataKey(key string) bool {
+	_, err := parseChunkTombstoneKey(key, prefixChunk)
+	return err == nil
+}
+
+func chunkMapsDiffer(old InodeMeta, oldFound bool, next InodeMeta, nextFound bool) bool {
+	if oldFound != nextFound {
+		return true
+	}
+	if !oldFound || len(old.ChunkMap) != len(next.ChunkMap) {
+		return oldFound
+	}
+	for i := range old.ChunkMap {
+		if old.ChunkMap[i] != next.ChunkMap[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func addedChunkReferences(old InodeMeta, oldFound bool, next InodeMeta, nextFound bool) map[ChunkID]struct{} {
+	added := make(map[ChunkID]struct{})
+	if !nextFound {
+		return added
+	}
+	previous := make(map[ChunkID]struct{}, len(old.ChunkMap))
+	if oldFound {
+		for _, ref := range old.ChunkMap {
+			previous[ref.ID] = struct{}{}
+		}
+	}
+	for _, ref := range next.ChunkMap {
+		if _, found := previous[ref.ID]; !found {
+			added[ref.ID] = struct{}{}
+		}
+	}
+	return added
+}
+
+func encodeInodeReferenceEpoch(epoch uint64) []byte {
+	raw := make([]byte, 8)
+	binary.BigEndian.PutUint64(raw, epoch)
+	return raw
+}
+
+func decodeInodeReferenceEpoch(raw rawReferenceValue) (uint64, error) {
+	if !raw.found {
+		return 0, nil
+	}
+	if len(raw.value) != 8 {
+		return 0, fmt.Errorf("inode reference epoch is malformed")
+	}
+	return binary.BigEndian.Uint64(raw.value), nil
+}
+
+func inodeReferenceEpochPrecondition(raw rawReferenceValue) ConditionalPrecondition {
+	precondition := ConditionalPrecondition{Key: []byte(keyInodeReferenceEpoch)}
+	if raw.found {
+		precondition.ExpectedValue = append([]byte(nil), raw.value...)
+	} else {
+		precondition.ExpectAbsent = true
+	}
+	return precondition
+}
+
+func rawReferenceValuesEqual(left, right rawReferenceValue) bool {
+	return left.found == right.found && (!left.found || bytes.Equal(left.value, right.value))
 }
 
 // ========== RebalanceService Implementation ==========
@@ -3046,6 +3465,44 @@ func (s *PebbleStore) readBucketStats(rootInode InodeID) BucketUsage {
 	var stats BucketUsage
 	s.getJSON(s.bucketStatsKey(rootInode), &stats)
 	return stats
+}
+
+func (s *PebbleStore) ensureBucketStats(ctx context.Context) error {
+	buckets, err := s.ListBuckets(ctx)
+	if err != nil || len(buckets) == 0 {
+		return err
+	}
+	for _, bucket := range buckets {
+		var stats BucketUsage
+		exists, err := s.getValue(s.bucketStatsKey(bucket.RootInode), &stats)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			wasEnabled := s.cfg.UseBucketStats
+			s.cfg.UseBucketStats = false
+			usages, scanErr := s.ComputeAllBucketUsage(ctx)
+			s.cfg.UseBucketStats = wasEnabled
+			if scanErr != nil {
+				return scanErr
+			}
+			roots := make(map[string]InodeID, len(buckets))
+			for _, item := range buckets {
+				roots[item.Name] = item.RootInode
+			}
+			ops := make([]batchOp, 0, len(usages))
+			for i := range usages {
+				root, ok := roots[usages[i].Name]
+				if !ok {
+					continue
+				}
+				usage := usages[i]
+				ops = append(ops, batchOp{Key: s.bucketStatsKey(root), Value: &usage})
+			}
+			return s.applyBatchMsgpack(ops, nil)
+		}
+	}
+	return nil
 }
 
 // addBucketStatsOp adds a counter update to the pending batch ops.
@@ -3273,13 +3730,117 @@ func (s *PebbleStore) SaveUsage(bucket string, usage *BucketUsage) error {
 	return s.putMsgpack(prefixQuotaUsage+bucket, usage)
 }
 
+// GetBucketQuota returns the configured quota for an existing bucket.
+func (s *PebbleStore) GetBucketQuota(ctx context.Context, bucket string) (*BucketQuota, error) {
+	if _, err := s.GetBucket(ctx, bucket); err != nil {
+		return nil, err
+	}
+	var quota BucketQuota
+	exists, err := s.getValue(prefixQuota+bucket, &quota)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, nil
+	}
+	return &quota, nil
+}
+
+// SetBucketQuota configures a quota for an existing bucket.
+func (s *PebbleStore) SetBucketQuota(ctx context.Context, bucket string, quota *BucketQuota) error {
+	if _, err := s.GetBucket(ctx, bucket); err != nil {
+		return err
+	}
+	if err := quota.Validate(); err != nil {
+		return err
+	}
+	if err := s.SaveQuota(bucket, quota); err != nil {
+		return err
+	}
+	if s.quota != nil {
+		s.quota.LoadQuota(bucket, quota)
+	}
+	return nil
+}
+
+// DeleteBucketQuota clears the configured quota for an existing bucket.
+func (s *PebbleStore) DeleteBucketQuota(ctx context.Context, bucket string) error {
+	if _, err := s.GetBucket(ctx, bucket); err != nil {
+		return err
+	}
+	if err := s.DeleteQuota(bucket); err != nil {
+		return err
+	}
+	if s.quota != nil {
+		s.quota.LoadQuota(bucket, nil)
+	}
+	return nil
+}
+
+// DeleteQuota removes a persisted quota entry.
+func (s *PebbleStore) DeleteQuota(bucket string) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	return s.applyBatchMsgpack(nil, []string{prefixQuota + bucket})
+}
+
+// CheckBucketQuota checks actual write deltas for an existing bucket.
+func (s *PebbleStore) CheckBucketQuota(ctx context.Context, bucket string, additionalBytes int64, additionalObjects int64) error {
+	quota, err := s.GetBucketQuota(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	if quota == nil {
+		return nil
+	}
+	usage, err := s.GetBucketUsage(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	usedBytes := usage.UsedBytes
+	objects := int64(usage.Objects)
+	if quota.MaxSizeBytes > 0 && additionalBytes > 0 && usedBytes > quota.MaxSizeBytes-additionalBytes {
+		return fmt.Errorf("%w: bucket %s would exceed size limit (%d + %d > %d)",
+			ErrQuotaExceeded, bucket, usedBytes, additionalBytes, quota.MaxSizeBytes)
+	}
+	if quota.MaxObjects > 0 && additionalObjects > 0 && objects > quota.MaxObjects-additionalObjects {
+		return fmt.Errorf("%w: bucket %s would exceed object limit (%d + %d > %d)",
+			ErrQuotaExceeded, bucket, objects, additionalObjects, quota.MaxObjects)
+	}
+	return nil
+}
+
+// GetBucketUsage returns the current aggregate usage for an existing bucket.
+func (s *PebbleStore) GetBucketUsage(ctx context.Context, bucket string) (*BucketUsage, error) {
+	b, err := s.GetBucket(ctx, bucket)
+	if err != nil {
+		return nil, err
+	}
+	if s.cfg.UseBucketStats {
+		stats := s.readBucketStats(b.RootInode)
+		stats.Name = b.Name
+		return &stats, nil
+	}
+	all, err := s.ComputeAllBucketUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range all {
+		if all[i].Name == bucket {
+			return &all[i], nil
+		}
+	}
+	return &BucketUsage{Name: bucket}, nil
+}
+
 // loadQuotas restores previously persisted quota and usage data from Pebble
 // into the QuotaManager's in-memory maps. Called during SetQuotaManager.
 func (s *PebbleStore) loadQuotas(qm *QuotaManager) {
 	// Load quotas
 	s.scanPrefix(prefixQuota, func(key, val []byte) error {
 		var quota BucketQuota
-		if err := json.Unmarshal(val, &quota); err != nil {
+		if err := unmarshalValue(val, &quota); err != nil {
 			slog.Warn("quota: failed to unmarshal quota entry", "key", string(key), "error", err)
 			return nil
 		}
@@ -3291,7 +3852,7 @@ func (s *PebbleStore) loadQuotas(qm *QuotaManager) {
 	// Load usage
 	s.scanPrefix(prefixQuotaUsage, func(key, val []byte) error {
 		var usage BucketUsage
-		if err := json.Unmarshal(val, &usage); err != nil {
+		if err := unmarshalValue(val, &usage); err != nil {
 			slog.Warn("quota: failed to unmarshal usage entry", "key", string(key), "error", err)
 			return nil
 		}

@@ -86,7 +86,7 @@ func main() {
 	router := api.NewRouter(requestProxy, aggregator, jwt, users, registry)
 
 	// Create and run server
-	srv := server.New(cfg.Server.Listen, router)
+	srv := server.New(cfg.Server.Listen, router, os.DirFS("web/dist"))
 	if err := srv.Run(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}

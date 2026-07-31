@@ -126,6 +126,55 @@ func BenchmarkPebbleStoreAllocateChunk(b *testing.B) {
 	}
 }
 
+func BenchmarkPrepareReferenceAwareBatchChunkMap(b *testing.B) {
+	const refs = 10_000
+	store, err := NewPebbleStore(PebbleStoreConfig{Dir: b.TempDir()})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+
+	baseRefs := make([]ChunkRef, refs)
+	for i := range baseRefs {
+		baseRefs[i] = ChunkRef{ID: ChunkID(i + 1), Offset: int64(i) * MaxChunkSize, Length: MaxChunkSize}
+	}
+	old := &InodeMeta{ID: 8001, Mode: 0644, ChunkMap: baseRefs}
+	oldRaw, err := marshalValue(old, codecMsgpack)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := store.db.Set([]byte(fmt.Sprintf("%s%d", prefixInode, old.ID)), oldRaw, nil); err != nil {
+		b.Fatal(err)
+	}
+
+	bench := func(b *testing.B, next *InodeMeta) {
+		raw, err := marshalValue(next, codecMsgpack)
+		if err != nil {
+			b.Fatal(err)
+		}
+		op := []BatchOp{{Key: []byte(fmt.Sprintf("%s%d", prefixInode, next.ID)), Value: raw}}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := prepareReferenceAwareBatch(store.db, op); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+
+	b.Run("unchanged_10k", func(b *testing.B) {
+		next := &InodeMeta{ID: old.ID, Mode: 0600, ChunkMap: append([]ChunkRef(nil), baseRefs...)}
+		bench(b, next)
+	})
+	b.Run("one_addition_10k", func(b *testing.B) {
+		addedID := ChunkID(refs + 1)
+		if err := store.putMsgpack(chunkMetadataKey(addedID), &ChunkMeta{ID: addedID, Size: MaxChunkSize, State: ChunkReady}); err != nil {
+			b.Fatal(err)
+		}
+		nextRefs := append(append([]ChunkRef(nil), baseRefs...), ChunkRef{ID: addedID, Offset: int64(refs) * MaxChunkSize, Length: MaxChunkSize})
+		bench(b, &InodeMeta{ID: old.ID, Mode: 0600, ChunkMap: nextRefs})
+	})
+}
+
 // BenchmarkPebbleStoreLookup benchmarks file lookup in a directory.
 func BenchmarkPebbleStoreLookup(b *testing.B) {
 	dir := b.TempDir()

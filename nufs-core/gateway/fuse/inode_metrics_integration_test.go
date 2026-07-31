@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/example/dfs/gateway/s3"
+	"github.com/example/dfs/chunkstore"
 )
 
 // ========== 集成测试：验证 FUSE 操作正确递增 MetricsRecorder 计数器 ==========
@@ -16,7 +16,7 @@ import (
 // TestDFSFile_Open_IncrementsOps 验证 Open 一次后 OpsOpen=1。
 func TestDFSFile_Open_IncrementsOps(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	f := newTestFileWithRecorder(meta, cs, id, rec)
 
@@ -32,7 +32,7 @@ func TestDFSFile_Open_IncrementsOps(t *testing.T) {
 // TestDFSFile_Read_IncrementsOps 验证 Read 一次后 OpsRead=1。
 func TestDFSFile_Read_IncrementsOps(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	f := newTestFileWithRecorder(meta, cs, id, rec)
 
@@ -49,7 +49,7 @@ func TestDFSFile_Read_IncrementsOps(t *testing.T) {
 // TestDFSFile_Write_IncrementsOps 验证 Write 一次后 OpsWrite=1。
 func TestDFSFile_Write_IncrementsOps(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	f := newTestFileWithRecorder(meta, cs, id, rec)
 
@@ -66,7 +66,7 @@ func TestDFSFile_Write_IncrementsOps(t *testing.T) {
 // TestDFSFile_Flush_IncrementsOps 验证 Flush 一次后 OpsFlush=1。
 func TestDFSFile_Flush_IncrementsOps(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	f := newTestFileWithRecorder(meta, cs, id, rec)
 
@@ -84,7 +84,7 @@ func TestDFSFile_Flush_IncrementsOps(t *testing.T) {
 // TestDFSFile_Release_IncrementsOps 验证 Release 一次后 OpsRelease=1。
 func TestDFSFile_Release_IncrementsOps(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	f := newTestFileWithRecorder(meta, cs, id, rec)
 
@@ -101,7 +101,7 @@ func TestDFSFile_Release_IncrementsOps(t *testing.T) {
 // 第二次会命中缓存并递增 CacheHits。
 func TestDFSFile_Read_HitCache_IncrementsCacheHits(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 
 	// 创建带缓存 + recorder 的 DFSFile
@@ -158,7 +158,7 @@ func TestDFSFile_Read_HitCache_IncrementsCacheHits(t *testing.T) {
 // 通过注入超过 MaxChunkPayload 的数据触发 EFBIG。
 func TestDFSFile_Flush_ErrorIncrementsOpsErrors(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	f := newTestFileWithRecorder(meta, cs, id, rec)
 
@@ -193,7 +193,7 @@ func TestDFSFile_Getattr_IncrementsOpsErrorsOnFailure(t *testing.T) {
 // TestDFSFile_MultipleOps_AggregateCounters 验证多个操作累加计数。
 func TestDFSFile_MultipleOps_AggregateCounters(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
 	f := newTestFileWithRecorder(meta, cs, id, rec)
 

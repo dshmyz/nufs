@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -33,6 +36,7 @@ func main() {
 		cacheDir             = flag.String("cache-dir", "", "Pebble read cache directory (optional)")
 		nodeID               = flag.String("node-id", "1", "Metadata node ID or StatefulSet pod name ending in -<ordinal>")
 		memTableSize         = flag.Uint64("memtable-size", 256<<20, "Pebble memtable size in bytes")
+		bucketStats          = flag.Bool("bucket-stats", true, "Enable persisted per-bucket usage counters")
 		enableRaft           = flag.Bool("raft", true, "Enable Raft consensus")
 		raftAddr             = flag.String("raft-addr", "0.0.0.0:7000", "Raft bind address")
 		raftAdvertiseAddr    = flag.String("raft-advertise-addr", "", "Advertised Raft address for peers (default: raft-addr)")
@@ -58,10 +62,18 @@ func main() {
 		tlsRequireClientCert = flag.Bool("tls-require-client-cert", false, "Require clients to present a certificate signed by tls-ca")
 		tlsSkipVerify        = flag.Bool("tls-skip-verify", false, "Skip TLS server certificate verification (dev only)")
 		authToken            = flag.String("auth-token", "", "Bearer token for ops API auth (empty = no auth)")
-		backupDir            = flag.String("backup-dir", "", "Directory for Pebble checkpoint backups (empty = disabled)")
-		backupInterval       = flag.Duration("backup-interval", time.Hour, "Backup interval")
-		backupMax            = flag.Int("backup-max", 24, "Maximum local backups to retain (0 = unlimited)")
-		backupDryRun         = flag.Bool("backup-dry-run", false, "Log backup actions without writing checkpoints")
+		backupEnabled        = flag.Bool("backup-enabled", false, "Enable leader-only metadata backups")
+		backupLocalDir       = flag.String("backup-local-dir", "/var/lib/dfs/backup-tmp", "Local temporary directory for metadata backups")
+		backupInterval       = flag.Duration("backup-interval", time.Hour, "Metadata backup interval")
+		backupRetention      = flag.Int("backup-retention", 24, "Number of committed metadata backups to retain")
+		backupS3Bucket       = flag.String("backup-s3-bucket", "", "S3 bucket for metadata backups")
+		backupS3Prefix       = flag.String("backup-s3-prefix", "", "S3 key prefix for metadata backups")
+		backupS3Region       = flag.String("backup-s3-region", "", "S3 region for metadata backups")
+		backupS3Endpoint     = flag.String("backup-s3-endpoint", "", "Custom S3-compatible endpoint")
+		backupUploadTimeout  = flag.Duration("backup-upload-timeout", 10*time.Minute, "Maximum duration of a metadata backup run")
+		backupStagingMaxAge  = flag.Duration("backup-staging-max-age", 24*time.Hour, "Maximum age of incomplete backup staging data")
+		restoreMinReplicas   = flag.Int("restore-minimum-readable-replicas", 1, "Minimum readable datanode replicas required before a restored metadata cluster becomes ready")
+		clusterID            = flag.String("cluster-id", "", "Stable metadata cluster identity")
 		traceEnabled         = flag.Bool("trace-enabled", false, "Enable OpenTelemetry tracing")
 		traceEndpoint        = flag.String("trace-endpoint", "", "OTLP gRPC endpoint")
 		traceInsecure        = flag.Bool("trace-insecure", true, "Use insecure OTLP connection")
@@ -71,6 +83,29 @@ func main() {
 	_ = configPath
 	config.Preload()
 	flag.Parse()
+	if *restoreMinReplicas < 1 {
+		fmt.Fprintln(os.Stderr, "invalid restore readiness configuration: --restore-minimum-readable-replicas must be at least 1")
+		os.Exit(1)
+	}
+
+	backupCfg, err := validateBackupRuntimeConfig(backupRuntimeConfig{
+		Enabled:       *backupEnabled,
+		RaftEnabled:   *enableRaft,
+		ClusterID:     *clusterID,
+		LocalDir:      *backupLocalDir,
+		Interval:      *backupInterval,
+		Retention:     *backupRetention,
+		S3Bucket:      *backupS3Bucket,
+		S3Prefix:      *backupS3Prefix,
+		S3Region:      *backupS3Region,
+		S3Endpoint:    *backupS3Endpoint,
+		UploadTimeout: *backupUploadTimeout,
+		StagingMaxAge: *backupStagingMaxAge,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid backup configuration: %v\n", err)
+		os.Exit(1)
+	}
 
 	nodeIDValue, err := resolveMetadataNodeID(*nodeID)
 	if err != nil {
@@ -96,10 +131,11 @@ func main() {
 	}
 
 	pebbleCfg := metadata.PebbleStoreConfig{
-		Dir:          *dataDir,
-		CacheDir:     *cacheDir,
-		NodeID:       nodeIDValue,
-		MemTableSize: *memTableSize,
+		Dir:            *dataDir,
+		CacheDir:       *cacheDir,
+		NodeID:         nodeIDValue,
+		MemTableSize:   *memTableSize,
+		UseBucketStats: *bucketStats,
 	}
 
 	store, err := metadata.NewPebbleStore(pebbleCfg)
@@ -215,14 +251,66 @@ func main() {
 
 	log.Info("service bundle initialized")
 
+	restoreGate, err := startRestoreReadinessGate(context.Background(), store, bundle, restoreReadinessConfig{
+		MinimumReadableReplicas: *restoreMinReplicas,
+		Probe:                   datanodeRestoreReplicaProbe{},
+	})
+	if err != nil {
+		log.Error("failed to initialize restore readiness gate", "error", err)
+		os.Exit(1)
+	}
+	defer restoreGate.Stop()
+
+	var backupRepository metadata.BackupRepository
+	backupCoordinator, err := createBackupCoordinatorRuntime(
+		backupCfg,
+		store,
+		func(cfg metadata.S3Config) (metadata.BackupRepository, error) {
+			repository, err := metadata.NewS3BackupRepository(cfg)
+			if err != nil {
+				return nil, err
+			}
+			backupRepository = repository
+			return repository, nil
+		},
+		func(
+			cfg metadata.BackupCoordinatorConfig,
+			store *metadata.PebbleStore,
+			repository metadata.BackupRepository,
+		) backupCoordinatorLifecycle {
+			return metadata.NewBackupCoordinator(cfg, store, repository)
+		},
+	)
+	if err != nil {
+		log.Error("failed to initialize backup coordinator", "error", err)
+		os.Exit(1)
+	}
+	if backupCoordinator != nil {
+		backupCoordinator.Start()
+		log.Info(
+			"backup coordinator started",
+			"bucket", backupCfg.S3Bucket,
+			"prefix", backupCfg.S3Prefix,
+			"interval", backupCfg.Interval,
+			"retention", backupCfg.Retention,
+		)
+	}
+
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle, advertiseOpsURL)
+	var backupDeps []backupOpsDependency
+	if coordinator, ok := backupCoordinator.(backupOpsCoordinator); ok {
+		backupDeps = append(backupDeps, backupOpsDependency{
+			coordinator: coordinator,
+			repository:  backupRepository,
+		})
+	}
+	registerOpsHandlers(mux, store, bundle, advertiseOpsURL, backupDeps...)
 
 	admin := newAdminServer(store, bundle)
 	admin.RegisterRoutes(mux)
 
 	// Prometheus metrics endpoint
-	mux.Handle("/metrics", metadata.PrometheusHandler(bundle.Metrics))
+	mux.Handle("/metrics", prometheusMetricsHandler(store, bundle.Metrics, backupDeps...))
 	// Health check endpoint
 	mux.Handle("/healthz", metadata.HealthHandler(bundle.Health))
 	// Version endpoint
@@ -242,7 +330,7 @@ func main() {
 		"/api/v1/health":  {},
 		"/version":        {},
 	}
-	var handler http.Handler = drain.Middleware(public, mux)
+	var handler http.Handler = rejectEmptyBucketQuotaPath(drain.Middleware(public, mux))
 	if *authToken != "" {
 		log.Info("auth token enabled for ops API")
 		handler = internalhttp.BearerAuth(*authToken, public, handler)
@@ -297,18 +385,6 @@ func main() {
 		}
 	}()
 
-	var backupManager *metadata.BackupManager
-	if *backupDir != "" {
-		backupManager = metadata.NewBackupManager(store, metadata.BackupConfig{
-			Dir:        *backupDir,
-			Interval:   *backupInterval,
-			MaxBackups: *backupMax,
-			DryRun:     *backupDryRun,
-		})
-		backupManager.Start()
-		log.Info("backup manager started", "dir", *backupDir, "interval", *backupInterval, "max_backups", *backupMax, "dry_run", *backupDryRun)
-	}
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	sig := <-sigCh
@@ -344,9 +420,9 @@ func main() {
 		log.Warn("ops shutdown error", "error", err)
 	}
 
-	if backupManager != nil {
-		backupManager.Stop()
-		log.Info("backup manager stopped")
+	if backupCoordinator != nil {
+		backupCoordinator.Stop()
+		log.Info("backup coordinator stopped")
 	}
 
 	if raftNode != nil {
@@ -465,4 +541,183 @@ func parseRaftPeerSpecs(spec string) ([]raftPeerSpec, error) {
 		pairs = append(pairs, raftPeerSpec{id: id, value: value})
 	}
 	return pairs, nil
+}
+
+type backupRuntimeConfig struct {
+	Enabled       bool
+	RaftEnabled   bool
+	ClusterID     string
+	LocalDir      string
+	Interval      time.Duration
+	Retention     int
+	S3Bucket      string
+	S3Prefix      string
+	S3Region      string
+	S3Endpoint    string
+	UploadTimeout time.Duration
+	StagingMaxAge time.Duration
+}
+
+type backupCoordinatorLifecycle interface {
+	Start()
+	Stop()
+}
+
+func createBackupCoordinatorRuntime(
+	cfg backupRuntimeConfig,
+	store *metadata.PebbleStore,
+	repositoryFactory func(metadata.S3Config) (metadata.BackupRepository, error),
+	coordinatorFactory func(
+		metadata.BackupCoordinatorConfig,
+		*metadata.PebbleStore,
+		metadata.BackupRepository,
+	) backupCoordinatorLifecycle,
+) (backupCoordinatorLifecycle, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	repository, err := repositoryFactory(metadata.S3Config{
+		Bucket:   cfg.S3Bucket,
+		Prefix:   cfg.S3Prefix,
+		Region:   cfg.S3Region,
+		Endpoint: cfg.S3Endpoint,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create backup repository: %w", err)
+	}
+	coordinator := coordinatorFactory(metadata.BackupCoordinatorConfig{
+		ClusterID:     cfg.ClusterID,
+		Interval:      cfg.Interval,
+		Retention:     cfg.Retention,
+		LocalTempDir:  cfg.LocalDir,
+		StagingMaxAge: cfg.StagingMaxAge,
+		UploadTimeout: cfg.UploadTimeout,
+	}, store, repository)
+	if coordinator == nil {
+		return nil, fmt.Errorf("create backup coordinator: factory returned nil")
+	}
+	return coordinator, nil
+}
+
+func validateBackupRuntimeConfig(cfg backupRuntimeConfig) (backupRuntimeConfig, error) {
+	if !cfg.Enabled {
+		return backupRuntimeConfig{}, nil
+	}
+	if !cfg.RaftEnabled {
+		return backupRuntimeConfig{}, fmt.Errorf("backup requires Raft to be enabled")
+	}
+	cfg.ClusterID = strings.TrimSpace(cfg.ClusterID)
+	if err := validateBackupClusterID(cfg.ClusterID); err != nil {
+		return backupRuntimeConfig{}, err
+	}
+	cfg.S3Bucket = strings.TrimSpace(cfg.S3Bucket)
+	if cfg.S3Bucket == "" {
+		return backupRuntimeConfig{}, fmt.Errorf("backup S3 bucket is required")
+	}
+	if cfg.Interval <= 0 {
+		return backupRuntimeConfig{}, fmt.Errorf("backup interval must be positive")
+	}
+	if cfg.Retention < 1 {
+		return backupRuntimeConfig{}, fmt.Errorf("backup retention must be at least 1")
+	}
+	if cfg.UploadTimeout <= 0 {
+		return backupRuntimeConfig{}, fmt.Errorf("backup upload timeout must be positive")
+	}
+	if cfg.StagingMaxAge <= 0 {
+		return backupRuntimeConfig{}, fmt.Errorf("backup staging max age must be positive")
+	}
+
+	cfg.LocalDir = strings.TrimSpace(cfg.LocalDir)
+	if cfg.LocalDir == "" {
+		return backupRuntimeConfig{}, fmt.Errorf("backup local directory is required")
+	}
+	absolute, err := filepath.Abs(cfg.LocalDir)
+	if err != nil {
+		return backupRuntimeConfig{}, fmt.Errorf("resolve backup local directory: %w", err)
+	}
+	cfg.LocalDir = filepath.Clean(absolute)
+	if err := os.MkdirAll(cfg.LocalDir, 0o700); err != nil {
+		return backupRuntimeConfig{}, fmt.Errorf("create backup local directory: %w", err)
+	}
+	info, err := os.Stat(cfg.LocalDir)
+	if err != nil {
+		return backupRuntimeConfig{}, fmt.Errorf("inspect backup local directory: %w", err)
+	}
+	if !info.IsDir() {
+		return backupRuntimeConfig{}, fmt.Errorf("backup local path is not a directory")
+	}
+	probe, err := os.CreateTemp(cfg.LocalDir, ".nufs-backup-write-test-*")
+	if err != nil {
+		return backupRuntimeConfig{}, fmt.Errorf("backup local directory is not writable: %w", err)
+	}
+	probeName := probe.Name()
+	if err := probe.Sync(); err != nil {
+		_ = probe.Close()
+		_ = os.Remove(probeName)
+		return backupRuntimeConfig{}, fmt.Errorf("sync backup local directory probe: %w", err)
+	}
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(probeName)
+		return backupRuntimeConfig{}, fmt.Errorf("close backup local directory probe: %w", err)
+	}
+	if err := os.Remove(probeName); err != nil {
+		return backupRuntimeConfig{}, fmt.Errorf("remove backup local directory probe: %w", err)
+	}
+
+	cfg.S3Prefix, err = normalizeBackupS3Prefix(cfg.S3Prefix)
+	if err != nil {
+		return backupRuntimeConfig{}, err
+	}
+	cfg.S3Region = strings.TrimSpace(cfg.S3Region)
+	cfg.S3Endpoint = strings.TrimSpace(cfg.S3Endpoint)
+	if cfg.S3Endpoint != "" {
+		parsed, parseErr := url.ParseRequestURI(cfg.S3Endpoint)
+		if parseErr != nil || parsed.Host == "" ||
+			(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return backupRuntimeConfig{}, fmt.Errorf("invalid backup S3 endpoint %q", cfg.S3Endpoint)
+		}
+		cfg.S3Endpoint = strings.TrimSuffix(cfg.S3Endpoint, "/")
+	}
+	return cfg, nil
+}
+
+func validateBackupClusterID(id string) error {
+	if id == "" {
+		return fmt.Errorf("backup cluster ID is required")
+	}
+	if len(id) > 255 {
+		return fmt.Errorf("backup cluster ID exceeds 255 bytes")
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		alphaNumeric := c >= 'a' && c <= 'z' ||
+			c >= 'A' && c <= 'Z' ||
+			c >= '0' && c <= '9'
+		if i == 0 && !alphaNumeric {
+			return fmt.Errorf("backup cluster ID must start with an ASCII letter or digit")
+		}
+		if !alphaNumeric && c != '-' && c != '_' && c != '.' && c != ':' {
+			return fmt.Errorf("backup cluster ID contains an unsafe byte")
+		}
+	}
+	return nil
+}
+
+func normalizeBackupS3Prefix(prefix string) (string, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return "", nil
+	}
+	normalized := strings.TrimSuffix(prefix, "/")
+	if normalized == "" || strings.HasPrefix(normalized, "/") ||
+		strings.Contains(normalized, `\`) || path.Clean(normalized) != normalized {
+		return "", fmt.Errorf("invalid backup S3 prefix %q", prefix)
+	}
+	for _, part := range strings.Split(normalized, "/") {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("invalid backup S3 prefix %q", prefix)
+		}
+	}
+	return normalized, nil
 }

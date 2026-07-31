@@ -148,7 +148,7 @@ func TestChunkStore_FullReadSealedVerifiesCRC(t *testing.T) {
 	}
 
 	// Corrupt the chunk file on disk (flip a byte in the data region)
-	path := cs.chunkPath(chunkID)
+	path := cs.disks[0].chunkPath(chunkID)
 	f, err := openFileForCorruption(path)
 	if err != nil {
 		t.Fatalf("open for corruption: %v", err)
@@ -163,7 +163,7 @@ func TestChunkStore_FullReadSealedVerifiesCRC(t *testing.T) {
 
 	// Clear FD cache so the corrupted file is re-opened
 	cs.mu.Lock()
-	delete(cs.fdCache, chunkID)
+	delete(cs.disks[0].fdCache, chunkID)
 	cs.mu.Unlock()
 
 	// Full read should detect CRC mismatch
@@ -193,7 +193,7 @@ func TestChunkStore_RangeReadSealedSkipsCRCVerification(t *testing.T) {
 	}
 
 	// Corrupt a byte at offset 7000 (outside the range we'll read)
-	path := cs.chunkPath(chunkID)
+	path := cs.disks[0].chunkPath(chunkID)
 	f, err := openFileForCorruption(path)
 	if err != nil {
 		t.Fatalf("open for corruption: %v", err)
@@ -203,7 +203,7 @@ func TestChunkStore_RangeReadSealedSkipsCRCVerification(t *testing.T) {
 	f.Close()
 
 	cs.mu.Lock()
-	delete(cs.fdCache, chunkID)
+	delete(cs.disks[0].fdCache, chunkID)
 	cs.mu.Unlock()
 
 	// Range read [0:1024] should succeed despite corruption at 7000

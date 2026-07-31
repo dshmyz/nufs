@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/example/dfs/chunkstore"
 	"github.com/example/dfs/metadata"
 )
 
@@ -13,7 +14,8 @@ import (
 type Gateway struct {
 	meta       metadata.MetadataService
 	creds      *CredentialStore
-	chunkStore ChunkStore
+	chunkStore chunkstore.ChunkStore
+	committer  ObjectCommitter
 	dataNodes  map[metadata.NodeID]string // nodeID -> data node address
 	mux        *http.ServeMux
 	acl        *metadata.AccessController // RBAC access control
@@ -24,6 +26,7 @@ type Gateway struct {
 	health              HealthChecker
 	ready               HealthChecker
 	ratePool            *rateLimiterPool
+	backgroundWorkers   ObjectWriteBackgroundWorkerConfig
 }
 
 // GatewayConfig holds configuration for the S3 gateway.
@@ -33,7 +36,7 @@ type GatewayConfig struct {
 	// ChunkStore is the data path used to read and write chunk payloads.
 	// If nil, NewGateway installs a DatanodeChunkStore (the production
 	// default). Tests typically inject a MemoryChunkStore.
-	ChunkStore ChunkStore
+	ChunkStore chunkstore.ChunkStore
 	// MaxObjectSize is the largest allowed PUT body, in bytes, for
 	// single-shot PutObject and UploadPart. <= 0 means 5 GiB
 	// (the S3 single-shot limit). Requests exceeding the cap get a
@@ -64,6 +67,9 @@ type GatewayConfig struct {
 	// RateLimitBurst is the maximum burst size for the rate limiter.
 	// Defaults to RateLimit if 0.
 	RateLimitBurst int
+	// BackgroundWorkers controls object write recovery and garbage
+	// collection loops. Disabled by default for tests and embedded use.
+	BackgroundWorkers ObjectWriteBackgroundWorkerConfig
 }
 
 // HealthChecker reports the state of a subsystem. Returning nil means
@@ -92,8 +98,9 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		gw.creds = NewCredentialStore() // anonymous mode
 	}
 	if gw.chunkStore == nil {
-		gw.chunkStore = NewDatanodeChunkStore()
+		gw.chunkStore = chunkstore.NewDatanodeChunkStore()
 	}
+	gw.committer = newMetadataObjectCommitter(gw.meta, gw.chunkStore, cfg.RejectEmptyReplicas)
 	if cfg.MaxObjectSize <= 0 {
 		gw.maxObjectSize = DefaultMaxObjectSize
 	} else {
@@ -109,6 +116,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		gw.ready = gw.health
 	}
 	gw.ratePool = newRateLimiterPool(cfg.RateLimit, cfg.RateLimitBurst)
+	gw.backgroundWorkers = cfg.BackgroundWorkers
 
 	// Register routes — Go 1.22+ enhanced ServeMux patterns
 	gw.mux.HandleFunc("/", gw.route)
@@ -116,8 +124,8 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 	gw.mux.HandleFunc("/readyz", gw.handleReadyz)
 	gw.mux.HandleFunc("/admin/cluster/stats", gw.handleClusterStats)
 	gw.mux.HandleFunc("/admin/buckets", gw.handleAdminBuckets)
-	gw.mux.HandleFunc("/admin/policy", gw.handleGetBucketPolicy)       // GET ?bucket=xxx
-	gw.mux.HandleFunc("/admin/policy/set", gw.handleSetBucketPolicy)   // PUT ?bucket=xxx + JSON body
+	gw.mux.HandleFunc("/admin/policy", gw.handleGetBucketPolicy)           // GET ?bucket=xxx
+	gw.mux.HandleFunc("/admin/policy/set", gw.handleSetBucketPolicy)       // PUT ?bucket=xxx + JSON body
 	gw.mux.HandleFunc("/admin/policy/delete", gw.handleDeleteBucketPolicy) // DELETE ?bucket=xxx
 
 	return gw

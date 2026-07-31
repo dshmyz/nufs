@@ -38,6 +38,94 @@ groups:
           summary: "A datanode disk is marked failed"
           runbook: "https://docs.nufs.io/runbook/disk-failed"
 
+      - alert: NUFSNodeWriteErrorRateCritical
+        expr: nufs_node_write_error_rate > 0.5
+        for: 3m
+        labels:
+          severity: critical
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Datanode {{ $labels.node_id }} write error rate exceeds 50% — writes are being down-weighted"
+          runbook: "https://docs.nufs.io/runbook/node-write-errors"
+
+      - alert: NUFSClusterReadinessDegraded
+        expr: nufs_cluster_readiness < 2
+        for: 2m
+        labels:
+          severity: critical
+          team: storage
+          component: metad
+        annotations:
+          summary: "Cluster readiness is degraded or not ready"
+          runbook: "https://docs.nufs.io/runbook/cluster-readiness"
+
+      - alert: NUFSClusterLeaderUnstable
+        expr: nufs_cluster_leader_stable == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: storage
+          component: metad
+        annotations:
+          summary: "Raft leader is not stable — writes may be failing"
+          runbook: "https://docs.nufs.io/runbook/leader-instability"
+
+      - alert: NUFSClusterUnderReplicated
+        expr: nufs_cluster_chunks_under_replicated > 0
+        for: 15m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "{{ $value }} chunks are under-replicated"
+          runbook: "https://docs.nufs.io/runbook/under-replicated"
+
+      - alert: NUFSObjectWriteFailuresPersisting
+        expr: sum(nufs_object_write_attempts{state="failed"}) > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: storage
+          component: s3gateway
+        annotations:
+          summary: "Object writes are failing and require operator attention"
+          runbook: "docs/runbooks/object-write-recovery.md"
+
+      - alert: NUFSObjectWriteWorkerDeadLetter
+        expr: nufs_object_write_background_task_state{state="dead_letter"} > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: storage
+          component: metad
+        annotations:
+          summary: "Object write recovery or GC worker is in dead-letter state"
+          runbook: "docs/runbooks/object-write-recovery.md"
+
+      - alert: NUFSBucketQuotaBytesCritical
+        expr: nufs_bucket_quota_used_ratio{resource="bytes"} > 0.95
+        for: 5m
+        labels:
+          severity: critical
+          team: storage
+          component: metad
+        annotations:
+          summary: "Bucket {{ $labels.bucket }} byte quota usage exceeds 95%"
+          runbook: "docs/runbooks/bucket-quota.md"
+
+      - alert: NUFSBucketQuotaObjectsCritical
+        expr: nufs_bucket_quota_used_ratio{resource="objects"} > 0.95
+        for: 5m
+        labels:
+          severity: critical
+          team: storage
+          component: metad
+        annotations:
+          summary: "Bucket {{ $labels.bucket }} object quota usage exceeds 95%"
+          runbook: "docs/runbooks/bucket-quota.md"
+
   - name: nufs.warning
     rules:
       - alert: NUFSDiskUsageHigh
@@ -106,6 +194,17 @@ groups:
           summary: "Datanode replication errors observed"
           runbook: "https://docs.nufs.io/runbook/replication-errors"
 
+      - alert: NUFSNodeWriteErrorRateHigh
+        expr: nufs_node_write_error_rate > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Datanode {{ $labels.node_id }} write error rate exceeds 20%"
+          runbook: "https://docs.nufs.io/runbook/node-write-errors"
+
       - alert: NUFSAntiEntropyMismatches
         expr: rate(nufs_datanode_antientropy_mismatches_total[30m]) > 0
         for: 30m
@@ -116,6 +215,94 @@ groups:
         annotations:
           summary: "Anti-entropy found chunk mismatches"
           runbook: "https://docs.nufs.io/runbook/antientropy-mismatches"
+
+      - alert: NUFSObjectWriteRecoveryBacklog
+        expr: sum(nufs_object_write_attempts{state="recovery_needed"}) > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: storage
+          component: s3gateway
+        annotations:
+          summary: "Object write recovery backlog is not draining"
+          runbook: "docs/runbooks/object-write-recovery.md"
+
+      - alert: NUFSObjectWriteHalfWritesPersisting
+        expr: sum(nufs_object_write_attempts{state=~"pending|chunks_allocated"}) > 0
+        for: 15m
+        labels:
+          severity: warning
+          team: storage
+          component: s3gateway
+        annotations:
+          summary: "Object writes are stuck before durable commit"
+          runbook: "docs/runbooks/object-write-recovery.md"
+
+      - alert: NUFSObjectWriteWorkerStale
+        expr: nufs_object_write_background_task_last_updated_seconds > 0 and time() - nufs_object_write_background_task_last_updated_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Object write recovery or GC worker has not updated recently"
+          runbook: "docs/runbooks/object-write-recovery.md"
+
+      - alert: NUFSBucketQuotaBytesHigh
+        expr: nufs_bucket_quota_used_ratio{resource="bytes"} > 0.80
+        for: 15m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Bucket {{ $labels.bucket }} byte quota usage exceeds 80%"
+          runbook: "docs/runbooks/bucket-quota.md"
+
+      - alert: NUFSBucketQuotaObjectsHigh
+        expr: nufs_bucket_quota_used_ratio{resource="objects"} > 0.80
+        for: 15m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Bucket {{ $labels.bucket }} object quota usage exceeds 80%"
+          runbook: "docs/runbooks/bucket-quota.md"
+
+      - alert: NUFSBackupStale
+        expr: time() - nufs_backup_last_success_timestamp_seconds > 4500
+        for: 5m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Metadata backup has not completed recently"
+          runbook: "docs/runbooks/metadata-disaster-recovery.md"
+
+      - alert: NUFSBackupVerificationFailed
+        expr: increase(nufs_backup_verification_failures_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Metadata backup verification failed"
+          runbook: "docs/runbooks/metadata-disaster-recovery.md"
+
+      - alert: NUFSChunkTombstoneBacklog
+        expr: nufs_chunk_tombstone_oldest_age_seconds > 93600
+        for: 30m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Chunk tombstones are waiting beyond the purge safety window"
+          runbook: "docs/runbooks/metadata-disaster-recovery.md"
 
   - name: nufs.info
     rules:

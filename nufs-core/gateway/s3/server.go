@@ -117,6 +117,7 @@ func (gw *Gateway) Run(ctx context.Context, cfg ServerConfig) error {
 		}
 		close(errCh)
 	}()
+	gw.startObjectWriteBackgroundWorkers(ctx)
 
 	sigCh := make(chan os.Signal, 1)
 	cfg.Trap(sigCh)

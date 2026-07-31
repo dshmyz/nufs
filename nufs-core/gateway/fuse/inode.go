@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/example/dfs/gateway"
+	"github.com/example/dfs/chunkstore"
 	"github.com/example/dfs/metadata"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -79,7 +79,7 @@ type DFSFile struct {
 	fs.Inode
 
 	meta       metadata.MetadataService
-	chunkStore gateway.ChunkStore
+	chunkStore chunkstore.ChunkStore
 	cache      *ChunkCache
 	inodeID    metadata.InodeID
 

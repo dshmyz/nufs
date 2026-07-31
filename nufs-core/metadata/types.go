@@ -178,10 +178,21 @@ func (s NodeState) String() string {
 
 // NodeReport is sent by data nodes during heartbeat.
 type NodeReport struct {
-	UsedGB      int64                    `json:"used_gb"`
-	ChunkCount  int64                    `json:"chunk_count"`
-	DiskIO      float64                  `json:"disk_io"` // 0.0 - 1.0 utilization
-	ChunkStates map[ChunkID]ReplicaState `json:"chunk_states"`
+	UsedGB         int64                    `json:"used_gb"`
+	ChunkCount     int64                    `json:"chunk_count"`
+	DiskIO         float64                  `json:"disk_io"`        // 0.0 - 1.0 utilization
+	WriteErrorRate float64                  `json:"write_error_rate"` // 0.0 - 1.0, rolling write failure ratio
+	ChunkStates    map[ChunkID]ReplicaState `json:"chunk_states"`
+	DiskStats      []DiskReport             `json:"disk_stats,omitempty"` // per-disk breakdown (JBOD)
+}
+
+// DiskReport holds per-disk statistics for the heartbeat, allowing the
+// metadata service to track per-disk usage and health for placement.
+type DiskReport struct {
+	Index      int    `json:"index"`
+	UsedBytes  int64  `json:"used_bytes"`
+	ChunkCount int64  `json:"chunk_count"`
+	Failed     bool   `json:"failed"`
 }
 
 // RepairTask represents a pending repair operation.

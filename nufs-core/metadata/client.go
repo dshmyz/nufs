@@ -179,6 +179,44 @@ func (c *HTTPClient) doRequestWithRetry(ctx context.Context, method, path string
 	return nil, fmt.Errorf("metad: %w (after %d retries)", lastErr, c.maxRetries)
 }
 
+func (c *HTTPClient) doAllocationRequest(ctx context.Context, path string, body interface{}) (*http.Response, error) {
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("%w: allocation outcome unknown: %v", ErrRaftConditionalOutcomeUnknown, err)
+	}
+	if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect {
+		location := resp.Header.Get("Location")
+		resp.Body.Close()
+		if location == "" {
+			return nil, fmt.Errorf("metad: redirect without location")
+		}
+		redirectURL, err := url.Parse(location)
+		if err != nil || redirectURL.Host == "" {
+			return nil, fmt.Errorf("metad: invalid redirect location")
+		}
+		redirectBase := redirectURL.Scheme + "://" + redirectURL.Host
+		var reqBody io.Reader
+		if body != nil {
+			data, err := json.Marshal(body)
+			if err != nil {
+				return nil, fmt.Errorf("marshal redirect body: %w", err)
+			}
+			reqBody = bytes.NewReader(data)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, redirectBase+path, reqBody)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		c.addHeaders(req)
+		resp, err = c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("%w: allocation outcome unknown after redirect: %v", ErrRaftConditionalOutcomeUnknown, err)
+		}
+	}
+	return resp, nil
+}
+
 func (c *HTTPClient) doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
 	var reqBody io.Reader
 	if body != nil {
@@ -238,23 +276,35 @@ func (c *HTTPClient) readResponse(resp *http.Response, v interface{}) error {
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
-	if resp.StatusCode >= 400 {
-		if resp.StatusCode == http.StatusConflict {
-			var errResp struct {
-				Error string `json:"error"`
-				Code  string `json:"code"`
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		var errResp struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		_ = json.Unmarshal(data, &errResp)
+		if errResp.Code == "quota_exceeded" {
+			if errResp.Error == "" {
+				return ErrQuotaExceeded
 			}
-			if json.Unmarshal(data, &errResp) == nil && errResp.Code == "node_already_registered" {
+			return fmt.Errorf("%w: %s", ErrQuotaExceeded, errResp.Error)
+		}
+		if resp.StatusCode == http.StatusConflict {
+			if errResp.Code == "node_already_registered" {
 				return ErrNodeAlreadyExists
+			}
+			if errResp.Code == "allocation_outcome_unknown" {
+				if errResp.Error == "" {
+					return ErrRaftConditionalOutcomeUnknown
+				}
+				return fmt.Errorf("%w: allocation_outcome_unknown: %s", ErrRaftConditionalOutcomeUnknown, errResp.Error)
 			}
 		}
 		if resp.StatusCode == http.StatusNotFound {
-			var errResp struct {
-				Error string `json:"error"`
-				Code  string `json:"code"`
-			}
-			if json.Unmarshal(data, &errResp) == nil && errResp.Code == "xattr_not_found" {
+			switch errResp.Code {
+			case "xattr_not_found":
 				return ErrXAttrNotFound
+			case "entry_not_found":
+				return ErrEntryNotFound
 			}
 		}
 		return fmt.Errorf("metad: %s (status=%d)", string(data), resp.StatusCode)
@@ -265,6 +315,15 @@ func (c *HTTPClient) readResponse(resp *http.Response, v interface{}) error {
 		}
 	}
 	return nil
+}
+
+func (c *HTTPClient) readAllocationResponse(resp *http.Response, v interface{}) error {
+	if resp.StatusCode >= http.StatusInternalServerError {
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return fmt.Errorf("%w: allocation outcome unknown: server error status=%d", ErrRaftConditionalOutcomeUnknown, resp.StatusCode)
+	}
+	return c.readResponse(resp, v)
 }
 
 // Bucket operations
@@ -282,7 +341,7 @@ func (c *HTTPClient) CreateBucket(ctx context.Context, name string, policy Place
 }
 
 func (c *HTTPClient) DeleteBucket(ctx context.Context, name string) error {
-	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, "/api/v1/buckets/"+name, nil)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, "/api/v1/buckets/"+escapeBucketPathSegment(name), nil)
 	if err != nil {
 		return err
 	}
@@ -323,6 +382,87 @@ func (c *HTTPClient) GetBucketByRoot(ctx context.Context, rootInode InodeID) (*B
 		return nil, err
 	}
 	return &bucket, nil
+}
+
+// BucketQuotaStatus reports a bucket's configured quota and current usage.
+type BucketQuotaStatus struct {
+	Bucket string       `json:"bucket"`
+	Quota  *BucketQuota `json:"quota"`
+	Usage  BucketUsage  `json:"usage"`
+	Ratios struct {
+		Bytes   float64 `json:"bytes"`
+		Objects float64 `json:"objects"`
+	} `json:"ratios"`
+}
+
+func (c *HTTPClient) GetBucketQuotaStatus(ctx context.Context, bucket string) (*BucketQuotaStatus, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/buckets/"+escapeBucketPathSegment(bucket)+"/quota", nil)
+	if err != nil {
+		return nil, err
+	}
+	var status BucketQuotaStatus
+	if err := c.readResponse(resp, &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+func (c *HTTPClient) GetBucketQuota(ctx context.Context, bucket string) (*BucketQuota, error) {
+	status, err := c.GetBucketQuotaStatus(ctx, bucket)
+	if err != nil {
+		return nil, err
+	}
+	return status.Quota, nil
+}
+
+func (c *HTTPClient) GetBucketUsage(ctx context.Context, bucket string) (*BucketUsage, error) {
+	status, err := c.GetBucketQuotaStatus(ctx, bucket)
+	if err != nil {
+		return nil, err
+	}
+	return &status.Usage, nil
+}
+
+func (c *HTTPClient) SetBucketQuota(ctx context.Context, bucket string, quota *BucketQuota) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, "/api/v1/buckets/"+escapeBucketPathSegment(bucket)+"/quota", quota)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) DeleteBucketQuota(ctx context.Context, bucket string) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, "/api/v1/buckets/"+escapeBucketPathSegment(bucket)+"/quota", nil)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) CheckBucketQuota(ctx context.Context, bucket string, additionalBytes int64, additionalObjects int64) error {
+	req := struct {
+		AdditionalBytes   int64 `json:"additional_bytes"`
+		AdditionalObjects int64 `json:"additional_objects"`
+	}{
+		AdditionalBytes:   additionalBytes,
+		AdditionalObjects: additionalObjects,
+	}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/buckets/"+escapeBucketPathSegment(bucket)+"/quota/check", req)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func escapeBucketPathSegment(bucket string) string {
+	switch bucket {
+	case ".":
+		return "%2E"
+	case "..":
+		return "%2E%2E"
+	default:
+		return url.PathEscape(bucket)
+	}
 }
 
 // Namespace operations — these are typically handled by the gateway layer
@@ -488,25 +628,28 @@ func (c *HTTPClient) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 
 func (c *HTTPClient) AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error) {
 	req := map[string]interface{}{"inode_id": inodeID, "offset": offset, "policy": policy}
-	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/chunks", req)
+	resp, err := c.doAllocationRequest(ctx, "/api/v1/chunks", req)
 	if err != nil {
 		return nil, err
 	}
 	var chunk ChunkMeta
-	if err := c.readResponse(resp, &chunk); err != nil {
+	if err := c.readAllocationResponse(resp, &chunk); err != nil {
 		return nil, err
 	}
 	return &chunk, nil
 }
 
 func (c *HTTPClient) AllocateChunksBatch(ctx context.Context, inodeID InodeID, offsets []int64, policy PlacementPolicy) ([]*ChunkMeta, error) {
+	if len(offsets) > MaxChunkAllocationBatch {
+		return nil, fmt.Errorf("max chunk allocation batch is %d", MaxChunkAllocationBatch)
+	}
 	req := map[string]interface{}{"inode_id": inodeID, "offsets": offsets, "policy": policy}
-	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/chunks/batch", req)
+	resp, err := c.doAllocationRequest(ctx, "/api/v1/chunks/batch", req)
 	if err != nil {
 		return nil, err
 	}
 	var chunks []*ChunkMeta
-	if err := c.readResponse(resp, &chunks); err != nil {
+	if err := c.readAllocationResponse(resp, &chunks); err != nil {
 		return nil, err
 	}
 	return chunks, nil
@@ -519,6 +662,24 @@ func (c *HTTPClient) CommitChunk(ctx context.Context, chunkID ChunkID, checksum 
 		return err
 	}
 	return c.readResponse(resp, nil)
+}
+
+// CreateObjectWithChunks falls back to sequential operations over HTTP.
+// The batch optimization only applies to in-process PebbleStore; the HTTP
+// client cannot batch across multiple RPC calls to a remote service.
+func (c *HTTPClient) CreateObjectWithChunks(ctx context.Context, parent InodeID, name string, mode uint32, offsets []int64, policy PlacementPolicy) (*InodeMeta, []*ChunkMeta, error) {
+	inode, err := c.CreateFile(ctx, parent, name, mode)
+	if err != nil {
+		return nil, nil, err
+	}
+	chunks, err := c.AllocateChunksBatch(ctx, inode.ID, offsets, policy)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, chunk := range chunks {
+		_ = c.CommitChunk(ctx, chunk.ID, 0)
+	}
+	return inode, chunks, nil
 }
 
 func (c *HTTPClient) GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error) {
@@ -727,6 +888,117 @@ func (c *HTTPClient) TriggerRebalance(ctx context.Context) error {
 		return err
 	}
 	return c.readResponse(resp, nil)
+}
+
+// Write attempt operations
+
+func (c *HTTPClient) PutWriteAttempt(ctx context.Context, attempt *ObjectWriteAttempt) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, "/api/v1/write-attempts/"+url.PathEscape(attempt.ID), attempt)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) GetWriteAttempt(ctx context.Context, id string) (*ObjectWriteAttempt, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/write-attempts/"+url.PathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	var attempt ObjectWriteAttempt
+	if err := c.readResponse(resp, &attempt); err != nil {
+		return nil, err
+	}
+	return &attempt, nil
+}
+
+func (c *HTTPClient) ListWriteAttemptsByState(ctx context.Context, state WriteAttemptState, limit int) ([]ObjectWriteAttempt, error) {
+	path := fmt.Sprintf("/api/v1/write-attempts?state=%s&limit=%d", url.QueryEscape(string(state)), limit)
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var attempts []ObjectWriteAttempt
+	if err := c.readResponse(resp, &attempts); err != nil {
+		return nil, err
+	}
+	return attempts, nil
+}
+
+func (c *HTTPClient) DeleteWriteAttempt(ctx context.Context, id string) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodDelete, "/api/v1/write-attempts/"+url.PathEscape(id), nil)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+// Background task operations
+
+func (c *HTTPClient) PutBackgroundTask(ctx context.Context, task *BackgroundTask) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, "/api/v1/background-tasks/"+url.PathEscape(task.ID), task)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) GetBackgroundTask(ctx context.Context, id string) (*BackgroundTask, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/background-tasks/"+url.PathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	var task BackgroundTask
+	if err := c.readResponse(resp, &task); err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+func (c *HTTPClient) LeaseBackgroundTask(ctx context.Context, taskType BackgroundTaskType, owner string, lease time.Duration) (*BackgroundTask, error) {
+	req := map[string]interface{}{
+		"type":        taskType,
+		"owner":       owner,
+		"lease_nanos": int64(lease),
+	}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/background-tasks/lease", req)
+	if err != nil {
+		return nil, err
+	}
+	var task BackgroundTask
+	if err := c.readResponse(resp, &task); err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+func (c *HTTPClient) CompleteBackgroundTask(ctx context.Context, id string) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/background-tasks/"+url.PathEscape(id)+"/complete", nil)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) FailBackgroundTask(ctx context.Context, id string, lastErr string, maxAttempts int) error {
+	req := map[string]interface{}{"last_error": lastErr, "max_attempts": maxAttempts}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/background-tasks/"+url.PathEscape(id)+"/fail", req)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) GetWriteOpsStatus(ctx context.Context) (*WriteOpsStatus, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, "/api/v1/write-ops/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	var status WriteOpsStatus
+	if err := c.readResponse(resp, &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
 }
 
 func (c *HTTPClient) Close() error {

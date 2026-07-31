@@ -9,11 +9,11 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"syscall"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/example/dfs/gateway"
+	"github.com/example/dfs/chunkstore"
 	"github.com/example/dfs/metadata"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -24,7 +24,7 @@ type DFSFileSystem struct {
 	fs.Inode
 
 	meta       metadata.MetadataService
-	chunkStore gateway.ChunkStore
+	chunkStore chunkstore.ChunkStore
 
 	// lockOwner is the per-process string used when acquiring advisory
 	// file locks (commit 0: metadata: add advisory file lock service).
@@ -63,7 +63,7 @@ type chunkEventWatcher interface {
 // expiry at the datanode layer.
 // recorder 用于指标打点，nil 时使用 noopMetricsRecorder（关闭指标）。
 // reliability 注入 retry+breaker+pathlock 能力，nil 时为 passthrough 模式。
-func NewDFSFileSystem(meta metadata.MetadataService, chunkStore gateway.ChunkStore, cache *ChunkCache, recorder MetricsRecorder, reliability *ReliabilityWrapper) *DFSFileSystem {
+func NewDFSFileSystem(meta metadata.MetadataService, chunkStore chunkstore.ChunkStore, cache *ChunkCache, recorder MetricsRecorder, reliability *ReliabilityWrapper) *DFSFileSystem {
 	if recorder == nil {
 		recorder = noopMetricsRecorder{}
 	}
@@ -122,7 +122,7 @@ func parseChunkID(key string) (uint64, error) {
 // Mount mounts the DFS filesystem at the given mountpoint.
 // recorder 用于指标打点，nil 时使用 noopMetricsRecorder。
 // reliability 注入 retry+breaker+pathlock 能力，nil 时为 passthrough 模式。
-func Mount(mountpoint string, meta metadata.MetadataService, chunkStore gateway.ChunkStore, cache *ChunkCache, recorder MetricsRecorder, reliability *ReliabilityWrapper, opts *fuse.MountOptions) (*fuse.Server, error) {
+func Mount(mountpoint string, meta metadata.MetadataService, chunkStore chunkstore.ChunkStore, cache *ChunkCache, recorder MetricsRecorder, reliability *ReliabilityWrapper, opts *fuse.MountOptions) (*fuse.Server, error) {
 	root := NewDFSFileSystem(meta, chunkStore, cache, recorder, reliability)
 
 	if opts == nil {

@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,6 +62,10 @@ const (
 	// DrillFullOutage simulates a complete zone outage and verifies that
 	// cross-zone replication provides data access from the surviving zone.
 	DrillFullOutage DrillScenario = "full_zone_outage"
+
+	// DrillBackupRestore restores the latest committed backup into a temporary
+	// offline environment and verifies metadata-to-replica readability.
+	DrillBackupRestore DrillScenario = "backup_restore"
 )
 
 // DrillStatus represents the outcome of a single drill run.
@@ -88,11 +93,15 @@ type DrillReport struct {
 
 // DrillCheck is an individual validation step within a drill.
 type DrillCheck struct {
-	Name    string        `json:"name"`
-	Passed  bool          `json:"passed"`
-	Message string        `json:"message,omitempty"`
-	Took    time.Duration `json:"took"`
+	Name         string        `json:"name"`
+	Passed       bool          `json:"passed"`
+	Message      string        `json:"message,omitempty"`
+	Took         time.Duration `json:"took"`
+	ValueSeconds float64       `json:"value_seconds,omitempty"`
 }
+
+type DrillRestoreEngine func(context.Context, BackupRepository, RestoreOptions) (*RestoreReport, error)
+type DrillOpenRestoredStore func(string) (*PebbleStore, error)
 
 // DisasterDrillConfig configures the disaster drill runner.
 type DisasterDrillConfig struct {
@@ -117,6 +126,32 @@ type DisasterDrillConfig struct {
 
 	// DryRun runs all checks without actually injecting faults.
 	DryRun bool
+
+	// BackupRepository is used by the backup_restore scenario to select and
+	// fetch the latest committed backup.
+	BackupRepository BackupRepository
+
+	// RestoreTempRoot is the parent for temporary, offline restore drills.
+	RestoreTempRoot string
+
+	// RestoreNewClusterID is written into the temporary restored metadata.
+	RestoreNewClusterID string
+
+	// RestoreMinimumReplicas is the minimum readable replica count required
+	// before a restored metadata image is considered ready.
+	RestoreMinimumReplicas int
+
+	// RestoreReplicaProbe checks restored chunk replicas without mutating metadata.
+	RestoreReplicaProbe RestoreReplicaProbe
+
+	// RestoreEngine executes the offline restore. Defaults to RestoreBackupToNewCluster.
+	RestoreEngine DrillRestoreEngine
+
+	// OpenRestoredStore opens restored metadata without joining production Raft.
+	OpenRestoredStore DrillOpenRestoredStore
+
+	// Now supplies the clock used for observed RPO/RTO reporting.
+	Now func() time.Time
 }
 
 // DisasterDrillRunner orchestrates automated disaster recovery drills.
@@ -170,6 +205,20 @@ func NewDisasterDrillRunner(store MetadataService, cfg DisasterDrillConfig) *Dis
 	if cfg.FailureTimeout <= 0 {
 		cfg.FailureTimeout = 60 * time.Second
 	}
+	if cfg.RestoreMinimumReplicas <= 0 {
+		cfg.RestoreMinimumReplicas = 1
+	}
+	if cfg.RestoreEngine == nil {
+		cfg.RestoreEngine = RestoreBackupToNewCluster
+	}
+	if cfg.OpenRestoredStore == nil {
+		cfg.OpenRestoredStore = func(path string) (*PebbleStore, error) {
+			return NewPebbleStore(PebbleStoreConfig{Dir: path, NodeID: 1})
+		}
+	}
+	if cfg.Now == nil {
+		cfg.Now = func() time.Time { return time.Now().UTC() }
+	}
 	if len(cfg.Scenarios) == 0 {
 		cfg.Scenarios = []DrillScenario{
 			DrillNodeFailover,
@@ -180,9 +229,9 @@ func NewDisasterDrillRunner(store MetadataService, cfg DisasterDrillConfig) *Dis
 		}
 	}
 	return &DisasterDrillRunner{
-		store:        store,
-		cfg:          cfg,
-		stopCh:       make(chan struct{}),
+		store:         store,
+		cfg:           cfg,
+		stopCh:        make(chan struct{}),
 		faultInjector: &defaultFaultInjector{store: store},
 	}
 }
@@ -214,7 +263,7 @@ func (r *DisasterDrillRunner) Start() {
 		for {
 			select {
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+				ctx, cancel := context.WithTimeout(context.Background(), r.scheduleRunTimeout())
 				r.RunAll(ctx)
 				cancel()
 			case <-r.stopCh:
@@ -256,6 +305,17 @@ func (r *DisasterDrillRunner) RunAll(ctx context.Context) []DrillReport {
 	return reports
 }
 
+func (r *DisasterDrillRunner) scheduleRunTimeout() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, scenario := range r.cfg.Scenarios {
+		if scenario == DrillBackupRestore {
+			return 30 * time.Minute
+		}
+	}
+	return 10 * time.Minute
+}
+
 // RunScenario executes a single drill scenario and returns the report.
 func (r *DisasterDrillRunner) RunScenario(ctx context.Context, scenario DrillScenario) DrillReport {
 	report := DrillReport{
@@ -276,6 +336,8 @@ func (r *DisasterDrillRunner) RunScenario(ctx context.Context, scenario DrillSce
 		report = r.runDataCorruption(ctx, report)
 	case DrillFullOutage:
 		report = r.runFullZoneOutage(ctx, report)
+	case DrillBackupRestore:
+		report = r.runBackupRestore(ctx, report)
 	default:
 		report.Status = DrillSkipped
 		report.Message = fmt.Sprintf("unknown scenario: %s", scenario)
@@ -591,6 +653,145 @@ func (r *DisasterDrillRunner) runFullZoneOutage(ctx context.Context, report Dril
 
 	report.Status = r.aggregateChecks(report.Checks)
 	return report
+}
+
+func (r *DisasterDrillRunner) runBackupRestore(ctx context.Context, report DrillReport) DrillReport {
+	if r.cfg.BackupRepository == nil {
+		report.Status = DrillSkipped
+		report.Message = "backup restore drill requires a backup repository"
+		return report
+	}
+	if r.cfg.RestoreReplicaProbe == nil {
+		report.Status = DrillSkipped
+		report.Message = "backup restore drill requires a restore replica probe"
+		return report
+	}
+	if r.cfg.RestoreNewClusterID == "" {
+		report.Status = DrillSkipped
+		report.Message = "backup restore drill requires a restore cluster ID"
+		return report
+	}
+	deadlineCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+
+	latest, ok, err := r.latestCommittedBackup(deadlineCtx)
+	if err != nil {
+		report.Status = DrillFailed
+		report.Message = err.Error()
+		return report
+	}
+	if !ok {
+		report.Status = DrillSkipped
+		report.Message = "no committed backups available"
+		return report
+	}
+
+	tempRoot := r.cfg.RestoreTempRoot
+	if tempRoot == "" {
+		tempRoot = os.TempDir()
+	}
+	envDir, err := os.MkdirTemp(tempRoot, "nufs-restore-drill-*")
+	if err != nil {
+		report.Status = DrillFailed
+		report.Message = fmt.Sprintf("create temp restore environment: %v", err)
+		return report
+	}
+	defer os.RemoveAll(envDir)
+
+	restoreTarget := filepath.Join(envDir, "metadata")
+	restoreStarted := r.cfg.Now()
+	restoreReport, err := r.cfg.RestoreEngine(deadlineCtx, r.cfg.BackupRepository, RestoreOptions{
+		BackupID:     latest.ID,
+		TargetDir:    restoreTarget,
+		NewClusterID: r.cfg.RestoreNewClusterID,
+	})
+	restoreCompleted := r.cfg.Now()
+	if err != nil {
+		report.Status = DrillFailed
+		report.Message = fmt.Sprintf("restore latest backup %q: %v", latest.ID, err)
+		return report
+	}
+
+	rpo := r.cfg.Now().Sub(latest.CreatedAt)
+	rto := restoreCompleted.Sub(restoreStarted)
+	if restoreReport != nil && !restoreReport.CompletedAt.IsZero() && !restoreReport.StartedAt.IsZero() {
+		rto = restoreReport.CompletedAt.Sub(restoreReport.StartedAt)
+	}
+	report.Checks = append(report.Checks,
+		DrillCheck{Name: "latest_committed_backup_selected", Passed: restoreReport == nil || restoreReport.BackupID == latest.ID, Message: latest.ID},
+		DrillCheck{Name: "observed_rpo_seconds", Passed: rpo <= time.Hour, Message: rpo.String(), ValueSeconds: rpo.Seconds()},
+		DrillCheck{Name: "observed_rto_seconds", Passed: rto <= 30*time.Minute, Message: rto.String(), ValueSeconds: rto.Seconds()},
+	)
+	if restoreReport != nil {
+		report.Checks = append(report.Checks, DrillCheck{
+			Name:    "backup_artifact_verified",
+			Passed:  restoreReport.Verification.ManifestValid && restoreReport.Verification.FilesVerified > 0,
+			Message: fmt.Sprintf("%d files verified", restoreReport.Verification.FilesVerified),
+		})
+	}
+
+	restoredStore, err := r.cfg.OpenRestoredStore(restoreTarget)
+	if err != nil {
+		report.Status = DrillFailed
+		report.Message = fmt.Sprintf("open restored store: %v", err)
+		return report
+	}
+	defer restoredStore.Close()
+
+	readinessReport, err := VerifyRestoredChunkAvailability(deadlineCtx, restoredStore, r.cfg.RestoreReplicaProbe, r.cfg.RestoreMinimumReplicas)
+	report.Checks = append(report.Checks, DrillCheck{
+		Name:    "restored_replica_readiness",
+		Passed:  err == nil && readinessReport != nil && readinessReport.Ready,
+		Message: restoreReadinessDrillMessage(readinessReport, err),
+	})
+	report.Status = r.aggregateChecks(report.Checks)
+	if report.Status != DrillPassed && report.Message == "" {
+		report.Message = "backup restore drill checks failed"
+	}
+	return report
+}
+
+func (r *DisasterDrillRunner) latestCommittedBackup(ctx context.Context) (BackupDescriptor, bool, error) {
+	backups, err := r.cfg.BackupRepository.ListCommitted(ctx)
+	if err != nil {
+		return BackupDescriptor{}, false, fmt.Errorf("list committed backups: %w", err)
+	}
+	if len(backups) == 0 {
+		return BackupDescriptor{}, false, nil
+	}
+	sort.Slice(backups, func(i, j int) bool {
+		if backups[i].CreatedAt.Equal(backups[j].CreatedAt) {
+			return backups[i].AppliedIndex > backups[j].AppliedIndex
+		}
+		return backups[i].CreatedAt.After(backups[j].CreatedAt)
+	})
+	return backups[0], true, nil
+}
+
+func restoreReadinessDrillMessage(report *RestoreReadinessReport, err error) string {
+	if report == nil {
+		if err != nil {
+			return err.Error()
+		}
+		return "no restore readiness report"
+	}
+	if err != nil {
+		return fmt.Sprintf("%s; chunks=%d unavailable=%d", err.Error(), report.TotalChunks, report.UnavailableChunks)
+	}
+	return fmt.Sprintf("chunks=%d unavailable=%d", report.TotalChunks, report.UnavailableChunks)
+}
+
+func DailyRestoreVerificationDrillConfig(repository BackupRepository, probe RestoreReplicaProbe, tempRoot, newClusterID string) DisasterDrillConfig {
+	return DisasterDrillConfig{
+		ScheduleInterval:       24 * time.Hour,
+		Scenarios:              []DrillScenario{DrillBackupRestore},
+		BackupRepository:       repository,
+		RestoreReplicaProbe:    probe,
+		RestoreTempRoot:        tempRoot,
+		RestoreNewClusterID:    newClusterID,
+		RestoreMinimumReplicas: 1,
+		FailureTimeout:         30 * time.Minute,
+	}
 }
 
 // ============================================================

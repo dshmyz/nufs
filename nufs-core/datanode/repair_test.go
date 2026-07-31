@@ -4,7 +4,9 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
+	"fmt"
 	"github.com/example/dfs/metadata"
 )
 
@@ -16,12 +18,18 @@ type mockMetadataService struct {
 	repairQueue   []metadata.RepairTask
 	repairRemoved map[metadata.ChunkID]bool
 	getChunkErr   error // if set, GetChunk returns this error instead of looking up chunks
+
+	backgroundTasks     []metadata.BackgroundTask
+	backgroundCompleted map[string]bool
+	backgroundFailed    map[string]string
 }
 
 func newMockMetadataService() *mockMetadataService {
 	return &mockMetadataService{
-		chunks:        make(map[metadata.ChunkID]*metadata.ChunkMeta),
-		repairRemoved: make(map[metadata.ChunkID]bool),
+		chunks:              make(map[metadata.ChunkID]*metadata.ChunkMeta),
+		repairRemoved:       make(map[metadata.ChunkID]bool),
+		backgroundCompleted: make(map[string]bool),
+		backgroundFailed:    make(map[string]string),
 	}
 }
 
@@ -76,6 +84,33 @@ func (m *mockMetadataService) RemoveRepairTask(_ context.Context, chunkID metada
 
 func (m *mockMetadataService) TriggerRebalance(_ context.Context) error { return nil }
 
+func (m *mockMetadataService) LeaseBackgroundTask(_ context.Context, taskType metadata.BackgroundTaskType, owner string, lease time.Duration) (*metadata.BackgroundTask, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.backgroundTasks {
+		if m.backgroundTasks[i].Type == taskType && m.backgroundTasks[i].State == metadata.TaskQueued {
+			m.backgroundTasks[i].State = metadata.TaskLeased
+			m.backgroundTasks[i].LeaseOwner = owner
+			return &m.backgroundTasks[i], nil
+		}
+	}
+	return nil, metadata.ErrEntryNotFound
+}
+
+func (m *mockMetadataService) CompleteBackgroundTask(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.backgroundCompleted[id] = true
+	return nil
+}
+
+func (m *mockMetadataService) FailBackgroundTask(_ context.Context, id string, lastErr string, maxAttempts int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.backgroundFailed[id] = lastErr
+	return nil
+}
+
 // Unused interface methods
 func (m *mockMetadataService) CreateBucket(_ context.Context, _ string, _ metadata.PlacementPolicy) error {
 	return nil
@@ -102,6 +137,10 @@ func (m *mockMetadataService) ReadDir(_ context.Context, _ metadata.InodeID, _ i
 func (m *mockMetadataService) ReadDirFrom(_ context.Context, _ metadata.InodeID, _ string, _ int) ([]metadata.DirEntry, error) {
 	return nil, nil
 }
+func (m *mockMetadataService) CreateObjectWithChunks(_ context.Context, _ metadata.InodeID, _ string, _ uint32, _ []int64, _ metadata.PlacementPolicy) (*metadata.InodeMeta, []*metadata.ChunkMeta, error) {
+	return nil, nil, fmt.Errorf("not implemented in mock")
+}
+
 func (m *mockMetadataService) CreateFile(_ context.Context, _ metadata.InodeID, _ string, _ uint32) (*metadata.InodeMeta, error) {
 	return nil, nil
 }
@@ -376,6 +415,36 @@ func TestRepairWorker_RecordReplacementReplacesUnhealthyReplica(t *testing.T) {
 	}
 }
 
+func TestRepairWorker_RecordReplacementDoesNotDuplicateExistingTarget(t *testing.T) {
+	rw := &RepairWorker{}
+	chunk := &metadata.ChunkMeta{
+		ID: 11,
+		Replicas: []metadata.ReplicaInfo{
+			{NodeID: 1, Addr: "host1:9100", State: metadata.ReplicaReady},
+			{NodeID: 3, Addr: "host3:9100", State: metadata.ReplicaSyncing},
+		},
+	}
+	target := &metadata.NodeInfo{ID: 3, Addr: "host3-new:9100", State: metadata.NodeOnline}
+
+	rw.recordReplacementReplica(chunk, target)
+
+	if len(chunk.Replicas) != 2 {
+		t.Fatalf("expected existing target to be updated in place, got replicas %+v", chunk.Replicas)
+	}
+	var targetCount int
+	for _, replica := range chunk.Replicas {
+		if replica.NodeID == 3 {
+			targetCount++
+			if replica.Addr != "host3-new:9100" || replica.State != metadata.ReplicaSyncing {
+				t.Fatalf("unexpected target replica: %+v", replica)
+			}
+		}
+	}
+	if targetCount != 1 {
+		t.Fatalf("target replica count = %d, want 1 in %+v", targetCount, chunk.Replicas)
+	}
+}
+
 func TestRepairWorker_ProcessRepairQueue_RemovesCompleted(t *testing.T) {
 	meta := newMockMetadataService()
 
@@ -402,6 +471,27 @@ func TestRepairWorker_ProcessRepairQueue_RemovesCompleted(t *testing.T) {
 	// All replicas ready → task is healthy → should be removed
 	if !meta.repairRemoved[100] {
 		t.Error("expected completed repair task to be removed from queue")
+	}
+}
+
+func TestRepairWorker_ProcessesUnifiedRepairTask(t *testing.T) {
+	meta := newMockMetadataService()
+	meta.backgroundTasks = []metadata.BackgroundTask{
+		{ID: "repair-100", Type: metadata.TaskRepair, State: metadata.TaskQueued, Target: "chunk:100"},
+	}
+	meta.chunks[100] = &metadata.ChunkMeta{
+		ID: 100,
+		Replicas: []metadata.ReplicaInfo{
+			{NodeID: 1, State: metadata.ReplicaReady},
+			{NodeID: 2, State: metadata.ReplicaReady},
+		},
+	}
+
+	rw := &RepairWorker{meta: meta, nodeID: 1}
+	rw.processRepairQueue(context.Background())
+
+	if !meta.backgroundCompleted["repair-100"] {
+		t.Fatal("expected unified repair task to be completed")
 	}
 }
 

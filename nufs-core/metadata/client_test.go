@@ -4,11 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+var _ MetadataService = (*HTTPClient)(nil)
 
 func TestHTTPClientSendsAuthToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,5 +118,311 @@ func TestHTTPClientGetXAttrMapsNotFound(t *testing.T) {
 	_, err := c.GetXAttr(context.Background(), 42, "user.missing")
 	if !errors.Is(err, ErrXAttrNotFound) {
 		t.Fatalf("expected ErrXAttrNotFound, got %v", err)
+	}
+}
+
+func TestHTTPClientBucketQuotaEscapesPathAndUsesPublicJSONFields(t *testing.T) {
+	const bucket = "a/b c"
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPut && r.URL.EscapedPath() == "/api/v1/buckets/a%2Fb%20c/quota":
+			var quota map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&quota); err != nil {
+				t.Fatalf("decode quota request: %v", err)
+			}
+			if _, ok := quota["max_bytes"]; !ok {
+				t.Fatalf("quota request missing max_bytes: %#v", quota)
+			}
+			if _, ok := quota["max_objects"]; !ok {
+				t.Fatalf("quota request missing max_objects: %#v", quota)
+			}
+			if _, ok := quota["max_chunk_count"]; ok {
+				t.Fatalf("quota request leaked max_chunk_count: %#v", quota)
+			}
+			_, _ = w.Write([]byte(`{"status":"updated"}`))
+		case r.Method == http.MethodGet && r.URL.EscapedPath() == "/api/v1/buckets/a%2Fb%20c/quota":
+			_, _ = w.Write([]byte(`{"bucket":"a/b c","quota":{"max_bytes":1000,"max_objects":10},"usage":{"name":"a/b c","used_bytes":7,"objects":2},"ratios":{"bytes":0.007,"objects":0.2}}`))
+		case r.Method == http.MethodPost && r.URL.EscapedPath() == "/api/v1/buckets/a%2Fb%20c/quota/check":
+			var req map[string]int64
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode quota check request: %v", err)
+			}
+			if req["additional_bytes"] != 11 || req["additional_objects"] != 1 {
+				t.Fatalf("quota check request = %#v", req)
+			}
+			_, _ = w.Write([]byte(`{"status":"allowed"}`))
+		case r.Method == http.MethodDelete && r.URL.EscapedPath() == "/api/v1/buckets/a%2Fb%20c/quota":
+			_, _ = w.Write([]byte(`{"status":"deleted"}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.EscapedPath())
+		}
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, time.Second)
+	ctx := context.Background()
+	if err := c.SetBucketQuota(ctx, bucket, &BucketQuota{MaxSizeBytes: 1000, MaxObjects: 10, MaxChunkCount: 99}); err != nil {
+		t.Fatalf("SetBucketQuota: %v", err)
+	}
+	status, err := c.GetBucketQuotaStatus(ctx, bucket)
+	if err != nil {
+		t.Fatalf("GetBucketQuotaStatus: %v", err)
+	}
+	if status.Quota == nil || status.Quota.MaxSizeBytes != 1000 {
+		t.Fatalf("quota status = %+v", status)
+	}
+	quota, err := c.GetBucketQuota(ctx, bucket)
+	if err != nil {
+		t.Fatalf("GetBucketQuota: %v", err)
+	}
+	if quota == nil || quota.MaxObjects != 10 || quota.MaxChunkCount != 0 {
+		t.Fatalf("quota = %+v", quota)
+	}
+	usage, err := c.GetBucketUsage(ctx, bucket)
+	if err != nil {
+		t.Fatalf("GetBucketUsage: %v", err)
+	}
+	if usage.Name != bucket || usage.UsedBytes != 7 || usage.Objects != 2 {
+		t.Fatalf("usage = %+v", usage)
+	}
+	if err := c.CheckBucketQuota(ctx, bucket, 11, 1); err != nil {
+		t.Fatalf("CheckBucketQuota: %v", err)
+	}
+	if err := c.DeleteBucketQuota(ctx, bucket); err != nil {
+		t.Fatalf("DeleteBucketQuota: %v", err)
+	}
+	if calls != 6 {
+		t.Fatalf("quota client calls = %d, want 6", calls)
+	}
+}
+
+func TestHTTPClientBucketQuotaDistinguishesDotFromLiteralEncodedDot(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.EscapedPath())
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"bucket":"","quota":null,"usage":{},"ratios":{}}`))
+	}))
+	defer srv.Close()
+
+	client := NewHTTPClient(srv.URL, time.Second)
+	for _, bucket := range []string{".", "%2E"} {
+		if _, err := client.GetBucketQuotaStatus(context.Background(), bucket); err != nil {
+			t.Fatalf("GetBucketQuotaStatus(%q): %v", bucket, err)
+		}
+	}
+
+	want := []string{
+		"/api/v1/buckets/%2E/quota",
+		"/api/v1/buckets/%252E/quota",
+	}
+	if fmt.Sprint(paths) != fmt.Sprint(want) {
+		t.Fatalf("escaped paths = %v, want %v", paths, want)
+	}
+}
+
+func TestHTTPClientCheckBucketQuotaMapsOnlyQuotaExceeded(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		body       string
+		wantQuota  bool
+	}{
+		{name: "exceeded", statusCode: http.StatusConflict, body: `{"error":"over limit","code":"quota_exceeded"}`, wantQuota: true},
+		{name: "backend error", statusCode: http.StatusInternalServerError, body: `{"error":"pebble unavailable","code":"internal_error"}`},
+		{name: "other conflict", statusCode: http.StatusConflict, body: `{"error":"conflict","code":"other_conflict"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.statusCode)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			client := NewHTTPClient(srv.URL, time.Second)
+			err := client.CheckBucketQuota(context.Background(), "photos", 1, 1)
+			if err == nil {
+				t.Fatal("CheckBucketQuota returned nil")
+			}
+			if got := errors.Is(err, ErrQuotaExceeded); got != tc.wantQuota {
+				t.Fatalf("errors.Is(ErrQuotaExceeded) = %v, want %v: %v", got, tc.wantQuota, err)
+			}
+		})
+	}
+}
+
+func TestHTTPClientBucketQuotaMethodsRejectNon2xxResponses(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusMultipleChoices} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"invalid quota"}`))
+		}))
+
+		c := NewHTTPClient(srv.URL, time.Second)
+		ctx := context.Background()
+		for name, call := range map[string]func() error{
+			"get status": func() error {
+				_, err := c.GetBucketQuotaStatus(ctx, "photos")
+				return err
+			},
+			"set": func() error {
+				return c.SetBucketQuota(ctx, "photos", &BucketQuota{})
+			},
+			"delete": func() error {
+				return c.DeleteBucketQuota(ctx, "photos")
+			},
+		} {
+			if err := call(); err == nil {
+				t.Fatalf("%s quota request accepted status %d", name, status)
+			}
+		}
+		srv.Close()
+	}
+}
+
+func TestHTTPClientQuotaBackendErrorRetainsServerDetails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprint(w, `{"error":"quota backend unavailable"}`)
+	}))
+	defer srv.Close()
+
+	client := NewHTTPClient(srv.URL, time.Second)
+	err := client.CheckBucketQuota(context.Background(), "photos", 1, 0)
+	if err == nil || errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("backend error = %v", err)
+	}
+}
+
+func TestHTTPClientWriteAttemptCleanupPlanRoundTrip(t *testing.T) {
+	var stored ObjectWriteAttempt
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodPut:
+			if err := json.NewDecoder(r.Body).Decode(&stored); err != nil {
+				t.Fatalf("decode write attempt: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"status":"updated"}`))
+		case http.MethodGet:
+			if err := json.NewEncoder(w).Encode(&stored); err != nil {
+				t.Fatalf("encode write attempt: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewHTTPClient(srv.URL, time.Second)
+	ctx := context.Background()
+	want := &ObjectWriteAttempt{
+		ID:               "cleanup/a",
+		Bucket:           "photos",
+		Key:              "a.txt",
+		InodeID:          42,
+		InodeCTime:       12345,
+		RecoveryIntent:   WriteAttemptRecoveryCleanup,
+		CleanupParent:    2,
+		CleanupNewObject: true,
+		RollbackInode: &InodeMeta{
+			ID:       42,
+			CTime:    12345,
+			Size:     3,
+			ChunkMap: []ChunkRef{{ID: 9, Offset: 0, Length: 3, Version: 1}},
+		},
+		Chunks: []ChunkRef{{ID: 10, Offset: 0, Length: 7, Version: 1}},
+		State:  WriteAttemptRecoveryNeeded,
+	}
+	if err := client.PutWriteAttempt(ctx, want); err != nil {
+		t.Fatalf("PutWriteAttempt: %v", err)
+	}
+	got, err := client.GetWriteAttempt(ctx, want.ID)
+	if err != nil {
+		t.Fatalf("GetWriteAttempt: %v", err)
+	}
+	if got.RecoveryIntent != want.RecoveryIntent || got.InodeCTime != want.InodeCTime ||
+		got.CleanupParent != want.CleanupParent || !got.CleanupNewObject {
+		t.Fatalf("cleanup plan identity did not round trip: %+v", got)
+	}
+	if got.RollbackInode == nil || got.RollbackInode.ID != want.RollbackInode.ID ||
+		got.RollbackInode.CTime != want.RollbackInode.CTime ||
+		len(got.RollbackInode.ChunkMap) != 1 || got.RollbackInode.ChunkMap[0].ID != 9 {
+		t.Fatalf("rollback inode did not round trip: %+v", got.RollbackInode)
+	}
+	if len(got.Chunks) != 1 || got.Chunks[0].ID != 10 {
+		t.Fatalf("cleanup chunks did not round trip: %+v", got.Chunks)
+	}
+}
+
+func TestHTTPClientDoesNotReplayAllocationAfterServerOrTransportAmbiguity(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		handler    http.HandlerFunc
+		wantCalls  int32
+		wantErrSub string
+	}{
+		{
+			name: "allocation unknown response",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"code":"allocation_outcome_unknown","error":"outcome unknown"}`))
+			},
+			wantCalls:  1,
+			wantErrSub: "allocation_outcome_unknown",
+		},
+		{
+			name: "server error after possible allocation submit",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "ambiguous", http.StatusInternalServerError)
+			},
+			wantCalls:  1,
+			wantErrSub: "allocation outcome unknown",
+		},
+		{
+			name: "transport EOF after possible allocation submit",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				hj, ok := w.(http.Hijacker)
+				if !ok {
+					t.Fatalf("response writer is not hijackable")
+				}
+				conn, _, err := hj.Hijack()
+				if err != nil {
+					t.Fatalf("Hijack: %v", err)
+				}
+				_ = conn.Close()
+			},
+			wantCalls:  1,
+			wantErrSub: "allocation outcome unknown",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != http.MethodPost || (r.URL.Path != "/api/v1/chunks" && r.URL.Path != "/api/v1/chunks/batch") {
+					t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				tc.handler(w, r)
+			}))
+			defer srv.Close()
+
+			c := NewHTTPClient(srv.URL, time.Second)
+			c.SetRetryConfig(3, time.Millisecond)
+			_, err := c.AllocateChunk(context.Background(), 7, 0, PlacementPolicy{ReplicationFactor: 1})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Fatalf("AllocateChunk error = %v, want %q", err, tc.wantErrSub)
+			}
+			if got := calls.Load(); got != tc.wantCalls {
+				t.Fatalf("server calls = %d, want %d", got, tc.wantCalls)
+			}
+		})
 	}
 }

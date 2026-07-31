@@ -38,10 +38,8 @@ func main() {
 		listenAddr           = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
 		opsAddr              = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
 		dataDir              = flag.String("data-dir", "/var/lib/dfs/data", "Chunk storage root directory")
-		dataDirs             = flag.String("data-dirs", "", "Comma-separated data directories (enables supervisor mode)")
-		basePort             = flag.Int("base-port", 9100, "Base port for supervisor mode children")
+		dataDirs             = flag.String("data-dirs", "", "Comma-separated data directories for JBOD multi-disk mode")
 		machineID            = flag.String("machine-id", "", "Machine identifier for topology placement")
-		externalHost         = flag.String("external-host", "", "External host IP for node registration (supervisor mode only, defaults to 127.0.0.1)")
 		metaAddr             = flag.String("metadata", "localhost:8091", "Metadata service HTTP address")
 		rack                 = flag.String("rack", "rack-1", "Rack identifier for topology placement")
 		zone                 = flag.String("zone", "zone-1", "Availability zone identifier")
@@ -68,21 +66,15 @@ func main() {
 	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})
 	log := logging.Named("datanode")
 
+	var dirs []string
 	if *dataDirs != "" {
-		dirs := splitAndClean(*dataDirs)
+		dirs = splitAndClean(*dataDirs)
 		if len(dirs) == 0 {
 			log.Error("data-dirs is empty")
 			os.Exit(1)
 		}
-		mid := *machineID
-		if mid == "" {
-			mid = readMachineID()
-		}
-		runSupervisor(dirs, *basePort, mid, *externalHost, *metaAddr, *rack, *zone, *capacityGB)
-		return
 	}
-
-	if *dataDir == "" {
+	if len(dirs) == 0 && *dataDir == "" {
 		log.Error("either --data-dir or --data-dirs must be set")
 		os.Exit(1)
 	}
@@ -92,8 +84,13 @@ func main() {
 		mid = readMachineID()
 	}
 
-	log.Info("starting", "node_id", *nodeID, "addr", *listenAddr, "data", *dataDir, "machine", mid)
-	nid, err := resolveNodeID(*nodeID, *dataDir, mid)
+	singleDir := *dataDir
+	if len(dirs) == 0 {
+		dirs = []string{singleDir}
+	}
+
+	log.Info("starting", "node_id", *nodeID, "addr", *listenAddr, "disks", dirs, "machine", mid)
+	nid, err := resolveNodeID(*nodeID, dirs[0], mid)
 	if err != nil {
 		log.Error("invalid node-id", "node_id", *nodeID, "error", err)
 		os.Exit(1)
@@ -102,7 +99,8 @@ func main() {
 		NodeID:              nid,
 		ListenAddr:          *listenAddr,
 		OpsListenAddr:       *opsAddr,
-		DataDir:             *dataDir,
+		DataDir:             singleDir,
+		DataDirs:            dirs,
 		MetadataAddr:        *metaAddr,
 		MetadataCacheDir:    "",
 		HeartbeatInterval:   10 * time.Second,
@@ -204,13 +202,25 @@ func runDataNode(cfg datanode.Config) {
 		os.Exit(1)
 	}
 
-	wal, err := datanode.NewWriteAheadLog(filepath.Join(cfg.DataDir, "wal"))
-	if err != nil {
-		log.Error("failed to init WAL", "error", err)
-		os.Exit(1)
+	// Resolve the disk set: DataDirs (JBOD multi-disk) or fall back to a
+	// single-element list from DataDir.
+	dataDirs := cfg.DataDirs
+	if len(dataDirs) == 0 {
+		dataDirs = []string{cfg.DataDir}
 	}
 
-	chunkStore, err := datanode.NewChunkStore(cfg.DataDir, cfg.MaxConcurrentWrites, cfg.MaxConcurrentReads, wal)
+	// One WAL per disk (each lives on its own disk for crash-recovery isolation).
+	wals := make([]*datanode.WriteAheadLog, len(dataDirs))
+	for i, dir := range dataDirs {
+		w, err := datanode.NewWriteAheadLog(filepath.Join(dir, "wal"))
+		if err != nil {
+			log.Error("failed to init WAL", "disk", dir, "error", err)
+			os.Exit(1)
+		}
+		wals[i] = w
+	}
+
+	chunkStore, err := datanode.NewMultiDiskChunkStore(dataDirs, cfg.MaxConcurrentWrites, cfg.MaxConcurrentReads, wals)
 	if err != nil {
 		log.Error("failed to init chunk store", "error", err)
 		os.Exit(1)
@@ -233,9 +243,14 @@ func runDataNode(cfg datanode.Config) {
 	}
 
 	totalBytes, chunkCount := chunkStore.Stats()
-	log.Info("chunk store ready", "chunks", chunkCount, "bytes", totalBytes)
+	log.Info("chunk store ready", "disks", len(dataDirs), "chunks", chunkCount, "bytes", totalBytes)
 
-	diskManager, err := datanode.NewDiskManager(cfg.DataDir, chunkStore, cfg.CapacityGB, wal)
+	// Per-disk capacity: apply CapacityGB uniformly (0 = auto-detect via Statfs).
+	capacities := make([]int64, len(dataDirs))
+	for i := range dataDirs {
+		capacities[i] = cfg.CapacityGB
+	}
+	diskManager, err := datanode.NewMultiDiskManager(dataDirs, chunkStore, capacities, wals)
 	if err != nil {
 		log.Error("failed to init disk manager", "error", err)
 		os.Exit(1)
@@ -244,6 +259,15 @@ func runDataNode(cfg datanode.Config) {
 
 	// Wire disk health into chunk store so writes are rejected on disk failure
 	chunkStore.SetDiskManager(diskManager)
+
+	// Start the management socket for status/adopt/retire CLI commands.
+	stopMgmt, err := startManagementServer(chunkStore, diskManager, dataDirs)
+	if err != nil {
+		log.Warn("failed to start management socket", "error", err)
+	}
+	if stopMgmt != nil {
+		defer stopMgmt()
+	}
 
 	// Determine scheme for metadata service based on our TLS config.
 	// If the cluster uses TLS, metad should also be accessed over HTTPS.
@@ -372,8 +396,10 @@ func runDataNode(cfg datanode.Config) {
 
 	// Phase 5: Flush and close WAL — ensures all committed writes are durable.
 	log.Info("shutdown phase 5: flushing WAL")
-	if err := wal.Close(); err != nil {
-		log.Warn("WAL close error", "error", err)
+	for _, w := range wals {
+		if err := w.Close(); err != nil {
+			log.Warn("WAL close error", "error", err)
+		}
 	}
 
 	// Phase 6: Deregister from metadata service.

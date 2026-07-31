@@ -20,8 +20,8 @@ import (
 	"time"
 
 	// DFS backend
+	"github.com/example/dfs/chunkstore"
 	gofuse "github.com/example/dfs/gateway/fuse"
-	"github.com/example/dfs/gateway/s3"
 	"github.com/example/dfs/metadata"
 
 	// S3 backend
@@ -62,7 +62,6 @@ func main() {
 
 		// DFS cache quota flag
 		dfsCacheQuota = flag.Int64("dfs-cache-quota", 1<<30, "DFS: Chunk cache byte quota (0=unlimited, default 1GiB)")
-
 	)
 	_ = configPath
 	config.Preload()
@@ -127,7 +126,7 @@ func runDFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, ca
 	}
 	defer meta.Close()
 
-	chunkStore := s3.NewDatanodeChunkStore()
+	chunkStore := chunkstore.NewDatanodeChunkStore()
 
 	var chunkCache *gofuse.ChunkCache
 	if cacheDir != "" {

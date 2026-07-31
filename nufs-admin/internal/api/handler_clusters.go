@@ -87,3 +87,21 @@ func (r *Router) handleClusterOverview(w http.ResponseWriter, req *http.Request,
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(overview)
 }
+
+// handleClusterReadiness proxies the cluster readiness check to the metad.
+func (r *Router) handleClusterReadiness(w http.ResponseWriter, req *http.Request, clusterID string) {
+	if req.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var readiness map[string]interface{}
+	if err := r.proxy.Get(req.Context(), clusterID, "/api/v1/cluster/readiness", &readiness); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	readiness["cluster"] = clusterID
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(readiness)
+}

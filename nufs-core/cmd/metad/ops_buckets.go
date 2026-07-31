@@ -39,6 +39,15 @@ func (h *opsHandlers) handleBuckets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *opsHandlers) handleBucketByID(w http.ResponseWriter, r *http.Request) {
+	if name, isQuotaPath := bucketNameAndQuotaPath(r.URL.Path); isQuotaPath {
+		if name == "" {
+			writeJSONError(w, http.StatusBadRequest, "bucket name required")
+			return
+		}
+		h.handleBucketQuota(w, r, name)
+		return
+	}
+
 	name := r.URL.Path[len("/api/v1/buckets/"):]
 	if name == "" {
 		writeJSONError(w, http.StatusBadRequest, "bucket name required")

@@ -1,8 +1,7 @@
 package s3
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -18,239 +17,63 @@ import (
 )
 
 // handlePutObject handles PUT /{bucket}/{key+}
+//
+// Server-side retry is intentionally NOT implemented here. Under high
+// concurrency, retrying a metadata-contention error adds load to the
+// already-overloaded metadata service, making things worse (retry storm).
+// Instead, S3 clients handle retries with proper exponential backoff
+// and jitter — this is the standard behavior per the S3 spec.
 func (gw *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key, requestID string) {
 	ctx := r.Context()
-
-	// Get bucket info
-	b, err := gw.meta.GetBucket(ctx, bucket)
-	if err != nil {
-		if errors.Is(err, metadata.ErrBucketNotFound) {
-			WriteXMLError(w, http.StatusNotFound, ErrCodeNoSuchBucket,
-				"The specified bucket does not exist", "/"+bucket, requestID)
-			return
-		}
-		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			err.Error(), "/"+bucket+"/"+key, requestID)
-		return
-	}
 
 	// Cap the body at MaxObjectSize + 1 so http.MaxBytesReader trips
 	// exactly when the client overshoots.
 	r.Body = http.MaxBytesReader(w, r.Body, gw.maxObjectSize)
 
-	// Try to create file; if exists, look up the existing inode and
-	// update it in place.
-	var oldChunks []metadata.ChunkRef
-	inode, err := gw.meta.CreateFile(ctx, b.RootInode, key, 0644)
+	result, err := gw.committer.Put(ctx, PutObjectRequest{
+		Bucket:        bucket,
+		Key:           key,
+		Body:          r.Body,
+		ContentLength: r.ContentLength,
+		MaxObjectSize: gw.maxObjectSize,
+		RequestID:     requestID,
+	})
 	if err != nil {
-		if errors.Is(err, metadata.ErrEntryExists) {
-			inode, err = gw.meta.Lookup(ctx, b.RootInode, key)
-			if err != nil {
-				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-					err.Error(), "/"+bucket+"/"+key, requestID)
-				return
-			}
-			oldChunks = inode.ChunkMap
-		} else {
-			WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-				err.Error(), "/"+bucket+"/"+key, requestID)
-			return
-		}
-	}
-
-	// Acquire an exclusive advisory lock on the inode
-	lockOwner := fmt.Sprintf("s3gw-%s-%s-%d", bucket, key, time.Now().UnixNano())
-	if err := gw.meta.AdvisoryLock(ctx, inode.ID, lockOwner); err != nil {
-		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
-			"Object is locked by another writer: "+err.Error(),
-			"/"+bucket+"/"+key, requestID)
+		gw.writePutObjectCommitterError(w, err, bucket, key, requestID)
 		return
 	}
-	defer gw.meta.AdvisoryUnlock(ctx, inode.ID, lockOwner)
 
-	// Determine content length if known (Content-Length header)
-	contentLength := int64(-1)
-	if r.ContentLength > 0 {
-		contentLength = r.ContentLength
-	}
-
-	// --- Streaming chunked write ---
-	// Read body in MaxChunkSize pieces, allocating and writing chunks
-	// one at a time. If Content-Length is known and requires multiple
-	// chunks, use batch allocation to reduce metadata round trips.
-	var (
-		newChunkRefs []metadata.ChunkRef
-		totalSize    int64
-		hash         = sha256.New()
-	)
-
-	// Pre-allocate chunks if Content-Length is known and large enough
-	if contentLength > metadata.MaxChunkSize {
-		numChunks := int((contentLength + metadata.MaxChunkSize - 1) / metadata.MaxChunkSize)
-		offsets := make([]int64, numChunks)
-		for i := 0; i < numChunks; i++ {
-			offsets[i] = int64(i) * metadata.MaxChunkSize
-		}
-
-		preAllocChunks, err := gw.meta.AllocateChunksBatch(ctx, inode.ID, offsets, b.Policy)
-		if err != nil {
-			WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-				"Failed to batch allocate chunks: "+err.Error(), "/"+bucket+"/"+key, requestID)
-			return
-		}
-
-		// Validate replica availability
-		if gw.rejectEmptyReplicas {
-			for _, ch := range preAllocChunks {
-				if len(ch.Replicas) == 0 {
-					WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
-						"No datanode replicas are available for this bucket's placement policy",
-						"/"+bucket+"/"+key, requestID)
-					return
-				}
-			}
-		}
-
-		// Stream data through pre-allocated chunks
-		buf := make([]byte, metadata.MaxChunkSize)
-		chunkIdx := 0
-		remaining := contentLength
-
-		for remaining > 0 && chunkIdx < len(preAllocChunks) {
-			readSize := int64(metadata.MaxChunkSize)
-			if remaining < readSize {
-				readSize = remaining
-			}
-
-			// Read exactly readSize bytes into the buffer
-			n, err := io.ReadFull(r.Body, buf[:readSize])
-			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-				// MaxBytesReader trips here if the client exceeds the limit
-				var maxErr *http.MaxBytesError
-				if errors.As(err, &maxErr) {
-					WriteXMLError(w, http.StatusRequestEntityTooLarge, ErrCodeEntityTooLarge,
-						fmt.Sprintf("Object size exceeds %d bytes", gw.maxObjectSize),
-						"/"+bucket+"/"+key, requestID)
-					return
-				}
-				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-					"Failed to read request body: "+err.Error(), "/"+bucket+"/"+key, requestID)
-				return
-			}
-			if n == 0 {
-				break
-			}
-
-			chunkData := buf[:n]
-			chunk := preAllocChunks[chunkIdx]
-
-			checksum := crc32Checksum(chunkData)
-			if err := gw.chunkStore.WriteChunk(ctx, chunk, chunkData); err != nil {
-				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-					"Failed to write chunk data: "+err.Error(), "/"+bucket+"/"+key, requestID)
-				return
-			}
-
-			if err := gw.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
-				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-					"Failed to commit chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
-				return
-			}
-
-			if err := gw.meta.SealChunk(ctx, chunk.ID); err != nil {
-				log.Printf("s3gw: seal chunk %d: %v", chunk.ID, err)
-			}
-
-			newChunkRefs = append(newChunkRefs, metadata.ChunkRef{
-				ID:     chunk.ID,
-				Offset: int64(chunkIdx) * metadata.MaxChunkSize,
-				Length: int32(n),
-				Version: 1,
-			})
-			_, _ = hash.Write(chunkData)
-			totalSize += int64(n)
-			remaining -= int64(n)
-			chunkIdx++
-		}
-	} else {
-		// Small or unknown size: allocate and write single chunks on the fly
-		buf := make([]byte, metadata.MaxChunkSize)
-		for {
-			n, err := io.ReadFull(r.Body, buf)
-			if n == 0 || err == io.EOF {
-				break
-			}
-			if err != nil && err != io.ErrUnexpectedEOF {
-				var maxErr *http.MaxBytesError
-				if errors.As(err, &maxErr) {
-					WriteXMLError(w, http.StatusRequestEntityTooLarge, ErrCodeEntityTooLarge,
-						fmt.Sprintf("Object size exceeds %d bytes", gw.maxObjectSize),
-						"/"+bucket+"/"+key, requestID)
-					return
-				}
-				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-					"Failed to read request body: "+err.Error(), "/"+bucket+"/"+key, requestID)
-				return
-			}
-
-			chunkData := buf[:n]
-			chunk, err := gw.meta.AllocateChunk(ctx, inode.ID, totalSize, b.Policy)
-			if err != nil {
-				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-					"Failed to allocate chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
-				return
-			}
-
-			if gw.rejectEmptyReplicas && len(chunk.Replicas) == 0 {
-				WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
-					"No datanode replicas are available for this bucket's placement policy",
-					"/"+bucket+"/"+key, requestID)
-				return
-			}
-
-			checksum := crc32Checksum(chunkData)
-			if err := gw.chunkStore.WriteChunk(ctx, chunk, chunkData); err != nil {
-				WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
-					"Failed to write data to enough datanodes: "+err.Error(),
-					"/"+bucket+"/"+key, requestID)
-				return
-			}
-
-			if err := gw.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
-				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-					"Failed to commit chunk: "+err.Error(), "/"+bucket+"/"+key, requestID)
-				return
-			}
-
-			if err := gw.meta.SealChunk(ctx, chunk.ID); err != nil {
-				log.Printf("s3gw: seal chunk %d: %v", chunk.ID, err)
-			}
-
-			newChunkRefs = append(newChunkRefs, metadata.ChunkRef{
-				ID: chunk.ID, Offset: totalSize, Length: int32(n), Version: 1,
-			})
-			_, _ = hash.Write(chunkData)
-			totalSize += int64(n)
-		}
-	}
-
-	// Update inode with final size and all chunk references
-	inode.Size = totalSize
-	inode.ChunkMap = newChunkRefs
-	if err := gw.meta.UpdateInode(ctx, inode); err != nil {
-		log.Printf("s3gw: update inode %d: %v", inode.ID, err)
-	}
-
-	// Clean up old chunks (async)
-	for _, cref := range oldChunks {
-		_ = gw.meta.DeleteChunk(ctx, cref.ID)
-	}
-
-	// ETag from hash (truncated to 16 hex chars for consistency)
-	etag := "\"" + hex.EncodeToString(hash.Sum(nil)[:8]) + "\""
-
-	w.Header().Set("ETag", etag)
+	w.Header().Set("ETag", result.ETag)
 	w.WriteHeader(http.StatusOK)
+}
+
+func (gw *Gateway) writePutObjectCommitterError(w http.ResponseWriter, err error, bucket, key, requestID string) {
+	resource := "/" + bucket + "/" + key
+	switch {
+	case errors.Is(err, ErrObjectBucketNotFound):
+		WriteXMLError(w, http.StatusNotFound, ErrCodeNoSuchBucket,
+			"The specified bucket does not exist", "/"+bucket, requestID)
+	case errors.Is(err, ErrObjectLocked):
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
+			"Object is locked by another writer: "+err.Error(), resource, requestID)
+	case errors.Is(err, ErrObjectBodyTooLarge):
+		WriteXMLError(w, http.StatusRequestEntityTooLarge, ErrCodeEntityTooLarge,
+			fmt.Sprintf("Object size exceeds %d bytes", gw.maxObjectSize), resource, requestID)
+	case errors.Is(err, ErrObjectQuotaExceeded):
+		WriteXMLError(w, http.StatusForbidden, "QuotaExceeded", err.Error(), resource, requestID)
+	case errors.Is(err, ErrObjectNoReplicas):
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
+			"No datanode replicas are available for this bucket's placement policy", resource, requestID)
+	case errors.Is(err, ErrObjectWriteFailed):
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable,
+			err.Error(), resource, requestID)
+	case errors.Is(err, ErrObjectCommitFailed), errors.Is(err, ErrObjectMetadataFailed):
+		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			err.Error(), resource, requestID)
+	default:
+		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			err.Error(), resource, requestID)
+	}
 }
 
 // handleGetObject handles GET /{bucket}/{key+}
@@ -292,7 +115,11 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 			"/"+bucket+"/"+key, requestID)
 		return
 	}
-	defer gw.meta.AdvisoryUnlock(ctx, inode.ID, lockOwner)
+	defer func() {
+		if err := releaseAdvisoryLock(ctx, gw.meta, inode.ID, lockOwner); err != nil {
+			log.Printf("s3gw: release GET lock for /%s/%s: %v", bucket, key, err)
+		}
+	}()
 
 	// Handle range request
 	start, end := parseRange(r.Header.Get("Range"), inode.Size)
@@ -302,7 +129,6 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLen, 10))
 	w.Header().Set("Last-Modified", FormatS3Time(unixNanoToTime(inode.MTime)))
 	w.Header().Set("ETag", FormatETag(0))
-	w.Header().Set("Accept-Ranges", "bytes")
 
 	if start > 0 || end < inode.Size-1 {
 		w.Header().Set("Content-Range",
@@ -361,6 +187,7 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 // handleDeleteObject handles DELETE /{bucket}/{key+}
 func (gw *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key, requestID string) {
 	ctx := r.Context()
+	resource := "/" + bucket + "/" + key
 
 	b, err := gw.meta.GetBucket(ctx, bucket)
 	if err != nil {
@@ -374,15 +201,54 @@ func (gw *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
+	inode, err := gw.meta.Lookup(ctx, b.RootInode, key)
+	if err != nil {
+		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			err.Error(), resource, requestID)
+		return
+	}
+
+	lockOwner := fmt.Sprintf("s3gw-delete-%s-%s-%s-%d", bucket, key, requestID, time.Now().UnixNano())
+	if err := gw.meta.AdvisoryLock(ctx, inode.ID, lockOwner); err != nil {
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
+			"Object is locked: "+err.Error(), resource, requestID)
+		return
+	}
+	defer func() {
+		if err := releaseAdvisoryLock(ctx, gw.meta, inode.ID, lockOwner); err != nil {
+			log.Printf("s3gw: release DELETE lock for %s: %v", resource, err)
+		}
+	}()
+
+	lockedInode, err := gw.meta.Lookup(ctx, b.RootInode, key)
+	if err != nil {
+		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			err.Error(), resource, requestID)
+		return
+	}
+	if lockedInode.ID != inode.ID || lockedInode.CTime != inode.CTime {
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
+			"Object changed while waiting for lock", resource, requestID)
+		return
+	}
+
 	// Unlink (handles nlink decrement + cleanup)
 	if err := gw.meta.Unlink(ctx, b.RootInode, key); err != nil {
-		if errors.Is(err, metadata.ErrEntryNotFound) {
+		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
 			// S3 returns 204 even if key doesn't exist
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			err.Error(), "/"+bucket+"/"+key, requestID)
+			err.Error(), resource, requestID)
 		return
 	}
 
@@ -417,13 +283,13 @@ func (gw *Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, buck
 	w.Header().Set("Content-Length", strconv.FormatInt(inode.Size, 10))
 	w.Header().Set("Last-Modified", FormatS3Time(unixNanoToTime(inode.MTime)))
 	w.Header().Set("ETag", FormatETag(0))
-	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(http.StatusOK)
 }
 
 // handleCopyObject handles PUT /{bucket}/{key+} with X-Amz-Copy-Source header
 func (gw *Gateway) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket, key, requestID string) {
 	ctx := r.Context()
+	resource := "/" + bucket + "/" + key
 
 	copySource := r.Header.Get("X-Amz-Copy-Source")
 	copySource, _ = url.PathUnescape(copySource)
@@ -433,6 +299,11 @@ func (gw *Gateway) handleCopyObject(w http.ResponseWriter, r *http.Request, buck
 	if srcBucket == "" || srcKey == "" {
 		WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidArgument,
 			"Invalid copy source", "/"+bucket+"/"+key, requestID)
+		return
+	}
+	if srcBucket == bucket && srcKey == key {
+		WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidRequest,
+			"Copy source and destination must differ", resource, requestID)
 		return
 	}
 
@@ -456,27 +327,73 @@ func (gw *Gateway) handleCopyObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	// Get dest bucket
-	dstB, err := gw.meta.GetBucket(ctx, bucket)
+	lockOwner := fmt.Sprintf("s3gw-copy-%s-%s-%s-%d", srcBucket, srcKey, requestID, time.Now().UnixNano())
+	if err := gw.meta.AdvisoryLockShared(ctx, srcInode.ID, lockOwner); err != nil {
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
+			"Copy source is locked: "+err.Error(), resource, requestID)
+		return
+	}
+	defer func() {
+		if err := releaseAdvisoryLock(ctx, gw.meta, srcInode.ID, lockOwner); err != nil {
+			log.Printf("s3gw: release COPY source lock for /%s/%s: %v", srcBucket, srcKey, err)
+		}
+	}()
+
+	lockedSource, err := gw.meta.Lookup(ctx, srcB.RootInode, srcKey)
 	if err != nil {
-		WriteXMLError(w, http.StatusNotFound, ErrCodeNoSuchBucket,
-			"Destination bucket not found", "/"+bucket, requestID)
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
+			"Copy source changed while waiting for lock", resource, requestID)
+		return
+	}
+	if lockedSource.ID != srcInode.ID || lockedSource.CTime != srcInode.CTime {
+		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
+			"Copy source changed while waiting for lock", resource, requestID)
 		return
 	}
 
-	// Create hard link to same inode (server-side copy via shared chunks)
-	_, err = gw.meta.Link(ctx, dstB.RootInode, key, srcInode.ID)
+	reader, writer := io.Pipe()
+	go func() {
+		writer.CloseWithError(gw.streamCopySource(ctx, writer, lockedSource))
+	}()
+	result, err := gw.committer.Put(ctx, PutObjectRequest{
+		Bucket:        bucket,
+		Key:           key,
+		Body:          reader,
+		ContentLength: lockedSource.Size,
+		MaxObjectSize: gw.maxObjectSize,
+		RequestID:     requestID,
+	})
+	_ = reader.Close()
 	if err != nil {
-		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			err.Error(), "/"+bucket+"/"+key, requestID)
+		gw.writePutObjectCommitterError(w, err, bucket, key, requestID)
 		return
 	}
 
-	result := CopyObjectResult{
-		LastModified: FormatS3Time(unixNanoToTime(srcInode.MTime)),
-		ETag:         FormatETag(0),
+	response := CopyObjectResult{
+		LastModified: FormatS3Time(time.Now()),
+		ETag:         result.ETag,
 	}
-	WriteXML(w, http.StatusOK, result)
+	WriteXML(w, http.StatusOK, response)
+}
+
+func (gw *Gateway) streamCopySource(ctx context.Context, dst io.Writer, inode *metadata.InodeMeta) error {
+	for _, ref := range inode.ChunkMap {
+		chunk, err := gw.meta.GetChunk(ctx, ref.ID)
+		if err != nil {
+			return fmt.Errorf("get source chunk %d: %w", ref.ID, err)
+		}
+		if len(chunk.Replicas) == 0 {
+			return fmt.Errorf("source chunk %d has no replicas", ref.ID)
+		}
+		data, err := gw.chunkStore.ReadChunkRange(ctx, chunk, 0, int32(ref.Length))
+		if err != nil {
+			return fmt.Errorf("read source chunk %d: %w", ref.ID, err)
+		}
+		if _, err := dst.Write(data); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // parseRange parses the Range header "bytes=start-end"
@@ -517,4 +434,18 @@ func parseRange(rangeHeader string, fileSize int64) (start, end int64) {
 
 func crc32Checksum(data []byte) uint32 {
 	return crc32.ChecksumIEEE(data)
+}
+
+// isRetryablePutError returns true for transient errors that are safe to
+// retry at the server level (metadata contention, write failures).
+// Context-canceled errors are never retried since the request deadline
+// has already expired.
+func isRetryablePutError(err error) bool {
+	if ctxErr := context.Cause(context.Background()); ctxErr != nil {
+		// global context canceled — never retry
+		return false
+	}
+	return errors.Is(err, ErrObjectMetadataFailed) ||
+		errors.Is(err, ErrObjectCommitFailed) ||
+		errors.Is(err, ErrObjectWriteFailed)
 }

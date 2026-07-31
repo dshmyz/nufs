@@ -16,21 +16,27 @@ import (
 
 func main() {
 	var (
-		configPath      = flag.String("config", "", "Path to YAML config file")
-		listenAddr      = flag.String("listen", ":8080", "HTTP listen address")
-		metaAddr        = flag.String("meta-addr", "localhost:8091", "Metadata service address (host:port)")
-		accessKey       = flag.String("access-key", "", "Access key for auth (empty = anonymous)")
-		secretKey       = flag.String("secret-key", "", "Secret key for auth")
-		credentialsFile = flag.String("credentials-file", "", "Path to YAML credentials file (hot-reloadable)")
-		partDir         = flag.String("part-dir", "/var/lib/nufs-s3/parts", "Multipart upload temp directory (empty=in-memory)")
-		maxObjectSize   = flag.Int64("max-object-size", gos3.DefaultMaxObjectSize, "Maximum single-shot PUT body size in bytes (5 GiB by default)")
-		gracefulTimeout = flag.Duration("graceful-timeout", 30*time.Second, "Max time to wait for in-flight requests on shutdown")
-		tlsCert         = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
-		tlsKey          = flag.String("tls-key", "", "TLS private key file")
-		rateLimit       = flag.Float64("rate-limit", 0, "Max requests/second per client IP (0 = unlimited)")
-		rateLimitBurst  = flag.Int("rate-limit-burst", 0, "Rate limiter burst size (0 = same as rate-limit)")
-		logLevel        = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
-		logJSON         = flag.Bool("log-json", false, "JSON log output")
+		configPath          = flag.String("config", "", "Path to YAML config file")
+		listenAddr          = flag.String("listen", ":8080", "HTTP listen address")
+		metaAddr            = flag.String("meta-addr", "localhost:8091", "Metadata service address (host:port)")
+		accessKey           = flag.String("access-key", "", "Access key for auth (empty = anonymous)")
+		secretKey           = flag.String("secret-key", "", "Secret key for auth")
+		credentialsFile     = flag.String("credentials-file", "", "Path to YAML credentials file (hot-reloadable)")
+		partDir             = flag.String("part-dir", "/var/lib/nufs-s3/parts", "Multipart upload temp directory (empty=in-memory)")
+		maxObjectSize       = flag.Int64("max-object-size", gos3.DefaultMaxObjectSize, "Maximum single-shot PUT body size in bytes (5 GiB by default)")
+		gracefulTimeout     = flag.Duration("graceful-timeout", 30*time.Second, "Max time to wait for in-flight requests on shutdown")
+		tlsCert             = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS)")
+		tlsKey              = flag.String("tls-key", "", "TLS private key file")
+		rateLimit           = flag.Float64("rate-limit", 0, "Max requests/second per client IP (0 = unlimited)")
+		rateLimitBurst      = flag.Int("rate-limit-burst", 0, "Rate limiter burst size (0 = same as rate-limit)")
+		writeWorkers        = flag.Bool("write-workers", true, "Enable object write recovery and GC workers")
+		writeWorkerInterval = flag.Duration("write-worker-interval", time.Minute, "Object write recovery/GC worker interval")
+		writeWorkerLease    = flag.Duration("write-worker-lease", 30*time.Second, "Object write recovery/GC task lease duration")
+		writeRecoveryLimit  = flag.Int("write-recovery-limit", 100, "Max write attempts to recover per worker tick")
+		writeGCLimit        = flag.Int("write-gc-limit", 100, "Max write attempts to garbage collect per worker tick")
+		writeGCAbandonAge   = flag.Duration("write-gc-abandon-age", time.Hour, "Age after which pending/allocated write attempts are considered abandoned")
+		logLevel            = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
+		logJSON             = flag.Bool("log-json", false, "JSON log output")
 	)
 	_ = configPath
 	config.Preload()
@@ -76,6 +82,14 @@ func main() {
 		ReadyCheck:          health,
 		RateLimit:           *rateLimit,
 		RateLimitBurst:      *rateLimitBurst,
+		BackgroundWorkers: gos3.ObjectWriteBackgroundWorkerConfig{
+			Enabled:       *writeWorkers,
+			Interval:      *writeWorkerInterval,
+			Lease:         *writeWorkerLease,
+			RecoveryLimit: *writeRecoveryLimit,
+			GCLimit:       *writeGCLimit,
+			GCAbandonAge:  *writeGCAbandonAge,
+		},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

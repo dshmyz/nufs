@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/dfs/chunkstore"
 	"github.com/example/dfs/metadata"
 )
 
@@ -27,7 +28,7 @@ func TestPutObject_ExceedsMaxObjectSize(t *testing.T) {
 	gw := NewGateway(GatewayConfig{
 		MetaService:   meta,
 		Creds:         NewCredentialStore(),
-		ChunkStore:    NewMemoryChunkStore(),
+		ChunkStore:    chunkstore.NewMemoryChunkStore(),
 		MaxObjectSize: 16,
 	})
 	ts := httptest.NewServer(gw.Handler())
@@ -86,7 +87,7 @@ func TestPutObject_RejectsEmptyReplicas(t *testing.T) {
 	gw := NewGateway(GatewayConfig{
 		MetaService:         meta,
 		Creds:               NewCredentialStore(),
-		ChunkStore:          NewMemoryChunkStore(),
+		ChunkStore:          chunkstore.NewMemoryChunkStore(),
 		RejectEmptyReplicas: true,
 	})
 	ts := httptest.NewServer(gw.Handler())
@@ -134,7 +135,7 @@ func TestHealthz_CustomCheckDown(t *testing.T) {
 	gw := NewGateway(GatewayConfig{
 		MetaService: meta,
 		Creds:       NewCredentialStore(),
-		ChunkStore:  NewMemoryChunkStore(),
+		ChunkStore:  chunkstore.NewMemoryChunkStore(),
 		HealthCheck: func(_ context.Context) error { return errors.New("datanode down") },
 	})
 	ts := httptest.NewServer(gw.Handler())
@@ -155,7 +156,7 @@ func TestReadyz_IndependentOfHealthz(t *testing.T) {
 	gw := NewGateway(GatewayConfig{
 		MetaService: meta,
 		Creds:       NewCredentialStore(),
-		ChunkStore:  NewMemoryChunkStore(),
+		ChunkStore:  chunkstore.NewMemoryChunkStore(),
 		HealthCheck: func(_ context.Context) error { return nil },
 		ReadyCheck:  func(_ context.Context) error { return errors.New("metadata unreachable") },
 	})
@@ -182,7 +183,7 @@ func TestRun_GracefulShutdown(t *testing.T) {
 	gw := NewGateway(GatewayConfig{
 		MetaService: meta,
 		Creds:       NewCredentialStore(),
-		ChunkStore:  NewMemoryChunkStore(),
+		ChunkStore:  chunkstore.NewMemoryChunkStore(),
 	})
 
 	// Pick a free port; Run will re-listen on it.
@@ -232,7 +233,7 @@ func TestRun_RejectsMissingAddr(t *testing.T) {
 	gw := NewGateway(GatewayConfig{
 		MetaService: newMockMetaService(),
 		Creds:       NewCredentialStore(),
-		ChunkStore:  NewMemoryChunkStore(),
+		ChunkStore:  chunkstore.NewMemoryChunkStore(),
 	})
 	if err := gw.Run(context.Background(), ServerConfig{}); err == nil {
 		t.Fatal("expected error for empty Addr")

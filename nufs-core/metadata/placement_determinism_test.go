@@ -4,6 +4,12 @@ import (
 	"testing"
 )
 
+// helper: format node address
+func formatNodeAddr(i int) string {
+	return "10.0.0." + string(rune('1'+i)) + ":8080"
+}
+
+
 // ============================================================
 // TDD: Placement Algorithm Determinism
 // ============================================================

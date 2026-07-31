@@ -13,12 +13,12 @@ import (
 type ErrorCode string
 
 const (
-	ErrCodeNamespace     ErrorCode = "NAMESPACE_ERROR"
-	ErrCodeBucket        ErrorCode = "BUCKET_ERROR"
-	ErrCodeChunk         ErrorCode = "CHUNK_ERROR"
-	ErrCodeNode          ErrorCode = "NODE_ERROR"
-	ErrCodeConsistency   ErrorCode = "CONSISTENCY_ERROR"
-	ErrCodeSystem        ErrorCode = "SYSTEM_ERROR"
+	ErrCodeNamespace   ErrorCode = "NAMESPACE_ERROR"
+	ErrCodeBucket      ErrorCode = "BUCKET_ERROR"
+	ErrCodeChunk       ErrorCode = "CHUNK_ERROR"
+	ErrCodeNode        ErrorCode = "NODE_ERROR"
+	ErrCodeConsistency ErrorCode = "CONSISTENCY_ERROR"
+	ErrCodeSystem      ErrorCode = "SYSTEM_ERROR"
 )
 
 // Error is a structured error with an error code for API responses.
@@ -44,21 +44,22 @@ func NewError(code ErrorCode, message string, cause error) *Error {
 
 // Namespace errors
 var (
-	ErrBucketExists   = errors.New("metadata: bucket already exists")
-	ErrBucketNotFound = errors.New("metadata: bucket not found")
-	ErrBucketNotEmpty = errors.New("metadata: bucket is not empty")
-	ErrEntryExists    = errors.New("metadata: directory entry already exists")
-	ErrEntryNotFound  = errors.New("metadata: directory entry not found")
-	ErrInodeNotFound  = errors.New("metadata: inode not found")
-	ErrDirNotEmpty    = errors.New("metadata: directory is not empty")
-	ErrNotDirectory   = errors.New("metadata: not a directory")
-	ErrNotFile        = errors.New("metadata: not a regular file")
-	ErrNotSymlink     = errors.New("metadata: not a symbolic link")
-	ErrNameTooLong      = errors.New("metadata: name exceeds maximum length")
+	ErrBucketExists      = errors.New("metadata: bucket already exists")
+	ErrBucketNotFound    = errors.New("metadata: bucket not found")
+	ErrBucketNotEmpty    = errors.New("metadata: bucket is not empty")
+	ErrEntryExists       = errors.New("metadata: directory entry already exists")
+	ErrEntryNotFound     = errors.New("metadata: directory entry not found")
+	ErrInodeNotFound     = errors.New("metadata: inode not found")
+	ErrDirNotEmpty       = errors.New("metadata: directory is not empty")
+	ErrNotDirectory      = errors.New("metadata: not a directory")
+	ErrNotFile           = errors.New("metadata: not a regular file")
+	ErrNotSymlink        = errors.New("metadata: not a symbolic link")
+	ErrNameTooLong       = errors.New("metadata: name exceeds maximum length")
 	ErrCrossBucketRename = errors.New("metadata: rename across buckets is not allowed")
 	ErrXAttrNotFound     = errors.New("metadata: extended attribute not found")
 	ErrDirTooLarge       = errors.New("metadata: directory exceeds maximum entries limit")
 	ErrAccessDenied      = errors.New("metadata: access denied")
+	ErrQuotaExceeded     = errors.New("metadata: bucket quota exceeded")
 )
 
 // Internal sentinel errors

@@ -11,8 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/gateway"
-	"github.com/example/dfs/gateway/s3"
+	"github.com/example/dfs/chunkstore"
 	"github.com/example/dfs/metadata"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -55,7 +54,7 @@ func newTestMetaStore(t *testing.T) (*metadata.PebbleStore, metadata.InodeID) {
 // with a pre-set inodeID. The test does not have a real FUSE server
 // so the fs.Inode embedded field stays zero-value; we exercise the
 // Read/Write/Flush methods directly.
-func newTestFile(meta metadata.MetadataService, cs gateway.ChunkStore, id metadata.InodeID) *DFSFile {
+func newTestFile(meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID) *DFSFile {
 	return &DFSFile{
 		meta:       meta,
 		chunkStore: cs,
@@ -64,7 +63,7 @@ func newTestFile(meta metadata.MetadataService, cs gateway.ChunkStore, id metada
 }
 
 // newTestFileWithRecorder 同 newTestFile 但注入 MetricsRecorder。
-func newTestFileWithRecorder(meta metadata.MetadataService, cs gateway.ChunkStore, id metadata.InodeID, rec MetricsRecorder) *DFSFile {
+func newTestFileWithRecorder(meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID, rec MetricsRecorder) *DFSFile {
 	return &DFSFile{
 		meta:       meta,
 		chunkStore: cs,
@@ -81,7 +80,7 @@ func newTestFileWithRecorder(meta metadata.MetadataService, cs gateway.ChunkStor
 // the requested size, not nil, not an error.
 func TestDFSFile_Read_EmptyFile_ReturnsZeros(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	dest := make([]byte, 32)
@@ -103,7 +102,7 @@ func TestDFSFile_Read_EmptyFile_ReturnsZeros(t *testing.T) {
 // TestDFSFile_Read_PastEOF_ReturnsNil is the "offset >= size" path.
 func TestDFSFile_Read_PastEOF_ReturnsNil(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	// File size is 0 (fresh). Off=0 is "at EOF" because off >= size
@@ -126,7 +125,7 @@ func TestDFSFile_Read_PastEOF_ReturnsNil(t *testing.T) {
 // either returned zeros (fast path) or EIO.
 func TestDFSFile_Read_AfterFlush_ReadsFromChunkStore(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	// Write "hello, world!" into the buffer.
@@ -170,7 +169,7 @@ func TestDFSFile_Read_AfterFlush_ReadsFromChunkStore(t *testing.T) {
 // allocated chunk ID, and the inode's ChunkMap must have length 1.
 func TestDFSFile_Flush_AllocatesChunk(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	want := []byte("committed payload")
@@ -213,7 +212,7 @@ func TestDFSFile_Flush_AllocatesChunk(t *testing.T) {
 // payload.
 func TestDFSFile_Flush_CommitsAndSeals(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	want := []byte("check me")
@@ -253,7 +252,7 @@ func TestDFSFile_Flush_CommitsAndSeals(t *testing.T) {
 // error on the second Release (Flush).
 func TestDFSFile_Flush_Idempotent(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	if _, errno := f.Write(context.Background(), nil, []byte("abc"), 0); errno != 0 {
@@ -303,7 +302,7 @@ func TestDFSFile_Flush_Idempotent(t *testing.T) {
 // by close). It must return success without touching metadata.
 func TestDFSFile_Flush_CleanIsNoop(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	if errno := f.Flush(context.Background(), nil); errno != 0 {
@@ -328,7 +327,7 @@ func TestDFSFile_Flush_CleanIsNoop(t *testing.T) {
 // each fit in one chunk.
 func TestDFSFile_Flush_TooLarge_ReturnsEFBIG(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	// Write a payload one byte over the limit. We don't actually
@@ -363,7 +362,7 @@ func TestDFSFile_Flush_TooLarge_ReturnsEFBIG(t *testing.T) {
 // pwrite path is exercised.
 func TestDFSFile_Write_OffZero_ExtendsBuffer(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	if _, errno := f.Write(context.Background(), nil, []byte("AAA"), 0); errno != 0 {
@@ -395,7 +394,7 @@ func TestDFSFile_Write_OffZero_ExtendsBuffer(t *testing.T) {
 // pre-flush size.
 func TestDFSFile_Getattr_ReportsFlushedSize(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	want := int64(len("flushed-and-statted"))
@@ -435,7 +434,7 @@ func TestDFSFile_Getattr_ReportsFlushedSize(t *testing.T) {
 // work; commit 1.1 just makes sure Flush doesn't crash on it).
 func TestDFSFile_FullCycle_WriteFlushWriteFlush(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	if _, errno := f.Write(context.Background(), nil, []byte("first"), 0); errno != 0 {
@@ -470,7 +469,7 @@ func TestDFSFile_FullCycle_WriteFlushWriteFlush(t *testing.T) {
 // is reused across calls.
 func TestReadBufPool_ConcurrentStress(t *testing.T) {
 	meta, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	want := []byte("pool-test-data")
@@ -570,7 +569,7 @@ func TestDFSXAttr_NotFound(t *testing.T) {
 // returned ENOTDIR.
 func TestDFSFileSystem_Readdir_ListsBuckets(t *testing.T) {
 	store, _ := newTestMetaStore(t)
-	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore(), nil, nil, nil)
+	dfs := NewDFSFileSystem(store, chunkstore.NewMemoryChunkStore(), nil, nil, nil)
 	ctx := context.Background()
 
 	// Create a second bucket so we have two entries.
@@ -608,7 +607,7 @@ func TestDFSFileSystem_Readdir_ListsBuckets(t *testing.T) {
 // kernel caches it correctly.
 func TestDFSFileSystem_Lookup_ExistingBucket(t *testing.T) {
 	store, _ := newTestMetaStore(t)
-	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore(), nil, nil, nil)
+	dfs := NewDFSFileSystem(store, chunkstore.NewMemoryChunkStore(), nil, nil, nil)
 	ctx := context.Background()
 
 	bucket, err := store.GetBucket(ctx, "test")
@@ -633,7 +632,7 @@ func TestDFSFileSystem_Lookup_ExistingBucket(t *testing.T) {
 // that doesn't exist.
 func TestDFSFileSystem_Lookup_MissingBucket(t *testing.T) {
 	store, _ := newTestMetaStore(t)
-	dfs := NewDFSFileSystem(store, s3.NewMemoryChunkStore(), nil, nil, nil)
+	dfs := NewDFSFileSystem(store, chunkstore.NewMemoryChunkStore(), nil, nil, nil)
 	ctx := context.Background()
 
 	var out fuse.EntryOut
@@ -652,7 +651,7 @@ func TestDFSFileSystem_Lookup_MissingBucket(t *testing.T) {
 // EIO by the FUSE layer).
 func TestDFSFile_Open_AcquiresExclusiveLock(t *testing.T) {
 	store, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 
 	dfs := NewDFSFileSystem(store, cs, nil, nil, nil)
 	f := &DFSFile{
@@ -709,7 +708,7 @@ func TestDFSFile_Open_AcquiresExclusiveLock(t *testing.T) {
 // a writer is blocked by either reader.
 func TestDFSFile_Open_AcquiresSharedLock(t *testing.T) {
 	store, id := newTestMetaStore(t)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 
 	f1 := &DFSFile{meta: store, chunkStore: cs, inodeID: id, lockOwner: "reader-1"}
 	f2 := &DFSFile{meta: store, chunkStore: cs, inodeID: id, lockOwner: "reader-2"}
@@ -811,7 +810,7 @@ func TestDFSFile_Flush_UsesBucketPolicy(t *testing.T) {
 		TopologySpread:    metadata.SpreadNode,
 	}
 	meta, id := newTestMetaStoreWithPolicy(t, policy)
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
 	// Write and flush.
@@ -874,7 +873,7 @@ func TestDFSFile_Flush_FallsBackToDefaultOnNoBucket(t *testing.T) {
 		t.Fatalf("CreateFile: %v", err)
 	}
 
-	cs := s3.NewMemoryChunkStore()
+	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(store, cs, inode.ID)
 
 	data := []byte("orphan file")

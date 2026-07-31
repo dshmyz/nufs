@@ -52,7 +52,7 @@ func TestDiskManager_CanAdmitWrite_WithinCapacity(t *testing.T) {
 	dm, _ := newTestDiskManager(t)
 	defer dm.Stop()
 
-	err := dm.CanAdmitWrite(1024)
+	err := dm.CanAdmitWrite(0, 1024)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
@@ -63,10 +63,10 @@ func TestDiskManager_CanAdmitWrite_ExceedsCapacity(t *testing.T) {
 	defer dm.Stop()
 
 	dm.rejectPct = 0.5
-	dm.stats.UsedBytes = 60 * 1024 * 1024 * 1024  // 60GB used out of 100GB
-	dm.stats.TotalBytes = 100 * 1024 * 1024 * 1024 // 100GB total
+	dm.store.disks[0].usedBytes.Store(60 * 1024 * 1024 * 1024) // 60GB used out of 100GB
+	dm.capacities[0] = 100 * 1024 * 1024 * 1024 // 100GB total
 
-	err := dm.CanAdmitWrite(1024)
+	err := dm.CanAdmitWrite(0, 1024)
 	if err == nil {
 		t.Error("expected error for exceeded capacity")
 	}
@@ -76,9 +76,9 @@ func TestDiskManager_CanAdmitWrite_DiskFailed(t *testing.T) {
 	dm, _ := newTestDiskManager(t)
 	defer dm.Stop()
 
-	dm.diskState.Store(int64(DiskFailed))
+	dm.MarkDiskFailed(0)
 
-	err := dm.CanAdmitWrite(1024)
+	err := dm.CanAdmitWrite(0, 1024)
 	if err == nil {
 		t.Error("expected error for failed disk")
 	}
@@ -221,10 +221,10 @@ func TestDiskManager_CanAdmitWrite_DiskFailedWithNoCapacity(t *testing.T) {
 	dm, _ := newTestDiskManager(t)
 	defer dm.Stop()
 
-	dm.diskState.Store(int64(DiskFailed))
+	dm.MarkDiskFailed(0)
 	dm.stats.TotalBytes = 0 // No capacity limit
 
-	err := dm.CanAdmitWrite(1024)
+	err := dm.CanAdmitWrite(0, 1024)
 	if err == nil {
 		t.Error("expected error even without capacity limit when disk is failed")
 	}
@@ -289,7 +289,7 @@ func TestWAL_Recover_CleansCorrectChunkPath(t *testing.T) {
 	}
 
 	// Verify the chunk file exists at the correct path
-	chunkPath := cs.chunkPath(chunkID)
+	chunkPath := cs.disks[0].chunkPath(chunkID)
 	if _, err := os.Stat(chunkPath); os.IsNotExist(err) {
 		t.Fatalf("chunk file should exist at %s", chunkPath)
 	}

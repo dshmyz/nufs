@@ -14,8 +14,8 @@ import (
 
 // Proxy handles request proxying to a single cluster.
 type Proxy struct {
-	Registry  *cluster.Registry
-	cache     *cache.Cache
+	Registry *cluster.Registry
+	cache    *cache.Cache
 }
 
 // NewProxy creates a proxy with registry and cache.
@@ -29,7 +29,7 @@ func NewProxy(registry *cluster.Registry, cache *cache.Cache) *Proxy {
 // Get proxies GET request to a cluster with caching.
 func (p *Proxy) Get(ctx context.Context, clusterName, path string, result interface{}) error {
 	// Check cache first
-	cacheKey := fmt.Sprintf("%s:%s", clusterName, path)
+	cacheKey := p.cacheKey(clusterName, path)
 	if cached, ok := p.cache.Get(cacheKey); ok {
 		if result != nil {
 			if err := json.Unmarshal(cached, result); err != nil {
@@ -67,11 +67,24 @@ func (p *Proxy) Get(ctx context.Context, clusterName, path string, result interf
 	return nil
 }
 
+// GetUncached proxies a GET request without reading or populating the cache.
+func (p *Proxy) GetUncached(ctx context.Context, clusterName, path string, result interface{}) error {
+	client, ok := p.Registry.GetClient(clusterName)
+	if !ok {
+		return fmt.Errorf("%w: %s", cluster.ErrClusterNotFound, clusterName)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	return client.Get(ctx, path, result)
+}
+
 // Post proxies POST request without caching.
 func (p *Proxy) Post(ctx context.Context, clusterName, path string, body io.Reader, result interface{}) error {
 	client, ok := p.Registry.GetClient(clusterName)
 	if !ok {
-		return fmt.Errorf("cluster %s not found", clusterName)
+		return fmt.Errorf("%w: %s", cluster.ErrClusterNotFound, clusterName)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -80,22 +93,43 @@ func (p *Proxy) Post(ctx context.Context, clusterName, path string, body io.Read
 	return client.Post(ctx, path, body, result)
 }
 
-// Delete proxies DELETE request without caching.
-func (p *Proxy) Delete(ctx context.Context, clusterName, path string) error {
+// Put proxies PUT request and invalidates a cached representation on success.
+func (p *Proxy) Put(ctx context.Context, clusterName, path string, body io.Reader, result interface{}) error {
 	client, ok := p.Registry.GetClient(clusterName)
 	if !ok {
-		return fmt.Errorf("cluster %s not found", clusterName)
+		return fmt.Errorf("%w: %s", cluster.ErrClusterNotFound, clusterName)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	return client.Delete(ctx, path)
+	if err := client.Put(ctx, path, body, result); err != nil {
+		return err
+	}
+	p.invalidate(clusterName, path)
+	return nil
+}
+
+// Delete proxies DELETE request and invalidates a cached representation on success.
+func (p *Proxy) Delete(ctx context.Context, clusterName, path string) error {
+	client, ok := p.Registry.GetClient(clusterName)
+	if !ok {
+		return fmt.Errorf("%w: %s", cluster.ErrClusterNotFound, clusterName)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	if err := client.Delete(ctx, path); err != nil {
+		return err
+	}
+	p.invalidate(clusterName, path)
+	return nil
 }
 
 // RawGet returns raw JSON bytes for GET request (used by aggregator).
 func (p *Proxy) RawGet(ctx context.Context, clusterName, path string) (json.RawMessage, error) {
-	cacheKey := fmt.Sprintf("%s:%s", clusterName, path)
+	cacheKey := p.cacheKey(clusterName, path)
 	if cached, ok := p.cache.Get(cacheKey); ok {
 		return json.RawMessage(cached), nil
 	}
@@ -115,4 +149,12 @@ func (p *Proxy) RawGet(ctx context.Context, clusterName, path string) (json.RawM
 
 	p.cache.Set(cacheKey, raw)
 	return raw, nil
+}
+
+func (p *Proxy) cacheKey(clusterName, path string) string {
+	return fmt.Sprintf("%s:%s", clusterName, path)
+}
+
+func (p *Proxy) invalidate(clusterName, path string) {
+	p.cache.Delete(p.cacheKey(clusterName, path))
 }
