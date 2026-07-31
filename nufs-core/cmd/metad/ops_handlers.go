@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -80,6 +81,7 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/cluster/readiness", s.handleClusterReadiness)
+	mux.HandleFunc("/api/v1/cluster/balance", s.handleClusterBalance)
 	mux.HandleFunc("/api/v1/metrics", s.handleMetrics)
 
 	// Admin — read-only, no leader check
@@ -193,6 +195,87 @@ func (h *opsHandlers) handleClusterReadiness(w http.ResponseWriter, _ *http.Requ
 	json.NewEncoder(w).Encode(r)
 }
 
+// handleClusterBalance returns per-node and per-disk capacity utilization,
+// plus an aggregate imbalance score. This lets operators see at a glance
+// whether rebalancing is needed.
+func (h *opsHandlers) handleClusterBalance(w http.ResponseWriter, _ *http.Request) {
+	ctx := context.Background()
+	nodes, err := h.store.ListNodes(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(nodes) == 0 {
+		writeJSON(w, map[string]interface{}{"nodes": []interface{}{}, "imbalance": 0})
+		return
+	}
+
+	type nodeBalance struct {
+		ID       metadata.NodeID `json:"id"`
+		Addr     string          `json:"addr"`
+		CapGB    int64           `json:"capacity_gb"`
+		UsedGB   int64           `json:"used_gb"`
+		UsedPct  float64         `json:"used_pct"`
+		Tier     string          `json:"tier"`
+		Online   bool            `json:"online"`
+	}
+
+	var totalUsed, totalCap int64
+	var minPct, maxPct float64
+	minPct = 1.0
+	nodeBalances := make([]nodeBalance, 0, len(nodes))
+
+	for _, n := range nodes {
+		capGB := n.CapacityGB
+		usedGB := n.UsedGB
+		var usedPct float64
+		if capGB > 0 {
+			usedPct = float64(usedGB) / float64(capGB)
+		}
+		totalUsed += usedGB
+		totalCap += capGB
+		if usedPct < minPct {
+			minPct = usedPct
+		}
+		if usedPct > maxPct {
+			maxPct = usedPct
+		}
+		nodeBalances = append(nodeBalances, nodeBalance{
+			ID: n.ID, Addr: n.Addr, CapGB: capGB, UsedGB: usedGB,
+			UsedPct: usedPct, Tier: tierName(n.Tier), Online: n.State == metadata.NodeOnline,
+		})
+	}
+
+	imbalance := maxPct - minPct
+	var recommendation string
+	switch {
+	case imbalance < 0.10:
+		recommendation = "balanced"
+	case imbalance < 0.25:
+		recommendation = "slightly imbalanced"
+	case imbalance < 0.50:
+		recommendation = "imbalanced — consider rebalancing"
+	default:
+		recommendation = "severely imbalanced — rebalancing recommended"
+	}
+
+	var totalPct float64
+	if totalCap > 0 {
+		totalPct = float64(totalUsed) / float64(totalCap)
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"nodes":         nodeBalances,
+		"total_used_gb": totalUsed,
+		"total_cap_gb":  totalCap,
+		"total_used_pct": totalPct,
+		"imbalance":     imbalance,
+		"min_used_pct":  minPct,
+		"max_used_pct":  maxPct,
+		"recommendation": recommendation,
+	})
+}
+
 func (h *opsHandlers) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if h.bundle.Metrics != nil {
 		data, _ := json.Marshal(h.bundle.Metrics.Snapshot())
@@ -239,4 +322,19 @@ func writeJSONErrorC(w http.ResponseWriter, code int, errCode, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg, "code": errCode})
+}
+
+func tierName(t metadata.StorageTier) string {
+	switch t {
+	case metadata.TierHot:
+		return "hot"
+	case metadata.TierWarm:
+		return "warm"
+	case metadata.TierCold:
+		return "cold"
+	case metadata.TierArchive:
+		return "archive"
+	default:
+		return "any"
+	}
 }
