@@ -1505,7 +1505,6 @@ func (s *PebbleStore) CreateFile(ctx context.Context, parent InodeID, name strin
 	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", inodeID)})
 	return meta, nil
 }
-
 func (s *PebbleStore) Unlink(ctx context.Context, parent InodeID, name string) error {
 	if s.closed.Load() {
 		return ErrServiceClosed
