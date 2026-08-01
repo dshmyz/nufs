@@ -5,12 +5,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path"
 	"sync"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -126,7 +126,7 @@ func New(cfg *Config, options ...Option) (*S3FileSystem, error) {
 	// Start metrics server.
 	if cfg.MetricsAddr != "" {
 		mfs.metricsSrv = StartMetricsServer(cfg.MetricsAddr)
-		log.Printf("s3fs: metrics server listening on %s", cfg.MetricsAddr)
+		slog.Info("s3fs: metrics server listening", "addr", cfg.MetricsAddr)
 	}
 
 	// Recover pending uploads from previous crash.
@@ -293,7 +293,7 @@ func (fsys *S3FileSystem) moveOp(op *MoveOperation) {
 		})
 	})
 	if delErr != nil {
-		log.Printf("s3fs WARNING: rename copy succeeded but delete of %s failed: %s", op.Source, delErr)
+		slog.Warn("s3fs: rename ok but delete failed", "source", op.Source, "error", delErr)
 	}
 	op.Error <- nil
 }
@@ -351,7 +351,7 @@ func (fsys *S3FileSystem) recoverPending() {
 	if err != nil || len(entries) == 0 {
 		return
 	}
-	log.Printf("s3fs: recovering %d pending upload(s)", len(entries))
+	slog.Info("s3fs: recovering pending uploads", "count", len(entries))
 	for _, pu := range entries {
 		f, err := os.Open(pu.CachePath)
 		if err != nil {
@@ -372,12 +372,12 @@ func (fsys *S3FileSystem) recoverPending() {
 		})
 		f.Close()
 		if err != nil {
-			log.Printf("s3fs WARNING: recovery upload %s failed: %s", pu.RemotePath, err)
+			slog.Warn("s3fs: recovery upload failed", "path", pu.RemotePath, "error", err)
 			continue
 		}
 		os.Remove(pu.CachePath)
 		fsys.cache.ClearPending(pu.CachePath)
-		log.Printf("s3fs: recovered %s", pu.RemotePath)
+		slog.Info("s3fs: recovered upload", "path", pu.RemotePath)
 	}
 }
 

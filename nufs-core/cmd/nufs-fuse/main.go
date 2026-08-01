@@ -36,7 +36,7 @@ import (
 func main() {
 	var (
 		configPath = flag.String("config", "", "Path to YAML config file")
-		backend    = flag.String("backend", "dfs", "Backend: dfs (distributed filesystem) or s3 (external S3 bucket)")
+		backend    = flag.String("backend", "nufs", "Backend: dfs (distributed filesystem) or s3 (external S3 bucket)")
 
 		// DFS backend flags
 		metaDir  = flag.String("meta-dir", "/var/lib/dfs/metadata", "DFS: Pebble metadata directory (local mode)")
@@ -81,13 +81,13 @@ func main() {
 	log := logging.Named("nufs-fuse")
 
 	switch *backend {
-	case "dfs":
+	case "nufs":
 		mountpoint := mountpointFromArgs(flag.Args())
-		runDFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir, *dfsCacheQuota, *dfsMetricsAddr)
+		runNUFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir, *dfsCacheQuota, *dfsMetricsAddr)
 	case "s3":
 		runS3(log, flag.Args(), *cacheDir, *scanTTL, *readOnly, *cacheQuota, *metricsAddr, *insecure, *debug, *uid, *gid)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown backend: %q (use dfs or s3)\n", *backend)
+		fmt.Fprintf(os.Stderr, "unknown backend: %q (use nufs or s3)\n", *backend)
 		os.Exit(1)
 	}
 }
@@ -102,8 +102,8 @@ func mountpointFromArgs(args []string) string {
 	return args[0]
 }
 
-// runDFS mounts the DFS distributed filesystem via FUSE.
-func runDFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, cacheQuota int64, metricsAddr string) {
+// runNUFS mounts the DFS distributed filesystem via FUSE.
+func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, cacheQuota int64, metricsAddr string) {
 	if _, err := os.Stat(mountpoint); os.IsNotExist(err) {
 		if err := os.MkdirAll(mountpoint, 0755); err != nil {
 			log.Error("failed to create mountpoint", "mountpoint", mountpoint, "error", err)
@@ -170,7 +170,7 @@ func runDFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, ca
 	}
 	defer server.Unmount()
 
-	log.Info("mounted", "mountpoint", mountpoint, "backend", "dfs")
+	log.Info("mounted", "mountpoint", mountpoint, "backend", "nufs")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

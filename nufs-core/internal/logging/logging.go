@@ -17,10 +17,13 @@ package logging
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"sync/atomic"
 	"time"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // Config configures the global logger.
@@ -28,9 +31,14 @@ type Config struct {
 	Level     string // debug, info, warn, error
 	JSON      bool   // true = JSON output, false = text
 	AddSource bool   // include source file/line
+	LogFile   string // path to log file (empty = stderr). File is auto-rotated.
+	MaxSize   int64  // max log file size in bytes before rotation (default 100MB)
+	MaxBackups int   // max rotated files to keep (default 7)
 }
 
 // Init initializes the global logger. Must be called once at startup.
+// If Config.LogFile is set, logs are written to that file with automatic
+// rotation (default 100MB, 7 backups). Otherwise logs go to stderr.
 func Init(cfg Config) {
 	var level slog.Level
 	switch cfg.Level {
@@ -47,11 +55,24 @@ func Init(cfg Config) {
 	opts := &slog.HandlerOptions{Level: &dynamicLevel, AddSource: cfg.AddSource}
 	dynamicLevel.Set(level)
 
+	var w io.Writer
+	if cfg.LogFile != "" {
+		w = &lumberjack.Logger{
+			Filename:   cfg.LogFile,
+			MaxSize:    int(cfg.MaxSize / 1024 / 1024), // lumberjack uses MB
+			MaxBackups: cfg.MaxBackups,
+			MaxAge:     30, // days
+			Compress:   true,
+		}
+	} else {
+		w = os.Stderr
+	}
+
 	var h slog.Handler
 	if cfg.JSON {
-		h = slog.NewJSONHandler(os.Stderr, opts)
+		h = slog.NewJSONHandler(w, opts)
 	} else {
-		h = slog.NewTextHandler(os.Stderr, opts)
+		h = slog.NewTextHandler(w, opts)
 	}
 	slog.SetDefault(slog.New(h))
 }
