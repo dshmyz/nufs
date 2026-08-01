@@ -1,0 +1,646 @@
+package segment
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/example/dfs/datanode/storage"
+	"github.com/example/dfs/datanode/storage/index"
+	"github.com/example/dfs/datanode/storage/journal"
+)
+
+// Store implements storage.Store for a single commit stream on one disk
+// (V2.1 §6.4). It owns one active segment and its single-fsync group
+// commit: append records + BatchCommit, one fdatasync, then update the
+// committed-delta overlay and acknowledge. Pebble is a derived index
+// applied asynchronously after the durability point.
+//
+// V2.1 durability model (§6.1):
+//
+//	1. reserve offset in active segment
+//	2. append record header + frame index + frames + trailer
+//	3. append BatchCommit for the group
+//	4. one fdatasync on the segment
+//	5. apply committed locations to the bounded in-memory delta overlay
+//	6. return DurableReceipt for every request in the commit
+//	7. apply mutations asynchronously to Pebble
+//
+// BatchCommit is the foreground durability point. Pebble may lag the
+// committed sequence but never lead it; recovery replays committed
+// segment records, and a Pebble entry beyond the last committed
+// sequence is invalid and removed.
+type Store struct {
+	mu         sync.Mutex
+	alloc      *Allocator
+	writer     *Writer
+	writerPath string
+
+	// index is the derived location index (Pebble). The committed-delta
+	// overlay is the read authority until async apply catches up.
+	index  *index.Index
+	overlay *Overlay
+
+	// streamID distinguishes small (0) from data (1) commit streams.
+	streamID uint8
+	// streamSeq is the stream-local commit sequence (monotonic).
+	streamSeq uint64
+
+	nextSeg uint64
+	segDir  string
+
+	// Async Pebble apply queue.
+	applyCh chan []index.Mutation
+	stopCh  chan struct{}
+	applyWG sync.WaitGroup
+
+	// Safe-sequence tracking for INDEX_SAFE flush (§7.4).
+	pendingFlush  atomic.Uint64
+	flushInterval time.Duration
+
+	faults storage.FaultHook
+}
+
+// Config configures a Store.
+type Config struct {
+	Dir          string // disk root
+	SegmentSize  int64  // 0 = DefaultDataSegmentSize
+	IndexMemSize uint64
+	UseMemIndex  bool // in-memory index (tests)
+	Faults       storage.FaultHook
+	// StreamID is the commit-stream ID (0=small, 1=data).
+	StreamID uint8
+}
+
+// New opens (creating if needed) a Store for one commit stream.
+//
+// On restart it recovers: Pebble reopens (persisted), and committed
+// segment records after the safe sequence are replayed into the overlay
+// (recovery module). Segment IDs are seeded past surviving files.
+func New(cfg Config) (*Store, error) {
+	segDir := filepath.Join(cfg.Dir, "segments", streamClassDir(cfg.StreamID), "active")
+	if err := os.MkdirAll(segDir, 0755); err != nil {
+		return nil, err
+	}
+	ix, err := index.Open(index.Options{
+		Dir:          filepath.Join(cfg.Dir, "index"),
+		MemTableSize: cfg.IndexMemSize,
+		UseInMemory:  cfg.UseMemIndex,
+	})
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{
+		index:       ix,
+		overlay:     NewOverlay(),
+		segDir:      filepath.Join(cfg.Dir, "segments"),
+		streamID:    cfg.StreamID,
+		faults:      cfg.Faults,
+		applyCh:     make(chan []index.Mutation, 256),
+		stopCh:      make(chan struct{}),
+		flushInterval: 2 * time.Second,
+	}
+	s.applyWG.Add(1)
+	go s.applyLoop()
+
+	// V2.1 recovery: replay committed segment-log records from the
+	// active segment into the overlay, and truncate uncommitted tail
+	// data (§7.5 step 4-6). A committed record absent from Pebble is
+	// replayed here; a Pebble entry beyond the last committed sequence
+	// is invalid and reads consult the overlay first, so it is shadowed.
+	if err := s.recoverActiveSegment(filepath.Join(segDir, fmt.Sprintf("%d.seg", maxSegmentID(segDir)))); err != nil {
+		ix.Close()
+		return nil, err
+	}
+
+	segSize := cfg.SegmentSize
+	if segSize <= 0 {
+		segSize = storage.DefaultDataSegmentSize
+	}
+	s.nextSeg = maxSegmentID(segDir)
+	if err := s.newActiveSegment(classForStream(cfg.StreamID), segSize); err != nil {
+		ix.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// recoverActiveSegment replays committed records from an active segment
+// into the overlay. If the segment does not exist (fresh disk), it is a
+// no-op.
+func (s *Store) recoverActiveSegment(path string) error {
+	if path == "" || !fileExists(path) {
+		return nil
+	}
+	_, err := RecoverFromSegmentLog(path, s.streamID, s.overlay, func(d CommitDescriptor) error {
+		// Replay into the overlay (read authority). Committed-but-
+		// unflushed records are served from the overlay until the async
+		// apply loop or a later flush persists them to Pebble.
+		s.overlay.Put(index.Key(d.ExtentID, d.Generation), index.Value{
+			SegmentID:  d.SegmentID,
+			Offset:     d.Offset,
+			StoredLen:  d.StoredLen,
+			LogicalLen: d.LogicalLen,
+			State:      storage.ExtentDurable,
+			Checksum:   0, // checksum not in the descriptor; verified on read
+		})
+		return nil
+	})
+	return err
+}
+
+// fileExists reports whether a file exists.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func streamClassDir(streamID uint8) string {
+	if streamID == 0 {
+		return "small"
+	}
+	return "data"
+}
+
+func classForStream(streamID uint8) storage.SegmentClass {
+	if streamID == 0 {
+		return storage.SegmentSmall
+	}
+	return storage.SegmentData
+}
+
+// newActiveSegment creates a fresh active segment and opens its writer.
+func (s *Store) newActiveSegment(class storage.SegmentClass, segSize int64) error {
+	s.nextSeg++
+	segID := storage.SegmentID(s.nextSeg)
+	dir := filepath.Join(s.segDir, streamClassDir(s.streamID), "active")
+	path := filepath.Join(dir, fmt.Sprintf("%d.seg", segID))
+	w, err := OpenWriter(path)
+	if err != nil {
+		return err
+	}
+	var hdr SegmentHeader
+	hdr.Magic = storage.SegmentMagic
+	hdr.Version = storage.FormatVersion
+	hdr.ID = segID
+	hdr.SegmentClass = class
+	hb := make([]byte, SegmentHeaderSize)
+	if err := hdr.Encode(hb); err != nil {
+		w.Close()
+		return err
+	}
+	if _, err := w.f.WriteAt(hb, 0); err != nil {
+		w.Close()
+		return err
+	}
+	s.alloc = NewAllocator(segID, class, segSize, nowUnixNano())
+	s.writer = w
+	s.writerPath = path
+	return nil
+}
+
+// maxSegmentID returns the largest segment file ID in a directory.
+func maxSegmentID(dir string) uint64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var max uint64
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".seg") {
+			continue
+		}
+		idStr := strings.TrimSuffix(name, ".seg")
+		var id uint64
+		if _, err := fmt.Sscanf(idStr, "%d", &id); err == nil && id > max {
+			max = id
+		}
+	}
+	return max
+}
+
+// Write implements storage.Store.Write (V2.1 §6.1 single barrier).
+func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.DurableReceipt, error) {
+	// Phase 0: idempotency + generation fencing against the overlay
+	// (read authority) and the derived index.
+	if v, err := s.lookup(req.ExtentID, req.Generation); err == nil {
+		if v.Checksum == checksumOf(req.Data) {
+			return s.receiptFor(req, v), nil
+		}
+		return nil, storage.ErrStaleGeneration
+	} else if err != storage.ErrExtentNotFound {
+		return nil, err
+	}
+
+	if err := s.faultStage(storage.CrashBeforeBatchAppend); err != nil {
+		return nil, err
+	}
+
+	// Phase 1: reserve an offset.
+	payloadCRC := checksumOf(req.Data)
+	storedLen := uint32(len(req.Data))
+	frameSize := DefaultFrameSize
+	frameCRCs, err := BuildFrames(req.Data, frameSize)
+	if err != nil {
+		return nil, err
+	}
+	frameCount := len(frameCRCs)
+	framing := RecordFraming(storedLen, frameSize, frameCount)
+	// BatchCommit is appended at the end of the batch; the allocator
+	// also needs room for it.
+	commitLen := uint32(journal.BatchCommitSize)
+
+	s.mu.Lock()
+	// Reserve the record then the BatchCommit, atomically for the batch.
+	off, err := s.alloc.Reserve(framing, req.ExtentID, storedLen)
+	if err != nil {
+		s.mu.Unlock()
+		if err == storage.ErrSegmentFull {
+			if serr := s.sealActiveLocked(); serr != nil {
+				return nil, serr
+			}
+			off, err = s.alloc.Reserve(framing, req.ExtentID, storedLen)
+		}
+		if err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
+	// Reserve BatchCommit space immediately after the record.
+	if _, err := s.alloc.ReserveCommit(commitLen); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	segID := s.alloc.State().SegmentID
+	streamSeq := s.streamSeq
+	s.streamSeq++
+	writer := s.writer
+	s.mu.Unlock()
+
+	// Phase 2: append record (header + frame index + frames + trailer).
+	header := &RecordHeader{
+		Magic:      storage.RecordMagic,
+		Version:    storage.FormatVersion,
+		ExtentID:   req.ExtentID,
+		Generation: req.Generation,
+		LogicalLen: storedLen,
+		StoredLen:  storedLen,
+		Codec:      storage.CompressionNone,
+		KeyID:      req.KeyID,
+		FrameSize:  uint16(frameSize),
+		FrameCount: uint16(frameCount),
+	}
+	// Build frame-index bytes.
+	idxBuf := make([]byte, frameCount*FrameIndexEntrySize)
+	var fi FrameIndex
+	offset := uint32(0)
+	for i, crc := range frameCRCs {
+		fi.Entries = append(fi.Entries, FrameIndexEntry{Offset: offset, CRC: crc})
+		offset += uint32(frameSize)
+		if i == frameCount-1 {
+			// last frame may be shorter; offset derived below
+		}
+	}
+	// Recompute last-frame offset for a non-multiple payload.
+	if frameCount > 0 {
+		lastLen := uint32(len(req.Data)) - uint32((frameCount-1)*frameSize)
+		fi.Entries[frameCount-1].Offset = uint32((frameCount - 1) * frameSize)
+		_ = lastLen
+	}
+	if err := fi.Encode(idxBuf); err != nil {
+		return nil, err
+	}
+	header.FrameIndexCRC = fi.CRC
+
+	if _, err := writer.WriteRecordFramed(off, header, idxBuf, req.Data, frameSize); err != nil {
+		return nil, err
+	}
+	if err := s.faultStage(storage.CrashAfterRecordAppend); err != nil {
+		return nil, err
+	}
+	if err := s.faultStage(storage.CrashAfterFrameIndex); err != nil {
+		return nil, err
+	}
+
+	// Phase 3: append BatchCommit (the durability point).
+	commitOffset := off + int64(framing)
+	bc := &journal.BatchCommit{
+		Magic:        journal.BatchCommitMagic,
+		Version:      storage.FormatVersion,
+		StreamID:     s.streamID,
+		Seq:          streamSeq + 1,
+		RecordCount:  1,
+		FirstOffset:  off,
+		LastOffset:   commitOffset,
+		DescriptorsCRC: checksumOf(req.Data),
+	}
+	if err := writer.WriteBatchCommit(commitOffset, bc); err != nil {
+		return nil, err
+	}
+	if err := s.faultStage(storage.CrashAfterBatchCommitWrite); err != nil {
+		return nil, err
+	}
+
+	// Phase 4: ONE fdatasync covers payloads + BatchCommit (§6.1 step 5).
+	if err := writer.Sync(); err != nil {
+		return nil, err
+	}
+	if err := s.faultStage(storage.CrashAfterBatchSync); err != nil {
+		return nil, err
+	}
+
+	// Phase 5: apply committed location to the bounded overlay so
+	// immediate reads observe the write (§6.4).
+	if err := s.faultStage(storage.CrashBeforeOverlayApply); err != nil {
+		return nil, err
+	}
+	s.overlay.Put(index.Key(req.ExtentID, req.Generation), index.Value{
+		SegmentID:  segID,
+		Offset:     off,
+		StoredLen:  storedLen,
+		LogicalLen: uint32(len(req.Data)),
+		State:      storage.ExtentDurable,
+		Checksum:   payloadCRC,
+	})
+	if err := s.faultStage(storage.CrashAfterOverlayApply); err != nil {
+		return nil, err
+	}
+
+	// Phase 6: schedule async Pebble apply (§6.1 step 8). The batch is
+	// already durable; a crash here loses only the derived index, which
+	// recovery rebuilds from the segment.
+	s.enqueueApply([]index.Mutation{{
+		ExtentID:   req.ExtentID,
+		Generation: req.Generation,
+		Value: index.Value{
+			SegmentID:  segID,
+			Offset:     off,
+			StoredLen:  storedLen,
+			LogicalLen: uint32(len(req.Data)),
+			State:      storage.ExtentDurable,
+			Checksum:   payloadCRC,
+		},
+	}})
+
+	return &storage.DurableReceipt{
+		ExtentID:   req.ExtentID,
+		Generation: req.Generation,
+		SegmentID:  segID,
+		Offset:     off,
+		StoredLen:  storedLen,
+		LogicalLen: uint32(len(req.Data)),
+		Seq:        streamSeq + 1,
+	}, nil
+}
+
+// lookup checks the overlay (read authority) first, then the derived
+// index, matching the V2.1 read path (§6.4).
+func (s *Store) lookup(extentID storage.ExtentID, generation storage.Generation) (*index.Value, error) {
+	if v, ok := s.overlay.Get(index.Key(extentID, generation)); ok {
+		return &v, nil
+	}
+	return s.index.Get(extentID, generation)
+}
+
+// Read implements storage.Store.Read. Range reads fetch and
+// authenticate only intersecting frames (§8).
+func (s *Store) Read(_ context.Context, req *storage.ReadRequest) (*storage.ReadResult, error) {
+	v, err := s.lookup(req.ExtentID, req.Generation)
+	if err != nil {
+		return nil, err
+	}
+	if v.State == storage.ExtentTombstoned {
+		return nil, storage.ErrExtentNotFound
+	}
+	if v.State == storage.ExtentCorrupt {
+		return nil, storage.ErrQuarantined
+	}
+	path := filepath.Join(s.segDir, streamClassDir(s.streamID), "active", fmt.Sprintf("%d.seg", v.SegmentID))
+	rd, err := OpenReader(path)
+	if err != nil {
+		return nil, storage.ErrSegmentUnavailable
+	}
+	defer rd.Close()
+
+	var payload []byte
+	if req.Length > 0 {
+		payload, err = rd.ReadRangeFrames(v.Offset, v.StoredLen, v.LogicalLen, req.LogicalOffset, req.Length)
+	} else {
+		payload, err = rd.ReadPayloadFrames(v.Offset, v.StoredLen, v.LogicalLen)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &storage.ReadResult{Data: payload, Checksum: v.Checksum}, nil
+}
+
+// Delete implements storage.Store.Delete (generation-fenced). A
+// tombstone is appended and committed in the stream, synced once,
+// before acknowledging (§10.1).
+func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
+	v, err := s.lookup(req.ExtentID, req.Generation)
+	if err != nil {
+		if err == storage.ErrExtentNotFound {
+			return nil // already gone
+		}
+		return err
+	}
+	// Append tombstone + BatchCommit in one barrier.
+	// (Full tombstone-batch support lands with compaction in phase 4;
+	// here we mark the overlay/index directly after a durable commit.)
+	if _, err := s.appendTombstone(req.ExtentID, req.Generation, v); err != nil {
+		return err
+	}
+	v.State = storage.ExtentTombstoned
+	s.overlay.Put(index.Key(req.ExtentID, req.Generation), *v)
+	return s.enqueueApply([]index.Mutation{{ExtentID: req.ExtentID, Generation: req.Generation, Value: *v}})
+}
+
+// appendTombstone appends a tombstone BatchCommit to the stream.
+func (s *Store) appendTombstone(extentID storage.ExtentID, gen storage.Generation, v *index.Value) (*storage.DurableReceipt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Reserve a tombstone marker (a zero-length record + BatchCommit).
+	// Tombstones carry the old location for generation fencing.
+	// Simplification: a single committed BatchCommit records the delete.
+	bc := &journal.BatchCommit{
+		Magic:       journal.BatchCommitMagic,
+		Version:     storage.FormatVersion,
+		StreamID:    s.streamID,
+		Seq:         s.streamSeq + 1,
+		RecordCount: 1,
+		FirstOffset: v.Offset,
+		LastOffset:  v.Offset,
+		DescriptorsCRC: checksumOf(nil),
+	}
+	buf := make([]byte, journal.BatchCommitSize)
+	if err := bc.Encode(buf); err != nil {
+		return nil, err
+	}
+	// Append at the current tail.
+	tail, err := s.alloc.CurrentTail()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.writer.WriteAt(buf, tail); err != nil {
+		return nil, err
+	}
+	if err := s.writer.Sync(); err != nil {
+		return nil, err
+	}
+	s.streamSeq++
+	s.alloc.Consume(journal.BatchCommitSize)
+	return &storage.DurableReceipt{ExtentID: extentID, Generation: gen, SegmentID: v.SegmentID, Offset: v.Offset, Seq: s.streamSeq}, nil
+}
+
+// Stat implements storage.Store.Stat.
+func (s *Store) Stat(_ context.Context, req *storage.StatRequest) (*storage.StatResult, error) {
+	v, err := s.lookup(req.ExtentID, req.Generation)
+	if err != nil {
+		return nil, err
+	}
+	return &storage.StatResult{
+		SegmentID:  v.SegmentID,
+		Offset:     v.Offset,
+		StoredLen:  v.StoredLen,
+		LogicalLen: v.LogicalLen,
+		State:      v.State,
+		Checksum:   v.Checksum,
+	}, nil
+}
+
+// Index exposes the derived index.
+func (s *Store) Index() *index.Index { return s.index }
+
+// Overlay exposes the committed-delta overlay.
+func (s *Store) Overlay() *Overlay { return s.overlay }
+
+// Close flushes pending index applies and closes the store. It is a
+// durability barrier: any committed overlay entries not yet applied to
+// Pebble are flushed synchronously before the DB closes, so no
+// acknowledged write is lost across a clean shutdown.
+func (s *Store) Close() error {
+	// Drain any queued async applies.
+	close(s.stopCh)
+	s.applyWG.Wait()
+	// Flush the committed-delta overlay into Pebble synchronously.
+	muts := s.overlay.Drain()
+	if len(muts) > 0 {
+		if err := s.applyNow(muts); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.writer != nil {
+		s.writer.Close()
+	}
+	return s.index.Close()
+}
+
+// sealActiveLocked seals the current active segment (V2.1 §7.2):
+// drains the batch, appends footer + SEAL_SEGMENT in one committed
+// batch, syncs once, then opens a fresh active segment.
+func (s *Store) sealActiveLocked() error {
+	st := s.alloc.State()
+	footer := &SegmentFooter{
+		Magic:         storage.SegmentMagic,
+		Version:       storage.FormatVersion,
+		RecordCount:   st.RecordCount,
+		TotalPayload:  uint64(st.PayloadBytes),
+		MinExtentID:   st.MinExtent,
+		MaxExtentID:   st.MaxExtent,
+		LastCommittedSeq: st.LastCommitSeq,
+		CreatedAtUnix: st.CreatedAt,
+		SealedAtUnix:  nowUnixNano(),
+	}
+	if err := s.writer.WriteFooter(st.NextOffset, footer); err != nil {
+		return err
+	}
+	if err := s.writer.Sync(); err != nil {
+		return err
+	}
+	return s.newActiveSegment(st.Class, st.NextOffset)
+}
+
+// enqueueApply schedules an async Pebble mutation. A crash here (after
+// ack, before Pebble apply) loses only the derived index, which
+// recovery rebuilds from the committed segment log. Close() drains the
+// overlay into Pebble, so an unqueued mutation here is still durable
+// via the segment log + overlay.
+func (s *Store) enqueueApply(muts []index.Mutation) error {
+	if err := s.faultStage(storage.CrashAfterAck); err != nil {
+		return err
+	}
+	select {
+	case s.applyCh <- muts:
+		return nil
+	default:
+		// Channel full: apply synchronously to avoid unbounded backlog.
+		return s.applyNow(muts)
+	}
+}
+
+// applyNow applies mutations to Pebble.
+func (s *Store) applyNow(muts []index.Mutation) error {
+	batch := s.index.NewBatch()
+	defer batch.Close()
+	for _, m := range muts {
+		if err := s.index.PutBatch(batch, m.ExtentID, m.Generation, &m.Value); err != nil {
+			return err
+		}
+	}
+	return s.index.ApplyBatch(batch)
+}
+
+// applyLoop drains the async apply queue.
+func (s *Store) applyLoop() {
+	defer s.applyWG.Done()
+	for {
+		select {
+		case muts := <-s.applyCh:
+			_ = s.applyNow(muts)
+		case <-s.stopCh:
+			// Drain any remaining queued mutations before exiting.
+			for {
+				select {
+				case muts := <-s.applyCh:
+					_ = s.applyNow(muts)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// faultStage consults the injected fault hook, if any.
+func (s *Store) faultStage(point storage.CrashPoint) error {
+	if s.faults != nil {
+		return s.faults.OnStage(point)
+	}
+	return nil
+}
+
+// receiptFor constructs a receipt from an existing index entry.
+func (s *Store) receiptFor(req *storage.WriteRequest, v *index.Value) *storage.DurableReceipt {
+	return &storage.DurableReceipt{
+		ExtentID:   req.ExtentID,
+		Generation: req.Generation,
+		SegmentID:  v.SegmentID,
+		Offset:     v.Offset,
+		StoredLen:  v.StoredLen,
+		LogicalLen: v.LogicalLen,
+		Seq:        s.streamSeq,
+	}
+}
+
+func checksumOf(data []byte) uint32 {
+	return crc32ChecksumIEEE(data)
+}

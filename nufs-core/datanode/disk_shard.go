@@ -32,9 +32,10 @@ type diskShard struct {
 
 	// Per-disk usage and health, read by DiskManager.PickDisk /
 	// CanAdmitWrite to spread writes and isolate failed disks.
-	usedBytes   atomic.Int64
-	failed      atomic.Bool
-	writeErrors atomic.Int64 // consecutive write errors; marks disk failed at threshold
+	usedBytes    atomic.Int64
+	chunkCount   atomic.Int64 // mirror of the global count, per disk
+	failed       atomic.Bool
+	writeErrors  atomic.Int64 // consecutive write errors; marks disk failed at threshold
 
 	// File descriptor cache for hot chunks (per-disk so fds never cross
 	// disk boundaries). Uses LRU eviction to bound open file descriptors.

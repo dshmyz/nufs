@@ -834,18 +834,39 @@ func (ss *ShardedStore) DeleteChunk(ctx context.Context, chunkID ChunkID) error 
 }
 
 func (ss *ShardedStore) ReportChunkState(ctx context.Context, nodeID NodeID, states map[ChunkID]ReplicaState) error {
-	// Route each chunk to its shard
+	// Group states by target shard so each shard is written once with a
+	// batched update instead of one conditional write per chunk.
+	byShard := make(map[ShardID]map[ChunkID]ReplicaState)
 	for chunkID, state := range states {
-		store, err := ss.routeToShard(shardKeyForChunk(chunkID))
+		sid := ss.ring.Route(shardKeyForChunk(chunkID))
+		m := byShard[sid]
+		if m == nil {
+			m = make(map[ChunkID]ReplicaState)
+			byShard[sid] = m
+		}
+		m[chunkID] = state
+	}
+	for sid, group := range byShard {
+		store, err := ss.routeToShardID(sid)
 		if err != nil {
 			return err
 		}
-		singleState := map[ChunkID]ReplicaState{chunkID: state}
-		if err := store.ReportChunkState(ctx, nodeID, singleState); err != nil {
+		if err := store.ReportChunkState(ctx, nodeID, group); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// routeToShardID returns the store registered for a shard ID.
+func (ss *ShardedStore) routeToShardID(sid ShardID) (*PebbleStore, error) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	store, ok := ss.shards[sid]
+	if !ok {
+		return nil, fmt.Errorf("sharded store: shard %d not available", sid)
+	}
+	return store, nil
 }
 
 // --- NodeService ---
@@ -864,10 +885,21 @@ func (ss *ShardedStore) Heartbeat(ctx context.Context, nodeID NodeID, report *No
 	if ss.throttle != nil && !ss.throttle.Allow(nodeID) {
 		return ErrTooManyRequests
 	}
-	// Broadcast to all shards
-	return ss.forEachShard(func(s *PebbleStore) error {
-		return s.Heartbeat(ctx, nodeID, report)
+	// Nodes are replicated on every shard (for placement), so liveness/
+	// load must be broadcast. Chunk states are routed per shard instead
+	// of broadcast, so each shard only writes the chunks it owns.
+	var livenessErr error
+	ss.forEachShard(func(s *PebbleStore) error {
+		livenessErr = s.HeartbeatLiveness(ctx, nodeID, report)
+		return livenessErr
 	})
+	if livenessErr != nil {
+		return livenessErr
+	}
+	if report != nil && len(report.ChunkStates) > 0 {
+		return ss.ReportChunkState(ctx, nodeID, report.ChunkStates)
+	}
+	return nil
 }
 
 // SetNodeThrottle installs or replaces the registration/heartbeat rate

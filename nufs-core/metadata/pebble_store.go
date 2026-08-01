@@ -2474,6 +2474,20 @@ func (s *PebbleStore) triggerAutoRebalance() {
 }
 
 func (s *PebbleStore) Heartbeat(ctx context.Context, nodeID NodeID, report *NodeReport) error {
+	if err := s.HeartbeatLiveness(ctx, nodeID, report); err != nil {
+		return err
+	}
+	if report != nil && len(report.ChunkStates) > 0 {
+		return s.ReportChunkState(ctx, nodeID, report.ChunkStates)
+	}
+	return nil
+}
+
+// HeartbeatLiveness updates node liveness, load, and placement state
+// without touching chunk replica state. The ShardedStore splits a
+// heartbeat into a liveness broadcast (all shards, for placement) and a
+// per-shard chunk-state update, so it can call this directly.
+func (s *PebbleStore) HeartbeatLiveness(ctx context.Context, nodeID NodeID, report *NodeReport) error {
 	if s.closed.Load() {
 		return ErrServiceClosed
 	}
@@ -2506,9 +2520,6 @@ func (s *PebbleStore) Heartbeat(ctx context.Context, nodeID NodeID, report *Node
 	}
 	s.placement.UpdateNode(&info)
 	s.publishNodeEvent(key, &info)
-	if report != nil && len(report.ChunkStates) > 0 {
-		return s.ReportChunkState(ctx, nodeID, report.ChunkStates)
-	}
 	return nil
 }
 

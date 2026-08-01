@@ -36,6 +36,13 @@ type ChunkStore struct {
 	totalBytes atomic.Int64
 	chunkCount atomic.Int64
 
+	// stateVersion counts every change to a chunk's State that would
+	// alter the replica state the heartbeat reports (new chunk, seal,
+	// rewrite, corruption, delete). Heartbeat reads it to skip the
+	// O(N) ListChunks scan when nothing has changed since the last
+	// report. Guarded by mu.
+	stateVersion uint64
+
 	// At-rest encryption layer (nil = encryption disabled). Process-level,
 	// shared across all disks.
 	encryptor *crypto.Encryptor
@@ -324,8 +331,10 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) (writeErr err
 		disk.usedBytes.Add(-existing.Size)
 	} else {
 		cs.chunkCount.Add(1)
+		disk.chunkCount.Add(1)
 	}
 	cs.chunks[chunkID] = info
+	cs.stateVersion++
 	cs.mu.Unlock()
 
 	cs.totalBytes.Add(int64(len(data)))
@@ -513,9 +522,11 @@ func (cs *ChunkStore) WriteBatch(reqs []WriteChunkReq) (batchErr error) {
 			disk.usedBytes.Add(-existing.Size)
 		} else {
 			cs.chunkCount.Add(1)
+			disk.chunkCount.Add(1)
 		}
 		cs.chunks[of.req.ChunkID] = info
 	}
+	cs.stateVersion++
 	cs.mu.Unlock()
 
 	for _, of := range openFiles {
@@ -609,6 +620,7 @@ func (cs *ChunkStore) WriteAt(chunkID metadata.ChunkID, offset int64, data []byt
 	if info, ok := cs.chunks[chunkID]; ok {
 		info.State = LocalWritten
 		info.Checksum = 0
+		cs.stateVersion++
 	}
 	cs.mu.Unlock()
 
@@ -777,6 +789,7 @@ func (cs *ChunkStore) Seal(chunkID metadata.ChunkID) (uint32, error) {
 	}
 	info.State = LocalSealed
 	info.Checksum = checksum
+	cs.stateVersion++
 	cs.mu.Unlock()
 
 	// Persist CRC to file header so Read can verify it.
@@ -813,7 +826,9 @@ func (cs *ChunkStore) Delete(chunkID metadata.ChunkID) error {
 		cs.totalBytes.Add(-info.Size)
 		cs.chunkCount.Add(-1)
 		disk.usedBytes.Add(-info.Size)
+		disk.chunkCount.Add(-1)
 		delete(cs.chunks, chunkID)
+		cs.stateVersion++
 	}
 	cs.mu.Unlock()
 
@@ -854,6 +869,39 @@ func (cs *ChunkStore) Stats() (totalBytes int64, chunkCount int64) {
 	return cs.totalBytes.Load(), cs.chunkCount.Load()
 }
 
+// StateVersion returns a counter incremented on every chunk state change
+// (new chunk, seal, rewrite, corruption, delete). A stable value between
+// calls means the reported replica-state set is unchanged, so heartbeat
+// can skip rebuilding it.
+func (cs *ChunkStore) StateVersion() uint64 {
+	<-cs.scanDone
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.stateVersion
+}
+
+// ChunkStateSnapshot returns the current replica-state view of every local
+// chunk, mapped to the ReplicaState heartbeat reports. Built in one pass
+// under the store lock; heartbeat caches it and only rebuilds when
+// StateVersion changes.
+func (cs *ChunkStore) ChunkStateSnapshot() map[metadata.ChunkID]metadata.ReplicaState {
+	<-cs.scanDone
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	out := make(map[metadata.ChunkID]metadata.ReplicaState, len(cs.chunks))
+	for id, info := range cs.chunks {
+		switch info.State {
+		case LocalSealed:
+			out[id] = metadata.ReplicaReady
+		case LocalCorrupt:
+			out[id] = metadata.ReplicaFailed
+		default:
+			out[id] = metadata.ReplicaSyncing
+		}
+	}
+	return out
+}
+
 // DiskStatsItem holds per-disk usage and health, used by the heartbeat
 // reporter and the management interface.
 type DiskStatsItem struct {
@@ -871,16 +919,10 @@ func (cs *ChunkStore) DiskStats() []DiskStatsItem {
 		result[i] = DiskStatsItem{
 			Index:      i,
 			UsedBytes:  d.usedBytes.Load(),
+			ChunkCount: d.chunkCount.Load(),
 			Failed:     d.failed.Load(),
 		}
 	}
-	cs.mu.RLock()
-	for _, info := range cs.chunks {
-		if info.DiskIndex >= 0 && info.DiskIndex < len(result) {
-			result[info.DiskIndex].ChunkCount++
-		}
-	}
-	cs.mu.RUnlock()
 	return result
 }
 
@@ -979,6 +1021,20 @@ func (cs *ChunkStore) scanExisting() error {
 		cs.totalBytes.Add(r.totalBytes)
 		cs.chunkCount.Add(r.chunkCount)
 	}
+	// Track per-disk chunk counts for DiskStats (was previously derived
+	// by scanning the global index every call). The caller holds
+	// cs.mu, so no extra lock is needed here.
+	for _, d := range cs.disks {
+		d.chunkCount.Store(0)
+	}
+	for _, info := range cs.chunks {
+		if info.DiskIndex >= 0 && info.DiskIndex < len(cs.disks) {
+			cs.disks[info.DiskIndex].chunkCount.Add(1)
+		}
+	}
+	// Initial index is complete and consistent; heartbeat deltas now have
+	// a stable baseline version to diff against.
+	cs.stateVersion++
 	return nil
 }
 
@@ -1012,7 +1068,8 @@ func (cs *ChunkStore) AddDisk(dir string, maxWrites, maxReads int, wal *WriteAhe
 	}
 	// Phase 1: scan the new disk (reads only the filesystem, no global state).
 	chunks, totalBytes, chunkCount := shard.scanShard()
-	shard.usedBytes.Store(totalBytes) // track pre-existing usage for PickDisk
+	shard.usedBytes.Store(totalBytes)  // track pre-existing usage for PickDisk
+	shard.chunkCount.Store(chunkCount) // track pre-existing count for DiskStats
 
 	// Phase 2: append + merge under lock (fast map insert).
 	cs.mu.Lock()
@@ -1142,6 +1199,8 @@ func (cs *ChunkStore) MigrateChunk(chunkID metadata.ChunkID, targetIdx int) erro
 	cs.mu.Unlock()
 	src.usedBytes.Add(-int64(len(data)))
 	dst.usedBytes.Add(int64(len(data)))
+	src.chunkCount.Add(-1)
+	dst.chunkCount.Add(1)
 
 	// 5. Delete from source.
 	os.Remove(srcPath)
