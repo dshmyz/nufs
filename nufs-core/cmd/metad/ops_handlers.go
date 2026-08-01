@@ -82,7 +82,7 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/cluster/readiness", s.handleClusterReadiness)
 	mux.HandleFunc("/api/v1/cluster/balance", s.handleClusterBalance)
-	mux.HandleFunc("/api/v1/cluster/transfer-leader", mut(s.handleTransferLeader))
+	mux.HandleFunc("/api/v1/cluster/leader", mut(s.handleTransferLeader))
 	mux.HandleFunc("/api/v1/metrics", s.handleMetrics)
 
 	// Admin — read-only, no leader check
@@ -341,7 +341,7 @@ func tierName(t metadata.StorageTier) string {
 }
 
 // handleTransferLeader transfers Raft leadership to another node.
-// POST /api/v1/cluster/transfer-leader?node_id=meta-2
+// POST /api/v1/cluster/leader?node_id=meta-2
 // If node_id is empty, lets Raft pick the best candidate.
 func (h *opsHandlers) handleTransferLeader(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
