@@ -354,3 +354,59 @@ per-disk 指标通过 heartbeat 的 `DiskStats` 字段上报到 metadata。
 5. 向 metadata 重新注册（旧的 N 个 NodeID 变为 1 个）
 
 **注意**：迁移期间旧的子进程 NodeID 会过期被摘除，新的 JBOD NodeID 注册后接管。
+
+### 生产安全校验
+
+metad 启动时自动校验：
+
+```bash
+# 无 token / 无 TLS / 单节点 → 启动失败
+metad --data-dir=/var/lib/dfs/metadata
+# Error: production config validation failed:
+#   - production JWT secret is empty or uses a dev default
+#   - production Raft requires at least 3 nodes
+#   - production TLS is required
+
+# 开发环境跳过校验
+metad --data-dir=/tmp/test --allow-insecure-dev --raft=false
+```
+
+必须满足：JWT token 非空 + TLS 启用 + Raft ≥ 3 节点。`--allow-insecure-dev` 可跳过。
+
+### nufs-cli 远程管理（不需要 SSH）
+
+```bash
+# 集群状态
+nufs-cli nodes
+nufs-cli balance
+
+# 磁盘管理（--node 指定目标 datanode 地址）
+nufs-cli disk status --node=10.0.0.1:8091
+nufs-cli disk adopt /new-disk --node=10.0.0.1:8091
+nufs-cli disk retire /bad-disk --node=10.0.0.1:8091
+nufs-cli disk decommission /old-disk --node=10.0.0.1:8091
+nufs-cli disk drain --node=10.0.0.1:8091
+nufs-cli disk verify /disk1 --node=10.0.0.1:8091
+
+# Raft 领导权切换（维护前切换 leader）
+nufs-cli leader              # 查看当前 leader
+nufs-cli leader meta-2       # 切换到 meta-2（~1-2s，期间写请求重试）
+```
+
+### 滚动重启流程
+
+```bash
+# 1. 切换 Raft leader 到非目标节点
+nufs-cli leader meta-2
+
+# 2. drain 目标节点（停写，等进行中写完成）
+nufs-cli disk drain --node=10.0.0.1:8091
+
+# 3. 安全重启
+ssh target-node
+systemctl restart nufs-datanode
+
+# 4. 验证恢复
+nufs-cli disk status --node=10.0.0.1:8091
+# 确认所有盘 online + chunks 数稳定
+```

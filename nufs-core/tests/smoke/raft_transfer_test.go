@@ -53,17 +53,19 @@ func TestRaft_LeadershipTransfer(t *testing.T) {
 	oldLeader := leader.ID
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-	timeout := time.After(5 * time.Second)
+	waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer waitCancel()
 	newLeader := leader
 	for {
 		select {
-		case <-timeout:
+		case <-waitCtx.Done():
 			t.Fatalf("leader did not change from %s within 5s", oldLeader)
 		case <-ticker.C:
-			candidate := cluster.WaitForLeader(t, context.Background())
-			if candidate.ID != oldLeader {
-				newLeader = candidate
-				goto done
+			for _, candidate := range cluster.Nodes {
+				if candidate.Store != nil && candidate.Store.IsLeader() && candidate.ID != oldLeader {
+					newLeader = candidate
+					goto done
+				}
 			}
 		}
 	}
