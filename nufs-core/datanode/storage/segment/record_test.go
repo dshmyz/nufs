@@ -69,9 +69,9 @@ func TestRecordTrailerGolden(t *testing.T) {
 
 func TestFrameIndexRoundtrip(t *testing.T) {
 	fi := FrameIndex{Entries: []FrameIndexEntry{
-		{Offset: 0, CRC: 1},
-		{Offset: 1024, CRC: 2},
-		{Offset: 2048, CRC: 3},
+		{Offset: 0, StoredLen: 100, Codec: storage.CompressionNone, CRC: 1},
+		{Offset: 100, StoredLen: 200, Codec: storage.CompressionZstd, CRC: 2},
+		{Offset: 300, StoredLen: 150, Codec: storage.CompressionNone, CRC: 3},
 	}}
 	buf := make([]byte, len(fi.Entries)*FrameIndexEntrySize)
 	if err := fi.Encode(buf); err != nil {
@@ -81,7 +81,7 @@ func TestFrameIndexRoundtrip(t *testing.T) {
 	if err := decoded.Decode(buf, fi.CRC); err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded.Entries) != 3 || decoded.Entries[1].CRC != 2 {
+	if len(decoded.Entries) != 3 || decoded.Entries[1].CRC != 2 || decoded.Entries[1].Codec != storage.CompressionZstd {
 		t.Fatalf("frame index mismatch: %+v", decoded.Entries)
 	}
 	// Wrong CRC must fail.
@@ -125,9 +125,9 @@ func TestFrameCRCFailure(t *testing.T) {
 }
 
 func TestRecordFramingV21(t *testing.T) {
-	// header(50) + index(2 entries × 8) + payload(4096) + trailer(12)
+	// header(50) + index(2 entries × 13) + payload(4096) + trailer(12)
 	got := RecordFraming(4096, 2048, 2)
-	if got != 50+16+4096+12 {
-		t.Fatalf("RecordFraming = %d, want %d", got, 50+16+4096+12)
+	if got != 50+26+4096+12 {
+		t.Fatalf("RecordFraming = %d, want %d", got, 50+26+4096+12)
 	}
 }

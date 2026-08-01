@@ -4,6 +4,7 @@ import (
 	"os"
 
 	"github.com/example/dfs/datanode/storage"
+	"github.com/example/dfs/datanode/storage/encryption"
 )
 
 // Reader reads and validates records from a segment via pread.
@@ -15,10 +16,18 @@ type Reader struct {
 	path string
 	// SizeBytes is the sealed size; used to bound reads.
 	sizeBytes int64
+	// enc is the record encryption registry (nil = plaintext).
+	enc *encryption.KeyRegistry
 }
 
 // OpenReader opens a segment for reading.
 func OpenReader(path string) (*Reader, error) {
+	return OpenReaderWithEnc(path, nil)
+}
+
+// OpenReaderWithEnc opens a segment for reading with an encryption
+// registry so encrypted records can be decrypted.
+func OpenReaderWithEnc(path string, enc *encryption.KeyRegistry) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -28,7 +37,7 @@ func OpenReader(path string) (*Reader, error) {
 		f.Close()
 		return nil, err
 	}
-	return &Reader{f: f, path: path, sizeBytes: st.Size()}, nil
+	return &Reader{f: f, path: path, sizeBytes: st.Size(), enc: enc}, nil
 }
 
 // ReadPayloadFrames reads and validates the full record payload,
@@ -67,7 +76,7 @@ func (r *Reader) ReadRangeFrames(offset int64, storedLen uint32, logicalLen uint
 
 // readRecord reads header + frame index + frames + trailer and verifies
 // all checksums. It returns the decoded header, frame index, and the
-// concatenated payload.
+// concatenated frame payloads (compressed frames are decompressed).
 func (r *Reader) readRecord(offset int64, storedLen uint32, logicalLen uint32) (*RecordHeader, *FrameIndex, []byte, uint32, error) {
 	// Read the header first to learn the frame layout.
 	if offset < int64(SegmentHeaderSize) {
@@ -81,15 +90,11 @@ func (r *Reader) readRecord(offset int64, storedLen uint32, logicalLen uint32) (
 	if err := header.Decode(hb); err != nil {
 		return nil, nil, nil, 0, err
 	}
-	if header.StoredLen != storedLen || header.LogicalLen != logicalLen {
+	if header.LogicalLen != logicalLen {
 		return nil, nil, nil, 0, storage.ErrIndexCorrupt
 	}
 
-	frameSize := header.EffectiveFrameSize()
 	frameCount := int(header.FrameCount)
-	if frameCount == 0 {
-		frameCount = (int(storedLen) + frameSize - 1) / frameSize
-	}
 	indexBytes := frameCount * FrameIndexEntrySize
 	idxBuf := make([]byte, indexBytes)
 	if _, err := r.f.ReadAt(idxBuf, offset+int64(RecordHeaderSize)); err != nil {
@@ -100,31 +105,69 @@ func (r *Reader) readRecord(offset int64, storedLen uint32, logicalLen uint32) (
 		return nil, nil, nil, 0, err
 	}
 
-	// Frames start after the index.
+	// Frames start after the index. Sum the stored frame lengths; this
+	// must match the header's stored length.
 	firstFrameOff := offset + int64(RecordHeaderSize) + int64(indexBytes)
-	if firstFrameOff+int64(storedLen)+int64(RecordTrailerSize) > r.sizeBytes {
+	var totalStored int64
+	for _, e := range fi.Entries {
+		totalStored += int64(e.StoredLen)
+	}
+	if totalStored != int64(storedLen) {
 		return nil, nil, nil, 0, storage.ErrIndexCorrupt
 	}
-	payload := make([]byte, storedLen)
-	if _, err := r.f.ReadAt(payload, firstFrameOff); err != nil {
+	if firstFrameOff+totalStored+int64(RecordTrailerSize) > r.sizeBytes {
+		return nil, nil, nil, 0, storage.ErrIndexCorrupt
+	}
+	raw := make([]byte, totalStored)
+	if _, err := r.f.ReadAt(raw, firstFrameOff); err != nil {
 		return nil, nil, nil, 0, err
 	}
 
-	// Verify each frame's CRC.
-	frameSizeInt := frameSize
-	for i, entry := range fi.Entries {
-		start := i * frameSizeInt
-		end := start + frameSizeInt
-		if end > int(len(payload)) {
-			end = len(payload)
+	// Read and validate each frame individually, decrypting and then
+	// decompressing frames (§5.3: compression and encryption are
+	// independent per frame).
+	var decKey []byte
+	if header.KeyID != 0 {
+		if r.enc == nil {
+			return nil, nil, nil, 0, storage.ErrDecryptFailed
 		}
-		if err := VerifyFrameCRC(payload[start:end], entry.CRC); err != nil {
+		var err error
+		decKey, err = r.enc.ResolveNumeric(header.KeyID)
+		if err != nil {
 			return nil, nil, nil, 0, err
 		}
 	}
+	payload := make([]byte, 0, logicalLen)
+	for _, e := range fi.Entries {
+		frame := raw[e.Offset : e.Offset+uint32(e.StoredLen)]
+		if err := VerifyFrameCRC(frame, e.CRC); err != nil {
+			return nil, nil, nil, 0, err
+		}
+		if decKey != nil {
+			open, err := DecryptFrame(decKey, frame)
+			if err != nil {
+				return nil, nil, nil, 0, err
+			}
+			frame = open
+		}
+		var logical []byte
+		if e.Codec == storage.CompressionZstd {
+			dec, err := DecompressFrame(frame)
+			if err != nil {
+				return nil, nil, nil, 0, err
+			}
+			logical = dec
+		} else {
+			logical = frame
+		}
+		payload = append(payload, logical...)
+	}
+	if uint32(len(payload)) != logicalLen {
+		return nil, nil, nil, 0, storage.ErrIndexCorrupt
+	}
 
 	// Verify the trailer.
-	trailerOff := firstFrameOff + int64(storedLen)
+	trailerOff := firstFrameOff + totalStored
 	tr := make([]byte, RecordTrailerSize)
 	if _, err := r.f.ReadAt(tr, trailerOff); err != nil {
 		return nil, nil, nil, 0, err
@@ -133,8 +176,8 @@ func (r *Reader) readRecord(offset int64, storedLen uint32, logicalLen uint32) (
 	if err := trailer.Decode(tr); err != nil {
 		return nil, nil, nil, 0, err
 	}
-	want := RecordFraming(header.StoredLen, frameSize, frameCount)
-	if trailer.FramingLen != want {
+	framing := RecordHeaderSize + indexBytes + int(totalStored) + RecordTrailerSize
+	if trailer.FramingLen != uint32(framing) {
 		return nil, nil, nil, 0, storage.ErrIndexCorrupt
 	}
 

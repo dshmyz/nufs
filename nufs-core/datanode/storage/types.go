@@ -185,6 +185,18 @@ var (
 
 // ========== Crash-point injection ==========
 
+// Reloc is one record's new location after compaction (§10.3). It lives
+// in the storage root so both the segment store and the maintenance
+// compactor can reference it without an import cycle.
+type Reloc struct {
+	ExtentID   ExtentID
+	Generation Generation
+	SegmentID  SegmentID
+	Offset     int64
+	StoredLen  uint32
+	LogicalLen uint32
+}
+
 // CrashPoint identifies a durable operation stage where a crash can be
 // injected (V2.1 §18.2). The order mirrors the V2.1 write transaction
 // (§6.1): a batch is appended, BatchCommit written, one sync executes,

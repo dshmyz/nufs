@@ -13,6 +13,7 @@ import (
 	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/datanode/storage/index"
 	"github.com/example/dfs/datanode/storage/journal"
+	"github.com/example/dfs/datanode/storage/encryption"
 )
 
 // Store implements storage.Store for a single commit stream on one disk
@@ -63,6 +64,9 @@ type Store struct {
 	pendingFlush  atomic.Uint64
 	flushInterval time.Duration
 
+	// enc is the record encryption registry (nil = plaintext).
+	enc *encryption.KeyRegistry
+
 	faults storage.FaultHook
 }
 
@@ -75,6 +79,8 @@ type Config struct {
 	Faults       storage.FaultHook
 	// StreamID is the commit-stream ID (0=small, 1=data).
 	StreamID uint8
+	// Enc is the record encryption registry (nil = plaintext).
+	Enc *encryption.KeyRegistry
 }
 
 // New opens (creating if needed) a Store for one commit stream.
@@ -101,6 +107,7 @@ func New(cfg Config) (*Store, error) {
 		segDir:      filepath.Join(cfg.Dir, "segments"),
 		streamID:    cfg.StreamID,
 		faults:      cfg.Faults,
+		enc:         cfg.Enc,
 		applyCh:     make(chan []index.Mutation, 256),
 		stopCh:      make(chan struct{}),
 		flushInterval: 2 * time.Second,
@@ -244,14 +251,27 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 
 	// Phase 1: reserve an offset.
 	payloadCRC := checksumOf(req.Data)
-	storedLen := uint32(len(req.Data))
 	frameSize := DefaultFrameSize
-	frameCRCs, err := BuildFrames(req.Data, frameSize)
+	// Decide compression from the sampling rule (§9).
+	compressed := ShouldCompress(len(req.Data), SampledBytes(req.Data, 4096))
+	// Resolve the active encryption key (nil when encryption is off).
+	var encKey []byte
+	keyID := uint64(0)
+	if s.enc != nil && s.enc.Enabled() {
+		kid, key, err := s.enc.ActiveKey()
+		if err != nil {
+			return nil, err
+		}
+		encKey = key
+		keyID = kid
+	}
+	storedBytes, fi, codec, _, err := BuildFramedRecord(req.Data, frameSize, compressed, encKey)
 	if err != nil {
 		return nil, err
 	}
-	frameCount := len(frameCRCs)
-	framing := RecordFraming(storedLen, frameSize, frameCount)
+	storedLen := uint32(len(storedBytes))
+	frameCount := len(fi.Entries)
+	framing := uint32(RecordHeaderSize) + uint32(frameCount*FrameIndexEntrySize) + storedLen + uint32(RecordTrailerSize)
 	// BatchCommit is appended at the end of the batch; the allocator
 	// also needs room for it.
 	commitLen := uint32(journal.BatchCommitSize)
@@ -289,36 +309,21 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 		Version:    storage.FormatVersion,
 		ExtentID:   req.ExtentID,
 		Generation: req.Generation,
-		LogicalLen: storedLen,
+		LogicalLen: uint32(len(req.Data)),
 		StoredLen:  storedLen,
-		Codec:      storage.CompressionNone,
-		KeyID:      req.KeyID,
+		Codec:      codec,
+		KeyID:      keyID,
 		FrameSize:  uint16(frameSize),
 		FrameCount: uint16(frameCount),
 	}
-	// Build frame-index bytes.
+	// Serialize the frame index.
 	idxBuf := make([]byte, frameCount*FrameIndexEntrySize)
-	var fi FrameIndex
-	offset := uint32(0)
-	for i, crc := range frameCRCs {
-		fi.Entries = append(fi.Entries, FrameIndexEntry{Offset: offset, CRC: crc})
-		offset += uint32(frameSize)
-		if i == frameCount-1 {
-			// last frame may be shorter; offset derived below
-		}
-	}
-	// Recompute last-frame offset for a non-multiple payload.
-	if frameCount > 0 {
-		lastLen := uint32(len(req.Data)) - uint32((frameCount-1)*frameSize)
-		fi.Entries[frameCount-1].Offset = uint32((frameCount - 1) * frameSize)
-		_ = lastLen
-	}
 	if err := fi.Encode(idxBuf); err != nil {
 		return nil, err
 	}
 	header.FrameIndexCRC = fi.CRC
 
-	if _, err := writer.WriteRecordFramed(off, header, idxBuf, req.Data, frameSize); err != nil {
+	if _, err := writer.WriteRecordFramed(off, header, idxBuf, storedBytes, frameSize); err != nil {
 		return nil, err
 	}
 	if err := s.faultStage(storage.CrashAfterRecordAppend); err != nil {
@@ -399,6 +404,142 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 	}, nil
 }
 
+// AppendRecord writes a payload into the active segment and commits it,
+// returning the new durable location. Used by the compactor to move live
+// records (§10.3 step 3). The codec is passed through so already-
+// compressed records are not recompressed; encryption uses the store's
+// active key.
+func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, data []byte, codec storage.CompressionCodec) (*storage.Reloc, error) {
+	// Resolve the active encryption key (nil when encryption is off).
+	var encKey []byte
+	keyID := uint64(0)
+	if s.enc != nil && s.enc.Enabled() {
+		kid, key, err := s.enc.ActiveKey()
+		if err != nil {
+			return nil, err
+		}
+		encKey = key
+		keyID = kid
+	}
+	// Compaction preserves the original stored bytes: when the codec is
+	// already zstd, the data is compressed per-frame and must not be
+	// re-compressed. BuildFramedRecord(compressed=false) stores frames
+	// verbatim with the given codec on the record header.
+	frameSize := DefaultFrameSize
+	storedBytes, fi, _, _, err := BuildFramedRecord(data, frameSize, codec == storage.CompressionZstd, encKey)
+	if err != nil {
+		return nil, err
+	}
+	storedLen := uint32(len(storedBytes))
+	frameCount := len(fi.Entries)
+	framing := uint32(RecordHeaderSize) + uint32(frameCount*FrameIndexEntrySize) + storedLen + uint32(RecordTrailerSize)
+
+	s.mu.Lock()
+	off, err := s.alloc.Reserve(framing, extentID, storedLen)
+	if err != nil {
+		s.mu.Unlock()
+		if err == storage.ErrSegmentFull {
+			if serr := s.sealActiveLocked(); serr != nil {
+				return nil, serr
+			}
+			off, err = s.alloc.Reserve(framing, extentID, storedLen)
+		}
+		if err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
+	if _, err := s.alloc.ReserveCommit(uint32(journal.BatchCommitSize)); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	segID := s.alloc.State().SegmentID
+	streamSeq := s.streamSeq
+	s.streamSeq++
+	writer := s.writer
+	s.mu.Unlock()
+
+	header := &RecordHeader{
+		Magic:      storage.RecordMagic,
+		Version:    storage.FormatVersion,
+		ExtentID:   extentID,
+		Generation: gen,
+		LogicalLen: uint32(len(data)),
+		StoredLen:  storedLen,
+		Codec:      codec,
+		KeyID:      keyID,
+		FrameSize:  uint16(frameSize),
+		FrameCount: uint16(frameCount),
+	}
+	idxBuf := make([]byte, frameCount*FrameIndexEntrySize)
+	if err := fi.Encode(idxBuf); err != nil {
+		return nil, err
+	}
+	header.FrameIndexCRC = fi.CRC
+	if _, err := writer.WriteRecordFramed(off, header, idxBuf, storedBytes, frameSize); err != nil {
+		return nil, err
+	}
+	commitOffset := off + int64(framing)
+	bc := &journal.BatchCommit{
+		Magic:          journal.BatchCommitMagic,
+		Version:        storage.FormatVersion,
+		StreamID:       s.streamID,
+		Seq:            streamSeq + 1,
+		RecordCount:    1,
+		FirstOffset:    off,
+		LastOffset:     commitOffset,
+		DescriptorsCRC: checksumOf(data),
+	}
+	if err := writer.WriteBatchCommit(commitOffset, bc); err != nil {
+		return nil, err
+	}
+	if err := writer.Sync(); err != nil {
+		return nil, err
+	}
+
+	// Update the overlay so immediate reads observe the relocation.
+	s.overlay.Put(index.Key(extentID, gen), index.Value{
+		SegmentID:  segID,
+		Offset:     off,
+		StoredLen:  storedLen,
+		LogicalLen: uint32(len(data)),
+		State:      storage.ExtentDurable,
+		Checksum:   checksumOf(data),
+	})
+	s.enqueueApply([]index.Mutation{{
+		ExtentID:   extentID,
+		Generation: gen,
+		Value: index.Value{
+			SegmentID:  segID,
+			Offset:     off,
+			StoredLen:  storedLen,
+			LogicalLen: uint32(len(data)),
+			State:      storage.ExtentDurable,
+			Checksum:   checksumOf(data),
+		},
+	}})
+	s.alloc.RecordCommit(streamSeq + 1)
+
+	return &storage.Reloc{ExtentID: extentID, Generation: gen, SegmentID: segID, Offset: off, StoredLen: storedLen, LogicalLen: uint32(len(data))}, nil
+}
+
+// Relocate updates the derived index and overlay for records moved by
+// compaction (§10.3 step 6), applying only if the old location still
+// matches.
+func (s *Store) Relocate(relocs []storage.Reloc) error {
+	for _, r := range relocs {
+		s.overlay.Put(index.Key(r.ExtentID, r.Generation), index.Value{
+			SegmentID:  r.SegmentID,
+			Offset:     r.Offset,
+			StoredLen:  r.StoredLen,
+			LogicalLen: r.LogicalLen,
+			State:      storage.ExtentDurable,
+			Checksum:   0,
+		})
+	}
+	return nil
+}
+
 // lookup checks the overlay (read authority) first, then the derived
 // index, matching the V2.1 read path (§6.4).
 func (s *Store) lookup(extentID storage.ExtentID, generation storage.Generation) (*index.Value, error) {
@@ -422,7 +563,7 @@ func (s *Store) Read(_ context.Context, req *storage.ReadRequest) (*storage.Read
 		return nil, storage.ErrQuarantined
 	}
 	path := filepath.Join(s.segDir, streamClassDir(s.streamID), "active", fmt.Sprintf("%d.seg", v.SegmentID))
-	rd, err := OpenReader(path)
+	rd, err := OpenReaderWithEnc(path, s.enc)
 	if err != nil {
 		return nil, storage.ErrSegmentUnavailable
 	}

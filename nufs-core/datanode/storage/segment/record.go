@@ -32,7 +32,7 @@ const RecordHeaderSize = 4 + 1 + 8 + 8 + 4 + 4 + 1 + 8 + 2 + 2 + 4 + 4 // 50
 const RecordTrailerSize = 8 + 4 // 12
 
 // FrameIndexEntrySize is the fixed on-disk size of one frame-index entry.
-const FrameIndexEntrySize = 4 + 4 // offset + crc
+const FrameIndexEntrySize = 4 + 4 + 1 + 4 // offset + stored_len + codec + crc
 
 // RecordHeader is the fixed-size header of one record (V2.1 §5.3).
 type RecordHeader struct {
@@ -121,11 +121,18 @@ func (h *RecordHeader) EffectiveFrameSize() int {
 }
 
 // FrameIndexEntry locates one frame within a record. Offsets are
-// relative to the first frame byte (after the frame index).
+// relative to the first frame byte (after the frame index). For
+// compressed records the stored length is needed to delimit frames;
+// for uncompressed records it equals the frame size.
 type FrameIndexEntry struct {
 	// Offset is the byte offset of the frame's payload start relative
 	// to the record's first frame byte.
 	Offset uint32
+	// StoredLen is the stored length of this frame.
+	StoredLen uint32
+	// Codec is the compression codec applied to THIS frame (independent
+	// per-frame compression, §5.3).
+	Codec storage.CompressionCodec
 	// CRC is the frame payload CRC32C.
 	CRC uint32
 }
@@ -146,8 +153,11 @@ func (fi *FrameIndex) Encode(dst []byte) error {
 		return fmt.Errorf("storage: frame index buffer too small")
 	}
 	for i, e := range fi.Entries {
-		binary.BigEndian.PutUint32(dst[i*FrameIndexEntrySize:i*FrameIndexEntrySize+4], e.Offset)
-		binary.BigEndian.PutUint32(dst[i*FrameIndexEntrySize+4:i*FrameIndexEntrySize+8], e.CRC)
+		base := i * FrameIndexEntrySize
+		binary.BigEndian.PutUint32(dst[base:base+4], e.Offset)
+		binary.BigEndian.PutUint32(dst[base+4:base+8], e.StoredLen)
+		dst[base+8] = byte(e.Codec)
+		binary.BigEndian.PutUint32(dst[base+9:base+13], e.CRC)
 	}
 	fi.CRC = crc32.ChecksumIEEE(dst[0:need])
 	return nil
@@ -161,8 +171,10 @@ func (fi *FrameIndex) Decode(src []byte, expectedCRC uint32) error {
 	fi.Entries = fi.Entries[:0]
 	for i := 0; i < len(src); i += FrameIndexEntrySize {
 		fi.Entries = append(fi.Entries, FrameIndexEntry{
-			Offset: binary.BigEndian.Uint32(src[i : i+4]),
-			CRC:    binary.BigEndian.Uint32(src[i+4 : i+8]),
+			Offset:    binary.BigEndian.Uint32(src[i : i+4]),
+			StoredLen: binary.BigEndian.Uint32(src[i+4 : i+8]),
+			Codec:     storage.CompressionCodec(src[i+8]),
+			CRC:       binary.BigEndian.Uint32(src[i+9 : i+13]),
 		})
 	}
 	got := crc32.ChecksumIEEE(src)
