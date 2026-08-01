@@ -2944,6 +2944,16 @@ func (s *PebbleStore) SetRaftNode(node *RaftNode) {
 	s.raft = node
 }
 
+// TransferLeadership initiates a Raft leadership transfer. If targetID is
+// empty, Raft automatically selects the best candidate. Returns once the
+// transfer is initiated (the new leader may take 1-2 election timeouts).
+func (s *PebbleStore) TransferLeadership(targetID string) error {
+	if s.raft == nil {
+		return fmt.Errorf("raft not enabled")
+	}
+	return s.raft.TransferLeadership(targetID)
+}
+
 // IsLeader returns true if this node is the Raft leader.
 func (s *PebbleStore) IsLeader() bool {
 	if s.raft == nil {
