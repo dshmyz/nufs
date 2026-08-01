@@ -62,6 +62,7 @@ func main() {
 		tlsRequireClientCert = flag.Bool("tls-require-client-cert", false, "Require clients to present a certificate signed by tls-ca")
 		tlsSkipVerify        = flag.Bool("tls-skip-verify", false, "Skip TLS server certificate verification (dev only)")
 		authToken            = flag.String("auth-token", "", "Bearer token for ops API auth (empty = no auth)")
+	allowInsecureDev    = flag.Bool("allow-insecure-dev", false, "Allow running without auth, TLS, or multi-node Raft (dev only)")
 		backupEnabled        = flag.Bool("backup-enabled", false, "Enable leader-only metadata backups")
 		backupLocalDir       = flag.String("backup-local-dir", "/var/lib/dfs/backup-tmp", "Local temporary directory for metadata backups")
 		backupInterval       = flag.Duration("backup-interval", time.Hour, "Metadata backup interval")
@@ -115,6 +116,24 @@ func main() {
 
 	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})
 	log := logging.Named("metad")
+
+	// Production safety validation: ensure auth, TLS, and Raft are configured
+	// before starting the service. Can be bypassed with --allow-insecure-dev.
+	raftNodeCount := 1
+	if *enableRaft && *raftBootstrapPeers != "" {
+		raftNodeCount = len(parsePeerOpsURLsForValidation(*raftBootstrapPeers)) + 1
+	}
+	if err := metadata.ValidateProductionConfig(metadata.ProductionValidationConfig{
+		Mode:             metadata.RuntimeProduction,
+		JWTSecret:        *authToken,
+		RaftNodeCount:    raftNodeCount,
+		TLSEnabled:       *tlsCert != "",
+		AllowInsecureDev: *allowInsecureDev,
+	}); err != nil {
+		log.Error("production config validation failed", "error", err)
+		os.Exit(1)
+	}
+
 	log.Info("starting metadata service", "node_id", nodeIDValue, "data", *dataDir)
 	log.Info("runtime", "go", runtime.Version(), "os", runtime.GOOS, "arch", runtime.GOARCH)
 	log.Info("version", "version", version.Version, "git_commit", version.GitCommit, "build_time", version.BuildTime)
@@ -720,4 +739,34 @@ func normalizeBackupS3Prefix(prefix string) (string, error) {
 		}
 	}
 	return normalized, nil
+}
+
+// parsePeerOpsURLsForValidation counts Raft peer nodes from the bootstrap peers string.
+func parsePeerOpsURLsForValidation(peers string) []string {
+	if peers == "" {
+		return nil
+	}
+	var result []string
+	for i, start := 0, 0; ; i++ {
+		idx := indexOfByte(peers[start:], ',')
+		if idx < 0 {
+			part := peers[start:]
+			if part != "" {
+				result = append(result, part)
+			}
+			break
+		}
+		result = append(result, peers[start:start+idx])
+		start += idx + 1
+	}
+	return result
+}
+
+func indexOfByte(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
 }

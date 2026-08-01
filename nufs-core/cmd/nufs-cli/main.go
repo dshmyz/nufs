@@ -598,7 +598,7 @@ func (a *remoteAPI) cmdTransferLeader(targetID string) {
 	json.Unmarshal(leaderResp, &status)
 	fmt.Printf("Current leader: %s\n", status.LeaderURI)
 
-	path := "/api/v1/nodes/transfer-leader"
+	path := "/api/v1/cluster/leader"
 	if targetID != "" {
 		path += "?node_id=" + url.QueryEscape(targetID)
 		fmt.Printf("Transferring leadership to %s...\n", targetID)
