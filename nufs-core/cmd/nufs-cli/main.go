@@ -20,6 +20,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/example/dfs/internal/tools/backup"
+	"github.com/example/dfs/internal/tools/doctor"
+	"github.com/example/dfs/internal/tools/restore"
 	"github.com/example/dfs/metadata"
 )
 
@@ -55,6 +58,11 @@ Commands (remote only):
   health                   Check node health
   rebalance                Show rebalance plan
   scrub                    Check chunk replica consistency
+
+Tools (dispatched to subcommands):
+  backup [flags]           Metadata backup (was nufs-backup)
+  restore [flags]          Metadata restore (was nufs-restore)
+  doctor [flags]           Cluster diagnostics (was nufs-doctor)
 `)
 	}
 	flag.Parse()
@@ -71,6 +79,19 @@ Commands (remote only):
 	if len(args) == 0 {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	// Check for tools that are dispatched to subcommands before
+	// the normal local/remote mode handling.
+	if len(args) > 0 {
+		switch args[0] {
+		case "backup":
+			os.Exit(backup.RunBackupCommand(context.Background(), args[1:], os.Stdout, os.Stderr))
+		case "restore":
+			os.Exit(restore.RunRestoreCommand(context.Background(), args[1:], os.Stdout, os.Stderr))
+		case "doctor":
+			os.Exit(doctor.RunDoctor(context.Background(), args[1:], os.Stdout, os.Stderr))
+		}
 	}
 
 	if useLocal {
