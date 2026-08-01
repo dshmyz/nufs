@@ -16,6 +16,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"os"
 	"text/tabwriter"
 	"time"
@@ -63,6 +65,17 @@ Tools (dispatched to subcommands):
   backup [flags]           Metadata backup (was nufs-backup)
   restore [flags]          Metadata restore (was nufs-restore)
   doctor [flags]           Cluster diagnostics (was nufs-doctor)
+
+Disk management (remote, --node=<addr>):
+  disk status              Show disk status on a datanode
+  disk adopt <dir>         Add a disk to a running datanode
+  disk retire <dir>        Emergency remove (no migration)
+  disk decommission <dir>  Planned remove (migrate first)
+  disk drain               Stop accepting new writes
+  disk verify <dir>        Verify checksums on a disk
+
+Cluster:
+  balance                  Show capacity balance across nodes
 `)
 	}
 	flag.Parse()
@@ -366,6 +379,10 @@ func runRemote(args []string, metaAddr string) {
 		api.cmdClusterInfo()
 	case "scrub":
 		api.cmdScrub()
+	case "balance":
+		api.cmdBalance()
+	case "disk":
+		api.cmdDisk(cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command (remote mode): %s\n", cmd)
 		os.Exit(1)
@@ -516,4 +533,260 @@ func (a *remoteAPI) cmdScrub() {
 	fmt.Println("Scrubbing all chunks (remote)...")
 	resp := a.get("/api/v1/scrub")
 	a.prettyJSON(resp)
+}
+
+// ============================================================
+// Cluster balance
+// ============================================================
+
+func (a *remoteAPI) cmdBalance() {
+	resp := a.get("/api/v1/cluster/balance")
+	var bal struct {
+		Nodes []struct {
+			ID      int     `json:"id"`
+			Addr    string  `json:"addr"`
+			CapGB   int64   `json:"capacity_gb"`
+			UsedGB  int64   `json:"used_gb"`
+			UsedPct float64 `json:"used_pct"`
+			Tier    string  `json:"tier"`
+			Online  bool    `json:"online"`
+		} `json:"nodes"`
+		TotalUsedGB   int64   `json:"total_used_gb"`
+		TotalCapGB    int64   `json:"total_cap_gb"`
+		TotalUsedPct  float64 `json:"total_used_pct"`
+		Imbalance     float64 `json:"imbalance"`
+		MinUsedPct    float64 `json:"min_used_pct"`
+		MaxUsedPct    float64 `json:"max_used_pct"`
+		Recommendation string `json:"recommendation"`
+	}
+	json.Unmarshal(resp, &bal)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "NODE\tADDR\tCAP(GB)\tUSED(GB)\tUSED%%\tTIER\tSTATUS\n")
+	for _, n := range bal.Nodes {
+		status := "online"
+		if !n.Online {
+			status = "offline"
+		}
+		fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%.1f%%\t%s\t%s\n",
+			n.ID, n.Addr, n.CapGB, n.UsedGB, n.UsedPct*100, n.Tier, status)
+	}
+	w.Flush()
+	fmt.Printf("\nTotal: %d/%d GB (%.1f%%)  Imbalance: %.1f%%  %s\n",
+		bal.TotalUsedGB, bal.TotalCapGB, bal.TotalUsedPct*100,
+		bal.Imbalance*100, bal.Recommendation)
+}
+
+// ============================================================
+// Disk management (remote datanode HTTP API)
+// ============================================================
+
+func (a *remoteAPI) cmdDisk(args []string) {
+	if len(args) < 1 {
+		fmt.Println(`Usage: nufs-cli disk <subcommand> --node=<addr>
+
+Subcommands:
+  status [--node=addr]              Show disk status on a datanode
+  adopt <dir> --node=addr           Add a disk to a running datanode
+  retire <dir> --node=addr          Emergency remove a disk (no migration)
+  decommission <dir> --node=addr    Planned remove (migrate first)
+  drain --node=addr                 Stop accepting new writes
+  verify <dir> --node=addr          Verify checksums on a disk
+
+Examples:
+  nufs-cli disk status --node=10.0.0.1:8091
+  nufs-cli disk adopt /new-disk --node=10.0.0.1:8091
+  nufs-cli disk decommission /old-disk --node=10.0.0.1:8091`)
+		os.Exit(1)
+	}
+
+	subcmd := args[0]
+	rest := args[1:]
+
+	// Parse --node flag
+	var nodeAddr string
+	var positional []string
+	for _, a := range rest {
+		if strings.HasPrefix(a, "--node=") {
+			nodeAddr = strings.TrimPrefix(a, "--node=")
+		} else if a == "--node" {
+			// handled below
+		} else {
+			positional = append(positional, a)
+		}
+	}
+	// Also handle --node addr (space separated)
+	for i, a := range rest {
+		if a == "--node" && i+1 < len(rest) {
+			nodeAddr = rest[i+1]
+		}
+	}
+
+	if nodeAddr == "" {
+		// Try to find a datanode address from the cluster
+		nodes := a.get("/api/v1/nodes")
+		var nodeList []struct {
+			ID   int    `json:"id"`
+			Addr string `json:"addr"`
+		}
+		json.Unmarshal(nodes, &nodeList)
+		if len(nodeList) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: --node not specified and no nodes found in cluster")
+			os.Exit(1)
+		}
+		// Use first node's data addr, replace port with ops port (8091)
+		// In production, datanode ops addr is typically :8091
+		nodeAddr = strings.Split(nodeList[0].Addr, ":")[0] + ":8091"
+		fmt.Fprintf(os.Stderr, "Using first node: %s (use --node to specify)\n", nodeAddr)
+	}
+
+	diskAPI := &diskRemoteAPI{base: "http://" + nodeAddr}
+
+	switch subcmd {
+	case "status":
+		diskAPI.status()
+	case "adopt":
+		if len(positional) < 1 {
+			fmt.Fprintln(os.Stderr, "Error: adopt requires a directory path")
+			os.Exit(1)
+		}
+		diskAPI.adopt(positional[0])
+	case "retire":
+		if len(positional) < 1 {
+			fmt.Fprintln(os.Stderr, "Error: retire requires a directory path")
+			os.Exit(1)
+		}
+		diskAPI.retire(positional[0])
+	case "decommission":
+		if len(positional) < 1 {
+			fmt.Fprintln(os.Stderr, "Error: decommission requires a directory path")
+			os.Exit(1)
+		}
+		diskAPI.decommission(positional[0])
+	case "drain":
+		diskAPI.drain()
+	case "verify":
+		if len(positional) < 1 {
+			fmt.Fprintln(os.Stderr, "Error: verify requires a directory path")
+			os.Exit(1)
+		}
+		diskAPI.verify(positional[0])
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown disk subcommand: %s\n", subcmd)
+		os.Exit(1)
+	}
+}
+
+type diskRemoteAPI struct {
+	base string
+}
+
+func (d *diskRemoteAPI) get(path string) []byte {
+	resp, err := http.Get(d.base + path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot connect to datanode at %s: %v\n", d.base, err)
+		fmt.Fprintf(os.Stderr, "Hint: use --node=<addr> to specify the datanode ops address (default port 8091)\n")
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		fmt.Fprintf(os.Stderr, "Error (HTTP %d): %s\n", resp.StatusCode, string(data))
+		os.Exit(1)
+	}
+	return data
+}
+
+func (d *diskRemoteAPI) post(path string) []byte {
+	resp, err := http.Post(d.base+path, "application/json", nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot connect to datanode at %s: %v\n", d.base, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		fmt.Fprintf(os.Stderr, "Error (HTTP %d): %s\n", resp.StatusCode, string(data))
+		os.Exit(1)
+	}
+	return data
+}
+
+func (d *diskRemoteAPI) status() {
+	resp := d.get("/api/v1/disks")
+	var disks struct {
+		Disks []struct {
+			Index  int    `json:"index"`
+			Dir    string `json:"dir"`
+			Failed bool   `json:"failed"`
+			Chunks int64  `json:"chunks"`
+			Bytes  int64  `json:"bytes"`
+		} `json:"disks"`
+		TotalChunks int64 `json:"total_chunks"`
+		TotalBytes  int64 `json:"total_bytes"`
+	}
+	json.Unmarshal(resp, &disks)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "INDEX\tDIR\tSTATUS\tCHUNKS\tSIZE\n")
+	for _, d := range disks.Disks {
+		status := "online"
+		if d.Failed {
+			status = "FAILED"
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%s\n",
+			d.Index, d.Dir, status, d.Chunks, humanBytes(d.Bytes))
+	}
+	w.Flush()
+	fmt.Printf("\nTotal: %d chunks, %s\n", disks.TotalChunks, humanBytes(disks.TotalBytes))
+}
+
+func (d *diskRemoteAPI) adopt(dir string) {
+	resp := d.post("/api/v1/disks/adopt?dir=" + url.QueryEscape(dir))
+	fmt.Printf("Adopted: %s\n", string(resp))
+}
+
+func (d *diskRemoteAPI) retire(dir string) {
+	resp := d.post("/api/v1/disks/retire?dir=" + url.QueryEscape(dir))
+	fmt.Printf("Retired: %s\n", string(resp))
+}
+
+func (d *diskRemoteAPI) decommission(dir string) {
+	resp := d.post("/api/v1/disks/decommission?dir=" + url.QueryEscape(dir))
+	fmt.Printf("Decommissioned: %s\n", string(resp))
+}
+
+func (d *diskRemoteAPI) drain() {
+	resp := d.post("/api/v1/disks/drain")
+	fmt.Printf("Drain: %s\n", string(resp))
+}
+
+func (d *diskRemoteAPI) verify(dir string) {
+	resp := d.post("/api/v1/disks/verify?dir=" + url.QueryEscape(dir))
+	var result struct {
+		Dir       string `json:"dir"`
+		Total     int    `json:"total"`
+		Verified  int    `json:"verified"`
+		Corrupted int    `json:"corrupted"`
+		Failed    int    `json:"failed"`
+	}
+	json.Unmarshal(resp, &result)
+	fmt.Printf("Verify %s: %d total, %d verified, %d corrupted, %d failed\n",
+		result.Dir, result.Total, result.Verified, result.Corrupted, result.Failed)
+	if result.Corrupted > 0 || result.Failed > 0 {
+		os.Exit(1)
+	}
+}
+
+func humanBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
