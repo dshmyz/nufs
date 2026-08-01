@@ -152,7 +152,24 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 	}
 
 	// EC decode
-	fullData, err := encoder.Decode(shards, present, int(chunk.Size))
+	// chunk.Size is set to MaxChunkSize at allocation time and never updated
+	// by the committer. For chunks allocated via S3 gateway, Size is wrong.
+	// For chunks created directly (tests), Size is the actual data length.
+	// Use shard sizes to compute the padded length, then trim to chunk.Size
+	// if it's smaller (actual data) or use padded length if chunk.Size is
+	// MaxChunkSize (allocation placeholder).
+	paddedLen := 0
+	for i, s := range shards {
+		if present[i] && len(s) > paddedLen {
+			paddedLen = len(s)
+		}
+	}
+	paddedLen *= ec.DataShards // K * shardSize = padded original length
+	decodeLen := paddedLen
+	if chunk.Size > 0 && int64(chunk.Size) < int64(paddedLen) {
+		decodeLen = int(chunk.Size) // actual data length (tests set this correctly)
+	}
+	fullData, err := encoder.Decode(shards, present, decodeLen)
 	if err != nil {
 		return nil, fmt.Errorf("chunkstore: ec decode chunk %d: %w", chunk.ID, err)
 	}

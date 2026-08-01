@@ -117,7 +117,6 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 
 	objectDelta := int64(0)
 	contentLength := req.ContentLength
-	var preAllocChunks []*metadata.ChunkMeta
 
 	if newObject {
 		objectDelta = 1
@@ -141,36 +140,16 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 	}
 
 	if newObject {
-		// Optimized path: combine CreateFile + AllocateChunks + CommitChunk
-		// into a single atomic metadata operation (one lock acquisition).
-		if numChunks, useBatch := batchAllocationChunkCount(contentLength); useBatch {
-			offsets := make([]int64, numChunks)
-			for i := 0; i < numChunks; i++ {
-				offsets[i] = int64(i) * metadata.MaxChunkSize
-			}
-			inode, preAllocChunks, err = c.meta.CreateObjectWithChunks(
-				ctx, b.RootInode, req.Key, 0644, offsets, b.Policy)
-			if errors.Is(err, metadata.ErrEntryExists) {
-				// Race: another writer created the key after our Lookup.
-				inode, err = c.meta.Lookup(ctx, b.RootInode, req.Key)
-				if err == nil {
-					oldInodeSnapshot = cloneInodeMeta(inode)
-					oldChunks = append([]metadata.ChunkRef(nil), inode.ChunkMap...)
-					oldSize = inode.Size
-					newObject = false
-				}
-			}
-		} else {
-			// Streaming allocation: create inode first, allocate chunks later.
-			inode, err = c.meta.CreateFile(ctx, b.RootInode, req.Key, 0644)
-			if errors.Is(err, metadata.ErrEntryExists) {
-				inode, err = c.meta.Lookup(ctx, b.RootInode, req.Key)
-				if err == nil {
-					oldInodeSnapshot = cloneInodeMeta(inode)
-					oldChunks = append([]metadata.ChunkRef(nil), inode.ChunkMap...)
-					oldSize = inode.Size
-					newObject = false
-				}
+		inode, err = c.meta.CreateFile(ctx, b.RootInode, req.Key, 0644)
+		if errors.Is(err, metadata.ErrEntryExists) {
+			// Another writer created the key after the initial lookup.
+			// Continue as an overwrite, matching the pre-existing behavior.
+			inode, err = c.meta.Lookup(ctx, b.RootInode, req.Key)
+			if err == nil {
+				oldInodeSnapshot = cloneInodeMeta(inode)
+				oldChunks = append([]metadata.ChunkRef(nil), inode.ChunkMap...)
+				oldSize = inode.Size
+				newObject = false
 			}
 		}
 		if err != nil {
@@ -285,7 +264,7 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 
 	// Batch allocation: skip if CreateObjectWithChunks already allocated
 	// (new object path), otherwise allocate for overwrite.
-	if preAllocChunks == nil {
+	
 		if numChunks, useBatch := batchAllocationChunkCount(contentLength); useBatch {
 			offsets := make([]int64, numChunks)
 			for i := 0; i < numChunks; i++ {
@@ -443,7 +422,6 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 			totalSize += int64(n)
 		}
 	}
-	} // close if preAllocChunks == nil
 
 	// CreateFile already accounts for a new object's object count.
 	if err := c.meta.CheckBucketQuota(ctx, req.Bucket, totalSize-oldSize, 0); err != nil {
