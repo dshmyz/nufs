@@ -201,7 +201,16 @@ func (p *PlacementEngine) PlaceChunk(
 		candidates = append(candidates, n)
 	}
 
-	if len(candidates) < policy.ReplicationFactor {
+	// For EC or high-RF where RF > node count, allow multiple shards
+	// per node (up to maxPerNode). Each shard lands on a different disk
+	// via the datanode's PickDisk (least-used selection).
+	// Only enabled for EC configs (DataShards > 0); replication keeps
+	// one-shard-per-node for maximum fault isolation.
+	maxPerNode := 1
+	if policy.ECConfig != nil && policy.ECConfig.DataShards > 0 && len(candidates) < policy.ReplicationFactor {
+		maxPerNode = (policy.ReplicationFactor + len(candidates) - 1) / len(candidates)
+	}
+	if len(candidates)*maxPerNode < policy.ReplicationFactor {
 		return nil, ErrInsufficientNodes
 	}
 
@@ -253,7 +262,7 @@ func (p *PlacementEngine) PlaceChunk(
 	})
 
 	// 3. Topology-aware selection
-	selected := p.spreadSelect(scored, policy.ReplicationFactor, policy.TopologySpread)
+	selected := p.spreadSelect(scored, policy.ReplicationFactor, policy.TopologySpread, maxPerNode)
 
 	if len(selected) < policy.ReplicationFactor {
 		return nil, ErrPlacementFailed
@@ -263,57 +272,67 @@ func (p *PlacementEngine) PlaceChunk(
 }
 
 // spreadSelect picks nodes respecting topology spread constraints.
-// It implements a best-effort cross-domain placement strategy:
-//  1. First pass: pick one node per domain (strict isolation)
-//  2. Second pass: if not enough domains, allow same-domain nodes
-//     but prefer domains with fewer selected nodes
-//
-// This ensures that replicas are spread across failure domains (racks/zones)
-// to survive rack/zone-level failures.
+// 1. Strict isolation: one node per domain
+// 2. Relaxed: allow same-domain nodes
+// 3. Multi-shard: allow same node up to maxPerNode (EC with few nodes)
 func (p *PlacementEngine) spreadSelect(
 	scored []scoredNode,
 	count int,
 	spread TopologySpread,
+	maxPerNode int,
 ) []NodeID {
 	if len(scored) == 0 {
 		return nil
 	}
 
 	result := make([]NodeID, 0, count)
-	domainCount := make(map[string]int) // domain → number of selected nodes in it
-	selected := make(map[NodeID]bool)
+	domainCount := make(map[string]int)
+	nodeCount := make(map[NodeID]int)
 
-	// Pass 1: Strict isolation — pick at most one node per domain
+	// Pass 1: Strict isolation - pick at most one node per domain
 	for _, s := range scored {
 		if len(result) >= count {
 			break
 		}
-		if selected[s.node.ID] {
+		if nodeCount[s.node.ID] >= 1 {
 			continue
 		}
 		domain := p.getDomain(s.node, spread)
 		if domainCount[domain] > 0 {
-			continue // skip — already have a node in this domain
+			continue
 		}
 		result = append(result, s.node.ID)
-		selected[s.node.ID] = true
+		nodeCount[s.node.ID]++
 		domainCount[domain]++
 	}
 
-	// Pass 2: Relaxed — fill remaining slots, preferring domains with fewer nodes
+	// Pass 2: Relaxed - fill remaining slots
 	if len(result) < count {
 		for _, s := range scored {
 			if len(result) >= count {
 				break
 			}
-			if selected[s.node.ID] {
+			if nodeCount[s.node.ID] >= 1 {
 				continue
 			}
-			domain := p.getDomain(s.node, spread)
-			// Allow but track domain usage
 			result = append(result, s.node.ID)
-			selected[s.node.ID] = true
+			nodeCount[s.node.ID]++
+			domain := p.getDomain(s.node, spread)
 			domainCount[domain]++
+		}
+	}
+
+	// Pass 3: Multi-shard per node (EC with fewer nodes than K+M)
+	if len(result) < count && maxPerNode > 1 {
+		for _, s := range scored {
+			if len(result) >= count {
+				break
+			}
+			if nodeCount[s.node.ID] >= maxPerNode {
+				continue
+			}
+			result = append(result, s.node.ID)
+			nodeCount[s.node.ID]++
 		}
 	}
 
