@@ -82,6 +82,7 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/cluster/readiness", s.handleClusterReadiness)
 	mux.HandleFunc("/api/v1/cluster/balance", s.handleClusterBalance)
+	mux.HandleFunc("/api/v1/cluster/transfer-leader", mut(s.handleTransferLeader))
 	mux.HandleFunc("/api/v1/metrics", s.handleMetrics)
 
 	// Admin — read-only, no leader check
@@ -337,4 +338,33 @@ func tierName(t metadata.StorageTier) string {
 	default:
 		return "any"
 	}
+}
+
+// handleTransferLeader transfers Raft leadership to another node.
+// POST /api/v1/cluster/transfer-leader?node_id=meta-2
+// If node_id is empty, lets Raft pick the best candidate.
+func (h *opsHandlers) handleTransferLeader(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.bundle == nil || h.bundle.Raft == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "raft not configured")
+		return
+	}
+	if !h.store.IsLeader() {
+		writeJSONError(w, http.StatusServiceUnavailable, "not leader")
+		return
+	}
+
+	targetID := r.URL.Query().Get("node_id")
+	if err := h.bundle.Raft.TransferLeadership(targetID); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"status":   "transferred",
+		"target":   targetID,
+		"message":  "leadership transfer initiated, check leader status",
+	})
 }

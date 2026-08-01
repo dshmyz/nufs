@@ -50,7 +50,7 @@ Commands (local/remote):
   decommission <id>        Decommission a data node
   repair-queue             Show pending repair tasks
   trigger-rebalance        Trigger cluster-wide rebalance
-  leader                   Show Raft leader info
+  leader [id]            Show/transfer Raft leadership
 
 Commands (remote only):
   cluster info             Show cluster status
@@ -145,7 +145,7 @@ func runLocal(args []string, metaDir string) {
 	case "trigger-rebalance":
 		cmdTriggerRebalance(ctx, store)
 	case "leader":
-		cmdLeader(store)
+		cmdLeader(store, cmdArgs)
 	case "rebalance":
 		cmdRebalancePlan(ctx, store)
 	case "scrub":
@@ -273,7 +273,11 @@ func cmdTriggerRebalance(ctx context.Context, store *metadata.PebbleStore) {
 	fmt.Println("Rebalance triggered.")
 }
 
-func cmdLeader(store *metadata.PebbleStore) {
+func cmdLeader(store *metadata.PebbleStore, args []string) {
+	if len(args) > 0 {
+		fmt.Println("Leader transfer not available in local mode (use --mode=remote)")
+		return
+	}
 	if store.IsLeader() {
 		fmt.Println("This node IS the Raft leader")
 	} else {
@@ -364,7 +368,11 @@ func runRemote(args []string, metaAddr string) {
 	case "trigger-rebalance":
 		api.cmdTriggerRebalance()
 	case "leader":
-		api.cmdClusterInfo()
+		if len(cmdArgs) > 0 {
+			api.cmdTransferLeader(cmdArgs[0])
+		} else {
+			api.cmdClusterInfo()
+		}
 	case "rebalance":
 		api.cmdClusterInfo()
 	case "cluster":
@@ -575,6 +583,35 @@ func (a *remoteAPI) cmdBalance() {
 	fmt.Printf("\nTotal: %d/%d GB (%.1f%%)  Imbalance: %.1f%%  %s\n",
 		bal.TotalUsedGB, bal.TotalCapGB, bal.TotalUsedPct*100,
 		bal.Imbalance*100, bal.Recommendation)
+}
+
+// ============================================================
+// Transfer Raft leadership
+// ============================================================
+
+func (a *remoteAPI) cmdTransferLeader(targetID string) {
+	leaderResp := a.get("/api/v1/cluster/status")
+	var status struct {
+		IsLeader  bool   `json:"is_leader"`
+		LeaderURI string `json:"leader_uri"`
+	}
+	json.Unmarshal(leaderResp, &status)
+	fmt.Printf("Current leader: %s\n", status.LeaderURI)
+
+	path := "/api/v1/nodes/transfer-leader"
+	if targetID != "" {
+		path += "?node_id=" + url.QueryEscape(targetID)
+		fmt.Printf("Transferring leadership to %s...\n", targetID)
+	} else {
+		fmt.Println("Transferring leadership (auto-select)...")
+	}
+	resp := a.post(path, nil)
+	fmt.Printf("Result: %s\n", string(resp))
+
+	time.Sleep(2 * time.Second)
+	leaderResp2 := a.get("/api/v1/cluster/status")
+	json.Unmarshal(leaderResp2, &status)
+	fmt.Printf("New leader: %s\n", status.LeaderURI)
 }
 
 // ============================================================

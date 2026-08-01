@@ -1385,6 +1385,37 @@ func (n *RaftNode) IsLeader() bool {
 	return n.raft.State() == raft.Leader
 }
 
+// TransferLeadership transfers leadership to another node. If targetID
+// is empty, the Raft library picks the best candidate. Returns an error
+// if the transfer fails or times out.
+func (n *RaftNode) TransferLeadership(targetID string) error {
+	if n.raft == nil {
+		return fmt.Errorf("raft not initialized")
+	}
+	var future raft.Future
+	if targetID == "" {
+		future = n.raft.LeadershipTransfer()
+	} else {
+		// Find the server address for the given ID.
+		config := n.raft.GetConfiguration()
+		if err := config.Error(); err != nil {
+			return fmt.Errorf("get raft config: %w", err)
+		}
+		var found bool
+		for _, srv := range config.Configuration().Servers {
+			if string(srv.ID) == targetID {
+				future = n.raft.LeadershipTransferToServer(srv.ID, srv.Address)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("server %s not found in raft configuration", targetID)
+		}
+	}
+	return future.Error()
+}
+
 // NodeID returns the Raft node ID of this node.
 func (n *RaftNode) NodeID() string {
 	return n.nodeID
