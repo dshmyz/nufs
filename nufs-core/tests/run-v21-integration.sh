@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 COMPOSE_FILE="deploy/docker-compose.yml"
-S3_ENDPOINT="http://localhost:8080"
+S3_ENDPOINT="http://localhost:8081"
 ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 BUCKET="v21-integration-test"
