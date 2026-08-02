@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/example/dfs/datanode/storage"
+	"github.com/example/dfs/datanode/storage/index"
 	"github.com/example/dfs/datanode/storage/journal"
 )
 
@@ -39,6 +40,9 @@ type pendingWrite struct {
 	storedLen  uint32
 	logicalLen uint32
 	payloadCRC uint32
+	// publishedValue overrides the normal durable-record location for
+	// tombstones, which retain the prior location while changing state.
+	publishedValue *index.Value
 
 	// Set by the coordinator.
 	segID     storage.SegmentID

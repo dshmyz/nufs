@@ -39,6 +39,16 @@ import (
 // segment records, and a Pebble entry beyond the last committed
 // sequence is invalid and removed.
 type Store struct {
+	// mu serializes active-segment appends with the entire checkpoint
+	// transaction. While mu is held by flush, no batch may append a durable
+	// record or publish its overlay mutation. Consequently a batch is either
+	// included in the drained overlay and INDEX_SAFE boundary, or it appends
+	// after that marker and is replayed from the sidecar offset on restart.
+	//
+	// Lock order when both locks are needed is mu -> publicationMu. The
+	// checkpoint path takes only mu; publication never takes mu while holding
+	// publicationMu. Overlay has its own internal lock, acquired only after
+	// mu on serving paths.
 	mu         sync.Mutex
 	alloc      *Allocator
 	writer     *Writer
@@ -98,6 +108,12 @@ type Store struct {
 	publishedSeq  uint64
 	readyBatches  map[uint64]*recoveryPublishBatch
 	flushInterval time.Duration
+	// beforeCommitLock, flushCheckpointHook, and flushApply are package-private
+	// test seams for proving the checkpoint exclusion and injecting a failed
+	// index apply. Production leaves them nil.
+	beforeCommitLock    func()
+	flushCheckpointHook func()
+	flushApply          func([]index.Mutation) error
 	// safeSeq is the last sequence covered by an INDEX_SAFE record.
 	safeSeq atomic.Uint64
 	// flushLoopDone signals the background flush loop.
@@ -152,6 +168,12 @@ type Config struct {
 	// disableAsyncApply is a package-private crash-test seam. Production
 	// always applies committed overlay mutations asynchronously.
 	disableAsyncApply bool
+	// flushCheckpointHook pauses a flush while its checkpoint transaction
+	// holds the segment lock. It is only for deterministic race tests.
+	flushCheckpointHook func()
+	// flushApply replaces the synchronous checkpoint index apply in tests.
+	// Production always uses applyNow.
+	flushApply func([]index.Mutation) error
 }
 
 type recoveryStartupPolicy struct {
@@ -207,23 +229,25 @@ func New(cfg Config) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		index:              ix,
-		overlay:            NewOverlay(),
-		segDir:             filepath.Join(cfg.Dir, "segments"),
-		streamID:           cfg.StreamID,
-		faults:             cfg.Faults,
-		enc:                cfg.Enc,
-		applyCh:            make(chan []index.Mutation, 256),
-		stopCh:             make(chan struct{}),
-		flushDone:          make(chan struct{}),
-		readyBatches:       make(map[uint64]*recoveryPublishBatch),
-		flushInterval:      cfg.FlushInterval,
-		disableAsyncApply:  cfg.disableAsyncApply,
-		recoveryClock:      recoveryClock,
-		recoveryStartedAt:  recoveryStartedAt,
-		recoveryDeadline:   recoveryStartedAt.Add(policy.budget),
-		recoveryPolicy:     policy,
-		recoveryCheckpoint: checkpoint,
+		index:               ix,
+		overlay:             NewOverlay(),
+		segDir:              filepath.Join(cfg.Dir, "segments"),
+		streamID:            cfg.StreamID,
+		faults:              cfg.Faults,
+		enc:                 cfg.Enc,
+		applyCh:             make(chan []index.Mutation, 256),
+		stopCh:              make(chan struct{}),
+		flushDone:           make(chan struct{}),
+		readyBatches:        make(map[uint64]*recoveryPublishBatch),
+		flushInterval:       cfg.FlushInterval,
+		disableAsyncApply:   cfg.disableAsyncApply,
+		flushCheckpointHook: cfg.flushCheckpointHook,
+		flushApply:          cfg.flushApply,
+		recoveryClock:       recoveryClock,
+		recoveryStartedAt:   recoveryStartedAt,
+		recoveryDeadline:    recoveryStartedAt.Add(policy.budget),
+		recoveryPolicy:      policy,
+		recoveryCheckpoint:  checkpoint,
 	}
 	if s.flushInterval <= 0 {
 		s.flushInterval = 2 * time.Second
@@ -372,8 +396,8 @@ func (s *Store) recoverActiveSegment(path string) error {
 
 // persistRecoveredOverlay establishes the same durable index/INDEX_SAFE/
 // sidecar boundary as a normal flush before startup creates a higher-numbered
-// active segment. It intentionally reuses flush and writeIndexSafe so there
-// is only one checkpoint publication protocol.
+// active segment. It intentionally reuses flush so there is only one
+// checkpoint publication protocol.
 func (s *Store) persistRecoveredOverlay(path string, class storage.SegmentClass, segSize int64) (err error) {
 	if s.overlay.Len() == 0 {
 		return s.checkRecoveryDeadline()
@@ -593,33 +617,15 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 		return nil, err
 	}
 
-	// Phase 5: apply committed location to the bounded overlay so
-	// immediate reads observe the write (§6.4).
-	segID := pw.segID
-	off := pw.offset
-	if err := s.faultStage(storage.CrashBeforeOverlayApply); err != nil {
-		return nil, err
-	}
-	s.overlay.Put(index.Key(req.ExtentID, req.Generation), index.Value{
-		SegmentID:  segID,
-		Offset:     off,
-		StoredLen:  storedLen,
-		LogicalLen: uint32(len(req.Data)),
-		State:      storage.ExtentDurable,
-		Checksum:   payloadCRC,
-	})
-	if err := s.faultStage(storage.CrashAfterOverlayApply); err != nil {
-		return nil, err
-	}
-	s.publishRecoveryBatch(pw.recoveryBatch)
-
-	// Phase 6: schedule async Pebble apply (§6.1 step 8).
+	// The batch callback published the committed location to the overlay while
+	// it still held the segment/checkpoint lock. Schedule only the derived
+	// Pebble apply here, after the durable publication point.
 	s.enqueueApply([]index.Mutation{{
 		ExtentID:   req.ExtentID,
 		Generation: req.Generation,
 		Value: index.Value{
-			SegmentID:  segID,
-			Offset:     off,
+			SegmentID:  pw.segID,
+			Offset:     pw.offset,
 			StoredLen:  storedLen,
 			LogicalLen: uint32(len(req.Data)),
 			State:      storage.ExtentDurable,
@@ -630,8 +636,8 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 	return &storage.DurableReceipt{
 		ExtentID:   req.ExtentID,
 		Generation: req.Generation,
-		SegmentID:  segID,
-		Offset:     off,
+		SegmentID:  pw.segID,
+		Offset:     pw.offset,
 		StoredLen:  storedLen,
 		LogicalLen: uint32(len(req.Data)),
 		Seq:        pw.streamSeq,
@@ -653,6 +659,9 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 //   - any error (append or sync) is returned to every writer in the
 //     batch.
 func (s *Store) commitBatch(batch []*pendingWrite) error {
+	if s.beforeCommitLock != nil {
+		s.beforeCommitLock()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -734,6 +743,29 @@ func (s *Store) commitBatch(batch []*pendingWrite) error {
 	for _, pw := range batch {
 		pw.recoveryBatch = publication
 	}
+	if err := s.faultStage(storage.CrashBeforeOverlayApply); err != nil {
+		return err
+	}
+	for _, pw := range batch {
+		value := index.Value{
+			SegmentID:  pw.segID,
+			Offset:     pw.offset,
+			StoredLen:  pw.storedLen,
+			LogicalLen: pw.logicalLen,
+			State:      storage.ExtentDurable,
+			Checksum:   pw.payloadCRC,
+		}
+		if pw.publishedValue != nil {
+			value = *pw.publishedValue
+		}
+		s.overlay.Put(index.Key(pw.extentID, pw.generation), value)
+	}
+	if err := s.faultStage(storage.CrashAfterOverlayApply); err != nil {
+		return err
+	}
+	for range batch {
+		s.publishRecoveryBatch(publication)
+	}
 	return nil
 }
 
@@ -748,8 +780,10 @@ type recoveryPublishBatch struct {
 }
 
 // publishRecoveryBatch advances the flush watermark only through contiguous
-// batches whose every mutation has been published to the overlay. This is the
-// index-durability precondition for an INDEX_SAFE sidecar checkpoint.
+// batches whose every mutation has been published to the overlay. Serving
+// callers hold s.mu before this acquires publicationMu (the documented lock
+// order); startup recovery has no concurrent commit or checkpoint. This is
+// the index-durability precondition for an INDEX_SAFE sidecar checkpoint.
 func (s *Store) publishRecoveryBatch(batch *recoveryPublishBatch) {
 	if batch == nil {
 		return
@@ -822,9 +856,9 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 	framing := uint32(RecordHeaderSize) + uint32(frameCount*FrameIndexEntrySize) + storedLen + uint32(RecordTrailerSize)
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	off, err := s.alloc.Reserve(framing, extentID, storedLen)
 	if err != nil {
-		s.mu.Unlock()
 		if err == storage.ErrSegmentFull {
 			if serr := s.sealActiveLocked(); serr != nil {
 				return nil, serr
@@ -832,20 +866,15 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 			off, err = s.alloc.Reserve(framing, extentID, storedLen)
 		}
 		if err != nil {
-			s.mu.Unlock()
 			return nil, err
 		}
 	}
 	if _, err := s.alloc.ReserveCommit(uint32(journal.BatchCommitSize)); err != nil {
-		s.mu.Unlock()
 		return nil, err
 	}
 	segID := s.alloc.State().SegmentID
 	streamSeq := s.streamSeq
 	s.streamSeq++
-	writer := s.writer
-	s.mu.Unlock()
-
 	header := &RecordHeader{
 		Magic:           storage.RecordMagic,
 		Version:         storage.FormatVersion,
@@ -865,7 +894,7 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 		return nil, err
 	}
 	header.FrameIndexCRC = fi.CRC
-	if _, err := writer.WriteRecordFramed(off, header, idxBuf, storedBytes, frameSize); err != nil {
+	if _, err := s.writer.WriteRecordFramed(off, header, idxBuf, storedBytes, frameSize); err != nil {
 		return nil, err
 	}
 	commitOffset := off + int64(framing)
@@ -882,10 +911,10 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 			StoredLen: storedLen, LogicalLen: uint32(len(data)), Checksum: checksumOf(data), Op: uint8(RecordPut),
 		}}),
 	}
-	if err := writer.WriteBatchCommit(commitOffset, bc); err != nil {
+	if err := s.writer.WriteBatchCommit(commitOffset, bc); err != nil {
 		return nil, err
 	}
-	if err := writer.Sync(); err != nil {
+	if err := s.writer.Sync(); err != nil {
 		return nil, err
 	}
 
@@ -1019,9 +1048,12 @@ func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
 	// Submit a zero-frame delete record through the normal coordinator so it
 	// remains contiguous with writes and shares the exact one-sync batch
 	// durability rule.
+	tombstone := *v
+	tombstone.State = storage.ExtentTombstoned
 	pw := &pendingWrite{
-		extentID:   req.ExtentID,
-		generation: req.Generation,
+		extentID:       req.ExtentID,
+		generation:     req.Generation,
+		publishedValue: &tombstone,
 		header: &RecordHeader{
 			Magic: storage.RecordMagic, Version: storage.FormatVersion,
 			Op: RecordDelete, ExtentID: req.ExtentID, Generation: req.Generation,
@@ -1032,15 +1064,11 @@ func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
 	if err := s.group.Submit(pw, s.commitBatch); err != nil {
 		return err
 	}
-	tombstone := *v
-	tombstone.State = storage.ExtentTombstoned
 	key := index.Key(req.ExtentID, req.Generation)
-	s.overlay.Put(key, tombstone)
 	// cachedLookup checks locCache before the overlay. Publish the tombstone
 	// into that cache as part of the durable-delete visibility update so a
 	// prior live cache entry cannot outlive an acknowledged delete.
 	s.locCache.Put(key, &tombstone)
-	s.publishRecoveryBatch(pw.recoveryBatch)
 	return s.enqueueApply([]index.Mutation{{ExtentID: req.ExtentID, Generation: req.Generation, Value: tombstone}})
 }
 

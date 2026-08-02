@@ -258,3 +258,27 @@ cd /Users/gracegaoya/work/project/nufs
 git diff --check
 # PASS
 ```
+
+## Fix Round 5
+
+Fixed the critical flush/checkpoint race in the active segment. `s.mu` is now
+the checkpoint transaction lock: it excludes a batch's append, sync, overlay
+publication, and flush-watermark publication from overlay drain through Pebble
+durability, `INDEX_SAFE` append+sync, recovery-sidecar publication, and pending
+counter reconciliation. The documented nested lock order is `mu` then
+`publicationMu`; checkpoints take only `mu`.
+
+A batch is therefore wholly before the checkpoint (its overlay mutation is in
+the drain and its sequence is certified), or wholly after the synced marker
+and sidecar (its record is physically in the replay suffix). Successful flush
+now subtracts the snapshotted pending count rather than resetting it, so
+post-checkpoint publications cannot be lost. Every error after an overlay drain
+re-inserts that drain; no sidecar is published before the index and marker, and
+the next flush retries conservatively.
+
+The package-private checkpoint hook deterministically pauses the transaction
+at the former drain/marker race boundary. The regression proves a concurrent
+write cannot be acknowledged there, verifies the post-checkpoint pending count,
+simulates a crash, and verifies one-record suffix replay plus byte-exact reads
+after reopen. A separate injected apply failure proves the transaction lock is
+released and the drained overlay is retained for retry.

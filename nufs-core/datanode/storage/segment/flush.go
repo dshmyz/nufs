@@ -56,58 +56,79 @@ func (s *Store) flushLoop() {
 	}
 }
 
-// flush applies all committed mutations to Pebble, syncs, and publishes
-// an INDEX_SAFE record for the current safe sequence.
+// flush applies all committed mutations to Pebble, syncs, and publishes an
+// INDEX_SAFE record for the current safe sequence. It holds s.mu from overlay
+// drain through sidecar publication and counter reconciliation. commitBatch
+// holds that same lock through record sync and overlay publication, so no
+// durable batch can land in the marker's physical prefix without also being
+// present in the index snapshot it certifies.
 func (s *Store) flush() error {
-	// Snapshot the overlay-published watermark before the drain. Mutations
-	// arriving later may be indexed by this flush, but are deliberately not
-	// certified by this marker/sidecar and will replay conservatively.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Snapshot the overlay-published watermark and pending count while commits
+	// are excluded. A successful checkpoint subtracts this exact count instead
+	// of resetting it, so post-checkpoint publications cannot be erased.
 	safe := s.flushSeq.Load()
+	pending := s.flushMutations.Load()
 	muts := s.overlay.Drain()
 	if len(muts) == 0 {
 		return nil
 	}
-	// Apply to Pebble (the overlay is now the delta-since-flush).
-	if err := s.applyNow(muts); err != nil {
-		// Re-insert into the overlay so nothing is lost: the committed
-		// records are still the durability authority, and reads consult
-		// the overlay first.
+	reinsert := func() {
+		// Every error after Drain leaves the durable log as recovery authority.
+		// Restore the overlay as well so the next flush retries the same
+		// checkpoint instead of dropping its pending count or publishing a
+		// later sidecar without these mutations.
 		for _, m := range muts {
 			s.overlay.Put(indexKeyFor(m), m.Value)
 		}
+	}
+	if s.flushCheckpointHook != nil {
+		s.flushCheckpointHook()
+	}
+	// Apply to Pebble (the overlay is now the delta-since-flush).
+	apply := s.applyNow
+	if s.flushApply != nil {
+		apply = s.flushApply
+	}
+	if err := apply(muts); err != nil {
+		reinsert()
 		return err
 	}
 	// Sync Pebble SSTs so the index entries are durable (§7.4: "After
 	// flush and SST sync, an INDEX_SAFE record ... publishes the safe
 	// sequence").
 	if err := s.index.DB().Flush(); err != nil {
+		reinsert()
 		return err
 	}
 	// Publish INDEX_SAFE with the safe sequence, then atomically persist the
 	// matching marker-end offset in the index-owned recovery checkpoint. The
 	// ordering is intentional: the sidecar is never durable unless both the
 	// index and marker it certifies are already durable.
-	checkpoint, err := s.writeIndexSafe(safe)
+	checkpoint, err := s.writeIndexSafeLocked(safe)
 	if err != nil {
+		reinsert()
 		return err
 	}
 	if err := index.StoreRecoveryCheckpoint(s.index, checkpoint); err != nil {
+		reinsert()
 		return err
 	}
 	s.safeSeq.Store(safe)
-	s.flushMutations.Store(0)
+	s.flushMutations.Add(-pending)
 	slog.Debug("storage: index flushed", "safe_seq", safe, "mutations", len(muts))
 	return nil
 }
 
-// writeIndexSafe appends an INDEX_SAFE record to the commit log and
-// syncs it, making the safe sequence durable in the segment.
-func (s *Store) writeIndexSafe(safeSeq uint64) (index.RecoveryCheckpoint, error) {
+// writeIndexSafeLocked appends an INDEX_SAFE record to the commit log and
+// syncs it, making the safe sequence durable in the segment. The caller must
+// hold s.mu for the entire checkpoint transaction.
+func (s *Store) writeIndexSafeLocked(safeSeq uint64) (index.RecoveryCheckpoint, error) {
 	// The INDEX_SAFE record carries the safe sequence in its Seq field
 	// (§7.1 OpIndexSafe). It is written into the active segment so
 	// recovery reads it during segment-log replay.
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	rec := &journal.CommitRecord{
 		Seq: safeSeq,
 		Op:  journal.OpIndexSafe,
