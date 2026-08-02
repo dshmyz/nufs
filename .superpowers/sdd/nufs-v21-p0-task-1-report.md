@@ -78,3 +78,102 @@ The plan's count-10/count-20 race commands were not launched after the count=1 m
 - Test review: tests exercise real coordinator/store/file-layout behavior without mocks. Hook waits and result waits are bounded.
 - A subagent reviewer was not available in this task, so review was performed directly against the brief and diff.
 - Concern: high-count race repetition and the complete package suite remain unverified in this run because of measured synchronous-I/O duration and the explicit instruction not to start another long run after the timeout. All isolated count=1 required tests passed.
+
+## Review Fix Evidence
+
+### Scope and test changes
+
+- `nufs-core/datanode/storage/segment/group_commit_test.go`: added `TestGroupCommit_CloseRacingSubmit`. It deterministically holds an accepted request inside its callback, closes the coordinator twice concurrently, verifies the in-flight request commits exactly once and does not hang, and verifies a post-close request returns `storage.ErrCapacity`.
+- `nufs-core/datanode/storage/segment/commit_layout_test.go`: strengthened `TestCommitLayout_OverflowBatchStartsOnFreshSegment` by retaining the old package-private allocator and asserting its `RecordCount`, `NextOffset`, and `LastCommitSeq` are unchanged after the overflow batch seals and moves to a fresh segment.
+- `nufs-core/datanode/storage/segment/group_commit_test.go` and `crash_test.go`: reduced fixture cardinality while preserving the exercised invariants: eight simultaneously released real durable writes must share fewer sync barriers than writes and survive reopen; sixteen sequential durable writes must all recover byte-exactly. This removes synchronous-I/O cost that previously made the required repetition counts exceed their test timeouts.
+
+No production implementation files changed: the existing coordinator already satisfied the close/Submit behavior exercised by the new deterministic test. RED was not available for these new assertions on the fixed Task 1 branch; the newly added tests passed immediately against the already-present implementation rather than requiring a behavior change.
+
+### Commands, results, and durations
+
+| Command | Result | Duration |
+| --- | --- | --- |
+| `cd /Users/gracegaoya/work/project/nufs/nufs-core && go test ./datanode/storage/segment -run '^(TestGroupCommit_CloseRacingSubmit|TestCommitLayout_OverflowBatchStartsOnFreshSegment)$' -count=1 -timeout 10s -v` | PASS | package 1.670s; wall 7.7s |
+| `cd /Users/gracegaoya/work/project/nufs/nufs-core && go test -race ./datanode/storage/segment -run '^(TestGroupCommit_NoLostWakeup|TestGroupCommit_CloseRacingSubmit|TestGroupCommit_SharesSyncBarrier|TestCommitLayout_ConcurrentBatchIsContiguous|TestCommitLayout_OverflowBatchStartsOnFreshSegment|TestRecovery_ManyWritesReopen)$' -count=1 -timeout 15s -v` | PASS; eight concurrent writes used one sync barrier | package 4.205s; wall 9.1s |
+| `cd /Users/gracegaoya/work/project/nufs/nufs-core && go test -race ./datanode/storage/segment -run 'TestGroupCommit_NoLostWakeup|TestRecovery_ManyWritesReopen' -count=10 -timeout 30s` | PASS | package 15.104s; wall 15.1s |
+| `cd /Users/gracegaoya/work/project/nufs/nufs-core && time go test -race ./datanode/storage/segment -run 'TestGroupCommit|TestCommitLayout|TestRecovery_ManyWritesReopen' -count=20 -timeout 60s` | PASS, isolated after terminating PIDs 36281 and 36586; their concurrent attempts were discarded | wall 27.3s |
+| `cd /Users/gracegaoya/work/project/nufs/nufs-core && go test ./datanode/storage/segment -run '^TestGroupCommit_CloseRacingSubmit$' -count=1 -timeout 10s -v` | PASS after adding failure-safe coordinator cleanup | package 1.061s; wall 3.6s |
+
+### Self-review
+
+- The close test gates callback entry before shutdown, distinguishes accepted completion from rejected submission, bounds every wait, and checks both concurrent `close` callers return.
+- The overflow test observes the sealed segment through the old allocator pointer and compares its tail, record count, and footer commit sequence state with the known pre-overflow snapshot.
+- Required count=10 and count=20 race commands were executed without skip logic; the count=20 result above is the single isolated post-interruption run.
+- `git diff --check` and the focused tests are run again before the task-scoped commit. The report is ignored and excluded from the commit.
+- Task-scoped commit: `0cb9fbb test(storage): harden group commit review coverage`.
+
+## Review Fix Evidence V2
+
+### Scope
+
+- Production code was not changed.
+- The only files prepared for the task-scoped commit are `nufs-core/datanode/storage/segment/group_commit_test.go` and `nufs-core/datanode/storage/segment/crash_test.go`.
+- `gofmt` was run on both files before the required test sequence.
+- `git diff --check` passed before testing and again after all four required commands.
+
+### Required commands: complete output and durations
+
+1. Command:
+
+   ```text
+   cd nufs-core && go test -race ./datanode/storage/segment -run '^TestGroupCommit_CloseRacingSubmit$' -count=20 -timeout 30s
+   ```
+
+   Result: PASS (process wall duration 5.082s; package duration 2.996s).
+
+   ```text
+   ok  \tgithub.com/example/dfs/datanode/storage/segment\t2.996s
+   ```
+
+2. Command:
+
+   ```text
+   cd nufs-core && go test -race ./datanode/storage/segment -run 'TestGroupCommit_NoLostWakeup|TestRecovery_ManyWritesReopen' -count=10 -timeout 30s
+   ```
+
+   Result: PASS (process wall duration 16.771s; package duration 14.614s).
+
+   ```text
+   ok  \tgithub.com/example/dfs/datanode/storage/segment\t14.614s
+   ```
+
+3. Command:
+
+   ```text
+   cd nufs-core && go test -race ./datanode/storage/segment -run 'TestGroupCommit|TestCommitLayout|TestRecovery_ManyWritesReopen' -count=20 -timeout 60s
+   ```
+
+   Result: PASS (package duration 47.674s).
+
+   ```text
+   ok  \tgithub.com/example/dfs/datanode/storage/segment\t47.674s
+   ```
+
+4. Command:
+
+   ```text
+   cd nufs-core && go test -race ./datanode/storage/segment -run '^TestSustained_(Concurrent1024Writes|Recovery500Writes)$' -count=1 -timeout 180s -v
+   ```
+
+   Result: PASS (package duration 30.640s; recovery test 20.91s; concurrent test 7.02s).
+
+   ```text
+   === RUN   TestSustained_Recovery500Writes
+   2026/08/02 19:39:18 [JOB 1] WAL file /var/folders/zl/22c93r7j41dc6s_bbxfql77h0000gn/T/TestSustained_Recovery500Writes2304367566/001/index/000027.log with log number 000027 stopped reading at offset: 0; replayed 0 keys in 0 batches
+   --- PASS: TestSustained_Recovery500Writes (20.91s)
+   === RUN   TestSustained_Concurrent1024Writes
+       group_commit_test.go:160: 1024 concurrent writes → 5 fsync barriers (batched 204.8x)
+   2026/08/02 19:39:25 [JOB 1] WAL file /var/folders/zl/22c93r7j41dc6s_bbxfql77h0000gn/T/TestSustained_Concurrent1024Writes468695507/001/index/000005.log with log number 000005 stopped reading at offset: 18288; replayed 254 keys in 254 batches
+   --- PASS: TestSustained_Concurrent1024Writes (7.02s)
+   PASS
+   ok  \tgithub.com/example/dfs/datanode/storage/segment\t30.640s
+   ```
+
+### Concern
+
+The current `TestGroupCommit_SharesSyncBarrier` assertion requires the observed number of fsync barriers to be strictly below the number of writes. This passed here (5 barriers for 1024 writes), but the test deliberately relies on concurrent scheduling to produce batching and could be sensitive to unusual scheduler or I/O behavior.
