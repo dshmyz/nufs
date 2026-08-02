@@ -85,6 +85,10 @@ type Store struct {
 	// enc is the record encryption registry (nil = plaintext).
 	enc *encryption.KeyRegistry
 
+	// Caches (§8).
+	locCache  *LocationCache            // extent → index.Value
+	segCache  *SegmentDescriptorCache   // segment path → *Reader
+
 	faults storage.FaultHook
 }
 
@@ -105,6 +109,10 @@ type Config struct {
 	// FlushMaxMutations is the committed-mutation flush trigger
 	// (§7.4 flush_max_committed_records: 100000).
 	FlushMaxMutations int64
+	// LocationCacheSize sets the location cache entry count (0 = default 1M).
+	LocationCacheSize int
+	// SegCacheSize sets the segment descriptor cache size (0 = default 4096).
+	SegCacheSize int
 }
 
 // New opens (creating if needed) a Store for one commit stream.
@@ -141,6 +149,8 @@ func New(cfg Config) (*Store, error) {
 		s.flushInterval = 2 * time.Second
 	}
 	s.group = newGroupCommitCoordinator(defaultGroupCommitConfig())
+	s.locCache = NewLocationCache(cfg.LocationCacheSize)
+	s.segCache = NewSegmentDescriptorCache(cfg.SegCacheSize)
 	s.applyWG.Add(1)
 	go s.applyLoop()
 	s.flushWG.Add(1)
@@ -252,6 +262,9 @@ func (s *Store) newActiveSegment(class storage.SegmentClass, segSize int64) erro
 	s.alloc = NewAllocator(segID, class, segSize, nowUnixNano())
 	s.writer = w
 	s.writerPath = path
+	if s.segCache != nil {
+		s.segCache.Pin(path)
+	}
 	return nil
 }
 
@@ -657,9 +670,11 @@ func (s *Store) lookup(extentID storage.ExtentID, generation storage.Generation)
 }
 
 // Read implements storage.Store.Read. Range reads fetch and
-// authenticate only intersecting frames (§8).
+// authenticate only intersecting frames (§8). Uses the location cache
+// to avoid Pebble lookups and the segment descriptor cache to avoid
+// os.Open on every read.
 func (s *Store) Read(_ context.Context, req *storage.ReadRequest) (*storage.ReadResult, error) {
-	v, err := s.lookup(req.ExtentID, req.Generation)
+	v, err := s.cachedLookup(req.ExtentID, req.Generation)
 	if err != nil {
 		return nil, err
 	}
@@ -670,12 +685,10 @@ func (s *Store) Read(_ context.Context, req *storage.ReadRequest) (*storage.Read
 		return nil, storage.ErrQuarantined
 	}
 	path := filepath.Join(s.segDir, streamClassDir(s.streamID), "active", fmt.Sprintf("%d.seg", v.SegmentID))
-	rd, err := OpenReaderWithEnc(path, s.enc)
+	rd, err := s.segCache.Get(path, s.enc)
 	if err != nil {
 		return nil, storage.ErrSegmentUnavailable
 	}
-	defer rd.Close()
-
 	var payload []byte
 	if req.Length > 0 {
 		payload, err = rd.ReadRangeFrames(v.Offset, v.StoredLen, v.LogicalLen, req.LogicalOffset, req.Length)
@@ -686,6 +699,21 @@ func (s *Store) Read(_ context.Context, req *storage.ReadRequest) (*storage.Read
 		return nil, err
 	}
 	return &storage.ReadResult{Data: payload, Checksum: v.Checksum}, nil
+}
+
+// cachedLookup checks the location cache first, then the overlay, then
+// the derived index, backfilling the location cache on miss.
+func (s *Store) cachedLookup(extentID storage.ExtentID, generation storage.Generation) (*index.Value, error) {
+	key := index.Key(extentID, generation)
+	if v, ok := s.locCache.Get(key); ok {
+		return v, nil
+	}
+	v, err := s.lookup(extentID, generation)
+	if err != nil {
+		return nil, err
+	}
+	s.locCache.Put(key, v)
+	return v, nil
 }
 
 // Delete implements storage.Store.Delete (generation-fenced). A
@@ -795,6 +823,9 @@ func (s *Store) Close() error {
 	defer s.mu.Unlock()
 	if s.writer != nil {
 		s.writer.Close()
+	}
+	if s.segCache != nil {
+		s.segCache.Close()
 	}
 	return s.index.Close()
 }
