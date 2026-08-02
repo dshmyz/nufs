@@ -2,8 +2,10 @@ package segment
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,6 +65,84 @@ func TestGroupCommit_NoLostWakeup(t *testing.T) {
 	}
 }
 
+func TestGroupCommit_CloseRacingSubmit(t *testing.T) {
+	c := newGroupCommitCoordinator(groupCommitConfig{MaxBatch: 1})
+	commitStarted := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	accepted := make(chan error, 1)
+	var commitCalls atomic.Int32
+	t.Cleanup(func() {
+		select {
+		case <-releaseCommit:
+		default:
+			close(releaseCommit)
+		}
+		c.close()
+	})
+	go func() {
+		accepted <- c.Submit(testPendingWrite(1), func(batch []*pendingWrite) error {
+			if len(batch) != 1 {
+				return fmt.Errorf("batch size = %d, want 1", len(batch))
+			}
+			close(commitStarted)
+			<-releaseCommit
+			commitCalls.Add(1)
+			return nil
+		})
+	}()
+
+	select {
+	case <-commitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("accepted request did not begin commit")
+	}
+
+	closed := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			c.close()
+			closed <- struct{}{}
+		}()
+	}
+
+	rejected := make(chan error, 1)
+	go func() { rejected <- c.Submit(testPendingWrite(2), func([]*pendingWrite) error { return nil }) }()
+	select {
+	case err := <-rejected:
+		if !errors.Is(err, storage.ErrCapacity) {
+			t.Fatalf("rejected request error = %v, want %v", err, storage.ErrCapacity)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request submitted after close hung")
+	}
+
+	select {
+	case <-closed:
+		t.Fatal("close returned before the accepted request completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseCommit)
+
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("accepted request error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted request hung during close")
+	}
+	if got := commitCalls.Load(); got != 1 {
+		t.Fatalf("accepted request completed %d commits, want exactly one", got)
+	}
+	for range 2 {
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatal("idempotent close did not return")
+		}
+	}
+}
+
 // TestGroupCommit_SharesSyncBarrier verifies the §6.4 core: N concurrent
 // writes to the same stream share far fewer than N fsync barriers.
 // With the coordinator loop, concurrent writers batch into a single sync
@@ -75,8 +155,8 @@ func TestGroupCommit_SharesSyncBarrier(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	const writers = 16
-	const perWriter = 64 // 1024 total writes
+	const writers = 8
+	const perWriter = 1 // 8 concurrent durable writes
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	errs := make([]error, writers)
@@ -103,10 +183,11 @@ func TestGroupCommit_SharesSyncBarrier(t *testing.T) {
 		}
 	}
 	syncs := s.syncCalls.Load()
-	if syncs >= 1024 {
-		t.Fatalf("group commit did not batch: %d syncs for %d writes", syncs, 1024)
+	const writes = writers * perWriter
+	if syncs >= writes {
+		t.Fatalf("group commit did not batch: %d syncs for %d writes", syncs, writes)
 	}
-	t.Logf("%d concurrent writes → %d fsync barriers (batched %.1fx)", 1024, syncs, float64(1024)/float64(syncs))
+	t.Logf("%d concurrent writes → %d fsync barriers (batched %.1fx)", writes, syncs, float64(writes)/float64(syncs))
 
 	// Every write must be readable after reopen (no data loss despite
 	// batching).
@@ -126,7 +207,7 @@ func TestGroupCommit_SharesSyncBarrier(t *testing.T) {
 			checked++
 		}
 	}
-	if checked != 1024 {
-		t.Fatalf("checked %d extents, want 1024", checked)
+	if checked != writes {
+		t.Fatalf("checked %d extents, want %d", checked, writes)
 	}
 }

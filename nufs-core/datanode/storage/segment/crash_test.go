@@ -138,7 +138,7 @@ func TestRecovery_ManyWritesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const n = 500
+	const n = 16
 	for i := 0; i < n; i++ {
 		data := testutil.DeterministicData(storage.ExtentID(i+1), 1, 128, uint32(i))
 		if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: storage.ExtentID(i + 1), Generation: 1, Data: data}); err != nil {

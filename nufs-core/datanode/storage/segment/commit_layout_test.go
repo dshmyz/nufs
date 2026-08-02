@@ -134,6 +134,8 @@ func TestCommitLayout_OverflowBatchStartsOnFreshSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	oldAllocator := s.alloc
+	oldState := oldAllocator.State()
 
 	s.group.close()
 	beforeWait := make(chan struct{})
@@ -200,5 +202,18 @@ func TestCommitLayout_OverflowBatchStartsOnFreshSegment(t *testing.T) {
 	secondFraming := int64(RecordFraming(receipts[1].StoredLen, DefaultFrameSize, 1))
 	if got, want := s.alloc.State().NextOffset, receipts[1].Offset+secondFraming+int64(journal.BatchCommitSize); got != want {
 		t.Fatalf("fresh segment tail=%d want one contiguous commit at %d", got, want)
+	}
+	if s.alloc == oldAllocator {
+		t.Fatal("overflow batch retained the old allocator")
+	}
+	gotOldState := oldAllocator.State()
+	if got, want := gotOldState.RecordCount, oldState.RecordCount; got != want {
+		t.Fatalf("old segment record count = %d, want pre-existing %d", got, want)
+	}
+	if got, want := gotOldState.NextOffset, oldState.NextOffset; got != want {
+		t.Fatalf("old segment tail = %d, want pre-existing %d", got, want)
+	}
+	if got, want := gotOldState.LastCommitSeq, oldState.LastCommitSeq; got != want {
+		t.Fatalf("old segment last commit = %d, want pre-existing %d", got, want)
 	}
 }
