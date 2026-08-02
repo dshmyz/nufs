@@ -54,22 +54,20 @@ func TestDrill_CorruptReadNeverSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data := bytes.Repeat([]byte("drill-data"), 1000)
-	if _, err := s.Write(context.Background(), &storage.WriteRequest{ExtentID: 1, Generation: 1, Data: data}); err != nil {
+	data := deterministicDrillPayload(16 << 10)
+	receipt, err := s.Write(context.Background(), &storage.WriteRequest{ExtentID: 1, Generation: 1, Data: data})
+	if err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
 
 	// Flip a byte in the segment file's payload region to simulate
 	// bitrot (§18.3 "bit flip"). Default StreamID=0 → small/active.
-	corruptSegmentPayload(t, dir+"/segments/small/active/1.seg")
+	corruptSegmentPayload(t, dir+"/segments/small/active/1.seg", receipt.Offset)
 
 	s2, err := New(Config{Dir: dir, UseMemIndex: false})
 	if err != nil {
-		// A bit flip may corrupt the INDEX_SAFE marker certified by the
-		// recovery checkpoint. Fail-closed startup is a valid outcome: no
-		// corrupt or unverifiable data can be served.
-		return
+		t.Fatalf("payload corruption must not mask an unrelated startup failure: %v", err)
 	}
 	defer s2.Close()
 	got, err := s2.Read(context.Background(), &storage.ReadRequest{ExtentID: 1, Generation: 1})
@@ -83,25 +81,33 @@ func TestDrill_CorruptReadNeverSucceeds(t *testing.T) {
 	}
 }
 
-// corruptSegmentPayload flips a byte in the payload region of a segment
-// file (past the header + first record header) to simulate bitrot
+// corruptSegmentPayload flips a byte in a known record payload region to
+// simulate bitrot
 // (§18.3 "bit flip").
-func corruptSegmentPayload(t *testing.T, path string) {
+func corruptSegmentPayload(t *testing.T, path string, offset int64) {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(data) <= SegmentHeaderSize+RecordHeaderSize {
-		t.Fatalf("segment too small to corrupt: %d", len(data))
-	}
-	// Flip a byte in the payload area (after header + record header).
-	pos := SegmentHeaderSize + RecordHeaderSize + 100
+	pos := int(offset) + RecordHeaderSize + FrameIndexEntrySize + 100
 	if pos >= len(data) {
-		pos = SegmentHeaderSize + RecordHeaderSize + 4
+		t.Fatalf("segment too small to corrupt: %d", len(data))
 	}
 	data[pos] ^= 0xFF
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func deterministicDrillPayload(n int) []byte {
+	payload := make([]byte, n)
+	var state uint32 = 0x6d2b79f5
+	for i := range payload {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		payload[i] = byte(state)
+	}
+	return payload
 }

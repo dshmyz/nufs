@@ -73,6 +73,8 @@ type Store struct {
 	applyCh chan []index.Mutation
 	stopCh  chan struct{}
 	applyWG sync.WaitGroup
+	// disableAsyncApply is a package-private crash-test seam.
+	disableAsyncApply bool
 
 	// group commits writes to the active segment (§6.4): the coordinator
 	// collects requests, appends records + one BatchCommit, syncs once,
@@ -147,6 +149,9 @@ type Config struct {
 	// recoveryPolicy is a package-private test seam. Production always uses
 	// the exact storage recovery limits and 30-second startup budget.
 	recoveryPolicy recoveryStartupPolicy
+	// disableAsyncApply is a package-private crash-test seam. Production
+	// always applies committed overlay mutations asynchronously.
+	disableAsyncApply bool
 }
 
 type recoveryStartupPolicy struct {
@@ -213,6 +218,7 @@ func New(cfg Config) (*Store, error) {
 		flushDone:          make(chan struct{}),
 		readyBatches:       make(map[uint64]*recoveryPublishBatch),
 		flushInterval:      cfg.FlushInterval,
+		disableAsyncApply:  cfg.disableAsyncApply,
 		recoveryClock:      recoveryClock,
 		recoveryStartedAt:  recoveryStartedAt,
 		recoveryDeadline:   recoveryStartedAt.Add(policy.budget),
@@ -226,23 +232,34 @@ func New(cfg Config) (*Store, error) {
 	s.locCache = NewLocationCache(cfg.LocationCacheSize)
 	s.segCache = NewSegmentDescriptorCache(cfg.SegCacheSize)
 	s.changeJournal = cfg.ChangeJournal
-	// V2.1 recovery: replay committed segment-log records from the
-	// active segment into the overlay, and truncate uncommitted tail
-	// data (§7.5 step 4-6). A committed record absent from Pebble is
-	// replayed here; a Pebble entry beyond the last committed sequence
-	// is invalid and reads consult the overlay first, so it is shadowed.
-	if err := s.recoverActiveSegment(filepath.Join(segDir, fmt.Sprintf("%d.seg", maxSegmentID(segDir)))); err != nil {
-		s.group.close()
-		s.segCache.Close()
-		ix.Close()
-		return nil, err
-	}
-
 	segSize := cfg.SegmentSize
 	if segSize <= 0 {
 		segSize = storage.DefaultDataSegmentSize
 	}
 	s.segmentSize = segSize
+	activePath := filepath.Join(segDir, fmt.Sprintf("%d.seg", maxSegmentID(segDir)))
+	// V2.1 recovery: replay committed segment-log records from the
+	// active segment into the overlay, and truncate uncommitted tail
+	// data (§7.5 step 4-6). A committed record absent from Pebble is
+	// replayed here; a Pebble entry beyond the last committed sequence
+	// is invalid and reads consult the overlay first, so it is shadowed.
+	if err := s.recoverActiveSegment(activePath); err != nil {
+		s.group.close()
+		s.segCache.Close()
+		ix.Close()
+		return nil, err
+	}
+	// A recovered suffix exists only in memory until it is synchronously
+	// indexed, flushed, marked INDEX_SAFE, and checkpointed. That durable
+	// handoff must finish while the recovered segment is still the highest
+	// active segment; otherwise a second crash can select the new empty
+	// segment and lose acknowledged data.
+	if err := s.persistRecoveredOverlay(activePath, classForStream(cfg.StreamID), segSize); err != nil {
+		s.group.close()
+		s.segCache.Close()
+		ix.Close()
+		return nil, err
+	}
 	s.nextSeg = maxSegmentID(segDir)
 	if err := s.newActiveSegment(classForStream(cfg.StreamID), segSize); err != nil {
 		s.group.close()
@@ -343,15 +360,63 @@ func (s *Store) recoverActiveSegment(path string) error {
 	return nil
 }
 
-// finishRecoveryStartup records the elapsed interval through active-writer
-// setup and performs the final inclusive deadline check immediately before
-// publishing DataReady.
-func (s *Store) finishRecoveryStartup() error {
+// persistRecoveredOverlay establishes the same durable index/INDEX_SAFE/
+// sidecar boundary as a normal flush before startup creates a higher-numbered
+// active segment. It intentionally reuses flush and writeIndexSafe so there
+// is only one checkpoint publication protocol.
+func (s *Store) persistRecoveredOverlay(path string, class storage.SegmentClass, segSize int64) (err error) {
+	if s.overlay.Len() == 0 {
+		return s.checkRecoveryDeadline()
+	}
+	if err := s.checkRecoveryDeadline(); err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Size() < int64(SegmentHeaderSize) {
+		return fmt.Errorf("storage: recovered segment shorter than header")
+	}
+	w, err := OpenWriter(path)
+	if err != nil {
+		return err
+	}
+	s.writer = w
+	s.writerPath = path
+	s.alloc = NewAllocator(storage.SegmentID(segIDFromPath(path)), class, segSize, nowUnixNano())
+	s.alloc.Consume(info.Size() - int64(SegmentHeaderSize))
+	s.alloc.RecordCommit(s.streamSeq)
+	defer func() {
+		closeErr := w.Close()
+		s.writer = nil
+		s.writerPath = ""
+		if err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+	if err := s.flush(); err != nil {
+		return err
+	}
+	return s.checkRecoveryDeadline()
+}
+
+func (s *Store) checkRecoveryDeadline() error {
 	now := s.recoveryClock()
 	s.recoveryResult.Duration = now.Sub(s.recoveryStartedAt)
 	if now.After(s.recoveryDeadline) {
 		s.recoveryResult.DataReady = false
 		return storage.ErrRecoveryBudgetExceeded
+	}
+	return nil
+}
+
+// finishRecoveryStartup records the elapsed interval through active-writer
+// setup and performs the final inclusive deadline check immediately before
+// publishing DataReady.
+func (s *Store) finishRecoveryStartup() error {
+	if err := s.checkRecoveryDeadline(); err != nil {
+		return err
 	}
 	s.recoveryResult.DataReady = true
 	s.dataReady.Store(true)
@@ -1059,6 +1124,9 @@ func (s *Store) sealActiveLocked() error {
 // overlay into Pebble, so an unqueued mutation here is still durable
 // via the segment log + overlay.
 func (s *Store) enqueueApply(muts []index.Mutation) error {
+	if s.disableAsyncApply {
+		return nil
+	}
 	if err := s.faultStage(storage.CrashAfterAck); err != nil {
 		return err
 	}

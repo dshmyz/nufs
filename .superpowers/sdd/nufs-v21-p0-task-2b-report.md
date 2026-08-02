@@ -144,3 +144,50 @@ cd /Users/gracegaoya/work/project/nufs
 git diff --check
 # PASS
 ```
+
+## Fix Round 2
+
+Fixed the repeated-crash data-loss window in startup ordering. If recovery
+replays acknowledged records into the overlay, `Store.New` now reopens that
+recovered segment long enough to run the existing flush protocol
+synchronously: apply overlay mutations to the derived index, flush Pebble,
+append and sync `INDEX_SAFE`, and atomically publish the recovery sidecar.
+Only after this durable handoff succeeds does startup create a higher-numbered
+active segment or transition to `DataReady`. The handoff checks the shared
+startup deadline before and after the durable work and returns the canonical
+budget error with no usable Store when it is exceeded.
+
+The new deterministic repeated-crash test disables only asynchronous index
+apply and uses a one-hour periodic interval; it does not sleep. It verifies
+the recovered sidecar certifies segment 1 before active segment 2, crashes
+immediately, then proves a second reopen on active segment 3 can still read
+the acknowledged suffix and is `DataReady`.
+
+Also added Store.New record-limit exact/+1 coverage through the injectable
+startup policy with production-valid delete batches (two records, below the
+256-record batch maximum and zero-byte extents). Production defaults remain
+100,000 records. The corruption drill now deterministically flips a known
+uncompressed payload byte and fails on any unrelated startup error. Sidecar
+publication now cleans the temporary file after write, sync, close, and rename
+failures, and preserves close errors; injected tests cover each path.
+
+Final verification:
+
+```bash
+cd /Users/gracegaoya/work/project/nufs/nufs-core
+go test ./datanode/storage/segment ./datanode/storage/recovery ./datanode/storage/index -count=1 -timeout 180s
+# PASS (exit 0)
+
+go test -race ./datanode/storage/segment ./datanode/storage/recovery -run 'Recover|Budget|DataReady|Checkpoint|RepeatedCrash|Drill' -count=10 -timeout 180s
+# PASS (exit 0)
+
+go test -race ./datanode/storage/segment ./datanode/storage/recovery -count=1 -timeout 240s
+# PASS (exit 0)
+
+go test -race ./datanode/storage/index -run 'RecoveryCheckpoint' -count=10 -timeout 120s
+# PASS (exit 0)
+
+cd /Users/gracegaoya/work/project/nufs
+git diff --check
+# PASS
+```

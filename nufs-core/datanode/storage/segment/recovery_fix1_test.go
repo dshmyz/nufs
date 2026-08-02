@@ -183,6 +183,123 @@ func TestStoreRecovery_CheckpointForOtherSegmentFallsBack(t *testing.T) {
 	}
 }
 
+func TestStoreRecovery_RepeatedCrashPersistsRecoveredSuffixBeforeNewSegment(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte("acknowledged suffix")
+
+	// Keep the acknowledged write exclusively in the log+overlay. This makes
+	// the first crash exercise recovery's synchronous handoff, not an
+	// incidental asynchronous Pebble apply.
+	first, err := New(Config{Dir: dir, FlushInterval: time.Hour, disableAsyncApply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Write(context.Background(), &storage.WriteRequest{ExtentID: 41, Generation: 1, Data: data}); err != nil {
+		t.Fatal(err)
+	}
+	crashStoreForTest(t, first)
+
+	// Recovery must persist the replayed overlay and certify segment 1 before
+	// creating segment 2. Crash immediately after startup, before any periodic
+	// background flush could run.
+	recovered, err := New(Config{Dir: dir, FlushInterval: time.Hour, disableAsyncApply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered.DataReady() {
+		t.Fatal("first recovery did not become DataReady")
+	}
+	checkpoint, err := index.LoadRecoveryCheckpoint(recovered.index, recovered.streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint == nil || checkpoint.SegmentID != 1 || checkpoint.SafeSeq != 1 {
+		t.Fatalf("checkpoint = %+v, want recovered segment 1 sequence 1", checkpoint)
+	}
+	if got := filepath.Base(recovered.writerPath); got != "2.seg" {
+		t.Fatalf("active writer = %s, want higher segment 2 after checkpoint publication", got)
+	}
+	crashStoreForTest(t, recovered)
+
+	again, err := New(Config{Dir: dir, FlushInterval: time.Hour, disableAsyncApply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if !again.DataReady() {
+		t.Fatal("second recovery did not become DataReady")
+	}
+	got, err := again.Read(context.Background(), &storage.ReadRequest{ExtentID: 41, Generation: 1})
+	if err != nil {
+		t.Fatalf("acknowledged suffix lost after repeated crash: %v", err)
+	}
+	if !bytes.Equal(got.Data, data) {
+		t.Fatalf("data = %q, want %q", got.Data, data)
+	}
+	checkpoint, err = index.LoadRecoveryCheckpoint(again.index, again.streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint == nil || checkpoint.SegmentID != 1 || filepath.Base(again.writerPath) != "3.seg" {
+		t.Fatalf("checkpoint/segment ordering checkpoint=%+v active=%s, want segment 1 before active segment 3", checkpoint, again.writerPath)
+	}
+}
+
+func TestStoreRecovery_RecordLimitBoundaryUsesStoreStartup(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		records int
+		wantErr bool
+	}{
+		{name: "exact", records: 2},
+		{name: "plus one", records: 3, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			active := filepath.Join(dir, "segments", "small", "active")
+			if err := os.MkdirAll(active, 0755); err != nil {
+				t.Fatal(err)
+			}
+			w := newProductionRecoveryLog(t, filepath.Join(active, "7.seg"))
+			w.appendDeleteRecords(tc.records, 2) // production-valid: <= MaxBatch, zero-byte extents.
+			w.close()
+
+			s, err := New(Config{Dir: dir, UseMemIndex: true, recoveryPolicy: recoveryStartupPolicy{maxRecords: 2}})
+			if tc.wantErr {
+				if !errors.Is(err, storage.ErrRecoveryBudgetExceeded) || s != nil {
+					t.Fatalf("result store=%v error=%v, want unavailable Store and canonical budget error", s, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			if res := s.RecoveryResult(); !s.DataReady() || !res.DataReady || res.Applied != tc.records {
+				t.Fatalf("result = %+v, want DataReady with %d replayed records", res, tc.records)
+			}
+		})
+	}
+}
+
+// crashStoreForTest models process termination without calling Store.Close,
+// which would intentionally flush the overlay. Callers disable async apply
+// and use a one-hour flush interval so no background operation can race this
+// deterministic crash seam.
+func crashStoreForTest(t *testing.T, s *Store) {
+	t.Helper()
+	s.group.close()
+	if err := s.writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s.segCache != nil {
+		s.segCache.Close()
+	}
+}
+
 func TestStoreRecovery_ReplayBytesUseFullCommittedFramingBoundary(t *testing.T) {
 	payload := bytes.Repeat([]byte("p"), 1024)
 	wantBytes := int64(RecordFraming(uint32(len(payload)), DefaultFrameSize, 1) + journal.BatchCommitSize)

@@ -2,6 +2,7 @@ package index
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -29,12 +30,28 @@ const (
 	recoveryCheckpointSize           = 4 + 1 + 1 + 8 + 8 + 8 + 4
 )
 
+var recoveryCheckpointFileOps = struct {
+	open   func(string, int, os.FileMode) (*os.File, error)
+	write  func(*os.File, []byte) (int, error)
+	sync   func(*os.File) error
+	close  func(*os.File) error
+	rename func(string, string) error
+	remove func(string) error
+}{
+	open:   os.OpenFile,
+	write:  func(f *os.File, b []byte) (int, error) { return f.Write(b) },
+	sync:   func(f *os.File) error { return f.Sync() },
+	close:  func(f *os.File) error { return f.Close() },
+	rename: os.Rename,
+	remove: os.Remove,
+}
+
 // StoreRecoveryCheckpoint atomically publishes a recovery checkpoint for one
 // stream. The temporary file is synced before rename and the index directory
 // is synced after rename, so a returned checkpoint is durable across restart.
 // In-memory indexes deliberately have no restart authority and therefore do
 // not publish a sidecar.
-func StoreRecoveryCheckpoint(ix *Index, checkpoint RecoveryCheckpoint) error {
+func StoreRecoveryCheckpoint(ix *Index, checkpoint RecoveryCheckpoint) (err error) {
 	if ix == nil {
 		return fmt.Errorf("storage: nil index recovery checkpoint")
 	}
@@ -52,24 +69,37 @@ func StoreRecoveryCheckpoint(ix *Index, checkpoint RecoveryCheckpoint) error {
 	buf := encodeRecoveryCheckpoint(checkpoint)
 	path := recoveryCheckpointPath(ix.dir, checkpoint.StreamID)
 	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err := recoveryCheckpointFileOps.open(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(buf[:]); err != nil {
-		_ = f.Close()
+	published := false
+	closeTemp := func() error {
+		closeErr := recoveryCheckpointFileOps.close(f)
+		f = nil
+		return closeErr
+	}
+	defer func() {
+		if f != nil {
+			err = errors.Join(err, closeTemp())
+		}
+		if !published {
+			_ = recoveryCheckpointFileOps.remove(tmp)
+		}
+	}()
+	if _, err = recoveryCheckpointFileOps.write(f, buf[:]); err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
+	if err = recoveryCheckpointFileOps.sync(f); err != nil {
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err = closeTemp(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err = recoveryCheckpointFileOps.rename(tmp, path); err != nil {
 		return err
 	}
+	published = true
 	if err := syncDir(ix.dir); err != nil {
 		return err
 	}
