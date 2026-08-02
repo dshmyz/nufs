@@ -116,6 +116,26 @@ func TestCommitLayout_ConcurrentBatchIsContiguous(t *testing.T) {
 	if got, want := commit.LastOffset, commitOffset; got != want {
 		t.Fatalf("commit last offset=%d want contiguous offset=%d", got, want)
 	}
+	firstHeader := RecordHeader{}
+	if err := firstHeader.Decode(raw[firstOffset : firstOffset+RecordHeaderSize]); err != nil {
+		t.Fatal(err)
+	}
+	secondHeader := RecordHeader{}
+	if err := secondHeader.Decode(raw[secondOffset : secondOffset+RecordHeaderSize]); err != nil {
+		t.Fatal(err)
+	}
+	descs := []journal.BatchDescriptor{
+		{ExtentID: firstHeader.ExtentID, Generation: firstHeader.Generation, SegmentID: receipts[0].SegmentID, Offset: firstOffset, StoredLen: firstHeader.StoredLen, LogicalLen: firstHeader.LogicalLen, Checksum: firstHeader.PayloadChecksum},
+		{ExtentID: secondHeader.ExtentID, Generation: secondHeader.Generation, SegmentID: receipts[1].SegmentID, Offset: secondOffset, StoredLen: secondHeader.StoredLen, LogicalLen: secondHeader.LogicalLen, Checksum: secondHeader.PayloadChecksum},
+	}
+	descBuf := make([]byte, len(descs)*journal.BatchDescriptorSize)
+	wantCRC, err := journal.EncodeDescriptors(descBuf, descs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := commit.DescriptorsCRC; got != wantCRC {
+		t.Fatalf("commit descriptor crc=%d want full descriptor crc=%d", got, wantCRC)
+	}
 }
 
 func TestCommitLayout_OverflowBatchStartsOnFreshSegment(t *testing.T) {

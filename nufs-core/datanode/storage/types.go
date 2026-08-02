@@ -41,7 +41,7 @@ func (id ExtentID) OwnerShard() uint16 {
 
 // Format version of the on-disk record/segment format. Bumped only on
 // incompatible layout changes.
-const FormatVersion = 2
+const FormatVersion = 3
 
 // Record magic distinguishes record payload framing from arbitrary
 // bytes in a segment.
@@ -57,10 +57,10 @@ const (
 
 // WAL defaults (§7.1, §16).
 const (
-	DefaultWALSegmentSize     = 256 << 20 // 256 MiB
-	DefaultWALRotateInterval  = 10 * 60 * 1e9 // 10 minutes in ns
-	DefaultWALRetainMin       = 24 * 3600 * 1e9 // 24 hours in ns
-	DefaultCheckpointInterval = 5 * 60 * 1e9 // 5 minutes in ns
+	DefaultWALSegmentSize          = 256 << 20       // 256 MiB
+	DefaultWALRotateInterval       = 10 * 60 * 1e9   // 10 minutes in ns
+	DefaultWALRetainMin            = 24 * 3600 * 1e9 // 24 hours in ns
+	DefaultCheckpointInterval      = 5 * 60 * 1e9    // 5 minutes in ns
 	DefaultCheckpointMaxWALRecords = 1000000
 	DefaultCheckpointMaxWALBytes   = 2 << 30 // 2 GiB
 	DefaultRetainCheckpoints       = 3

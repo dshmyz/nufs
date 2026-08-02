@@ -26,13 +26,13 @@ import (
 //
 // V2.1 durability model (§6.1):
 //
-//	1. reserve offset in active segment
-//	2. append record header + frame index + frames + trailer
-//	3. append BatchCommit for the group
-//	4. one fdatasync on the segment
-//	5. apply committed locations to the bounded in-memory delta overlay
-//	6. return DurableReceipt for every request in the commit
-//	7. apply mutations asynchronously to Pebble
+//  1. reserve offset in active segment
+//  2. append record header + frame index + frames + trailer
+//  3. append BatchCommit for the group
+//  4. one fdatasync on the segment
+//  5. apply committed locations to the bounded in-memory delta overlay
+//  6. return DurableReceipt for every request in the commit
+//  7. apply mutations asynchronously to Pebble
 //
 // BatchCommit is the foreground durability point. Pebble may lag the
 // committed sequence but never lead it; recovery replays committed
@@ -46,7 +46,7 @@ type Store struct {
 
 	// index is the derived location index (Pebble). The committed-delta
 	// overlay is the read authority until async apply catches up.
-	index  *index.Index
+	index   *index.Index
 	overlay *Overlay
 
 	// streamID distinguishes small (0) from data (1) commit streams.
@@ -78,9 +78,9 @@ type Store struct {
 	// flushSeq is the highest committed stream sequence (mutation
 	// counter for the flush trigger). flushInterval bounds how long the
 	// index can lag the committed log.
-	flushSeq      atomic.Uint64
+	flushSeq       atomic.Uint64
 	flushMutations atomic.Int64
-	flushInterval time.Duration
+	flushInterval  time.Duration
 	// safeSeq is the last sequence covered by an INDEX_SAFE record.
 	safeSeq atomic.Uint64
 	// flushLoopDone signals the background flush loop.
@@ -91,8 +91,8 @@ type Store struct {
 	enc *encryption.KeyRegistry
 
 	// Caches (§8).
-	locCache  *LocationCache            // extent → index.Value
-	segCache  *SegmentDescriptorCache   // segment path → *Reader
+	locCache *LocationCache          // extent → index.Value
+	segCache *SegmentDescriptorCache // segment path → *Reader
 
 	// changeJournal is the async change journal (§12). nil when not
 	// configured (production deployments should always provide one).
@@ -205,7 +205,11 @@ func (s *Store) recoverActiveSegment(path string) error {
 	if path == "" || !fileExists(path) {
 		return nil
 	}
-	res, err := RecoverFromSegmentLog(path, s.streamID, s.overlay, func(d CommitDescriptor) error {
+	res, err := RecoverFromSegmentLog(path, RecoverOptions{
+		StreamID:   s.streamID,
+		SafeOffset: int64(storage.SegmentHeaderSize),
+		SafeSeq:    s.safeSeq.Load(),
+	}, func(d CommitDescriptor) error {
 		// Replay into the overlay (read authority). Committed-but-
 		// unflushed records are served from the overlay until the async
 		// apply loop or a later flush persists them to Pebble.
@@ -215,7 +219,7 @@ func (s *Store) recoverActiveSegment(path string) error {
 			StoredLen:  d.StoredLen,
 			LogicalLen: d.LogicalLen,
 			State:      storage.ExtentDurable,
-			Checksum:   0, // checksum not in the descriptor; verified on read
+			Checksum:   d.Checksum,
 		})
 		return nil
 	})
@@ -353,17 +357,18 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 		return nil, err
 	}
 	header := &RecordHeader{
-		Magic:        storage.RecordMagic,
-		Version:      storage.FormatVersion,
-		ExtentID:     req.ExtentID,
-		Generation:   req.Generation,
-		LogicalLen:   uint32(len(req.Data)),
-		StoredLen:    storedLen,
-		Codec:        codec,
-		KeyID:        keyID,
-		FrameSize:    uint16(frameSize),
-		FrameCount:   uint16(frameCount),
-		FrameIndexCRC: fi.CRC,
+		Magic:           storage.RecordMagic,
+		Version:         storage.FormatVersion,
+		ExtentID:        req.ExtentID,
+		Generation:      req.Generation,
+		LogicalLen:      uint32(len(req.Data)),
+		StoredLen:       storedLen,
+		Codec:           codec,
+		KeyID:           keyID,
+		FrameSize:       uint16(frameSize),
+		FrameCount:      uint16(frameCount),
+		FrameIndexCRC:   fi.CRC,
+		PayloadChecksum: payloadCRC,
 	}
 	pw := &pendingWrite{
 		extentID:   req.ExtentID,
@@ -497,7 +502,7 @@ func (s *Store) commitBatch(batch []*pendingWrite) error {
 		RecordCount:    uint32(len(batch)),
 		FirstOffset:    first.offset,
 		LastOffset:     commitOffset,
-		DescriptorsCRC: checksumOf(batchDescriptorsChecksum(batch)),
+		DescriptorsCRC: batchDescriptorsCRC(batch),
 	}
 	if err := s.writer.WriteBatchCommit(commitOffset, bc); err != nil {
 		return err
@@ -522,23 +527,22 @@ func (s *Store) commitBatch(batch []*pendingWrite) error {
 	return nil
 }
 
-// batchDescriptorsChecksum derives a batch-level checksum over the
-// batch's extent/gen pairs (bound to the BatchCommit).
-func batchDescriptorsChecksum(batch []*pendingWrite) []byte {
-	out := make([]byte, 0, len(batch)*8)
-	for _, pw := range batch {
-		var b [8]byte
-		b[0] = byte(pw.extentID >> 56)
-		b[1] = byte(pw.extentID >> 48)
-		b[2] = byte(pw.extentID >> 40)
-		b[3] = byte(pw.extentID >> 32)
-		b[4] = byte(pw.extentID >> 24)
-		b[5] = byte(pw.extentID >> 16)
-		b[6] = byte(pw.extentID >> 8)
-		b[7] = byte(pw.extentID)
-		out = append(out, b[:]...)
+// batchDescriptorsCRC binds every location and checksum committed by a batch.
+func batchDescriptorsCRC(batch []*pendingWrite) uint32 {
+	descs := make([]journal.BatchDescriptor, len(batch))
+	for i, pw := range batch {
+		descs[i] = journal.BatchDescriptor{
+			ExtentID: pw.extentID, Generation: pw.generation, SegmentID: pw.segID,
+			Offset: pw.offset, StoredLen: pw.storedLen, LogicalLen: pw.logicalLen,
+			Checksum: pw.payloadCRC,
+		}
 	}
-	return out
+	buf := make([]byte, len(descs)*journal.BatchDescriptorSize)
+	crc, err := journal.EncodeDescriptors(buf, descs)
+	if err != nil {
+		panic(err)
+	}
+	return crc
 }
 
 // AppendRecord writes a payload into the active segment and commits it,
@@ -597,16 +601,17 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 	s.mu.Unlock()
 
 	header := &RecordHeader{
-		Magic:      storage.RecordMagic,
-		Version:    storage.FormatVersion,
-		ExtentID:   extentID,
-		Generation: gen,
-		LogicalLen: uint32(len(data)),
-		StoredLen:  storedLen,
-		Codec:      codec,
-		KeyID:      keyID,
-		FrameSize:  uint16(frameSize),
-		FrameCount: uint16(frameCount),
+		Magic:           storage.RecordMagic,
+		Version:         storage.FormatVersion,
+		ExtentID:        extentID,
+		Generation:      gen,
+		LogicalLen:      uint32(len(data)),
+		StoredLen:       storedLen,
+		Codec:           codec,
+		KeyID:           keyID,
+		FrameSize:       uint16(frameSize),
+		FrameCount:      uint16(frameCount),
+		PayloadChecksum: checksumOf(data),
 	}
 	idxBuf := make([]byte, frameCount*FrameIndexEntrySize)
 	if err := fi.Encode(idxBuf); err != nil {
@@ -618,14 +623,17 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 	}
 	commitOffset := off + int64(framing)
 	bc := &journal.BatchCommit{
-		Magic:          journal.BatchCommitMagic,
-		Version:        storage.FormatVersion,
-		StreamID:       s.streamID,
-		Seq:            streamSeq + 1,
-		RecordCount:    1,
-		FirstOffset:    off,
-		LastOffset:     commitOffset,
-		DescriptorsCRC: checksumOf(data),
+		Magic:       journal.BatchCommitMagic,
+		Version:     storage.FormatVersion,
+		StreamID:    s.streamID,
+		Seq:         streamSeq + 1,
+		RecordCount: 1,
+		FirstOffset: off,
+		LastOffset:  commitOffset,
+		DescriptorsCRC: descriptorCRC([]journal.BatchDescriptor{{
+			ExtentID: extentID, Generation: gen, SegmentID: segID, Offset: off,
+			StoredLen: storedLen, LogicalLen: uint32(len(data)), Checksum: checksumOf(data),
+		}}),
 	}
 	if err := writer.WriteBatchCommit(commitOffset, bc); err != nil {
 		return nil, err
@@ -771,41 +779,55 @@ func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
 	return s.enqueueApply([]index.Mutation{{ExtentID: req.ExtentID, Generation: req.Generation, Value: *v}})
 }
 
-// appendTombstone appends a tombstone BatchCommit to the stream.
-func (s *Store) appendTombstone(extentID storage.ExtentID, gen storage.Generation, v *index.Value) (*storage.DurableReceipt, error) {
+// appendTombstone writes a zero-frame record plus one validating BatchCommit.
+func (s *Store) appendTombstone(extentID storage.ExtentID, gen storage.Generation, _ *index.Value) (*storage.DurableReceipt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Reserve a tombstone marker (a zero-length record + BatchCommit).
-	// Tombstones carry the old location for generation fencing.
-	// Simplification: a single committed BatchCommit records the delete.
-	bc := &journal.BatchCommit{
-		Magic:       journal.BatchCommitMagic,
-		Version:     storage.FormatVersion,
-		StreamID:    s.streamID,
-		Seq:         s.streamSeq + 1,
-		RecordCount: 1,
-		FirstOffset: v.Offset,
-		LastOffset:  v.Offset,
-		DescriptorsCRC: checksumOf(nil),
+	framing := RecordFraming(0, DefaultFrameSize, 0)
+	required := int64(framing) + int64(journal.BatchCommitSize)
+	if !s.alloc.CanReserveBatch(required) || !s.alloc.CanReserveRecords(1) {
+		if err := s.sealActiveLocked(); err != nil {
+			return nil, err
+		}
+		if !s.alloc.CanReserveBatch(required) || !s.alloc.CanReserveRecords(1) {
+			return nil, storage.ErrSegmentFull
+		}
 	}
-	buf := make([]byte, journal.BatchCommitSize)
-	if err := bc.Encode(buf); err != nil {
-		return nil, err
-	}
-	// Append at the current tail.
-	tail, err := s.alloc.CurrentTail()
+	recordOff, err := s.alloc.Reserve(framing, extentID, 0)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.writer.WriteAt(buf, tail); err != nil {
+	commitOff, err := s.alloc.ReserveCommit(uint32(journal.BatchCommitSize))
+	if err != nil {
+		return nil, err
+	}
+	segID := s.alloc.State().SegmentID
+	header := &RecordHeader{
+		Magic: storage.RecordMagic, Version: storage.FormatVersion,
+		ExtentID: extentID, Generation: gen, FrameIndexCRC: crc32ChecksumIEEE(nil),
+	}
+	if _, err := s.writer.WriteRecordFramed(recordOff, header, nil, nil, DefaultFrameSize); err != nil {
+		return nil, err
+	}
+	bc := &journal.BatchCommit{
+		Magic:          journal.BatchCommitMagic,
+		Version:        storage.FormatVersion,
+		StreamID:       s.streamID,
+		Seq:            s.streamSeq + 1,
+		RecordCount:    1,
+		FirstOffset:    recordOff,
+		LastOffset:     commitOff,
+		DescriptorsCRC: descriptorCRC([]journal.BatchDescriptor{{ExtentID: extentID, Generation: gen, SegmentID: segID, Offset: recordOff}}),
+	}
+	if err := s.writer.WriteBatchCommit(commitOff, bc); err != nil {
 		return nil, err
 	}
 	if err := s.writer.Sync(); err != nil {
 		return nil, err
 	}
 	s.streamSeq++
-	s.alloc.Consume(journal.BatchCommitSize)
-	return &storage.DurableReceipt{ExtentID: extentID, Generation: gen, SegmentID: v.SegmentID, Offset: v.Offset, Seq: s.streamSeq}, nil
+	s.alloc.RecordCommit(s.streamSeq)
+	return &storage.DurableReceipt{ExtentID: extentID, Generation: gen, SegmentID: segID, Offset: recordOff, Seq: s.streamSeq}, nil
 }
 
 // Stat implements storage.Store.Stat.
@@ -869,15 +891,15 @@ func (s *Store) Close() error {
 func (s *Store) sealActiveLocked() error {
 	st := s.alloc.State()
 	footer := &SegmentFooter{
-		Magic:         storage.SegmentMagic,
-		Version:       storage.FormatVersion,
-		RecordCount:   st.RecordCount,
-		TotalPayload:  uint64(st.PayloadBytes),
-		MinExtentID:   st.MinExtent,
-		MaxExtentID:   st.MaxExtent,
+		Magic:            storage.SegmentMagic,
+		Version:          storage.FormatVersion,
+		RecordCount:      st.RecordCount,
+		TotalPayload:     uint64(st.PayloadBytes),
+		MinExtentID:      st.MinExtent,
+		MaxExtentID:      st.MaxExtent,
 		LastCommittedSeq: st.LastCommitSeq,
-		CreatedAtUnix: st.CreatedAt,
-		SealedAtUnix:  nowUnixNano(),
+		CreatedAtUnix:    st.CreatedAt,
+		SealedAtUnix:     nowUnixNano(),
 	}
 	if err := s.writer.WriteFooter(st.NextOffset, footer); err != nil {
 		return err

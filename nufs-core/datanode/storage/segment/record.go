@@ -26,7 +26,7 @@ import (
 const DefaultFrameSize = 64 << 10 // 64 KiB
 
 // RecordHeaderSize is the fixed on-disk size of RecordHeader (V2.1).
-const RecordHeaderSize = 4 + 1 + 8 + 8 + 4 + 4 + 1 + 8 + 2 + 2 + 4 + 4 // 50
+const RecordHeaderSize = 4 + 1 + 8 + 8 + 4 + 4 + 1 + 8 + 2 + 2 + 4 + 4 + 4 // 54
 
 // RecordTrailerSize is the fixed on-disk size of RecordTrailer.
 const RecordTrailerSize = 8 + 4 // 12
@@ -36,18 +36,21 @@ const FrameIndexEntrySize = 4 + 4 + 1 + 4 // offset + stored_len + codec + crc
 
 // RecordHeader is the fixed-size header of one record (V2.1 §5.3).
 type RecordHeader struct {
-	Magic      uint32          // RecordMagic
-	Version    uint8           // FormatVersion
-	ExtentID   storage.ExtentID        // 8 bytes
-	Generation storage.Generation      // 8 bytes
-	LogicalLen uint32          // logical payload length
-	StoredLen  uint32          // stored (possibly compressed/encrypted) length
+	Magic      uint32                   // RecordMagic
+	Version    uint8                    // FormatVersion
+	ExtentID   storage.ExtentID         // 8 bytes
+	Generation storage.Generation       // 8 bytes
+	LogicalLen uint32                   // logical payload length
+	StoredLen  uint32                   // stored (possibly compressed/encrypted) length
 	Codec      storage.CompressionCodec // 1 byte
-	KeyID      uint64          // encryption key ID (0 = plaintext)
-	FrameSize  uint16          // bytes per frame payload (0 = default 64KiB)
-	FrameCount uint16          // number of frames in this record
-	HeaderCRC  uint32          // CRC32C of the preceding fields
-	FrameIndexCRC uint32       // CRC32C of the frame-index bytes
+	KeyID      uint64                   // encryption key ID (0 = plaintext)
+	FrameSize  uint16                   // bytes per frame payload (0 = default 64KiB)
+	FrameCount uint16                   // number of frames in this record
+	// PayloadChecksum is the checksum of the logical payload. It lets
+	// recovery bind a BatchDescriptor without reading payload frames.
+	PayloadChecksum uint32
+	HeaderCRC       uint32 // CRC32C of the preceding fields
+	FrameIndexCRC   uint32 // CRC32C of the frame-index bytes
 }
 
 // RecordTrailer is appended after the payload. It carries the framing
@@ -73,10 +76,11 @@ func (h *RecordHeader) Encode(dst []byte) error {
 	binary.BigEndian.PutUint64(dst[30:38], h.KeyID)
 	binary.BigEndian.PutUint16(dst[38:40], h.FrameSize)
 	binary.BigEndian.PutUint16(dst[40:42], h.FrameCount)
-	// HeaderCRC covers bytes [0, 42); then write both checksums.
-	hdrCRC := crc32.ChecksumIEEE(dst[0:42])
-	binary.BigEndian.PutUint32(dst[42:46], hdrCRC)
-	binary.BigEndian.PutUint32(dst[46:50], h.FrameIndexCRC)
+	// HeaderCRC covers bytes [0, 46); then write both checksums.
+	binary.BigEndian.PutUint32(dst[42:46], h.PayloadChecksum)
+	hdrCRC := crc32.ChecksumIEEE(dst[0:46])
+	binary.BigEndian.PutUint32(dst[46:50], hdrCRC)
+	binary.BigEndian.PutUint32(dst[50:54], h.FrameIndexCRC)
 	return nil
 }
 
@@ -96,8 +100,9 @@ func (h *RecordHeader) Decode(src []byte) error {
 	h.KeyID = binary.BigEndian.Uint64(src[30:38])
 	h.FrameSize = binary.BigEndian.Uint16(src[38:40])
 	h.FrameCount = binary.BigEndian.Uint16(src[40:42])
-	wantCRC := binary.BigEndian.Uint32(src[42:46])
-	h.FrameIndexCRC = binary.BigEndian.Uint32(src[46:50])
+	h.PayloadChecksum = binary.BigEndian.Uint32(src[42:46])
+	wantCRC := binary.BigEndian.Uint32(src[46:50])
+	h.FrameIndexCRC = binary.BigEndian.Uint32(src[50:54])
 
 	if h.Magic != storage.RecordMagic {
 		return fmt.Errorf("storage: bad record magic 0x%x", h.Magic)
@@ -105,7 +110,7 @@ func (h *RecordHeader) Decode(src []byte) error {
 	if h.Version != storage.FormatVersion {
 		return fmt.Errorf("storage: unsupported record version %d", h.Version)
 	}
-	gotCRC := crc32.ChecksumIEEE(src[0:42])
+	gotCRC := crc32.ChecksumIEEE(src[0:46])
 	if gotCRC != wantCRC {
 		return fmt.Errorf("storage: record header crc mismatch: got %d want %d", gotCRC, wantCRC)
 	}

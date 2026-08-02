@@ -13,16 +13,17 @@ import (
 
 func TestRecordHeaderGolden(t *testing.T) {
 	h := RecordHeader{
-		Magic:      storage.RecordMagic,
-		Version:    storage.FormatVersion,
-		ExtentID:   0x1122334455667788,
-		Generation: 0xdeadbeef,
-		LogicalLen: 65536,
-		StoredLen:  4096,
-		Codec:      storage.CompressionZstd,
-		KeyID:      7,
-		FrameSize:  1024,
-		FrameCount: 4,
+		Magic:           storage.RecordMagic,
+		Version:         storage.FormatVersion,
+		ExtentID:        0x1122334455667788,
+		Generation:      0xdeadbeef,
+		LogicalLen:      65536,
+		StoredLen:       4096,
+		Codec:           storage.CompressionZstd,
+		KeyID:           7,
+		FrameSize:       1024,
+		FrameCount:      4,
+		PayloadChecksum: 0xaabbccdd,
 	}
 	// FrameIndexCRC is a stable constant for the golden check.
 	h.FrameIndexCRC = 0x01020304
@@ -53,7 +54,7 @@ func TestRecordHeaderGolden(t *testing.T) {
 }
 
 func TestRecordTrailerGolden(t *testing.T) {
-	trailer := RecordTrailer{FramingLen: 50 + 4096 + 12}
+	trailer := RecordTrailer{FramingLen: 54 + 4096 + 12}
 	buf := make([]byte, RecordTrailerSize)
 	if err := trailer.Encode(buf); err != nil {
 		t.Fatal(err)
@@ -124,10 +125,10 @@ func TestFrameCRCFailure(t *testing.T) {
 	}
 }
 
-func TestRecordFramingV21(t *testing.T) {
-	// header(50) + index(2 entries × 13) + payload(4096) + trailer(12)
+func TestRecordFramingV3(t *testing.T) {
+	// header(54) + index(2 entries × 13) + payload(4096) + trailer(12)
 	got := RecordFraming(4096, 2048, 2)
-	if got != 50+26+4096+12 {
-		t.Fatalf("RecordFraming = %d, want %d", got, 50+26+4096+12)
+	if got != 54+26+4096+12 {
+		t.Fatalf("RecordFraming = %d, want %d", got, 54+26+4096+12)
 	}
 }
