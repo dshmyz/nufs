@@ -12,7 +12,7 @@
 services:
   metad:
     build:
-      context: .
+      context: ..
       dockerfile: deploy/Dockerfile
     image: nufs:latest
     entrypoint: /usr/local/bin/metad
@@ -20,6 +20,7 @@ services:
       - --data-dir=/var/lib/dfs/metadata
       - --ops-addr=0.0.0.0:8091
       - --raft=false
+      - --allow-insecure-dev
       - --log-level=info
       - --log-json=true
     ports:

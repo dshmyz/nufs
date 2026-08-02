@@ -124,7 +124,7 @@ func main() {
 		raftNodeCount = len(parsePeerOpsURLsForValidation(*raftBootstrapPeers)) + 1
 	}
 	if err := metadata.ValidateProductionConfig(metadata.ProductionValidationConfig{
-		Mode:             metadata.RuntimeProduction,
+		Mode:             runtimeMode(*allowInsecureDev),
 		JWTSecret:        *authToken,
 		RaftNodeCount:    raftNodeCount,
 		TLSEnabled:       *tlsCert != "",
@@ -330,8 +330,8 @@ func main() {
 
 	// Prometheus metrics endpoint
 	mux.Handle("/metrics", prometheusMetricsHandler(store, bundle.Metrics, backupDeps...))
-	// Health check endpoint
-	mux.Handle("/healthz", metadata.HealthHandler(bundle.Health))
+	// Health check endpoint — handled by setupDefaultRoutes in ops_handlers.
+	// mux.Handle("/healthz", metadata.HealthHandler(bundle.Health))
 	// Version endpoint
 	mux.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -769,4 +769,13 @@ func indexOfByte(s string, b byte) int {
 		}
 	}
 	return -1
+}
+
+// runtimeMode returns RuntimeDev when allowInsecureDev is true, otherwise
+// RuntimeProduction.
+func runtimeMode(allowInsecureDev bool) metadata.RuntimeMode {
+	if allowInsecureDev {
+		return metadata.RuntimeDev
+	}
+	return metadata.RuntimeProduction
 }
