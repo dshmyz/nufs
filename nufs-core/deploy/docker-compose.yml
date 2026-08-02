@@ -28,9 +28,13 @@ services:
     volumes:
       - nufs-data:/var/lib/dfs
 
+  # V1 datanodes (legacy ChunkStore). Excluded by default via the
+  # "v1" profile — run `docker compose --profile v1 up` to include
+  # them. The default stack is V2.1-only (metad + datanode-v21 + s3).
   datanode-1:
     image: nufs:latest
     entrypoint: /usr/local/bin/datanode
+    profiles: ["v1"]
     command:
       - --node-id=auto
       - --listen=0.0.0.0:9100
@@ -51,6 +55,7 @@ services:
   datanode-2:
     image: nufs:latest
     entrypoint: /usr/local/bin/datanode
+    profiles: ["v1"]
     command:
       - --node-id=auto
       - --listen=0.0.0.0:9101
@@ -110,8 +115,6 @@ services:
       - "8081:8080"
     depends_on:
       - metad
-      - datanode-1
-      - datanode-2
       - datanode-v21
     volumes:
       - nufs-data:/var/lib/dfs
@@ -130,8 +133,6 @@ services:
       - --storage.tsdb.retention.time=7d
     depends_on:
       - metad
-      - datanode-1
-      - datanode-2
     restart: unless-stopped
 
   grafana:
