@@ -20,6 +20,7 @@ const (
 	prefixLogicalPartition  = "/logical-partition/"
 	prefixDirectoryMap      = "/directory-map/"
 	prefixCrossShardTxn     = "/cross-shard-txn/"
+	prefixGCBucket          = "/gc-bucket/"
 	prefixChunkTombstone    = "chunk-tombstone/"
 	prefixNode              = "/node/"
 	prefixPolicy            = "/policy/"
