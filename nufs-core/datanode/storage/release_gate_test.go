@@ -104,16 +104,17 @@ func TestGate_PaginatedListings(t *testing.T) {
 }
 
 // Gate 4: a durable local batch requires exactly one foreground fsync
-// barrier. The write path must contain exactly one writer.Sync() per
-// batch.
+// barrier. After the group-commit refactor, the barrier lives in
+// commitBatch (one Sync per batch); Write submits to the coordinator and
+// is acknowledged only after that barrier.
 func TestGate_SingleFsyncBarrier(t *testing.T) {
 	path := filepath.Join("..", "..", "datanode/storage/segment/store.go")
 	src, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Parse and find Write's body; count Sync calls between the record
-	// append and the overlay apply.
+	// Parse and find commitBatch's body; count Sync calls. It must be
+	// exactly one (the §6.4 single-barrier batch commit).
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, path, src, 0)
 	if err != nil {
@@ -121,10 +122,9 @@ func TestGate_SingleFsyncBarrier(t *testing.T) {
 	}
 	for _, decl := range f.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "Write" {
+		if !ok || fn.Name.Name != "commitBatch" {
 			continue
 		}
-		// Count .Sync() method calls inside Write.
 		syncCount := 0
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -137,7 +137,7 @@ func TestGate_SingleFsyncBarrier(t *testing.T) {
 			return true
 		})
 		if syncCount != 1 {
-			t.Errorf("Store.Write has %d Sync calls, want exactly 1 (single fsync barrier)", syncCount)
+			t.Errorf("commitBatch has %d Sync calls, want exactly 1 (single fsync barrier per batch)", syncCount)
 		}
 	}
 }

@@ -60,6 +60,15 @@ type Store struct {
 	stopCh  chan struct{}
 	applyWG sync.WaitGroup
 
+	// group commits writes to the active segment (§6.4): a leader
+	// collects followers, appends records + one BatchCommit, syncs once,
+	// then wakes everyone.
+	group *groupCommitCoordinator
+
+	// syncCalls counts writer.Sync() invocations (observability + tests
+	// proving group commit shares one barrier per batch).
+	syncCalls atomic.Int64
+
 	// Safe-sequence tracking for INDEX_SAFE flush (§7.4).
 	pendingFlush  atomic.Uint64
 	flushInterval time.Duration
@@ -102,16 +111,17 @@ func New(cfg Config) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		index:       ix,
-		overlay:     NewOverlay(),
-		segDir:      filepath.Join(cfg.Dir, "segments"),
-		streamID:    cfg.StreamID,
-		faults:      cfg.Faults,
-		enc:         cfg.Enc,
-		applyCh:     make(chan []index.Mutation, 256),
-		stopCh:      make(chan struct{}),
+		index:         ix,
+		overlay:       NewOverlay(),
+		segDir:        filepath.Join(cfg.Dir, "segments"),
+		streamID:      cfg.StreamID,
+		faults:        cfg.Faults,
+		enc:           cfg.Enc,
+		applyCh:       make(chan []index.Mutation, 256),
+		stopCh:        make(chan struct{}),
 		flushInterval: 2 * time.Second,
 	}
+	s.group = newGroupCommitCoordinator(defaultGroupCommitConfig())
 	s.applyWG.Add(1)
 	go s.applyLoop()
 
@@ -249,7 +259,8 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 		return nil, err
 	}
 
-	// Phase 1: reserve an offset.
+	// Phase 1: build the record material (offsets reserved by the group
+	// commit leader when the batch commits).
 	payloadCRC := checksumOf(req.Data)
 	frameSize := DefaultFrameSize
 	// Decide compression from the sampling rule (§9).
@@ -271,97 +282,50 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 	}
 	storedLen := uint32(len(storedBytes))
 	frameCount := len(fi.Entries)
-	framing := uint32(RecordHeaderSize) + uint32(frameCount*FrameIndexEntrySize) + storedLen + uint32(RecordTrailerSize)
-	// BatchCommit is appended at the end of the batch; the allocator
-	// also needs room for it.
-	commitLen := uint32(journal.BatchCommitSize)
-
-	s.mu.Lock()
-	// Reserve the record then the BatchCommit, atomically for the batch.
-	off, err := s.alloc.Reserve(framing, req.ExtentID, storedLen)
-	if err != nil {
-		s.mu.Unlock()
-		if err == storage.ErrSegmentFull {
-			if serr := s.sealActiveLocked(); serr != nil {
-				return nil, serr
-			}
-			off, err = s.alloc.Reserve(framing, req.ExtentID, storedLen)
-		}
-		if err != nil {
-			s.mu.Unlock()
-			return nil, err
-		}
-	}
-	// Reserve BatchCommit space immediately after the record.
-	if _, err := s.alloc.ReserveCommit(commitLen); err != nil {
-		s.mu.Unlock()
-		return nil, err
-	}
-	segID := s.alloc.State().SegmentID
-	streamSeq := s.streamSeq
-	s.streamSeq++
-	writer := s.writer
-	s.mu.Unlock()
-
-	// Phase 2: append record (header + frame index + frames + trailer).
-	header := &RecordHeader{
-		Magic:      storage.RecordMagic,
-		Version:    storage.FormatVersion,
-		ExtentID:   req.ExtentID,
-		Generation: req.Generation,
-		LogicalLen: uint32(len(req.Data)),
-		StoredLen:  storedLen,
-		Codec:      codec,
-		KeyID:      keyID,
-		FrameSize:  uint16(frameSize),
-		FrameCount: uint16(frameCount),
-	}
 	// Serialize the frame index.
 	idxBuf := make([]byte, frameCount*FrameIndexEntrySize)
 	if err := fi.Encode(idxBuf); err != nil {
 		return nil, err
 	}
-	header.FrameIndexCRC = fi.CRC
-
-	if _, err := writer.WriteRecordFramed(off, header, idxBuf, storedBytes, frameSize); err != nil {
-		return nil, err
-	}
-	if err := s.faultStage(storage.CrashAfterRecordAppend); err != nil {
-		return nil, err
-	}
 	if err := s.faultStage(storage.CrashAfterFrameIndex); err != nil {
 		return nil, err
 	}
-
-	// Phase 3: append BatchCommit (the durability point).
-	commitOffset := off + int64(framing)
-	bc := &journal.BatchCommit{
-		Magic:        journal.BatchCommitMagic,
+	header := &RecordHeader{
+		Magic:        storage.RecordMagic,
 		Version:      storage.FormatVersion,
-		StreamID:     s.streamID,
-		Seq:          streamSeq + 1,
-		RecordCount:  1,
-		FirstOffset:  off,
-		LastOffset:   commitOffset,
-		DescriptorsCRC: checksumOf(req.Data),
+		ExtentID:     req.ExtentID,
+		Generation:   req.Generation,
+		LogicalLen:   uint32(len(req.Data)),
+		StoredLen:    storedLen,
+		Codec:        codec,
+		KeyID:        keyID,
+		FrameSize:    uint16(frameSize),
+		FrameCount:   uint16(frameCount),
+		FrameIndexCRC: fi.CRC,
 	}
-	if err := writer.WriteBatchCommit(commitOffset, bc); err != nil {
-		return nil, err
-	}
-	if err := s.faultStage(storage.CrashAfterBatchCommitWrite); err != nil {
-		return nil, err
+	pw := &pendingWrite{
+		extentID:   req.ExtentID,
+		generation: req.Generation,
+		header:     header,
+		idxBuf:     idxBuf,
+		stored:     storedBytes,
+		frameSize:  frameSize,
+		storedLen:  storedLen,
+		logicalLen: uint32(len(req.Data)),
+		payloadCRC: payloadCRC,
 	}
 
-	// Phase 4: ONE fdatasync covers payloads + BatchCommit (§6.1 step 5).
-	if err := writer.Sync(); err != nil {
-		return nil, err
-	}
-	if err := s.faultStage(storage.CrashAfterBatchSync); err != nil {
+	// Phases 2-4: submit to the group-commit coordinator. The batch
+	// leader appends every record + one BatchCommit and syncs once; each
+	// request is acknowledged only after that single barrier (§6.4).
+	if err := s.group.Submit(pw, s.commitBatch); err != nil {
 		return nil, err
 	}
 
 	// Phase 5: apply committed location to the bounded overlay so
 	// immediate reads observe the write (§6.4).
+	segID := pw.segID
+	off := pw.offset
 	if err := s.faultStage(storage.CrashBeforeOverlayApply); err != nil {
 		return nil, err
 	}
@@ -377,9 +341,7 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 		return nil, err
 	}
 
-	// Phase 6: schedule async Pebble apply (§6.1 step 8). The batch is
-	// already durable; a crash here loses only the derived index, which
-	// recovery rebuilds from the segment.
+	// Phase 6: schedule async Pebble apply (§6.1 step 8).
 	s.enqueueApply([]index.Mutation{{
 		ExtentID:   req.ExtentID,
 		Generation: req.Generation,
@@ -400,8 +362,115 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 		Offset:     off,
 		StoredLen:  storedLen,
 		LogicalLen: uint32(len(req.Data)),
-		Seq:        streamSeq + 1,
+		Seq:        pw.streamSeq,
 	}, nil
+}
+
+// commitBatch is the group-commit callback: it reserves offsets for the
+// whole batch, appends every record + one BatchCommit, and syncs ONCE
+// (§6.4). It runs under the store lock so offset reservation and segment
+// sealing are atomic with respect to the batch.
+//
+// Correctness:
+//   - receipts are produced only after this returns (the caller closes
+//     done channels after the sync);
+//   - if a record would overflow the active segment, the batch is sealed
+//     first and continues on a fresh segment — a batch never spans two
+//     segment files, but the commit stays a single barrier on the new
+//     file;
+//   - any error (append or sync) is returned to every writer in the
+//     batch.
+func (s *Store) commitBatch(batch []*pendingWrite) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// First pass: reserve offsets; seal on overflow and retry.
+	for _, pw := range batch {
+		framing := RecordFraming(pw.storedLen, pw.frameSize, int(pw.header.FrameCount))
+		off, err := s.alloc.Reserve(framing, pw.extentID, pw.storedLen)
+		if err != nil {
+			if err == storage.ErrSegmentFull {
+				if serr := s.sealActiveLocked(); serr != nil {
+					return serr
+				}
+				off, err = s.alloc.Reserve(framing, pw.extentID, pw.storedLen)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		// Reserve BatchCommit space after the record (the leader writes
+		// one BatchCommit per batch, at the end; here we reserve per
+		// record to keep offsets monotonic, but only write one commit).
+		if _, err := s.alloc.ReserveCommit(uint32(journal.BatchCommitSize)); err != nil {
+			return err
+		}
+		pw.segID = s.alloc.State().SegmentID
+		pw.offset = off
+		pw.streamSeq = s.streamSeq
+		s.streamSeq++
+	}
+
+	// Second pass: append all records.
+	for _, pw := range batch {
+		if _, err := s.writer.WriteRecordFramed(pw.offset, pw.header, pw.idxBuf, pw.stored, pw.frameSize); err != nil {
+			return err
+		}
+	}
+	if err := s.faultStage(storage.CrashAfterRecordAppend); err != nil {
+		return err
+	}
+
+	// One BatchCommit covering the whole batch at the end.
+	first := batch[0]
+	last := batch[len(batch)-1]
+	lastOffset := last.offset + int64(RecordFraming(last.storedLen, last.frameSize, int(last.header.FrameCount)))
+	bc := &journal.BatchCommit{
+		Magic:          journal.BatchCommitMagic,
+		Version:        storage.FormatVersion,
+		StreamID:       s.streamID,
+		Seq:            s.streamSeq,
+		RecordCount:    uint32(len(batch)),
+		FirstOffset:    first.offset,
+		LastOffset:     lastOffset,
+		DescriptorsCRC: checksumOf(batchDescriptorsChecksum(batch)),
+	}
+	if err := s.writer.WriteBatchCommit(lastOffset, bc); err != nil {
+		return err
+	}
+	if err := s.faultStage(storage.CrashAfterBatchCommitWrite); err != nil {
+		return err
+	}
+
+	// ONE fdatasync covers payloads + BatchCommit (§6.1 step 5).
+	if err := s.writer.Sync(); err != nil {
+		return err
+	}
+	s.syncCalls.Add(1)
+	if err := s.faultStage(storage.CrashAfterBatchSync); err != nil {
+		return err
+	}
+	s.alloc.RecordCommit(s.streamSeq)
+	return nil
+}
+
+// batchDescriptorsChecksum derives a batch-level checksum over the
+// batch's extent/gen pairs (bound to the BatchCommit).
+func batchDescriptorsChecksum(batch []*pendingWrite) []byte {
+	out := make([]byte, 0, len(batch)*8)
+	for _, pw := range batch {
+		var b [8]byte
+		b[0] = byte(pw.extentID >> 56)
+		b[1] = byte(pw.extentID >> 48)
+		b[2] = byte(pw.extentID >> 40)
+		b[3] = byte(pw.extentID >> 32)
+		b[4] = byte(pw.extentID >> 24)
+		b[5] = byte(pw.extentID >> 16)
+		b[6] = byte(pw.extentID >> 8)
+		b[7] = byte(pw.extentID)
+		out = append(out, b[:]...)
+	}
+	return out
 }
 
 // AppendRecord writes a payload into the active segment and commits it,
@@ -667,6 +736,11 @@ func (s *Store) Overlay() *Overlay { return s.overlay }
 // Pebble are flushed synchronously before the DB closes, so no
 // acknowledged write is lost across a clean shutdown.
 func (s *Store) Close() error {
+	// Close the group-commit coordinator first: it wakes any queued
+	// followers so they do not block forever on a closed store.
+	if s.group != nil {
+		s.group.close()
+	}
 	// Drain any queued async applies.
 	close(s.stopCh)
 	s.applyWG.Wait()
