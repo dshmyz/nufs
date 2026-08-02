@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	"github.com/example/dfs/datanode"
+	"github.com/example/dfs/datanode/storage"
+	"github.com/example/dfs/datanode/storage/encryption"
+	"github.com/example/dfs/datanode/storage/segment"
 	"github.com/example/dfs/internal/config"
 	"github.com/example/dfs/internal/crypto"
 	"github.com/example/dfs/internal/logging"
@@ -57,6 +61,7 @@ func main() {
 		traceInsecure        = flag.Bool("trace-insecure", true, "Use insecure OTLP connection")
 		encryptAtRest        = flag.Bool("encrypt-at-rest", false, "Enable at-rest data encryption (AES-256-GCM)")
 		allowLocalKMS        = flag.Bool("allow-local-kms", false, "Allow in-memory development KMS; not production safe")
+		storageVersion       = flag.String("storage-version", "v1", "Storage engine version: v1 (legacy ChunkStore) or v2.1 (new engine)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON              = flag.Bool("log-json", false, "JSON log output")
 	)
@@ -126,6 +131,7 @@ func main() {
 		TraceInsecure:     *traceInsecure,
 		EncryptAtRest:     *encryptAtRest,
 		AllowLocalKMS:     *allowLocalKMS,
+		StorageVersion:    *storageVersion,
 		LogLevel:          *logLevel,
 	})
 }
@@ -209,6 +215,13 @@ func runDataNode(cfg datanode.Config) {
 	if len(dataDirs) == 0 {
 		dataDirs = []string{cfg.DataDir}
 	}
+
+	if cfg.StorageVersion == "v2.1" {
+		runDataNodeV21(cfg, dataDirs, log)
+		return
+	}
+
+	// === V1 (legacy ChunkStore) path ===
 
 	// One WAL per disk (each lives on its own disk for crash-recovery isolation).
 	wals := make([]*datanode.WriteAheadLog, len(dataDirs))
@@ -421,4 +434,68 @@ func runDataNode(cfg datanode.Config) {
 	traceCancel()
 
 	log.Info("shutdown complete")
+}
+
+// runDataNodeV21 initializes the V2.1 storage engine for each disk and
+// starts the metadata client. It is the V2.1 replacement for the legacy
+// ChunkStore path, activated by --storage-version=v2.1.
+func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
+	// Initialize one V2.1 segment.Store per disk.
+	stores := make([]storage.Store, len(dataDirs))
+	for i, dir := range dataDirs {
+		segCfg := segment.Config{
+			Dir:         dir,
+			SegmentSize: storage.DefaultDataSegmentSize,
+			UseMemIndex: false,
+			StreamID:    1, // data stream (0 = small)
+		}
+		// Configure at-rest encryption if enabled.
+		if cfg.EncryptAtRest {
+			if !cfg.AllowLocalKMS {
+				log.Error("at-rest encryption requires a production KMS; LocalKMS is in-memory/dev-only and loses keys on restart")
+				os.Exit(1)
+			}
+			kms, err := crypto.NewLocalKMS()
+			if err != nil {
+				log.Error("failed to init encryption KMS", "error", err)
+				os.Exit(1)
+			}
+			segCfg.Enc = encryption.NewKeyRegistry(kms)
+		}
+		s, err := segment.New(segCfg)
+		if err != nil {
+			log.Error("failed to init V2.1 store", "disk", dir, "error", err)
+			os.Exit(1)
+		}
+		stores[i] = s
+		defer s.Close()
+	}
+	log.Info("V2.1 storage engine ready", "disks", len(dataDirs))
+
+	// Set up the metadata client.
+	metaScheme := "http"
+	if cfg.TLS.Enabled() {
+		metaScheme = "https"
+	}
+	metaURL := fmt.Sprintf("%s://%s", metaScheme, cfg.MetadataAddr)
+	metaStore := metadata.NewHTTPClient(metaURL, 30*time.Second)
+	metaStore.SetAuthToken(cfg.MetadataAuthToken)
+
+	// Register with metadata service.
+	ctx := context.Background()
+	if err := metaStore.RegisterNode(ctx, &metadata.NodeInfo{
+		ID:      cfg.NodeID,
+		Addr:    cfg.ListenAddr,
+		State:   metadata.NodeOnline,
+	}); err != nil {
+		log.Error("failed to register with metadata service", "error", err)
+		os.Exit(1)
+	}
+	log.Info("registered with metadata service", "url", metaURL, "node_id", cfg.NodeID)
+
+	// Wait for shutdown signal.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	log.Info("shutting down", "signal", sig)
 }

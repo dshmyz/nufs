@@ -107,6 +107,10 @@ type Config struct {
 	// encryption. It is not production safe because keys are lost on restart.
 	AllowLocalKMS bool
 
+	// StorageVersion selects the storage engine: "v1" (legacy ChunkStore)
+	// or "v2.1" (new segment/commit-log engine).
+	StorageVersion string
+
 	// LogLevel is the initial log level (debug/info/warn/error).
 	// Can be changed at runtime via SIGHUP signal.
 	LogLevel string
