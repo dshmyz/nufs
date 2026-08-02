@@ -70,8 +70,17 @@ type Store struct {
 	syncCalls atomic.Int64
 
 	// Safe-sequence tracking for INDEX_SAFE flush (§7.4).
-	pendingFlush  atomic.Uint64
+	// flushSeq is the highest committed stream sequence (mutation
+	// counter for the flush trigger). flushInterval bounds how long the
+	// index can lag the committed log.
+	flushSeq      atomic.Uint64
+	flushMutations atomic.Int64
 	flushInterval time.Duration
+	// safeSeq is the last sequence covered by an INDEX_SAFE record.
+	safeSeq atomic.Uint64
+	// flushLoopDone signals the background flush loop.
+	flushDone chan struct{}
+	flushWG   sync.WaitGroup
 
 	// enc is the record encryption registry (nil = plaintext).
 	enc *encryption.KeyRegistry
@@ -90,6 +99,12 @@ type Config struct {
 	StreamID uint8
 	// Enc is the record encryption registry (nil = plaintext).
 	Enc *encryption.KeyRegistry
+	// FlushInterval bounds how long the index may lag the committed
+	// log before an INDEX_SAFE flush (§7.4 flush_max_interval: 2s).
+	FlushInterval time.Duration
+	// FlushMaxMutations is the committed-mutation flush trigger
+	// (§7.4 flush_max_committed_records: 100000).
+	FlushMaxMutations int64
 }
 
 // New opens (creating if needed) a Store for one commit stream.
@@ -119,11 +134,17 @@ func New(cfg Config) (*Store, error) {
 		enc:           cfg.Enc,
 		applyCh:       make(chan []index.Mutation, 256),
 		stopCh:        make(chan struct{}),
-		flushInterval: 2 * time.Second,
+		flushDone:     make(chan struct{}),
+		flushInterval: cfg.FlushInterval,
+	}
+	if s.flushInterval <= 0 {
+		s.flushInterval = 2 * time.Second
 	}
 	s.group = newGroupCommitCoordinator(defaultGroupCommitConfig())
 	s.applyWG.Add(1)
 	go s.applyLoop()
+	s.flushWG.Add(1)
+	go s.flushLoop()
 
 	// V2.1 recovery: replay committed segment-log records from the
 	// active segment into the overlay, and truncate uncommitted tail
@@ -150,11 +171,16 @@ func New(cfg Config) (*Store, error) {
 // recoverActiveSegment replays committed records from an active segment
 // into the overlay. If the segment does not exist (fresh disk), it is a
 // no-op.
+//
+// Records with sequence ≤ SafeSeq are already in Pebble (a prior
+// INDEX_SAFE flush); only records after it are replayed into the
+// overlay (§7.4: "A committed record absent from Pebble is replayed
+// before the node serves that extent").
 func (s *Store) recoverActiveSegment(path string) error {
 	if path == "" || !fileExists(path) {
 		return nil
 	}
-	_, err := RecoverFromSegmentLog(path, s.streamID, s.overlay, func(d CommitDescriptor) error {
+	res, err := RecoverFromSegmentLog(path, s.streamID, s.overlay, func(d CommitDescriptor) error {
 		// Replay into the overlay (read authority). Committed-but-
 		// unflushed records are served from the overlay until the async
 		// apply loop or a later flush persists them to Pebble.
@@ -168,7 +194,15 @@ func (s *Store) recoverActiveSegment(path string) error {
 		})
 		return nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	// Record the recovered safe sequence so the async apply loop knows
+	// what is already persisted in Pebble.
+	if res.SafeSeq > 0 {
+		s.safeSeq.Store(res.SafeSeq)
+	}
+	return nil
 }
 
 // fileExists reports whether a file exists.
@@ -451,6 +485,10 @@ func (s *Store) commitBatch(batch []*pendingWrite) error {
 		return err
 	}
 	s.alloc.RecordCommit(s.streamSeq)
+	// Track the committed sequence + mutation count for the flush
+	// trigger (§7.4).
+	s.flushSeq.Store(s.streamSeq)
+	s.flushMutations.Add(int64(len(batch)))
 	return nil
 }
 
@@ -741,8 +779,10 @@ func (s *Store) Close() error {
 	if s.group != nil {
 		s.group.close()
 	}
-	// Drain any queued async applies.
+	// Stop the flush loop (it performs a final flush on stop) and the
+	// async apply loop.
 	close(s.stopCh)
+	s.flushWG.Wait()
 	s.applyWG.Wait()
 	// Flush the committed-delta overlay into Pebble synchronously.
 	muts := s.overlay.Drain()

@@ -63,6 +63,22 @@ func RecoverFromSegmentLog(path string, streamID uint8, overlay *Overlay, apply 
 			continue
 		}
 
+		// An INDEX_SAFE record is a CommitRecord with Op==OpIndexSafe
+		// carrying the safe sequence (§7.1). Detect it before treating
+		// the bytes as a data record: decode the CommitRecord and check
+		// its op. The op byte is at offset 8 of the CommitRecord body.
+		if off+int64(journal.CommitRecordSize) <= int64(len(data)) {
+			var cr journal.CommitRecord
+			if err := cr.Decode(data[off : off+int64(journal.CommitRecordSize)]); err == nil &&
+				cr.Op == journal.OpIndexSafe {
+				// Safe-sequence marker: record it and continue past it.
+				res.SafeSeq = cr.Seq
+				lastCommitted = off + int64(journal.CommitRecordSize)
+				off += int64(journal.CommitRecordSize)
+				continue
+			}
+		}
+
 		// Otherwise a record: read its header, compute framing, advance.
 		var h RecordHeader
 		if err := h.Decode(data[off : off+int64(RecordHeaderSize)]); err != nil {
@@ -109,6 +125,8 @@ type RecoverResult struct {
 	LastSeq            uint64
 	LastCommittedOffset int64
 	TrailingBytes      int64
+	// SafeSeq is the last INDEX_SAFE sequence found in the log (§7.4).
+	SafeSeq uint64
 }
 
 // CommitDescriptor is a committed extent location discovered during
