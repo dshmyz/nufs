@@ -100,29 +100,53 @@ func TestDelete_GenerationFencing(t *testing.T) {
 }
 
 func TestDelete_CrashBeforeSyncHasNoAcknowledgementOrVisibility(t *testing.T) {
-	s := newTestStore(t, nil)
+	dir := t.TempDir()
 	ctx := context.Background()
 	const (
 		extentID   = storage.ExtentID(309)
 		generation = storage.Generation(1)
 	)
-	if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: extentID, Generation: generation, Data: []byte("live")}); err != nil {
+	s, err := New(Config{Dir: dir, UseMemIndex: false, FlushInterval: time.Hour, disableAsyncApply: true})
+	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: extentID, Generation: generation, Data: []byte("live")}); err != nil {
+		crashStoreForTest(t, s)
+		t.Fatal(err)
+	}
+	durableInfo, err := os.Stat(s.writerPath)
+	if err != nil {
+		crashStoreForTest(t, s)
+		t.Fatal(err)
+	}
+	durablePath := s.writerPath
 	s.faults = testutil.NewScriptedFaults([]testutil.Step{{
 		Point: storage.CrashAfterBatchCommitWrite,
 		Err:   testutil.ErrSimulatedCrash,
 	}})
 
-	if err := s.Delete(ctx, &storage.DeleteRequest{ExtentID: extentID, Generation: generation}); err == nil {
-		t.Fatal("delete succeeded despite crash before sync")
+	if err := s.Delete(ctx, &storage.DeleteRequest{ExtentID: extentID, Generation: generation}); !errors.Is(err, testutil.ErrSimulatedCrash) {
+		crashStoreForTest(t, s)
+		t.Fatalf("delete error = %v, want simulated crash", err)
 	}
-	got, err := s.Read(ctx, &storage.ReadRequest{ExtentID: extentID, Generation: generation})
+	// This is an abrupt process-death simulation, deliberately not Store.Close:
+	// close descriptors/index only, then drop the bytes written after the last
+	// known sync to model an unsynced delete tail being lost by the OS.
+	crashStoreForTest(t, s)
+	if err := os.Truncate(durablePath, durableInfo.Size()); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := New(Config{Dir: dir, UseMemIndex: false, FlushInterval: time.Hour, disableAsyncApply: true})
 	if err != nil {
-		t.Fatalf("unacknowledged delete became visible: %v", err)
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err := reopened.Read(ctx, &storage.ReadRequest{ExtentID: extentID, Generation: generation})
+	if err != nil {
+		t.Fatalf("old value absent after unacknowledged delete restart: %v", err)
 	}
 	if string(got.Data) != "live" {
-		t.Fatalf("visible data = %q, want live", got.Data)
+		t.Fatalf("recovered data = %q, want live", got.Data)
 	}
 }
 

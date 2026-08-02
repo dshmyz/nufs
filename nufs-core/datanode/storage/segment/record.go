@@ -3,7 +3,6 @@ package segment
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 
 	"github.com/example/dfs/datanode/storage"
 )
@@ -61,10 +60,11 @@ type RecordOp uint8
 const (
 	RecordPut RecordOp = iota + 1
 	RecordDelete
+	RecordRelocate
 )
 
 func (op RecordOp) valid() bool {
-	return op == RecordPut || op == RecordDelete
+	return op == RecordPut || op == RecordDelete || op == RecordRelocate
 }
 
 // RecordTrailer is appended after the payload. It carries the framing
@@ -97,7 +97,7 @@ func (h *RecordHeader) Encode(dst []byte) error {
 	binary.BigEndian.PutUint16(dst[41:43], h.FrameCount)
 	// HeaderCRC covers bytes [0, 47); then write both checksums.
 	binary.BigEndian.PutUint32(dst[43:47], h.PayloadChecksum)
-	hdrCRC := crc32.ChecksumIEEE(dst[0:47])
+	hdrCRC := storage.CRC32C(dst[0:47])
 	binary.BigEndian.PutUint32(dst[47:51], hdrCRC)
 	binary.BigEndian.PutUint32(dst[51:55], h.FrameIndexCRC)
 	return nil
@@ -130,7 +130,7 @@ func (h *RecordHeader) Decode(src []byte) error {
 	if h.Version != storage.FormatVersion {
 		return fmt.Errorf("storage: unsupported record version %d", h.Version)
 	}
-	gotCRC := crc32.ChecksumIEEE(src[0:47])
+	gotCRC := storage.CRC32C(src[0:47])
 	if gotCRC != wantCRC {
 		return fmt.Errorf("storage: record header crc mismatch: got %d want %d", gotCRC, wantCRC)
 	}
@@ -187,7 +187,7 @@ func (fi *FrameIndex) Encode(dst []byte) error {
 		dst[base+8] = byte(e.Codec)
 		binary.BigEndian.PutUint32(dst[base+9:base+13], e.CRC)
 	}
-	fi.CRC = crc32.ChecksumIEEE(dst[0:need])
+	fi.CRC = storage.CRC32C(dst[0:need])
 	return nil
 }
 
@@ -205,7 +205,7 @@ func (fi *FrameIndex) Decode(src []byte, expectedCRC uint32) error {
 			CRC:       binary.BigEndian.Uint32(src[i+9 : i+13]),
 		})
 	}
-	got := crc32.ChecksumIEEE(src)
+	got := storage.CRC32C(src)
 	if got != expectedCRC {
 		return fmt.Errorf("storage: frame index crc mismatch: got %d want %d", got, expectedCRC)
 	}
@@ -227,7 +227,7 @@ func BuildFrames(payload []byte, frameSize int) ([]uint32, error) {
 		if end > len(payload) {
 			end = len(payload)
 		}
-		crCS[i] = crc32.ChecksumIEEE(payload[start:end])
+		crCS[i] = storage.CRC32C(payload[start:end])
 	}
 	return crCS, nil
 }
@@ -238,7 +238,7 @@ func (t *RecordTrailer) Encode(dst []byte) error {
 		return fmt.Errorf("storage: record trailer buffer too small")
 	}
 	binary.BigEndian.PutUint32(dst[0:4], t.FramingLen)
-	t.TrailerCRC = crc32.ChecksumIEEE(dst[0:4])
+	t.TrailerCRC = storage.CRC32C(dst[0:4])
 	binary.BigEndian.PutUint32(dst[4:8], t.TrailerCRC)
 	binary.BigEndian.PutUint32(dst[8:12], 0)
 	t.Reserved = 0
@@ -253,7 +253,7 @@ func (t *RecordTrailer) Decode(src []byte) error {
 	t.FramingLen = binary.BigEndian.Uint32(src[0:4])
 	t.TrailerCRC = binary.BigEndian.Uint32(src[4:8])
 	wantCRC := t.TrailerCRC
-	gotCRC := crc32.ChecksumIEEE(src[0:4])
+	gotCRC := storage.CRC32C(src[0:4])
 	if gotCRC != wantCRC {
 		return fmt.Errorf("storage: record trailer crc mismatch")
 	}
@@ -274,7 +274,7 @@ func RecordFraming(storedLen uint32, frameSize int, frameCount int) uint32 {
 
 // VerifyFrameCRC checks one frame payload against its CRC.
 func VerifyFrameCRC(payload []byte, want uint32) error {
-	got := crc32.ChecksumIEEE(payload)
+	got := storage.CRC32C(payload)
 	if got != want {
 		return fmt.Errorf("%w: stored=%d computed=%d", storage.ErrChecksumMismatch, want, got)
 	}

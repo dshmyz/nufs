@@ -330,7 +330,7 @@ func (s *recoveryState) parseRecord(f *os.File, off int64) (int64, bool, bool, e
 	if err := readFullAt(f, index, off+int64(RecordHeaderSize)); err != nil {
 		return 0, false, false, err
 	}
-	if crc32.ChecksumIEEE(index) != header.FrameIndexCRC {
+	if storage.CRC32C(index) != header.FrameIndexCRC {
 		return 0, false, false, fmt.Errorf("storage: frame index crc mismatch")
 	}
 	var stored uint64
@@ -458,7 +458,7 @@ func (s *recoveryState) addReplayBytes(n int64) error {
 }
 
 func pendingDescriptorsCRC(pending []CommitDescriptor) uint32 {
-	h := crc32.NewIEEE()
+	h := storage.NewCRC32C()
 	var buf [journal.BatchDescriptorSize]byte
 	for _, d := range pending {
 		binary.BigEndian.PutUint64(buf[0:8], uint64(d.ExtentID))

@@ -3,7 +3,6 @@ package segment
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 
 	"github.com/example/dfs/datanode/storage"
 )
@@ -26,12 +25,12 @@ const SegmentFooterSize = storage.SegmentFooterSize
 
 // SegmentHeader is the immutable header of a segment file.
 type SegmentHeader struct {
-	Magic   uint32 // SegmentMagic
-	Version uint8  // FormatVersion
-	ID      storage.SegmentID
+	Magic        uint32 // SegmentMagic
+	Version      uint8  // FormatVersion
+	ID           storage.SegmentID
 	SegmentClass storage.SegmentClass // small vs data
-	Reserved    uint32
-	HeaderCRC   uint32 // CRC32C of the preceding fields
+	Reserved     uint32
+	HeaderCRC    uint32 // CRC32C of the preceding fields
 }
 
 // SegmentFooter is written once when a segment seals (V2.1 §5.3/§7.2).
@@ -60,7 +59,7 @@ func (h *SegmentHeader) Encode(dst []byte) error {
 	binary.BigEndian.PutUint64(dst[5:13], uint64(h.ID))
 	dst[13] = byte(h.SegmentClass)
 	binary.BigEndian.PutUint32(dst[14:18], h.Reserved)
-	crc := crc32.ChecksumIEEE(dst[0:18])
+	crc := storage.CRC32C(dst[0:18])
 	binary.BigEndian.PutUint32(dst[18:22], crc)
 	return nil
 }
@@ -82,7 +81,7 @@ func (h *SegmentHeader) Decode(src []byte) error {
 	if h.Version != storage.FormatVersion {
 		return fmt.Errorf("storage: unsupported segment version %d", h.Version)
 	}
-	gotCRC := crc32.ChecksumIEEE(src[0:18])
+	gotCRC := storage.CRC32C(src[0:18])
 	if gotCRC != wantCRC {
 		return fmt.Errorf("storage: segment header crc mismatch")
 	}

@@ -356,8 +356,14 @@ func (s *Store) recoverActiveSegment(path string) error {
 		// unflushed records are served from the overlay until the async
 		// apply loop or a later flush persists them to Pebble.
 		state := storage.ExtentDurable
-		if d.Op == RecordDelete {
+		switch d.Op {
+		case RecordPut:
+		case RecordDelete:
 			state = storage.ExtentTombstoned
+		case RecordRelocate:
+			return fmt.Errorf("%w: relocate", storage.ErrUnsupportedRecordOperation)
+		default:
+			return fmt.Errorf("%w: %d", storage.ErrUnsupportedRecordOperation, d.Op)
 		}
 		s.overlay.Put(index.Key(d.ExtentID, d.Generation), index.Value{
 			SegmentID:  d.SegmentID,
@@ -1057,7 +1063,7 @@ func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
 		header: &RecordHeader{
 			Magic: storage.RecordMagic, Version: storage.FormatVersion,
 			Op: RecordDelete, ExtentID: req.ExtentID, Generation: req.Generation,
-			FrameIndexCRC: crc32ChecksumIEEE(nil),
+			FrameIndexCRC: storage.CRC32C(nil),
 		},
 		frameSize: DefaultFrameSize,
 	}
@@ -1228,5 +1234,5 @@ func (s *Store) receiptFor(req *storage.WriteRequest, v *index.Value) *storage.D
 }
 
 func checksumOf(data []byte) uint32 {
-	return crc32ChecksumIEEE(data)
+	return storage.CRC32C(data)
 }

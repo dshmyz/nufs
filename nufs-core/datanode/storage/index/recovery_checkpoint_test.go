@@ -1,7 +1,9 @@
 package index
 
 import (
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +13,23 @@ import (
 )
 
 var errCheckpointInjected = errors.New("injected recovery checkpoint failure")
+
+func TestRecoveryCheckpointChecksumRejectsIEEE(t *testing.T) {
+	checkpoint := RecoveryCheckpoint{FormatVersion: recoveryCheckpointVersion, StreamID: 1, SegmentID: 7, SafeOffset: storage.SegmentHeaderSize, SafeSeq: 3}
+	buf := encodeRecoveryCheckpoint(checkpoint)
+	castagnoli := crc32.MakeTable(crc32.Castagnoli)
+	if got, want := binary.BigEndian.Uint32(buf[30:34]), crc32.Checksum(buf[0:30], castagnoli); got != want {
+		t.Fatalf("checkpoint CRC = %08x, want Castagnoli %08x", got, want)
+	}
+	if _, err := decodeRecoveryCheckpoint(buf[:]); err != nil {
+		t.Fatalf("Castagnoli-encoded checkpoint rejected: %v", err)
+	}
+
+	binary.BigEndian.PutUint32(buf[30:34], crc32.ChecksumIEEE(buf[0:30]))
+	if _, err := decodeRecoveryCheckpoint(buf[:]); err == nil {
+		t.Fatal("IEEE-encoded checkpoint accepted")
+	}
+}
 
 func TestStoreRecoveryCheckpoint_CleansTemporaryFileOnFailure(t *testing.T) {
 	for _, stage := range []string{"write", "sync", "close", "rename"} {

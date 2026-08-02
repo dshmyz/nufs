@@ -2,6 +2,7 @@ package segment
 
 import (
 	"bytes"
+	"encoding/binary"
 	"hash/crc32"
 	"testing"
 
@@ -38,7 +39,7 @@ func TestRecordHeaderGolden(t *testing.T) {
 		0x66, 0x77, 0x88, 0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef,
 		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x04, 0x00, 0x00, 0x04, 0xaa,
-		0xbb, 0xcc, 0xdd, 0x5f, 0x1a, 0x29, 0x4b, 0x01, 0x02, 0x03, 0x04,
+		0xbb, 0xcc, 0xdd, 0xba, 0x23, 0xed, 0xdd, 0x01, 0x02, 0x03, 0x04,
 	}
 	if !bytes.Equal(buf, wantV3) {
 		t.Fatalf("V3 record header bytes = %x, want %x", buf, wantV3)
@@ -61,6 +62,48 @@ func TestRecordHeaderGolden(t *testing.T) {
 	var bad RecordHeader
 	if err := bad.Decode(corrupt); err == nil {
 		t.Fatal("expected decode to reject corrupted header")
+	}
+}
+
+func TestRecordRelocateGolden(t *testing.T) {
+	h := RecordHeader{
+		Magic:      storage.RecordMagic,
+		Version:    storage.FormatVersion,
+		Op:         RecordRelocate,
+		ExtentID:   17,
+		Generation: 3,
+	}
+	buf := make([]byte, RecordHeaderSize)
+	if err := h.Encode(buf); err != nil {
+		t.Fatalf("encode relocate record: %v", err)
+	}
+	var decoded RecordHeader
+	if err := decoded.Decode(buf); err != nil {
+		t.Fatalf("decode relocate record: %v", err)
+	}
+	if decoded.Op != RecordRelocate {
+		t.Fatalf("decoded operation = %d, want RecordRelocate (%d)", decoded.Op, RecordRelocate)
+	}
+}
+
+func TestV3RecordChecksumRejectsIEEE(t *testing.T) {
+	h := RecordHeader{Magic: storage.RecordMagic, Version: storage.FormatVersion, Op: RecordPut}
+	buf := make([]byte, RecordHeaderSize)
+	if err := h.Encode(buf); err != nil {
+		t.Fatal(err)
+	}
+	castagnoli := crc32.MakeTable(crc32.Castagnoli)
+	if got, want := binary.BigEndian.Uint32(buf[47:51]), crc32.Checksum(buf[0:47], castagnoli); got != want {
+		t.Fatalf("V3 header CRC = %08x, want Castagnoli %08x", got, want)
+	}
+	var decoded RecordHeader
+	if err := decoded.Decode(buf); err != nil {
+		t.Fatalf("Castagnoli-encoded V3 header rejected: %v", err)
+	}
+
+	binary.BigEndian.PutUint32(buf[47:51], crc32.ChecksumIEEE(buf[0:47]))
+	if err := decoded.Decode(buf); err == nil {
+		t.Fatal("IEEE-encoded V3 header accepted")
 	}
 }
 
@@ -122,7 +165,7 @@ func TestBuildFrames(t *testing.T) {
 		if end > len(payload) {
 			end = len(payload)
 		}
-		if got := crc32.ChecksumIEEE(payload[start:end]); got != c {
+		if got := storage.CRC32C(payload[start:end]); got != c {
 			t.Fatalf("frame %d crc mismatch", i)
 		}
 	}
@@ -130,7 +173,7 @@ func TestBuildFrames(t *testing.T) {
 
 func TestFrameCRCFailure(t *testing.T) {
 	frame := []byte("hello world")
-	want := crc32.ChecksumIEEE(frame)
+	want := storage.CRC32C(frame)
 	if err := VerifyFrameCRC(frame, want); err != nil {
 		t.Fatalf("valid frame rejected: %v", err)
 	}

@@ -176,6 +176,10 @@ var (
 	// ErrStaleGeneration is returned when a write/delete targets an
 	// older generation than the stored one (generation fencing).
 	ErrStaleGeneration = errors.New("storage: stale generation")
+	// ErrUnsupportedRecordOperation marks a recognized durable operation whose
+	// recovery semantics are not implemented. Recovery must fail closed rather
+	// than treating it as a corrupt record or applying it as another operation.
+	ErrUnsupportedRecordOperation = errors.New("storage: unsupported record operation")
 	// ErrChecksumMismatch is returned when a record payload fails its
 	// checksum. The bytes are never returned to the caller.
 	ErrChecksumMismatch = errors.New("storage: checksum mismatch")

@@ -3,7 +3,6 @@ package journal
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 
 	"github.com/example/dfs/datanode/storage"
 )
@@ -43,8 +42,8 @@ func (o CommitLogOp) String() string {
 // sequence that made it durable (V2.1 §7.1).
 type CommitRecord struct {
 	// Seq is the stream-local batch-commit sequence covering this op.
-	Seq uint64
-	Op  CommitLogOp
+	Seq        uint64
+	Op         CommitLogOp
 	ExtentID   storage.ExtentID
 	Generation storage.Generation
 	SegmentID  storage.SegmentID
@@ -81,7 +80,7 @@ func (r *CommitRecord) Encode(dst []byte) error {
 	binary.BigEndian.PutUint64(dst[53:61], uint64(r.SourceSegment))
 	binary.BigEndian.PutUint64(dst[61:69], uint64(r.SourceOffset))
 	// CRC over [0,69).
-	r.CRC = crc32.ChecksumIEEE(dst[0:69])
+	r.CRC = storage.CRC32C(dst[0:69])
 	binary.BigEndian.PutUint32(dst[69:73], r.CRC)
 	return nil
 }
@@ -103,7 +102,7 @@ func (r *CommitRecord) Decode(src []byte) error {
 	r.SourceSegment = storage.SegmentID(binary.BigEndian.Uint64(src[53:61]))
 	r.SourceOffset = int64(binary.BigEndian.Uint64(src[61:69]))
 	want := binary.BigEndian.Uint32(src[69:73])
-	got := crc32.ChecksumIEEE(src[0:69])
+	got := storage.CRC32C(src[0:69])
 	if got != want {
 		return fmt.Errorf("storage: commit record crc mismatch")
 	}

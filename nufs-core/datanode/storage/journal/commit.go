@@ -3,7 +3,6 @@ package journal
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 
 	"github.com/example/dfs/datanode/storage"
 )
@@ -74,7 +73,7 @@ func (b *BatchCommit) Encode(dst []byte) error {
 	binary.BigEndian.PutUint64(dst[26:34], uint64(b.LastOffset))
 	binary.BigEndian.PutUint32(dst[34:38], b.DescriptorsCRC)
 	// CRC covers [0,38).
-	crc := crc32.ChecksumIEEE(dst[0:38])
+	crc := storage.CRC32C(dst[0:38])
 	binary.BigEndian.PutUint32(dst[38:42], crc)
 	return nil
 }
@@ -93,7 +92,7 @@ func (b *BatchCommit) Decode(src []byte) error {
 	b.LastOffset = int64(binary.BigEndian.Uint64(src[26:34]))
 	b.DescriptorsCRC = binary.BigEndian.Uint32(src[34:38])
 	want := binary.BigEndian.Uint32(src[38:42])
-	got := crc32.ChecksumIEEE(src[0:38])
+	got := storage.CRC32C(src[0:38])
 	if b.Magic != BatchCommitMagic {
 		return fmt.Errorf("storage: bad batchcommit magic 0x%x", b.Magic)
 	}
@@ -122,7 +121,7 @@ func EncodeDescriptors(dst []byte, descs []BatchDescriptor) (uint32, error) {
 		dst[base+44] = d.Op
 	}
 	used := len(descs) * BatchDescriptorSize
-	return crc32.ChecksumIEEE(dst[0:used]), nil
+	return storage.CRC32C(dst[0:used]), nil
 }
 
 // DecodeDescriptors parses batch descriptors from a buffer.

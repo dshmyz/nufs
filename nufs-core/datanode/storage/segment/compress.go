@@ -2,7 +2,6 @@ package segment
 
 import (
 	"bytes"
-	"hash/crc32"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -184,7 +183,7 @@ func BuildFramedRecord(payload []byte, frameSize int, compressed bool, encKey []
 			Offset:    offset,
 			StoredLen: uint32(len(storedFrame)),
 			Codec:     frameCodec,
-			CRC:       crc32.ChecksumIEEE(storedFrame),
+			CRC:       storage.CRC32C(storedFrame),
 		})
 		offset += uint32(len(storedFrame))
 		stored = append(stored, storedFrame...)
@@ -193,4 +192,3 @@ func BuildFramedRecord(payload []byte, frameSize int, compressed bool, encKey []
 }
 
 var _ = bytes.Equal // reserved
-var _ = crc32.ChecksumIEEE

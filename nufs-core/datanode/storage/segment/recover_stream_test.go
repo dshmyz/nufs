@@ -53,6 +53,65 @@ func TestRecoverStreaming_ReplaysCommittedBatchAndTruncatesTail(t *testing.T) {
 	}
 }
 
+func TestStoreRecovery_RelocateFailsClosed(t *testing.T) {
+	path, desc, committedEnd := writeRecoveryFixture(t, 0, 1, nil)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	headerBytes := make([]byte, RecordHeaderSize)
+	if _, err := f.ReadAt(headerBytes, int64(SegmentHeaderSize)); err != nil {
+		t.Fatal(err)
+	}
+	headerBytes[5] = byte(RecordRelocate)
+	binary.BigEndian.PutUint32(headerBytes[47:51], storage.CRC32C(headerBytes[0:47]))
+	if _, err := f.WriteAt(headerBytes, int64(SegmentHeaderSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	commitOffset := committedEnd - int64(journal.BatchCommitSize)
+	commitBytes := make([]byte, journal.BatchCommitSize)
+	if _, err := f.ReadAt(commitBytes, commitOffset); err != nil {
+		t.Fatal(err)
+	}
+	var commit journal.BatchCommit
+	if err := commit.Decode(commitBytes); err != nil {
+		t.Fatal(err)
+	}
+	commit.DescriptorsCRC = descriptorCRC([]journal.BatchDescriptor{{
+		ExtentID: desc.ExtentID, Generation: desc.Generation, SegmentID: desc.SegmentID,
+		Offset: desc.Offset, StoredLen: desc.StoredLen, LogicalLen: desc.LogicalLen, Checksum: desc.Checksum, Op: uint8(RecordRelocate),
+	}})
+	if err := commit.Encode(commitBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(commitBytes, commitOffset); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	active := filepath.Join(dir, "segments", "small", "active")
+	if err := os.MkdirAll(active, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, filepath.Join(active, "7.seg")); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Config{Dir: dir, UseMemIndex: true})
+	if s != nil {
+		crashStoreForTest(t, s)
+		t.Fatal("recovery returned a store for an unsupported relocate record")
+	}
+	if !errors.Is(err, storage.ErrUnsupportedRecordOperation) {
+		t.Fatalf("recovery error = %v, want ErrUnsupportedRecordOperation", err)
+	}
+}
+
 func TestRecoverStreaming_TruncatesTornRecordAndCommitTails(t *testing.T) {
 	for name, tail := range map[string][]byte{
 		"header":  tornRecordBytes(t, 0),
@@ -369,7 +428,7 @@ func writeRecoveryFixtureWithPayload(t *testing.T, streamID uint8, seq uint64, p
 	if err := idx.Encode(idxBuf); err != nil {
 		t.Fatal(err)
 	}
-	payloadChecksum := crc32.ChecksumIEEE(payload)
+	payloadChecksum := storage.CRC32C(payload)
 	record := &RecordHeader{
 		Magic: storage.RecordMagic, Version: storage.FormatVersion,
 		Op:       RecordPut,
@@ -402,7 +461,7 @@ func writeRecoveryFixtureWithPayload(t *testing.T, streamID uint8, seq uint64, p
 func tornRecordBytes(t *testing.T, n int) []byte {
 	t.Helper()
 	payload := []byte{'x'}
-	frameCRC := crc32.ChecksumIEEE(payload)
+	frameCRC := storage.CRC32C(payload)
 	idx := FrameIndex{Entries: []FrameIndexEntry{{StoredLen: 1, CRC: frameCRC}}}
 	idxBuf := make([]byte, FrameIndexEntrySize)
 	if err := idx.Encode(idxBuf); err != nil {
@@ -444,7 +503,7 @@ func appendRecoveryRecord(t *testing.T, path string, off int64, seq uint64) {
 	}
 	defer w.Close()
 	payload := []byte("second fixture payload")
-	checksum := crc32.ChecksumIEEE(payload)
+	checksum := storage.CRC32C(payload)
 	idx := FrameIndex{Entries: []FrameIndexEntry{{StoredLen: uint32(len(payload)), CRC: checksum}}}
 	idxBuf := make([]byte, FrameIndexEntrySize)
 	if err := idx.Encode(idxBuf); err != nil {

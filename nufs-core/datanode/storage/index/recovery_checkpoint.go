@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -147,7 +146,7 @@ func encodeRecoveryCheckpoint(checkpoint RecoveryCheckpoint) [recoveryCheckpoint
 	binary.BigEndian.PutUint64(buf[6:14], uint64(checkpoint.SegmentID))
 	binary.BigEndian.PutUint64(buf[14:22], uint64(checkpoint.SafeOffset))
 	binary.BigEndian.PutUint64(buf[22:30], checkpoint.SafeSeq)
-	binary.BigEndian.PutUint32(buf[30:34], crc32.ChecksumIEEE(buf[0:30]))
+	binary.BigEndian.PutUint32(buf[30:34], storage.CRC32C(buf[0:30]))
 	return buf
 }
 
@@ -161,7 +160,7 @@ func decodeRecoveryCheckpoint(data []byte) (RecoveryCheckpoint, error) {
 	if data[4] != recoveryCheckpointVersion {
 		return RecoveryCheckpoint{}, fmt.Errorf("storage: unsupported recovery checkpoint version %d", data[4])
 	}
-	if got, want := binary.BigEndian.Uint32(data[30:34]), crc32.ChecksumIEEE(data[0:30]); got != want {
+	if got, want := binary.BigEndian.Uint32(data[30:34]), storage.CRC32C(data[0:30]); got != want {
 		return RecoveryCheckpoint{}, fmt.Errorf("storage: recovery checkpoint crc mismatch")
 	}
 	checkpoint := RecoveryCheckpoint{
