@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/datanode/storage/index"
 	"github.com/example/dfs/datanode/storage/manifest"
 )
@@ -15,13 +16,13 @@ import (
 // since the last flush, never by total stored extents.
 const (
 	// MaxReplayRecords caps replayed committed mutations per disk.
-	MaxReplayRecords = uint64(100000)
+	MaxReplayRecords = storage.MaxRecoveryRecords
 	// MaxUnindexedBytes caps unindexed committed record bytes per disk.
-	MaxUnindexedBytes = int64(256 << 20) // 256 MiB
+	MaxUnindexedBytes = storage.MaxRecoveryReplayBytes
 	// MaxUncommittedTail caps uncommitted active-segment tail per disk.
-	MaxUncommittedTail = int64(128 << 20) // 128 MiB
+	MaxUncommittedTail = storage.MaxRecoveryTrailingBytes
 	// RecoveryBudget is the process-crash DataReady budget (§7.5).
-	RecoveryBudget = 30 * time.Second
+	RecoveryBudget = storage.RecoveryBudget
 )
 
 // Result reports what recovery did (V2.1 §7.5).

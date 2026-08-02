@@ -53,6 +53,13 @@ type Store struct {
 	streamID uint8
 	// streamSeq is the stream-local commit sequence (monotonic).
 	streamSeq uint64
+	dataReady atomic.Bool
+	// recoveryResult is immutable after New succeeds and records actual
+	// parser replay/truncation work rather than checkpoint validation alone.
+	recoveryResult    RecoverResult
+	recoveryClock     func() time.Time
+	recoveryStartedAt time.Time
+	recoveryDeadline  time.Time
 
 	nextSeg uint64
 	segDir  string
@@ -126,6 +133,9 @@ type Config struct {
 	// (§12). Deployments that do not wire a journal suppress event
 	// emission but still function correctly.
 	ChangeJournal *journal.ChangeJournal
+	// RecoveryClock supplies startup time for deterministic deadline tests.
+	// Nil uses time.Now.
+	RecoveryClock func() time.Time
 }
 
 // New opens (creating if needed) a Store for one commit stream.
@@ -134,6 +144,11 @@ type Config struct {
 // segment records after the safe sequence are replayed into the overlay
 // (recovery module). Segment IDs are seeded past surviving files.
 func New(cfg Config) (*Store, error) {
+	recoveryClock := cfg.RecoveryClock
+	if recoveryClock == nil {
+		recoveryClock = time.Now
+	}
+	recoveryStartedAt := recoveryClock()
 	segDir := filepath.Join(cfg.Dir, "segments", streamClassDir(cfg.StreamID), "active")
 	if err := os.MkdirAll(segDir, 0755); err != nil {
 		return nil, err
@@ -147,16 +162,19 @@ func New(cfg Config) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		index:         ix,
-		overlay:       NewOverlay(),
-		segDir:        filepath.Join(cfg.Dir, "segments"),
-		streamID:      cfg.StreamID,
-		faults:        cfg.Faults,
-		enc:           cfg.Enc,
-		applyCh:       make(chan []index.Mutation, 256),
-		stopCh:        make(chan struct{}),
-		flushDone:     make(chan struct{}),
-		flushInterval: cfg.FlushInterval,
+		index:             ix,
+		overlay:           NewOverlay(),
+		segDir:            filepath.Join(cfg.Dir, "segments"),
+		streamID:          cfg.StreamID,
+		faults:            cfg.Faults,
+		enc:               cfg.Enc,
+		applyCh:           make(chan []index.Mutation, 256),
+		stopCh:            make(chan struct{}),
+		flushDone:         make(chan struct{}),
+		flushInterval:     cfg.FlushInterval,
+		recoveryClock:     recoveryClock,
+		recoveryStartedAt: recoveryStartedAt,
+		recoveryDeadline:  recoveryStartedAt.Add(storage.RecoveryBudget),
 	}
 	if s.flushInterval <= 0 {
 		s.flushInterval = 2 * time.Second
@@ -165,17 +183,14 @@ func New(cfg Config) (*Store, error) {
 	s.locCache = NewLocationCache(cfg.LocationCacheSize)
 	s.segCache = NewSegmentDescriptorCache(cfg.SegCacheSize)
 	s.changeJournal = cfg.ChangeJournal
-	s.applyWG.Add(1)
-	go s.applyLoop()
-	s.flushWG.Add(1)
-	go s.flushLoop()
-
 	// V2.1 recovery: replay committed segment-log records from the
 	// active segment into the overlay, and truncate uncommitted tail
 	// data (§7.5 step 4-6). A committed record absent from Pebble is
 	// replayed here; a Pebble entry beyond the last committed sequence
 	// is invalid and reads consult the overlay first, so it is shadowed.
 	if err := s.recoverActiveSegment(filepath.Join(segDir, fmt.Sprintf("%d.seg", maxSegmentID(segDir)))); err != nil {
+		s.group.close()
+		s.segCache.Close()
 		ix.Close()
 		return nil, err
 	}
@@ -187,9 +202,26 @@ func New(cfg Config) (*Store, error) {
 	s.segmentSize = segSize
 	s.nextSeg = maxSegmentID(segDir)
 	if err := s.newActiveSegment(classForStream(cfg.StreamID), segSize); err != nil {
+		s.group.close()
+		s.segCache.Close()
 		ix.Close()
 		return nil, err
 	}
+	if s.recoveryClock().After(s.recoveryDeadline) {
+		s.recoveryResult.DataReady = false
+		_ = s.writer.Close()
+		s.group.close()
+		s.segCache.Close()
+		ix.Close()
+		return nil, storage.ErrRecoveryBudgetExceeded
+	}
+	// A Store is not returned until recovery replay/truncation and opening the
+	// new active writer both succeeded. This is the serving-state transition.
+	s.dataReady.Store(true)
+	s.applyWG.Add(1)
+	go s.applyLoop()
+	s.flushWG.Add(1)
+	go s.flushLoop()
 	return s, nil
 }
 
@@ -202,13 +234,25 @@ func New(cfg Config) (*Store, error) {
 // overlay (§7.4: "A committed record absent from Pebble is replayed
 // before the node serves that extent").
 func (s *Store) recoverActiveSegment(path string) error {
+	startedAt := s.recoveryStartedAt
 	if path == "" || !fileExists(path) {
+		s.recoveryResult = RecoverResult{Duration: s.recoveryClock().Sub(startedAt)}
+		if s.recoveryClock().After(s.recoveryDeadline) {
+			return storage.ErrRecoveryBudgetExceeded
+		}
+		s.recoveryResult.DataReady = true
 		return nil
 	}
 	res, err := RecoverFromSegmentLog(path, RecoverOptions{
-		StreamID:   s.streamID,
-		SafeOffset: int64(storage.SegmentHeaderSize),
-		SafeSeq:    s.safeSeq.Load(),
+		StreamID:         s.streamID,
+		SafeOffset:       int64(storage.SegmentHeaderSize),
+		SafeSeq:          s.safeSeq.Load(),
+		MaxRecords:       storage.MaxRecoveryRecords,
+		MaxReplayBytes:   storage.MaxRecoveryReplayBytes,
+		MaxTrailingBytes: storage.MaxRecoveryTrailingBytes,
+		Clock:            s.recoveryClock,
+		StartedAt:        startedAt,
+		Deadline:         s.recoveryDeadline,
 	}, func(d CommitDescriptor) error {
 		// Replay into the overlay (read authority). Committed-but-
 		// unflushed records are served from the overlay until the async
@@ -227,6 +271,9 @@ func (s *Store) recoverActiveSegment(path string) error {
 		})
 		return nil
 	})
+	if res != nil {
+		s.recoveryResult = *res
+	}
 	if err != nil {
 		return err
 	}
@@ -242,6 +289,14 @@ func (s *Store) recoverActiveSegment(path string) error {
 	}
 	return nil
 }
+
+// DataReady reports whether this Store completed startup recovery and may
+// serve requests. New returns a Store only after this becomes true.
+func (s *Store) DataReady() bool { return s.dataReady.Load() }
+
+// RecoveryResult returns the actual active-segment replay/truncation result
+// captured during startup.
+func (s *Store) RecoveryResult() RecoverResult { return s.recoveryResult }
 
 // fileExists reports whether a file exists.
 func fileExists(path string) bool {

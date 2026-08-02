@@ -7,20 +7,22 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"time"
 
 	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/datanode/storage/journal"
 )
 
-// ErrRecoveryBudgetExceeded reports recovery work beyond its caller-supplied
-// bound. The file is left unchanged so an operator can choose a safe policy.
-var ErrRecoveryBudgetExceeded = errors.New("storage: recovery budget exceeded")
+// ErrRecoveryBudgetExceeded is retained as a package alias for Task 2A
+// callers. The canonical sentinel lives in storage so recovery orchestration
+// and segment parsing agree without an import cycle.
+var ErrRecoveryBudgetExceeded = storage.ErrRecoveryBudgetExceeded
 
 var errUnsupportedRecoveryFormat = errors.New("storage: unsupported recovery format")
 
 // recoveryMaxRecords bounds both parser work and pending descriptor memory
 // even when callers leave RecoverOptions.MaxRecords unset.
-const recoveryMaxRecords uint64 = 100000
+const recoveryMaxRecords = storage.MaxRecoveryRecords
 
 // RecoverOptions bounds and identifies active-segment recovery.
 type RecoverOptions struct {
@@ -30,12 +32,24 @@ type RecoverOptions struct {
 	MaxRecords       uint64
 	MaxReplayBytes   int64
 	MaxTrailingBytes int64
+	// Clock and Deadline form a deterministic elapsed-time seam. A nil Clock
+	// uses wall time; zero Deadline defaults to storage.RecoveryBudget.
+	Clock     func() time.Time
+	Deadline  time.Time
+	StartedAt time.Time
 }
 
 // RecoverFromSegmentLog streams an active segment with positional reads.
 // It validates each record and BatchCommit before replaying descriptors and
 // removes only the invalid or uncommitted tail after the last valid boundary.
 func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDescriptor) error) (*RecoverResult, error) {
+	startedAt := opts.StartedAt
+	if startedAt.IsZero() {
+		startedAt = recoveryNow(opts)
+	}
+	if opts.Deadline.IsZero() {
+		opts.Deadline = startedAt.Add(storage.RecoveryBudget)
+	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return nil, err
@@ -81,13 +95,17 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 	state := recoveryState{
 		path: path, opts: opts, size: size, lastValid: start,
 		lastCommittedSeq: checkpointSeq, safeSeq: opts.SafeSeq, recordLimit: recoveryRecordLimit(opts),
+		startedAt: startedAt,
 	}
 	off := start
 	for off < size {
+		if state.deadlineExceeded() {
+			return state.result(false), ErrRecoveryBudgetExceeded
+		}
 		next, commit, indexSafe, err := state.parseEntry(f, off, apply)
 		if err != nil {
 			if errors.Is(err, ErrRecoveryBudgetExceeded) {
-				return nil, err
+				return state.result(false), err
 			}
 			if errors.Is(err, errUnsupportedRecoveryFormat) {
 				return nil, err
@@ -101,7 +119,7 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 	}
 	trailing := size - state.lastValid
 	if opts.MaxTrailingBytes > 0 && trailing > opts.MaxTrailingBytes {
-		return nil, ErrRecoveryBudgetExceeded
+		return state.result(false), ErrRecoveryBudgetExceeded
 	}
 	if trailing > 0 {
 		if state.lastValid < start {
@@ -114,10 +132,10 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 			return nil, err
 		}
 	}
-	return &RecoverResult{
-		Commits: state.commits, Applied: state.applied, LastSeq: state.lastCommittedSeq,
-		SafeSeq: state.safeSeq, LastCommittedOffset: state.lastValid, TrailingBytes: trailing,
-	}, nil
+	if state.deadlineExceeded() {
+		return state.result(false), ErrRecoveryBudgetExceeded
+	}
+	return state.result(true), nil
 }
 
 type recoveryState struct {
@@ -136,6 +154,7 @@ type recoveryState struct {
 	records          uint64
 	replayBytes      int64
 	recordLimit      uint64
+	startedAt        time.Time
 }
 
 func recoveryRecordLimit(opts RecoverOptions) uint64 {
@@ -143,6 +162,30 @@ func recoveryRecordLimit(opts RecoverOptions) uint64 {
 		return recoveryMaxRecords
 	}
 	return opts.MaxRecords
+}
+
+func recoveryNow(opts RecoverOptions) time.Time {
+	if opts.Clock != nil {
+		return opts.Clock()
+	}
+	return time.Now()
+}
+
+func (s *recoveryState) deadlineExceeded() bool {
+	return !s.opts.Deadline.IsZero() && recoveryNow(s.opts).After(s.opts.Deadline)
+}
+
+func (s *recoveryState) result(dataReady bool) *RecoverResult {
+	return &RecoverResult{
+		Commits:             s.commits,
+		Applied:             s.applied,
+		LastSeq:             s.lastCommittedSeq,
+		SafeSeq:             s.safeSeq,
+		LastCommittedOffset: s.lastValid,
+		TrailingBytes:       s.size - s.lastValid,
+		Duration:            recoveryNow(s.opts).Sub(s.startedAt),
+		DataReady:           dataReady,
+	}
 }
 
 // validateSafeRecoveryStart proves a caller-supplied checkpoint by decoding
@@ -343,6 +386,9 @@ func (s *recoveryState) parseCommit(f *os.File, off int64, apply func(CommitDesc
 	}
 	var batchBytes int64
 	for _, d := range s.pending {
+		if s.deadlineExceeded() {
+			return 0, false, false, ErrRecoveryBudgetExceeded
+		}
 		batchBytes += int64(d.StoredLen)
 	}
 	if commit.DescriptorsCRC != pendingDescriptorsCRC(s.pending) {
@@ -354,6 +400,9 @@ func (s *recoveryState) parseCommit(f *os.File, off int64, apply func(CommitDesc
 		}
 		if apply != nil {
 			for _, d := range s.pending {
+				if s.deadlineExceeded() {
+					return 0, false, false, ErrRecoveryBudgetExceeded
+				}
 				if err := apply(d); err != nil {
 					return 0, false, false, err
 				}
@@ -410,6 +459,8 @@ type RecoverResult struct {
 	LastCommittedOffset int64
 	TrailingBytes       int64
 	SafeSeq             uint64
+	Duration            time.Duration
+	DataReady           bool
 }
 
 // CommitDescriptor is a committed extent location discovered during replay.

@@ -11,6 +11,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ========== Core identifiers ==========
@@ -94,6 +95,14 @@ const (
 	DefaultDataSegmentSize = 4 << 30 // 4 GiB
 	// MaxRecordsPerSegment bounds records in one segment.
 	MaxRecordsPerSegment = 1000000
+
+	// Recovery bounds apply to the active segment tail on one disk. Keep
+	// these in storage so segment parsing and recovery orchestration share
+	// one policy without importing each other.
+	MaxRecoveryRecords       uint64        = 100000
+	MaxRecoveryReplayBytes   int64         = 256 << 20 // 256 MiB
+	MaxRecoveryTrailingBytes int64         = 128 << 20 // 128 MiB
+	RecoveryBudget           time.Duration = 30 * time.Second
 
 	// CompressionNoCompressionThreshold: files below this are not
 	// compressed by default (§9).
@@ -187,6 +196,9 @@ var (
 	// ErrSegmentFull is returned when a segment cannot fit another
 	// record and must be sealed first.
 	ErrSegmentFull = errors.New("storage: segment full")
+	// ErrRecoveryBudgetExceeded rejects startup recovery that exceeds one of
+	// the bounded replay, tail, record, or elapsed-time limits.
+	ErrRecoveryBudgetExceeded = errors.New("storage: recovery budget exceeded")
 )
 
 // ========== DurableReceipt ==========
