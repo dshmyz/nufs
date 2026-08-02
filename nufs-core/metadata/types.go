@@ -28,7 +28,8 @@ type NodeID uint64
 
 // ========== Namespace & Inode ==========
 
-// InodeMeta represents metadata for a file or directory.
+// InodeMeta represents metadata for a file or directory (legacy V1
+// layout, still used until V2.1 reaches feature parity).
 // Stored at key: /inode/{inode_id}
 type InodeMeta struct {
 	ID         InodeID  `json:"id"`
@@ -49,6 +50,119 @@ type InodeMeta struct {
 
 	// Extended attributes
 	XAttrs map[string][]byte `json:"xattrs,omitempty"`
+}
+
+// InodeLayout describes how a file's extents are stored (V2.1 §11.1).
+type InodeLayout uint8
+
+const (
+	LayoutEmpty InodeLayout = iota
+	LayoutInlineExtent
+	LayoutExtentPages
+)
+
+// InodeMetaV2 is the V2.1 fixed-attribute inode (§11.1). Unlike the
+// legacy InodeMeta (which embeds an unbounded ChunkMap), it holds only
+// fixed attributes plus a single inline extent reference or an extent
+// page root. Multi-extent files use copy-on-write extent pages under
+// /extent-page/{inode_id}/{extent_root}/{page_no}.
+type InodeMetaV2 struct {
+	ID         InodeID  `json:"id"`
+	Type       FileType `json:"type"`
+	Size       int64    `json:"size"`
+	NLink      uint32   `json:"nlink"`
+	BucketRoot InodeID  `json:"bucket_root,omitempty"`
+	UID        uint32   `json:"uid"`
+	GID        uint32   `json:"gid"`
+	Mode       uint32   `json:"mode"`
+	CTime      int64    `json:"ctime"`
+	MTime      int64    `json:"mtime"`
+	ATime      int64    `json:"atime"`
+
+	// Layout is Empty, InlineExtent, or ExtentPages.
+	Layout InodeLayout `json:"layout"`
+
+	// InlineExtent is set when Layout==InlineExtent (single-extent files).
+	InlineExtent *ExtentMetaV2 `json:"inline_extent,omitempty"`
+
+	// ExtentRoot is the versioned COW root for Layout==ExtentPages.
+	ExtentRoot uint64 `json:"extent_root,omitempty"`
+	// ExtentPageCount is the number of pages under the current root.
+	ExtentPageCount uint32 `json:"extent_page_count,omitempty"`
+	// ExtentRootVersion distinguishes COW roots (old roots enter GC).
+	ExtentRootVersion uint64 `json:"extent_root_version,omitempty"`
+
+	Symlink string `json:"symlink,omitempty"`
+	XAttrs  map[string][]byte `json:"xattrs,omitempty"`
+}
+
+// ExtentMetaV2 is one extent's metadata (V2.1 §11.2). It does not
+// repeat complete DataNode addresses; placement is resolved through the
+// placement group.
+type ExtentMetaV2 struct {
+	ID        ExtentIDV2 `json:"id"`
+	Generation uint64     `json:"generation"`
+	LogicalLen int64      `json:"logical_len"`
+	Checksum   uint32     `json:"checksum"`
+	// PGID selects the placement group (§11.3).
+	PGID uint32 `json:"pg_id"`
+	// PlacementEpoch is the PG epoch this extent was placed under.
+	PlacementEpoch uint64 `json:"placement_epoch"`
+	// Lifecycle state (Ready/Degraded/etc).
+	Lifecycle ExtentLifecycle `json:"lifecycle"`
+	// StorageClass distinguishes hot replica from cold EC.
+	StorageClass StorageClass `json:"storage_class"`
+	// ECStripeID is set when StorageClass==ColdEC.
+	ECStripeID string `json:"ec_stripe_id,omitempty"`
+	CreatedAt  int64  `json:"created_at"`
+}
+
+// ExtentIDV2 identifies an extent in the V2 metadata layer. The high
+// 16 bits encode the owning logical partition (§11.4).
+type ExtentIDV2 uint64
+
+// OwnerPartition returns the 16-bit logical partition encoded in the ID.
+func (id ExtentIDV2) OwnerPartition() uint16 {
+	return uint16(id >> 48)
+}
+
+// ExtentLifecycle is the lifecycle state of an extent.
+type ExtentLifecycle uint8
+
+const (
+	LifecycleReady ExtentLifecycle = iota
+	LifecycleReadyDegraded
+	LifecycleMigrating
+	LifecycleDeleting
+	LifecycleDeleted
+	LifecycleECConverting
+)
+
+// StorageClass distinguishes replica (hot) from EC (cold) storage.
+type StorageClass uint8
+
+const (
+	StorageClassHotReplica StorageClass = iota
+	StorageClassColdEC
+)
+
+// ExtentPage holds up to MaxExtentsPerPage extent references (V2.1
+// §11.1). Stored at /extent-page/{inode_id}/{extent_root}/{page_no}.
+type ExtentPage struct {
+	InodeID   InodeID        `json:"inode_id"`
+	PageNo    uint32         `json:"page_no"`
+	Extents   []ExtentRef    `json:"extents"`
+}
+
+// MaxExtentsPerPage is the page capacity (§11.1): 256 references →
+// 4 GiB at a 16 MiB extent size.
+const MaxExtentsPerPage = 256
+
+// ExtentRef references an extent within a file's logical byte range.
+type ExtentRef struct {
+	ExtentID ExtentIDV2 `json:"extent_id"`
+	// LogicalOffset is the byte offset of this extent in the file.
+	LogicalOffset int64 `json:"logical_offset"`
 }
 
 // DirEntry represents a directory entry (child pointer).
