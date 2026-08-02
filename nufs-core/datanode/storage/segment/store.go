@@ -56,15 +56,18 @@ type Store struct {
 
 	nextSeg uint64
 	segDir  string
+	// segmentSize is retained across seals so a fresh segment restores the
+	// configured capacity rather than inheriting the old segment's tail.
+	segmentSize int64
 
 	// Async Pebble apply queue.
 	applyCh chan []index.Mutation
 	stopCh  chan struct{}
 	applyWG sync.WaitGroup
 
-	// group commits writes to the active segment (§6.4): a leader
-	// collects followers, appends records + one BatchCommit, syncs once,
-	// then wakes everyone.
+	// group commits writes to the active segment (§6.4): the coordinator
+	// collects requests, appends records + one BatchCommit, syncs once,
+	// then completes every request.
 	group *groupCommitCoordinator
 
 	// syncCalls counts writer.Sync() invocations (observability + tests
@@ -181,6 +184,7 @@ func New(cfg Config) (*Store, error) {
 	if segSize <= 0 {
 		segSize = storage.DefaultDataSegmentSize
 	}
+	s.segmentSize = segSize
 	s.nextSeg = maxSegmentID(segDir)
 	if err := s.newActiveSegment(classForStream(cfg.StreamID), segSize); err != nil {
 		ix.Close()
@@ -442,31 +446,35 @@ func (s *Store) commitBatch(batch []*pendingWrite) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// First pass: reserve offsets; seal on overflow and retry.
+	required := int64(journal.BatchCommitSize)
+	for _, pw := range batch {
+		required += int64(RecordFraming(pw.storedLen, pw.frameSize, int(pw.header.FrameCount)))
+	}
+	if !s.alloc.CanReserveBatch(required) || !s.alloc.CanReserveRecords(len(batch)) {
+		if err := s.sealActiveLocked(); err != nil {
+			return err
+		}
+		if !s.alloc.CanReserveBatch(required) || !s.alloc.CanReserveRecords(len(batch)) {
+			return storage.ErrSegmentFull
+		}
+	}
+
+	// Reserve every record consecutively after the whole-batch preflight.
+	segID := s.alloc.State().SegmentID
 	for _, pw := range batch {
 		framing := RecordFraming(pw.storedLen, pw.frameSize, int(pw.header.FrameCount))
 		off, err := s.alloc.Reserve(framing, pw.extentID, pw.storedLen)
 		if err != nil {
-			if err == storage.ErrSegmentFull {
-				if serr := s.sealActiveLocked(); serr != nil {
-					return serr
-				}
-				off, err = s.alloc.Reserve(framing, pw.extentID, pw.storedLen)
-			}
-			if err != nil {
-				return err
-			}
-		}
-		// Reserve BatchCommit space after the record (the leader writes
-		// one BatchCommit per batch, at the end; here we reserve per
-		// record to keep offsets monotonic, but only write one commit).
-		if _, err := s.alloc.ReserveCommit(uint32(journal.BatchCommitSize)); err != nil {
 			return err
 		}
-		pw.segID = s.alloc.State().SegmentID
+		pw.segID = segID
 		pw.offset = off
 		pw.streamSeq = s.streamSeq
 		s.streamSeq++
+	}
+	commitOffset, err := s.alloc.ReserveCommit(uint32(journal.BatchCommitSize))
+	if err != nil {
+		return err
 	}
 
 	// Second pass: append all records.
@@ -481,8 +489,6 @@ func (s *Store) commitBatch(batch []*pendingWrite) error {
 
 	// One BatchCommit covering the whole batch at the end.
 	first := batch[0]
-	last := batch[len(batch)-1]
-	lastOffset := last.offset + int64(RecordFraming(last.storedLen, last.frameSize, int(last.header.FrameCount)))
 	bc := &journal.BatchCommit{
 		Magic:          journal.BatchCommitMagic,
 		Version:        storage.FormatVersion,
@@ -490,10 +496,10 @@ func (s *Store) commitBatch(batch []*pendingWrite) error {
 		Seq:            s.streamSeq,
 		RecordCount:    uint32(len(batch)),
 		FirstOffset:    first.offset,
-		LastOffset:     lastOffset,
+		LastOffset:     commitOffset,
 		DescriptorsCRC: checksumOf(batchDescriptorsChecksum(batch)),
 	}
-	if err := s.writer.WriteBatchCommit(lastOffset, bc); err != nil {
+	if err := s.writer.WriteBatchCommit(commitOffset, bc); err != nil {
 		return err
 	}
 	if err := s.faultStage(storage.CrashAfterBatchCommitWrite); err != nil {
@@ -879,7 +885,7 @@ func (s *Store) sealActiveLocked() error {
 	if err := s.writer.Sync(); err != nil {
 		return err
 	}
-	return s.newActiveSegment(st.Class, st.NextOffset)
+	return s.newActiveSegment(st.Class, s.segmentSize)
 }
 
 // enqueueApply schedules an async Pebble mutation. A crash here (after

@@ -14,6 +14,12 @@ type groupCommitConfig struct {
 	MaxBatch int
 	// MaxWait is the batch close timeout (2ms).
 	MaxWait time.Duration
+	// beforeWait is a package-private test hook invoked immediately
+	// before the coordinator waits for a follower or timeout.
+	beforeWait func()
+	// afterWake is a package-private test hook invoked after the batch
+	// timer makes its wake-up available to the coordinator loop.
+	afterWake func()
 }
 
 func defaultGroupCommitConfig() groupCommitConfig {
@@ -40,14 +46,17 @@ type pendingWrite struct {
 	streamSeq uint64
 	err       error
 	done      chan struct{}
-	doneOnce  sync.Once // guards done close (leader vs close() race)
+}
+
+type commitRequest struct {
+	write  *pendingWrite
+	commit func([]*pendingWrite) error
 }
 
 // groupCommitCoordinator batches writes to one active segment and
-// issues ONE fdatasync per batch (§6.4). It uses the leader-follower
-// pattern: the first submitter becomes the batch leader, collects
-// followers until MaxBatch or MaxWait, writes the single BatchCommit,
-// syncs once, then wakes every request in the batch.
+// issues ONE fdatasync per batch (§6.4). A dedicated goroutine owns batch
+// collection and its timer; submitters only enqueue and await their own
+// completion channel.
 //
 // Correctness invariants:
 //
@@ -57,13 +66,11 @@ type pendingWrite struct {
 //     seal.
 //  3. A sync failure is propagated to EVERY request in the batch.
 type groupCommitCoordinator struct {
-	cfg groupCommitConfig
-
-	mu       sync.Mutex
-	cond     *sync.Cond
-	pending  []*pendingWrite // followers awaiting the current leader
-	leader   *pendingWrite   // non-nil while a batch is being led
-	closed   bool
+	cfg  groupCommitConfig
+	reqs chan commitRequest
+	stop chan struct{}
+	done chan struct{}
+	once sync.Once
 }
 
 func newGroupCommitCoordinator(cfg groupCommitConfig) *groupCommitCoordinator {
@@ -73,91 +80,121 @@ func newGroupCommitCoordinator(cfg groupCommitConfig) *groupCommitCoordinator {
 	if cfg.MaxWait <= 0 {
 		cfg.MaxWait = 2 * time.Millisecond
 	}
-	c := &groupCommitCoordinator{cfg: cfg}
-	c.cond = sync.NewCond(&c.mu)
+	c := &groupCommitCoordinator{
+		cfg:  cfg,
+		reqs: make(chan commitRequest),
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	go c.loop()
 	return c
 }
 
-// finish wakes a pending write with its result. Safe against a
-// concurrent close() because it uses doneOnce.
+// finish wakes a pending write with its result. The coordinator loop owns
+// accepted requests and calls finish exactly once for each one.
 func (pw *pendingWrite) finish(err error) {
 	pw.err = err
-	pw.doneOnce.Do(func() { close(pw.done) })
+	close(pw.done)
 }
 
-// Submit enqueues a pending write. If this writer is the batch leader it
-// collects followers for up to MaxWait, commits (appending all records +
-// one BatchCommit + one sync via the commit callback), and wakes
-// everyone. If a leader already exists, this writer becomes a follower
-// and waits.
+// Submit enqueues a pending write and waits for the coordinator to complete
+// its batch. Once the request is accepted, the coordinator always finishes
+// it exactly once, including when shutdown races with batch collection.
 func (c *groupCommitCoordinator) Submit(pw *pendingWrite, commit func(batch []*pendingWrite) error) error {
 	pw.done = make(chan struct{})
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	select {
+	case c.reqs <- commitRequest{write: pw, commit: commit}:
+	case <-c.stop:
 		return storage.ErrCapacity
 	}
-
-	if c.leader == nil {
-		// I am the leader. Take any already-pending followers.
-		batch := append(c.pending, pw)
-		c.pending = nil
-		c.leader = pw
-		deadline := time.Now().Add(c.cfg.MaxWait)
-
-		// Collect followers until full or deadline.
-		for {
-			if len(batch) >= c.cfg.MaxBatch {
-				break
-			}
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				break
-			}
-			if len(c.pending) == 0 {
-				waitFor := remaining
-				if waitFor > time.Millisecond {
-					waitFor = time.Millisecond // re-check to stay responsive
-				}
-				t := time.AfterFunc(waitFor, func() { c.cond.Broadcast() })
-				c.cond.Wait()
-				t.Stop()
-			}
-			// Absorb any new followers.
-			batch = append(batch, c.pending...)
-			c.pending = nil
-		}
-
-		c.leader = nil
-		err := commit(batch)
-		for _, p := range batch {
-			p.finish(err)
-		}
-		c.cond.Broadcast()
-		c.mu.Unlock()
-		return err
-	}
-
-	// Follower: append to pending and wait for the leader to commit.
-	c.pending = append(c.pending, pw)
-	c.cond.Broadcast() // wake the leader
-	c.mu.Unlock()
 	<-pw.done
 	return pw.err
 }
 
-// close shuts down the coordinator, waking any queued followers with an
-// error. The in-flight leader (if any) finishes its own batch; the
-// doneOnce guards prevent a double-close.
-func (c *groupCommitCoordinator) close() {
-	c.mu.Lock()
-	c.closed = true
-	for _, p := range c.pending {
-		p.finish(storage.ErrCapacity)
+func (c *groupCommitCoordinator) loop() {
+	defer close(c.done)
+	for {
+		select {
+		case <-c.stop:
+			return
+		default:
+		}
+
+		select {
+		case <-c.stop:
+			return
+		case first := <-c.reqs:
+			if c.stopped() {
+				first.write.finish(storage.ErrCapacity)
+				return
+			}
+			if !c.collectAndCommit(first) {
+				return
+			}
+		}
 	}
-	c.pending = nil
-	c.cond.Broadcast()
-	c.mu.Unlock()
+}
+
+// collectAndCommit owns the timer and all accepted requests in one batch.
+// It returns false when shutdown interrupts collection.
+func (c *groupCommitCoordinator) collectAndCommit(first commitRequest) bool {
+	requests := make([]commitRequest, 1, c.cfg.MaxBatch)
+	requests[0] = first
+	if c.cfg.MaxBatch > 1 {
+		wake := make(chan struct{}, 1)
+		timer := time.AfterFunc(c.cfg.MaxWait, func() {
+			wake <- struct{}{}
+			if c.cfg.afterWake != nil {
+				c.cfg.afterWake()
+			}
+		})
+		if c.cfg.beforeWait != nil {
+			c.cfg.beforeWait()
+		}
+
+	collect:
+		for len(requests) < c.cfg.MaxBatch {
+			select {
+			case <-c.stop:
+				timer.Stop()
+				for _, req := range requests {
+					req.write.finish(storage.ErrCapacity)
+				}
+				return false
+			case req := <-c.reqs:
+				requests = append(requests, req)
+			case <-wake:
+				break collect
+			}
+		}
+		timer.Stop()
+	}
+
+	batch := make([]*pendingWrite, len(requests))
+	for i, req := range requests {
+		batch[i] = req.write
+	}
+	err := first.commit(batch)
+	for _, req := range requests {
+		req.write.finish(err)
+	}
+	return true
+}
+
+func (c *groupCommitCoordinator) stopped() bool {
+	select {
+	case <-c.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+// close shuts down the coordinator and waits until its loop has resolved
+// every request it accepted.
+func (c *groupCommitCoordinator) close() {
+	c.once.Do(func() { close(c.stop) })
+	<-c.done
 }
 
 var _ = journal.BatchCommitSize

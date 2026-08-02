@@ -2,16 +2,71 @@ package segment
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/example/dfs/datanode/storage"
 )
 
+func testPendingWrite(id storage.ExtentID) *pendingWrite {
+	return &pendingWrite{extentID: id}
+}
+
+func TestGroupCommit_NoLostWakeup(t *testing.T) {
+	beforeWait := make(chan struct{})
+	releaseWait := make(chan struct{})
+	timerWake := make(chan struct{})
+	c := newGroupCommitCoordinator(groupCommitConfig{
+		MaxBatch: 8,
+		MaxWait:  time.Millisecond,
+		beforeWait: func() {
+			close(beforeWait)
+			<-releaseWait
+		},
+		afterWake: func() { close(timerWake) },
+	})
+	defer c.close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Submit(testPendingWrite(1), func(batch []*pendingWrite) error {
+			if len(batch) != 1 {
+				return fmt.Errorf("batch size = %d, want 1", len(batch))
+			}
+			return nil
+		})
+	}()
+
+	select {
+	case <-beforeWait:
+	case <-time.After(time.Second):
+		close(releaseWait)
+		t.Fatal("coordinator did not reach batch wait")
+	}
+	select {
+	case <-timerWake:
+	case <-time.After(time.Second):
+		close(releaseWait)
+		t.Fatal("coordinator timer did not wake")
+	}
+	close(releaseWait)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("group commit leader lost wake-up")
+	}
+}
+
 // TestGroupCommit_SharesSyncBarrier verifies the §6.4 core: N concurrent
 // writes to the same stream share far fewer than N fsync barriers.
-// With the leader-follower coordinator, concurrent writers batch into a
-// single sync each. This is the performance property the design targets.
+// With the coordinator loop, concurrent writers batch into a single sync
+// each. This is the performance property the design targets.
 func TestGroupCommit_SharesSyncBarrier(t *testing.T) {
 	dir := t.TempDir()
 	s, err := New(Config{Dir: dir, UseMemIndex: false, SegmentSize: 1 << 20})

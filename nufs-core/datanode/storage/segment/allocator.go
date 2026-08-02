@@ -85,6 +85,29 @@ func (a *Allocator) Reserve(framingLen uint32, extent storage.ExtentID, storedLe
 	return off, nil
 }
 
+// CanReserveBatch reports whether the current segment can hold all bytes in
+// a batch, including its single BatchCommit, without changing allocator
+// state. Callers preflight the complete batch before reserving any record.
+func (a *Allocator) CanReserveBatch(required int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if required < 0 || a.offset > a.maxSegmentBytes {
+		return false
+	}
+	return required <= a.maxSegmentBytes-a.offset
+}
+
+// CanReserveRecords reports whether count more records fit under the
+// per-segment record limit. It complements CanReserveBatch's byte check.
+func (a *Allocator) CanReserveRecords(count int) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if count < 0 || a.recordCount > a.maxRecords {
+		return false
+	}
+	return uint64(count) <= a.maxRecords-a.recordCount
+}
+
 // ReserveCommit reserves bytes for a BatchCommit at the current tail
 // without counting a record. Returns the offset where the BatchCommit
 // must be written.
