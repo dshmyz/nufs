@@ -19,12 +19,25 @@ import (
 	"github.com/example/dfs/metadata"
 )
 
+// LocalChunkStore is the interface the TCP server requires from a
+// storage backend. Both the legacy ChunkStore and the V2.1 adapter
+// implement it, so the server can serve either engine.
+type LocalChunkStore interface {
+	Write(chunkID metadata.ChunkID, data []byte) error
+	Read(chunkID metadata.ChunkID, offset int64, length int32) ([]byte, uint32, error)
+	Delete(chunkID metadata.ChunkID) error
+	Seal(chunkID metadata.ChunkID) (uint32, error)
+	Info(chunkID metadata.ChunkID) (*LocalChunkInfo, bool)
+	ListChunks() []LocalChunkInfo
+	Stats() (totalBytes int64, chunkCount int64)
+}
+
 // Server is the data node TCP server that handles chunk read/write/replicate requests.
 // It supports connection limiting, request-level timeouts, and backpressure
 // to protect against connection storms and slow clients.
 type Server struct {
 	cfg        Config
-	store      *ChunkStore
+	store      LocalChunkStore
 	listener   net.Listener
 	wg         sync.WaitGroup
 	running    atomic.Bool
@@ -44,7 +57,7 @@ type Server struct {
 }
 
 // NewServer creates a new data node server.
-func NewServer(cfg Config, store *ChunkStore) *Server {
+func NewServer(cfg Config, store LocalChunkStore) *Server {
 	maxConns := cfg.MaxConnections
 	if maxConns <= 0 {
 		maxConns = 256 // Default: 256 concurrent connections

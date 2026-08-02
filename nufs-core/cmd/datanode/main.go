@@ -493,9 +493,38 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	}
 	log.Info("registered with metadata service", "url", metaURL, "node_id", cfg.NodeID)
 
+	// Wrap the first store in a V2 adapter and start the TCP server.
+	v2Store := datanode.NewV2Store(stores[0])
+	srvCfg := cfg
+	srvCfg.ListenAddr = cfg.ListenAddr
+	srv := datanode.NewServer(srvCfg, v2Store)
+	if err := srv.Start(); err != nil {
+		log.Error("failed to start TCP server", "error", err)
+		os.Exit(1)
+	}
+	log.Info("TCP server listening", "addr", srv.Addr())
+
 	// Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 	log.Info("shutting down", "signal", sig)
+
+	// Graceful shutdown.
+	srv.Stop()
+	for _, st := range stores {
+		if closer, ok := st.(interface{ Close() error }); ok {
+			closer.Close()
+		}
+	}
+
+	deregCtx, deregCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := metaStore.RegisterNode(deregCtx, &metadata.NodeInfo{
+		ID:    cfg.NodeID,
+		State: metadata.NodeOffline,
+	}); err != nil {
+		log.Warn("failed to mark node offline", "error", err)
+	}
+	deregCancel()
+	log.Info("shutdown complete")
 }
