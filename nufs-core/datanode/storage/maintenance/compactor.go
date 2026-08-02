@@ -61,17 +61,8 @@ type ScannedRecord struct {
 // Reloc is one relocated record's new location.
 type Reloc = storage.Reloc
 
-// StoreSink is the interface a disk store provides to the compactor:
-// append live records into its active segment and relocate index
-// entries atomically.
-type StoreSink interface {
-	// AppendRecord writes a payload into the store's active segment with
-	// the record's metadata and returns its durable location.
-	AppendRecord(extentID storage.ExtentID, gen storage.Generation, data []byte, codec storage.CompressionCodec) (*storage.Reloc, error)
-	// Relocate applies a relocation to the derived index only if the old
-	// location still matches (§10.3 step 6).
-	Relocate(relocs []storage.Reloc) error
-}
+// StoreSink is the interface a disk store provides to the compactor.
+type StoreSink = storage.StoreSink
 
 // Compactor moves live records from a sealed segment into a fresh
 // segment, applying the V2.1 §10.3 compaction transaction.

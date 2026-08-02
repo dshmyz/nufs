@@ -2,7 +2,9 @@ package segment
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,9 +13,9 @@ import (
 	"time"
 
 	"github.com/example/dfs/datanode/storage"
+	"github.com/example/dfs/datanode/storage/encryption"
 	"github.com/example/dfs/datanode/storage/index"
 	"github.com/example/dfs/datanode/storage/journal"
-	"github.com/example/dfs/datanode/storage/encryption"
 )
 
 // Store implements storage.Store for a single commit stream on one disk
@@ -89,6 +91,10 @@ type Store struct {
 	locCache  *LocationCache            // extent → index.Value
 	segCache  *SegmentDescriptorCache   // segment path → *Reader
 
+	// changeJournal is the async change journal (§12). nil when not
+	// configured (production deployments should always provide one).
+	changeJournal *journal.ChangeJournal
+
 	faults storage.FaultHook
 }
 
@@ -113,6 +119,10 @@ type Config struct {
 	LocationCacheSize int
 	// SegCacheSize sets the segment descriptor cache size (0 = default 4096).
 	SegCacheSize int
+	// ChangeJournal is the async change journal for out-of-band events
+	// (§12). Deployments that do not wire a journal suppress event
+	// emission but still function correctly.
+	ChangeJournal *journal.ChangeJournal
 }
 
 // New opens (creating if needed) a Store for one commit stream.
@@ -151,6 +161,7 @@ func New(cfg Config) (*Store, error) {
 	s.group = newGroupCommitCoordinator(defaultGroupCommitConfig())
 	s.locCache = NewLocationCache(cfg.LocationCacheSize)
 	s.segCache = NewSegmentDescriptorCache(cfg.SegCacheSize)
+	s.changeJournal = cfg.ChangeJournal
 	s.applyWG.Add(1)
 	go s.applyLoop()
 	s.flushWG.Add(1)
@@ -696,9 +707,25 @@ func (s *Store) Read(_ context.Context, req *storage.ReadRequest) (*storage.Read
 		payload, err = rd.ReadPayloadFrames(v.Offset, v.StoredLen, v.LogicalLen)
 	}
 	if err != nil {
+		if s.changeJournal != nil && (errors.Is(err, storage.ErrChecksumMismatch) || errors.Is(err, storage.ErrDecryptFailed)) {
+			s.emitChangeEvent(journal.EventCorrupt, req.ExtentID, req.Generation, v.SegmentID, err.Error())
+		}
 		return nil, err
 	}
 	return &storage.ReadResult{Data: payload, Checksum: v.Checksum}, nil
+}
+
+// emitChangeEvent appends an async event to the change journal (§12).
+// The normal write path does NOT emit EXTENT_DURABLE here — those are
+// already durable receipts to metadata. This is only for out-of-band
+// events: corruption, disk/segment loss, relocation, etc.
+func (s *Store) emitChangeEvent(kind journal.ChangeEventKind, extentID storage.ExtentID, gen storage.Generation, segID storage.SegmentID, reason string) {
+	if s.changeJournal == nil {
+		return
+	}
+	if _, err := s.changeJournal.Append(kind, extentID, gen, segID, reason); err != nil {
+		slog.Error("storage: change journal append", "error", err)
+	}
 }
 
 // cachedLookup checks the location cache first, then the overlay, then

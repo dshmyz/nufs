@@ -150,6 +150,14 @@ const (
 
 // ========== Errors ==========
 
+// StoreSink is the interface a disk store provides to the compactor:
+// append live records into its active segment and relocate index
+// entries atomically (§10.3).
+type StoreSink interface {
+	AppendRecord(extentID ExtentID, gen Generation, data []byte, codec CompressionCodec) (*Reloc, error)
+	Relocate(relocs []Reloc) error
+}
+
 // Sentinel errors for the V2 storage path (§8). Checksum and decrypt
 // failures never fall back to unverified bytes.
 var (
