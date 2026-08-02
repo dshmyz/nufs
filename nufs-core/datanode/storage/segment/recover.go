@@ -178,11 +178,11 @@ func recoveryRecordLimit(opts RecoverOptions) uint64 {
 
 func recoveryByteLimits(opts RecoverOptions) (replay, trailing int64) {
 	replay = opts.MaxReplayBytes
-	if replay == 0 {
+	if replay <= 0 || replay > storage.MaxRecoveryReplayBytes {
 		replay = storage.MaxRecoveryReplayBytes
 	}
 	trailing = opts.MaxTrailingBytes
-	if trailing == 0 {
+	if trailing <= 0 || trailing > storage.MaxRecoveryTrailingBytes {
 		trailing = storage.MaxRecoveryTrailingBytes
 	}
 	return replay, trailing

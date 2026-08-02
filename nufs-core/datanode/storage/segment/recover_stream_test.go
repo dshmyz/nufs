@@ -119,7 +119,7 @@ func TestRecoverStreaming_SafeSeqValidatesWithoutReplay(t *testing.T) {
 	assertRecoverySize(t, path, committedEnd)
 }
 
-func TestRecoverStreaming_SparseTailUsesBoundedMemory(t *testing.T) {
+func TestRecoverStreaming_SparseTailUsesBoundedMemoryAndCanonicalBudget(t *testing.T) {
 	path, _, committedEnd := writeRecoveryFixture(t, 0, 1, nil)
 	const sparseSize = int64(4 << 30)
 	if err := os.Truncate(path, sparseSize); err != nil {
@@ -128,12 +128,9 @@ func TestRecoverStreaming_SparseTailUsesBoundedMemory(t *testing.T) {
 	runtime.GC()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	res, err := RecoverFromSegmentLog(path, RecoverOptions{
-		StreamID:         0,
-		MaxTrailingBytes: sparseSize - committedEnd,
-	}, func(CommitDescriptor) error { return nil })
-	if err != nil {
-		t.Fatal(err)
+	res, err := RecoverFromSegmentLog(path, RecoverOptions{StreamID: 0}, func(CommitDescriptor) error { return nil })
+	if !errors.Is(err, ErrRecoveryBudgetExceeded) {
+		t.Fatalf("error = %v, want recovery budget exceeded", err)
 	}
 	runtime.ReadMemStats(&after)
 	if after.TotalAlloc-before.TotalAlloc > 8<<20 {
@@ -142,7 +139,7 @@ func TestRecoverStreaming_SparseTailUsesBoundedMemory(t *testing.T) {
 	if res.TrailingBytes != sparseSize-committedEnd {
 		t.Fatalf("trailing bytes = %d, want %d", res.TrailingBytes, sparseSize-committedEnd)
 	}
-	assertRecoverySize(t, path, committedEnd)
+	assertRecoverySize(t, path, sparseSize)
 }
 
 func TestRecoverStreaming_EnforcesTrailingBudget(t *testing.T) {

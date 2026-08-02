@@ -229,3 +229,32 @@ cd /Users/gracegaoya/work/project/nufs
 git diff --check
 # PASS
 ```
+
+## Fix Round 4
+
+Hardened the exported `segment.RecoverOptions` byte-budget inputs. Effective
+replay and trailing limits now clamp every nonpositive or over-cap value to
+the canonical storage limits: 256 MiB replay and 128 MiB trailing. Positive
+values within those caps remain available for tighter caller policy and
+tests, but no exported caller can bypass either production cap.
+
+Focused table coverage exercises zero, negative, exact-cap, below-cap, and
+above-cap values for both byte limits. A recovery-level sparse-tail test
+proves a negative trailing limit cannot disable the canonical budget. The
+existing sparse 4 GiB test now confirms bounded allocation while returning
+the expected canonical budget error and leaving the oversized tail intact.
+
+Final verification:
+
+```bash
+cd /Users/gracegaoya/work/project/nufs/nufs-core
+go test -race ./datanode/storage/segment ./datanode/storage/recovery -run 'Recover|Budget|DataReady|Checkpoint' -count=10 -timeout 180s
+# PASS (exit 0)
+
+go test -race ./datanode/storage/segment ./datanode/storage/recovery ./datanode/storage/index -count=1 -timeout 240s
+# PASS (exit 0)
+
+cd /Users/gracegaoya/work/project/nufs
+git diff --check
+# PASS
+```

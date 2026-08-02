@@ -111,14 +111,43 @@ func TestStoreRecovery_DeadlineDoesNotReturnUsableStore(t *testing.T) {
 	}
 }
 
-func TestRecoverBudget_ZeroByteLimitsUseCanonicalBounds(t *testing.T) {
-	gotReplay, gotTrailing := recoveryByteLimits(RecoverOptions{})
-	if gotReplay != storage.MaxRecoveryReplayBytes {
-		t.Fatalf("zero replay limit = %d, want canonical %d", gotReplay, storage.MaxRecoveryReplayBytes)
+func TestRecoverBudget_ByteLimitsClampToCanonicalCaps(t *testing.T) {
+	tests := []struct {
+		name          string
+		replay, trail int64
+		wantReplay    int64
+		wantTrailing  int64
+	}{
+		{name: "zero", wantReplay: storage.MaxRecoveryReplayBytes, wantTrailing: storage.MaxRecoveryTrailingBytes},
+		{name: "negative", replay: -1, trail: -1, wantReplay: storage.MaxRecoveryReplayBytes, wantTrailing: storage.MaxRecoveryTrailingBytes},
+		{name: "exact cap", replay: storage.MaxRecoveryReplayBytes, trail: storage.MaxRecoveryTrailingBytes, wantReplay: storage.MaxRecoveryReplayBytes, wantTrailing: storage.MaxRecoveryTrailingBytes},
+		{name: "below cap", replay: storage.MaxRecoveryReplayBytes - 1, trail: storage.MaxRecoveryTrailingBytes - 1, wantReplay: storage.MaxRecoveryReplayBytes - 1, wantTrailing: storage.MaxRecoveryTrailingBytes - 1},
+		{name: "above cap", replay: storage.MaxRecoveryReplayBytes + 1, trail: storage.MaxRecoveryTrailingBytes + 1, wantReplay: storage.MaxRecoveryReplayBytes, wantTrailing: storage.MaxRecoveryTrailingBytes},
 	}
-	if gotTrailing != storage.MaxRecoveryTrailingBytes {
-		t.Fatalf("zero trailing limit = %d, want canonical %d", gotTrailing, storage.MaxRecoveryTrailingBytes)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotReplay, gotTrailing := recoveryByteLimits(RecoverOptions{MaxReplayBytes: tc.replay, MaxTrailingBytes: tc.trail})
+			if gotReplay != tc.wantReplay || gotTrailing != tc.wantTrailing {
+				t.Fatalf("limits = (%d, %d), want (%d, %d)", gotReplay, gotTrailing, tc.wantReplay, tc.wantTrailing)
+			}
+		})
 	}
+}
+
+func TestRecoverBudget_NegativeTrailingLimitCannotDisableCanonicalBudget(t *testing.T) {
+	path, _, committedEnd := writeRecoveryFixture(t, 0, 1, nil)
+	size := committedEnd + storage.MaxRecoveryTrailingBytes + 1
+	if err := os.Truncate(path, size); err != nil {
+		t.Fatal(err)
+	}
+	res, err := RecoverFromSegmentLog(path, RecoverOptions{StreamID: 0, MaxTrailingBytes: -1}, nil)
+	if !errors.Is(err, ErrRecoveryBudgetExceeded) {
+		t.Fatalf("error = %v, want recovery budget exceeded", err)
+	}
+	if res == nil || res.DataReady || res.TrailingBytes != size-committedEnd {
+		t.Fatalf("result = %+v, want unsuccessful recovery with %d-byte tail", res, size-committedEnd)
+	}
+	assertRecoverySize(t, path, size)
 }
 
 func TestStoreRecovery_StatFailureDoesNotReturnDataReadyStore(t *testing.T) {
