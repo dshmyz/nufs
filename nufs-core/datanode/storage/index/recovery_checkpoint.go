@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -87,7 +88,11 @@ func StoreRecoveryCheckpoint(ix *Index, checkpoint RecoveryCheckpoint) (err erro
 			_ = recoveryCheckpointFileOps.remove(tmp)
 		}
 	}()
-	if _, err = recoveryCheckpointFileOps.write(f, buf[:]); err != nil {
+	if n, writeErr := recoveryCheckpointFileOps.write(f, buf[:]); writeErr != nil {
+		err = writeErr
+		return err
+	} else if n != len(buf) {
+		err = io.ErrShortWrite
 		return err
 	}
 	if err = recoveryCheckpointFileOps.sync(f); err != nil {

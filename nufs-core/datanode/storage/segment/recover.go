@@ -37,24 +37,25 @@ type RecoverOptions struct {
 	MaxRecords        uint64
 	MaxReplayBytes    int64
 	MaxTrailingBytes  int64
-	// Clock and Deadline form a deterministic elapsed-time seam. A nil Clock
-	// uses wall time; zero Deadline defaults to storage.RecoveryBudget.
-	Clock     func() time.Time
-	Deadline  time.Time
-	StartedAt time.Time
+	// The elapsed-time seam is package-private so external callers cannot
+	// weaken the fixed production startup deadline.
+	clock     func() time.Time
+	deadline  time.Time
+	startedAt time.Time
 }
 
 // RecoverFromSegmentLog streams an active segment with positional reads.
 // It validates each record and BatchCommit before replaying descriptors and
 // removes only the invalid or uncommitted tail after the last valid boundary.
 func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDescriptor) error) (*RecoverResult, error) {
-	startedAt := opts.StartedAt
+	startedAt := opts.startedAt
 	if startedAt.IsZero() {
 		startedAt = recoveryNow(opts)
 	}
-	if opts.Deadline.IsZero() {
-		opts.Deadline = startedAt.Add(storage.RecoveryBudget)
+	if opts.deadline.IsZero() {
+		opts.deadline = startedAt.Add(storage.RecoveryBudget)
 	}
+	opts.MaxReplayBytes, opts.MaxTrailingBytes = recoveryByteLimits(opts)
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return nil, err
@@ -175,15 +176,27 @@ func recoveryRecordLimit(opts RecoverOptions) uint64 {
 	return opts.MaxRecords
 }
 
+func recoveryByteLimits(opts RecoverOptions) (replay, trailing int64) {
+	replay = opts.MaxReplayBytes
+	if replay == 0 {
+		replay = storage.MaxRecoveryReplayBytes
+	}
+	trailing = opts.MaxTrailingBytes
+	if trailing == 0 {
+		trailing = storage.MaxRecoveryTrailingBytes
+	}
+	return replay, trailing
+}
+
 func recoveryNow(opts RecoverOptions) time.Time {
-	if opts.Clock != nil {
-		return opts.Clock()
+	if opts.clock != nil {
+		return opts.clock()
 	}
 	return time.Now()
 }
 
 func (s *recoveryState) deadlineExceeded() bool {
-	return !s.opts.Deadline.IsZero() && recoveryNow(s.opts).After(s.opts.Deadline)
+	return !s.opts.deadline.IsZero() && recoveryNow(s.opts).After(s.opts.deadline)
 }
 
 func (s *recoveryState) result(dataReady bool) *RecoverResult {

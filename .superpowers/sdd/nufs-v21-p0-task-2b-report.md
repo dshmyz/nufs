@@ -191,3 +191,41 @@ cd /Users/gracegaoya/work/project/nufs
 git diff --check
 # PASS
 ```
+
+## Fix Round 3
+
+Narrow final cleanup on `codex/v21-p0-hardening` from clean HEAD `e077309`.
+Production `segment.Config` no longer exposes a recovery clock; the parser's
+clock, deadline, and start-time injection fields are package-private too, so
+external callers always use wall time and the fixed 30-second storage budget.
+
+Zero `RecoverOptions.MaxReplayBytes` and `MaxTrailingBytes` now resolve to
+the canonical 256 MiB and 128 MiB limits. The 4 GiB sparse bounded-I/O test
+passes its exceptional trailing allowance explicitly. New direct limit tests
+verify the zero-option values without allocating a boundary-sized fixture.
+
+Recovery checkpoint publication now returns `io.ErrShortWrite` if a writer
+reports `n != len(data)` with no error; the temporary file is removed and no
+rename is attempted. Active-segment probing now fails closed: only
+`os.IsNotExist` is a fresh-disk condition, while stat permission/I/O errors
+make `Store.New` return a nil Store. The corruption drill now fails if a
+corrupted read succeeds even with unchanged data.
+
+The existing trailing-boundary assertion now accounts for the already-required
+durable recovered-overlay handoff, which appends a synced `INDEX_SAFE` marker
+after truncation.
+
+Final verification:
+
+```bash
+cd /Users/gracegaoya/work/project/nufs/nufs-core
+go test -race ./datanode/storage/segment ./datanode/storage/recovery -run 'Recover|Budget|DataReady|Checkpoint|RepeatedCrash|Drill|ShortWrite|Stat' -count=10 -timeout 180s
+# PASS: segment 102.262s; recovery 4.053s
+
+go test -race ./datanode/storage/segment ./datanode/storage/recovery ./datanode/storage/index -count=1 -timeout 240s
+# PASS: segment 138.532s; recovery 2.454s; index 6.170s
+
+cd /Users/gracegaoya/work/project/nufs
+git diff --check
+# PASS
+```

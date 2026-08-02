@@ -378,7 +378,9 @@ func TestStoreRecovery_TrailingBytesBoundaryUsesStoreStartup(t *testing.T) {
 			if res := s.RecoveryResult(); !res.DataReady || res.TrailingBytes != int64(tc.tail) {
 				t.Fatalf("result = %+v, want successful %d-byte tail truncation", res, tc.tail)
 			}
-			assertRecoverySize(t, filepath.Join(active, "7.seg"), end)
+			// The recovered record is durably handed off before startup creates
+			// the next segment, which appends its synced INDEX_SAFE marker.
+			assertRecoverySize(t, filepath.Join(active, "7.seg"), end+int64(journal.CommitRecordSize))
 		})
 	}
 }
@@ -407,7 +409,7 @@ func TestStoreRecovery_DeadlineBoundaryIncludesWriterSetup(t *testing.T) {
 			s, err := New(Config{
 				Dir:         dir,
 				UseMemIndex: true,
-				RecoveryClock: func() time.Time {
+				recoveryClock: func() time.Time {
 					calls++
 					if calls < 5 {
 						return start
@@ -446,9 +448,9 @@ func TestRecoverBudget_DeadlineBoundaryReportsFailurePoint(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			res, err := RecoverFromSegmentLog(path, RecoverOptions{
 				StreamID:  0,
-				StartedAt: start,
-				Deadline:  start.Add(storage.RecoveryBudget),
-				Clock: func() time.Time {
+				startedAt: start,
+				deadline:  start.Add(storage.RecoveryBudget),
+				clock: func() time.Time {
 					return start.Add(tc.now)
 				},
 			}, nil)

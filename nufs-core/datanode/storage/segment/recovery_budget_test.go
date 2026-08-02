@@ -24,8 +24,8 @@ func TestRecoverBudget_DeadlineLeavesDataNotReady(t *testing.T) {
 	}
 	res, err := RecoverFromSegmentLog(path, RecoverOptions{
 		StreamID: 0,
-		Clock:    now,
-		Deadline: start.Add(storage.RecoveryBudget),
+		clock:    now,
+		deadline: start.Add(storage.RecoveryBudget),
 	}, func(CommitDescriptor) error { return nil })
 	if !errors.Is(err, storage.ErrRecoveryBudgetExceeded) {
 		t.Fatalf("error = %v, want ErrRecoveryBudgetExceeded", err)
@@ -59,7 +59,7 @@ func TestStoreRecovery_ResultBecomesDataReadyOnlyAfterSuccessfulReplay(t *testin
 	s, err := New(Config{
 		Dir:         dir,
 		UseMemIndex: true,
-		RecoveryClock: func() time.Time {
+		recoveryClock: func() time.Time {
 			calls++
 			if calls == 1 {
 				return start
@@ -95,7 +95,7 @@ func TestStoreRecovery_DeadlineDoesNotReturnUsableStore(t *testing.T) {
 	s, err := New(Config{
 		Dir:         dir,
 		UseMemIndex: true,
-		RecoveryClock: func() time.Time {
+		recoveryClock: func() time.Time {
 			calls++
 			if calls == 1 {
 				return start
@@ -108,6 +108,45 @@ func TestStoreRecovery_DeadlineDoesNotReturnUsableStore(t *testing.T) {
 	}
 	if s != nil {
 		t.Fatal("deadline-exceeded recovery returned a usable store")
+	}
+}
+
+func TestRecoverBudget_ZeroByteLimitsUseCanonicalBounds(t *testing.T) {
+	gotReplay, gotTrailing := recoveryByteLimits(RecoverOptions{})
+	if gotReplay != storage.MaxRecoveryReplayBytes {
+		t.Fatalf("zero replay limit = %d, want canonical %d", gotReplay, storage.MaxRecoveryReplayBytes)
+	}
+	if gotTrailing != storage.MaxRecoveryTrailingBytes {
+		t.Fatalf("zero trailing limit = %d, want canonical %d", gotTrailing, storage.MaxRecoveryTrailingBytes)
+	}
+}
+
+func TestStoreRecovery_StatFailureDoesNotReturnDataReadyStore(t *testing.T) {
+	dir := t.TempDir()
+	active := filepath.Join(dir, "segments", "small", "active")
+	if err := os.MkdirAll(active, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path, _, _ := writeRecoveryFixture(t, 0, 1, nil)
+	if err := os.Rename(path, filepath.Join(active, "7.seg")); err != nil {
+		t.Fatal(err)
+	}
+
+	stat := recoveryStat
+	recoveryStat = func(path string) (os.FileInfo, error) {
+		if filepath.Base(path) == "7.seg" {
+			return nil, os.ErrPermission
+		}
+		return stat(path)
+	}
+	t.Cleanup(func() { recoveryStat = stat })
+
+	s, err := New(Config{Dir: dir, UseMemIndex: true})
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("error = %v, want permission failure", err)
+	}
+	if s != nil {
+		t.Fatal("stat failure returned a DataReady store")
 	}
 }
 

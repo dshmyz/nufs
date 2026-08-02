@@ -143,9 +143,9 @@ type Config struct {
 	// (§12). Deployments that do not wire a journal suppress event
 	// emission but still function correctly.
 	ChangeJournal *journal.ChangeJournal
-	// RecoveryClock supplies startup time for deterministic deadline tests.
-	// Nil uses time.Now.
-	RecoveryClock func() time.Time
+	// recoveryClock supplies startup time for deterministic deadline tests.
+	// Production callers cannot override the wall clock or 30-second budget.
+	recoveryClock func() time.Time
 	// recoveryPolicy is a package-private test seam. Production always uses
 	// the exact storage recovery limits and 30-second startup budget.
 	recoveryPolicy recoveryStartupPolicy
@@ -184,7 +184,7 @@ func (p recoveryStartupPolicy) withProductionDefaults() recoveryStartupPolicy {
 // (recovery module). Segment IDs are seeded past surviving files.
 func New(cfg Config) (*Store, error) {
 	policy := cfg.recoveryPolicy.withProductionDefaults()
-	recoveryClock := cfg.RecoveryClock
+	recoveryClock := cfg.recoveryClock
 	if recoveryClock == nil {
 		recoveryClock = time.Now
 	}
@@ -293,12 +293,22 @@ func New(cfg Config) (*Store, error) {
 // before the node serves that extent").
 func (s *Store) recoverActiveSegment(path string) error {
 	startedAt := s.recoveryStartedAt
-	if path == "" || !fileExists(path) {
+	if path == "" {
 		s.recoveryResult = RecoverResult{Duration: s.recoveryClock().Sub(startedAt)}
 		if s.recoveryClock().After(s.recoveryDeadline) {
 			return storage.ErrRecoveryBudgetExceeded
 		}
 		return nil
+	}
+	if _, err := recoveryStat(path); err != nil {
+		if os.IsNotExist(err) {
+			s.recoveryResult = RecoverResult{Duration: s.recoveryClock().Sub(startedAt)}
+			if s.recoveryClock().After(s.recoveryDeadline) {
+				return storage.ErrRecoveryBudgetExceeded
+			}
+			return nil
+		}
+		return err
 	}
 	safeOffset := int64(storage.SegmentHeaderSize)
 	safeSeq := uint64(0)
@@ -314,9 +324,9 @@ func (s *Store) recoverActiveSegment(path string) error {
 		MaxRecords:        s.recoveryPolicy.maxRecords,
 		MaxReplayBytes:    s.recoveryPolicy.maxReplayBytes,
 		MaxTrailingBytes:  s.recoveryPolicy.maxTrailingBytes,
-		Clock:             s.recoveryClock,
-		StartedAt:         startedAt,
-		Deadline:          s.recoveryDeadline,
+		clock:             s.recoveryClock,
+		startedAt:         startedAt,
+		deadline:          s.recoveryDeadline,
 	}, func(d CommitDescriptor) error {
 		// Replay into the overlay (read authority). Committed-but-
 		// unflushed records are served from the overlay until the async
@@ -431,11 +441,7 @@ func (s *Store) DataReady() bool { return s.dataReady.Load() }
 // captured during startup.
 func (s *Store) RecoveryResult() RecoverResult { return s.recoveryResult }
 
-// fileExists reports whether a file exists.
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
+var recoveryStat = os.Stat
 
 func streamClassDir(streamID uint8) string {
 	if streamID == 0 {

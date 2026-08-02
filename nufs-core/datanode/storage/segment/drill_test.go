@@ -77,7 +77,7 @@ func TestDrill_CorruptReadNeverSucceeds(t *testing.T) {
 		if !bytes.Equal(got.Data, data) {
 			t.Fatal("corrupt bytes returned as a successful read — §21 gate violated")
 		}
-		t.Skip("corruption hit a non-payload byte; read still valid")
+		t.Fatal("corrupt read succeeded unchanged — §21 gate violated")
 	}
 }
 

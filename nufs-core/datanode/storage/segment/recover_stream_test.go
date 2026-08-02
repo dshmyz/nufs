@@ -128,7 +128,10 @@ func TestRecoverStreaming_SparseTailUsesBoundedMemory(t *testing.T) {
 	runtime.GC()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	res, err := RecoverFromSegmentLog(path, RecoverOptions{StreamID: 0}, func(CommitDescriptor) error { return nil })
+	res, err := RecoverFromSegmentLog(path, RecoverOptions{
+		StreamID:         0,
+		MaxTrailingBytes: sparseSize - committedEnd,
+	}, func(CommitDescriptor) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
