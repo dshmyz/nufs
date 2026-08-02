@@ -795,9 +795,15 @@ func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
 	if err := s.group.Submit(pw, s.commitBatch); err != nil {
 		return err
 	}
-	v.State = storage.ExtentTombstoned
-	s.overlay.Put(index.Key(req.ExtentID, req.Generation), *v)
-	return s.enqueueApply([]index.Mutation{{ExtentID: req.ExtentID, Generation: req.Generation, Value: *v}})
+	tombstone := *v
+	tombstone.State = storage.ExtentTombstoned
+	key := index.Key(req.ExtentID, req.Generation)
+	s.overlay.Put(key, tombstone)
+	// cachedLookup checks locCache before the overlay. Publish the tombstone
+	// into that cache as part of the durable-delete visibility update so a
+	// prior live cache entry cannot outlive an acknowledged delete.
+	s.locCache.Put(key, &tombstone)
+	return s.enqueueApply([]index.Mutation{{ExtentID: req.ExtentID, Generation: req.Generation, Value: tombstone}})
 }
 
 // Stat implements storage.Store.Stat.

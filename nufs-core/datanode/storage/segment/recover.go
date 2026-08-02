@@ -70,14 +70,17 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 		return nil, fmt.Errorf("storage: safe offset %d outside segment size %d", opts.SafeOffset, size)
 	}
 
+	var checkpointSeq uint64
 	if start > int64(storage.SegmentHeaderSize) {
-		if err := validateSafeRecoveryStart(f, start, size); err != nil {
+		var err error
+		checkpointSeq, err = validateSafeRecoveryStart(f, start, opts.StreamID)
+		if err != nil {
 			return nil, fmt.Errorf("storage: safe offset %d is not an encoded boundary: %w", opts.SafeOffset, err)
 		}
 	}
 	state := recoveryState{
 		path: path, opts: opts, size: size, lastValid: start,
-		lastSeq: opts.SafeSeq, safeSeq: opts.SafeSeq, recordLimit: recoveryRecordLimit(opts),
+		lastCommittedSeq: checkpointSeq, safeSeq: opts.SafeSeq, recordLimit: recoveryRecordLimit(opts),
 	}
 	off := start
 	for off < size {
@@ -112,24 +115,27 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 		}
 	}
 	return &RecoverResult{
-		Commits: state.commits, Applied: state.applied, LastSeq: state.lastSeq,
+		Commits: state.commits, Applied: state.applied, LastSeq: state.lastCommittedSeq,
 		SafeSeq: state.safeSeq, LastCommittedOffset: state.lastValid, TrailingBytes: trailing,
 	}, nil
 }
 
 type recoveryState struct {
-	path        string
-	opts        RecoverOptions
-	size        int64
-	pending     []CommitDescriptor
-	lastValid   int64
-	lastSeq     uint64
-	safeSeq     uint64
-	commits     int
-	applied     int
-	records     uint64
-	replayBytes int64
-	recordLimit uint64
+	path      string
+	opts      RecoverOptions
+	size      int64
+	pending   []CommitDescriptor
+	lastValid int64
+	// lastCommittedSeq is structural validation state. It advances for every
+	// valid BatchCommit, including commits suppressed by SafeSeq. It is seeded
+	// only from a proven SafeOffset checkpoint, never from SafeSeq itself.
+	lastCommittedSeq uint64
+	safeSeq          uint64
+	commits          int
+	applied          int
+	records          uint64
+	replayBytes      int64
+	recordLimit      uint64
 }
 
 func recoveryRecordLimit(opts RecoverOptions) uint64 {
@@ -139,30 +145,44 @@ func recoveryRecordLimit(opts RecoverOptions) uint64 {
 	return opts.MaxRecords
 }
 
-// validateSafeRecoveryStart verifies that a caller-supplied checkpoint offset
-// starts a V3 record (or exactly reaches EOF) without parsing or replaying its
-// trusted prefix. BatchCommit and INDEX_SAFE entries are boundaries but not
-// valid replay starts: a checkpoint must point after them.
-func validateSafeRecoveryStart(f *os.File, off, size int64) error {
-	if off == size {
-		return nil
+// validateSafeRecoveryStart proves a caller-supplied checkpoint by decoding
+// the fixed-size commit structure immediately before it. SafeOffset is a
+// checkpoint published by our format only after a BatchCommit or INDEX_SAFE;
+// the prefix before it is trusted and deliberately not replayed. In
+// particular, a plausible RecordHeader at SafeOffset is not proof: identical
+// bytes can occur in a payload. This reads only a candidate fixed metadata
+// structure, never scans or loads payload frames.
+func validateSafeRecoveryStart(f *os.File, off int64, streamID uint8) (uint64, error) {
+	commitOff := off - int64(journal.BatchCommitSize)
+	if commitOff >= int64(storage.SegmentHeaderSize) {
+		var buf [journal.BatchCommitSize]byte
+		if err := readFullAt(f, buf[:], commitOff); err == nil {
+			var commit journal.BatchCommit
+			if err := commit.Decode(buf[:]); err == nil {
+				if commit.Version != storage.FormatVersion {
+					return 0, fmt.Errorf("storage: unsupported checkpoint batchcommit version %d", commit.Version)
+				}
+				if commit.StreamID != streamID || commit.Seq == 0 || commit.RecordCount == 0 ||
+					commit.FirstOffset < int64(storage.SegmentHeaderSize) ||
+					commit.FirstOffset >= commitOff || commit.LastOffset != commitOff {
+					return 0, fmt.Errorf("storage: invalid checkpoint batchcommit")
+				}
+				return commit.Seq, nil
+			}
+		}
 	}
-	var prefix [5]byte
-	if err := readFullAt(f, prefix[:], off); err != nil {
-		return err
+
+	markerOff := off - int64(journal.CommitRecordSize)
+	if markerOff >= int64(storage.SegmentHeaderSize) {
+		var buf [journal.CommitRecordSize]byte
+		if err := readFullAt(f, buf[:], markerOff); err == nil {
+			var marker journal.CommitRecord
+			if err := marker.Decode(buf[:]); err == nil && marker.Op == journal.OpIndexSafe && marker.Seq != 0 {
+				return marker.Seq, nil
+			}
+		}
 	}
-	if beUint32(prefix[:4]) != storage.RecordMagic {
-		return fmt.Errorf("storage: safe offset does not start a record")
-	}
-	if prefix[4] == 2 {
-		return validateV2RecordHeader(f, off)
-	}
-	var headerBuf [RecordHeaderSize]byte
-	if err := readFullAt(f, headerBuf[:], off); err != nil {
-		return err
-	}
-	var header RecordHeader
-	return header.Decode(headerBuf[:])
+	return 0, fmt.Errorf("storage: safe offset is not after a committed boundary")
 }
 
 // parseEntry validates one record, commit, or INDEX_SAFE marker. It never
@@ -315,7 +335,7 @@ func (s *recoveryState) parseCommit(f *os.File, off int64, apply func(CommitDesc
 	if commit.Version != storage.FormatVersion {
 		return 0, false, false, fmt.Errorf("storage: unsupported batchcommit version %d", commit.Version)
 	}
-	if commit.StreamID != s.opts.StreamID || commit.Seq <= s.lastSeq || commit.RecordCount != uint32(len(s.pending)) {
+	if commit.StreamID != s.opts.StreamID || commit.Seq <= s.lastCommittedSeq || commit.RecordCount != uint32(len(s.pending)) {
 		return 0, false, false, fmt.Errorf("storage: invalid batchcommit fields")
 	}
 	if len(s.pending) == 0 || commit.FirstOffset != s.pending[0].Offset || commit.LastOffset != off {
@@ -343,7 +363,7 @@ func (s *recoveryState) parseCommit(f *os.File, off int64, apply func(CommitDesc
 		s.replayBytes += batchBytes
 	}
 	s.pending = s.pending[:0]
-	s.lastSeq = commit.Seq
+	s.lastCommittedSeq = commit.Seq
 	s.commits++
 	return off + int64(journal.BatchCommitSize), true, false, nil
 }

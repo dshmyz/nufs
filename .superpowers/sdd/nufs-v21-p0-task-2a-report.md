@@ -153,3 +153,85 @@ Regression coverage was added or extended in:
   not compatible, but no additional format-version bump was introduced.
 - The parser bound is local to `RecoverFromSegmentLog`; Task 2B remains
   responsible for production integration budgets and DataReady state.
+
+## Fix Round 2 — Recovery Semantics, Checkpoint Boundaries, and Delete Cache
+
+### Scope
+
+This focused follow-up addresses the second independent review only. It keeps
+the V3-only format, positional streaming parser, bounded memory, strict
+validate-before-apply ordering, and Task 2B/DataReady exclusion intact.
+
+### Fixes
+
+- Recovery now keeps `lastCommittedSeq` as structural monotonic-validation
+  state. It advances for every valid `BatchCommit`, including a commit at or
+  below `SafeSeq`; `SafeSeq` now controls replay suppression only. A covered
+  committed batch remains validated, counted, preserved, and untruncated.
+- A non-header `SafeOffset` is now accepted only when the fixed-size structure
+  immediately before it is a CRC-valid, coherent V3 `BatchCommit` for the
+  stream (ending exactly at the offset), or a valid `INDEX_SAFE` marker.
+  Recovery begins its actual parse/count/replay at that offset and seeds
+  structural sequence state from the proven boundary.
+- The checkpoint trust invariant is explicit: producers may publish
+  `SafeOffset` only after a durable `BatchCommit` or `INDEX_SAFE`. Recovery
+  does not parse the trusted prefix and does not treat bytes that merely look
+  like a record header as a boundary. It reads only the one fixed-size
+  candidate commit/marker before the checkpoint, never scans or loads payload
+  frames. Consequently the trusted prefix's descriptors are not revalidated
+  at checkpoint time; their earlier durable commit is the format authority.
+- A durable delete now publishes its tombstone into `locCache` alongside the
+  overlay update. Since `cachedLookup` checks this cache first, a previous
+  live cache entry cannot remain visible after delete acknowledgement.
+- The V3 record golden test now checks all 55 encoded bytes, `RecordFraming`
+  expects the 55-byte header, and recovery fixtures include `RecordPut` in
+  their expected descriptor.
+
+### RED / GREEN evidence
+
+Before the production changes, the focused RED command failed for the exact
+review regressions: SafeSeq treated a valid commit as non-monotonic and
+truncated it, a crafted valid header inside payload was accepted as a safe
+checkpoint, and a read-populated location cache returned live data after an
+acknowledged delete.
+
+```bash
+cd /Users/gracegaoya/work/project/nufs/nufs-core && go test ./datanode/storage/segment -run 'TestRecoverStreaming_(SafeSeqValidatesWithoutReplay|RejectsSafeOffsetInsidePayloadWithCraftedHeader)|TestRecord(HeaderGolden|FramingV3)|TestDelete_EvictsLiveLocationCacheAndSurvivesReopen' -count=1 -timeout 60s
+# FAIL: SafeSeq, crafted-SafeOffset, and cached-delete regressions
+```
+
+Reviewer-reproduced focused GREEN command (including recovery fixture and
+record-layout coverage):
+
+```bash
+cd /Users/gracegaoya/work/project/nufs/nufs-core && go test ./datanode/storage/segment -run 'TestRecoverStreaming_(ReplaysCommittedBatchAndTruncatesTail|SafeSeqValidatesWithoutReplay|RejectsSafeOffsetInsidePayloadWithCraftedHeader|SafeOffsetSkipsCommittedPrefix)|TestRecord(HeaderGolden|TrailerGolden|FramingV3)|TestDelete_(EvictsLiveLocationCacheAndSurvivesReopen|CrashReopenTombstoneRemainsDeleted)' -count=1 -timeout 60s
+# ok github.com/example/dfs/datanode/storage/segment 1.658s
+```
+
+Required race verification:
+
+```bash
+cd /Users/gracegaoya/work/project/nufs/nufs-core && go test -race ./datanode/storage/segment -run 'Recover|Crash|CommitLayout|Tombstone|Delete|SafeSeq|SafeOffset' -count=10 -timeout 180s
+# PASS (exit 0)
+
+cd /Users/gracegaoya/work/project/nufs/nufs-core && go test -race ./datanode/storage/segment -count=1 -timeout 240s
+# PASS (exit 0)
+```
+
+### Files
+
+- `nufs-core/datanode/storage/segment/recover.go`
+- `nufs-core/datanode/storage/segment/recover_stream_test.go`
+- `nufs-core/datanode/storage/segment/store.go`
+- `nufs-core/datanode/storage/segment/store_test.go`
+- `nufs-core/datanode/storage/segment/record_test.go`
+- `.superpowers/sdd/nufs-v21-p0-task-2a-report.md`
+- `.superpowers/sdd/nufs-v21-p0-task-2a-fix2-report.md`
+
+### Concerns
+
+- A checkpoint is necessarily a trust boundary: validating its preceding
+  commit's CRC and coherence proves its encoded boundary without rescanning
+  the trusted prefix, but cannot recompute descriptor CRCs for that prefix.
+- Task 2B recovery-budget integration and DataReady state remain out of
+  scope. V2 remains unsupported, and no payload frames are read by recovery.

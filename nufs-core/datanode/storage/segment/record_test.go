@@ -33,6 +33,16 @@ func TestRecordHeaderGolden(t *testing.T) {
 	if err := h.Encode(buf); err != nil {
 		t.Fatal(err)
 	}
+	wantV3 := []byte{
+		0x4e, 0x55, 0x46, 0x53, 0x03, 0x01, 0x11, 0x22, 0x33, 0x44, 0x55,
+		0x66, 0x77, 0x88, 0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef,
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x04, 0x00, 0x00, 0x04, 0xaa,
+		0xbb, 0xcc, 0xdd, 0x5f, 0x1a, 0x29, 0x4b, 0x01, 0x02, 0x03, 0x04,
+	}
+	if !bytes.Equal(buf, wantV3) {
+		t.Fatalf("V3 record header bytes = %x, want %x", buf, wantV3)
+	}
 	if len(buf) != RecordHeaderSize {
 		t.Fatalf("header size = %d, want %d", len(buf), RecordHeaderSize)
 	}
@@ -131,9 +141,9 @@ func TestFrameCRCFailure(t *testing.T) {
 }
 
 func TestRecordFramingV3(t *testing.T) {
-	// header(54) + index(2 entries × 13) + payload(4096) + trailer(12)
+	// header(55) + index(2 entries × 13) + payload(4096) + trailer(12)
 	got := RecordFraming(4096, 2048, 2)
-	if got != 54+26+4096+12 {
-		t.Fatalf("RecordFraming = %d, want %d", got, 54+26+4096+12)
+	if got != 55+26+4096+12 {
+		t.Fatalf("RecordFraming = %d, want %d", got, 55+26+4096+12)
 	}
 }

@@ -137,6 +137,44 @@ func TestDeleteGenerationFenced(t *testing.T) {
 	}
 }
 
+func TestDelete_EvictsLiveLocationCacheAndSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	s, err := New(Config{Dir: dir, UseMemIndex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: 72, Generation: 1, Data: []byte("data")}); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	// Populate locCache with the live location before the durable delete.
+	if _, err := s.Read(ctx, &storage.ReadRequest{ExtentID: 72, Generation: 1}); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, &storage.DeleteRequest{ExtentID: 72, Generation: 1}); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if _, err := s.Read(ctx, &storage.ReadRequest{ExtentID: 72, Generation: 1}); !errors.Is(err, storage.ErrExtentNotFound) {
+		s.Close()
+		t.Fatalf("read after acknowledged delete = %v, want ErrExtentNotFound", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(Config{Dir: dir, UseMemIndex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.Read(ctx, &storage.ReadRequest{ExtentID: 72, Generation: 1}); !errors.Is(err, storage.ErrExtentNotFound) {
+		t.Fatalf("read after reopen = %v, want ErrExtentNotFound", err)
+	}
+}
+
 // TestDelete_CrashReopenTombstoneRemainsDeleted uses a fresh in-memory index
 // after the acknowledged delete so only durable segment-log recovery can
 // preserve the tombstone.

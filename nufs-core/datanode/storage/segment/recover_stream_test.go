@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -115,6 +116,7 @@ func TestRecoverStreaming_SafeSeqValidatesWithoutReplay(t *testing.T) {
 	if applied != 0 || res.Applied != 0 || res.Commits != 1 || res.LastSeq != 1 || res.LastCommittedOffset != committedEnd {
 		t.Fatalf("safe replay result = %+v, applied=%d", res, applied)
 	}
+	assertRecoverySize(t, path, committedEnd)
 }
 
 func TestRecoverStreaming_SparseTailUsesBoundedMemory(t *testing.T) {
@@ -240,6 +242,46 @@ func TestRecoverStreaming_RejectsUnsafeSafeOffset(t *testing.T) {
 	}
 }
 
+func TestRecoverStreaming_RejectsSafeOffsetInsidePayloadWithCraftedHeader(t *testing.T) {
+	payload := bytes.Repeat([]byte{'p'}, RecordHeaderSize+32)
+	path, _, _ := writeRecoveryFixtureWithPayload(t, 0, 1, payload, nil)
+	// Place a complete, CRC-valid V3 header inside the payload. A boundary
+	// check that only decodes at SafeOffset would accept this forged start.
+	safeOffset := int64(SegmentHeaderSize + RecordHeaderSize + FrameIndexEntrySize + 7)
+	crafted := RecordHeader{Magic: storage.RecordMagic, Version: storage.FormatVersion, Op: RecordPut}
+	craftedBytes := make([]byte, RecordHeaderSize)
+	if err := crafted.Encode(craftedBytes); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(craftedBytes, safeOffset); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = RecoverFromSegmentLog(path, RecoverOptions{StreamID: 0, SafeOffset: safeOffset}, nil)
+	if err == nil {
+		t.Fatal("crafted record header inside payload was accepted as SafeOffset")
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("invalid SafeOffset truncated segment: got %d want %d", after.Size(), before.Size())
+	}
+}
+
 func TestRecoverStreaming_SafeOffsetSkipsCommittedPrefix(t *testing.T) {
 	path, _, safeOffset := writeRecoveryFixture(t, 0, 1, nil)
 	appendRecoveryRecord(t, path, safeOffset, 2)
@@ -298,6 +340,10 @@ func TestRecoverStreaming_IndexSafeAdvancesValidBoundary(t *testing.T) {
 }
 
 func writeRecoveryFixture(t *testing.T, streamID uint8, seq uint64, mutate func(*journal.BatchCommit)) (string, CommitDescriptor, int64) {
+	return writeRecoveryFixtureWithPayload(t, streamID, seq, []byte("fixture payload"), mutate)
+}
+
+func writeRecoveryFixtureWithPayload(t *testing.T, streamID uint8, seq uint64, payload []byte, mutate func(*journal.BatchCommit)) (string, CommitDescriptor, int64) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "7.seg")
 	header := SegmentHeader{Magic: storage.SegmentMagic, Version: storage.FormatVersion, ID: 7, SegmentClass: storage.SegmentSmall}
@@ -314,7 +360,6 @@ func writeRecoveryFixture(t *testing.T, streamID uint8, seq uint64, mutate func(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = w.Close() })
-	payload := []byte("fixture payload")
 	frameCRCs, err := BuildFrames(payload, DefaultFrameSize)
 	if err != nil {
 		t.Fatal(err)
@@ -335,7 +380,7 @@ func writeRecoveryFixture(t *testing.T, streamID uint8, seq uint64, mutate func(
 	if _, err := w.WriteRecordFramed(off, record, idxBuf, payload, DefaultFrameSize); err != nil {
 		t.Fatal(err)
 	}
-	desc := CommitDescriptor{ExtentID: 11, Generation: 3, SegmentID: 7, Offset: off, StoredLen: uint32(len(payload)), LogicalLen: uint32(len(payload)), Checksum: payloadChecksum}
+	desc := CommitDescriptor{ExtentID: 11, Generation: 3, SegmentID: 7, Offset: off, StoredLen: uint32(len(payload)), LogicalLen: uint32(len(payload)), Checksum: payloadChecksum, Op: RecordPut}
 	commitOff := off + int64(RecordFraming(record.StoredLen, DefaultFrameSize, 1))
 	batch := &journal.BatchCommit{Magic: journal.BatchCommitMagic, Version: storage.FormatVersion, StreamID: streamID, Seq: seq, RecordCount: 1, FirstOffset: off, LastOffset: commitOff}
 	batch.DescriptorsCRC = descriptorCRC([]journal.BatchDescriptor{{
