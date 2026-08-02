@@ -134,6 +134,20 @@ func (h *opsHandlers) handleLookup(w http.ResponseWriter, r *http.Request) {
 	fmt.Sscanf(r.URL.Query().Get("parent"), "%d", &parent)
 	meta, err := h.store.Lookup(r.Context(), parent, name)
 	if err != nil {
+		// Use writeJSONErrorC so the HTTP client can map the 404 to
+		// ErrEntryNotFound via the machine-readable code (readResponse
+		// matches on code=="entry_not_found"). Without the code field,
+		// the client returns a generic error and callers cannot
+		// distinguish "key absent" from an unexpected failure — which
+		// breaks the S3 PUT new-object path (committer_put.go Lookup).
+		if errors.Is(err, metadata.ErrEntryNotFound) {
+			writeJSONErrorC(w, http.StatusNotFound, "entry_not_found", err.Error())
+			return
+		}
+		if errors.Is(err, metadata.ErrInodeNotFound) {
+			writeJSONErrorC(w, http.StatusNotFound, "inode_not_found", err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}

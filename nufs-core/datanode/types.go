@@ -20,6 +20,14 @@ type Config struct {
 	// ListenAddr is the TCP address for the data node server (e.g., "0.0.0.0:9100").
 	ListenAddr string
 
+	// RegisterAddr is the address registered with the metadata service
+	// as the reachable endpoint for this node. In containerized/multi-
+	// host deployments this must be a routable host:port (e.g.
+	// "datanode-1:9100"), NOT the bind address (0.0.0.0) — peers connect
+	// to this address, so 0.0.0.0 would make them dial themselves.
+	// Empty = ListenAddr.
+	RegisterAddr string
+
 	// OpsListenAddr is the HTTP address for management API (e.g., "0.0.0.0:8091").
 	OpsListenAddr string
 

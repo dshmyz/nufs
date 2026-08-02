@@ -34,6 +34,7 @@ services:
     command:
       - --node-id=auto
       - --listen=0.0.0.0:9100
+      - --register-addr=datanode-1:9100
       - --data-dir=/var/lib/dfs/datanode1
       - --metadata=metad:8091
       - --rack=rack1
@@ -53,6 +54,7 @@ services:
     command:
       - --node-id=auto
       - --listen=0.0.0.0:9101
+      - --register-addr=datanode-2:9101
       - --data-dir=/var/lib/dfs/datanode2
       - --metadata=metad:8091
       - --rack=rack1
@@ -75,6 +77,7 @@ services:
     command:
       - --node-id=auto
       - --listen=0.0.0.0:9102
+      - --register-addr=datanode-v21:9102
       - --data-dir=/var/lib/dfs/datanode-v21
       - --metadata=metad:8091
       - --rack=rack1

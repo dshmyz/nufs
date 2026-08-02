@@ -51,10 +51,8 @@ echo ""
 # 4. 等待 V2.1 datanode 注册
 echo "--- Step 4: Wait for V2.1 datanode to register ---"
 for i in $(seq 1 30); do
-  NODES=$(curl -sf http://localhost:8091/api/v1/nodes 2>/dev/null || echo "[]")
-  if echo "$NODES" | grep -q "online"; then
-    echo "datanode-v21 registered after ${i}s"
-    echo "$NODES" | head -5
+  if docker logs deploy-datanode-v21-1 2>&1 | grep -q '"TCP server listening"'; then
+    echo "datanode-v21 ready after ${i}s"
     break
   fi
   if [ "$i" -eq 30 ]; then
@@ -74,7 +72,7 @@ echo ""
 # 6. Wait for S3 gateway
 echo "--- Step 6: Wait for S3 gateway ---"
 for i in $(seq 1 30); do
-  if curl -sf http://localhost:8080/healthz > /dev/null 2>&1; then
+  if curl -sf http://localhost:8081/healthz > /dev/null 2>&1; then
     echo "S3 gateway ready after ${i}s"
     break
   fi
@@ -89,29 +87,71 @@ echo ""
 
 # 7. Create bucket
 echo "--- Step 7: Create bucket ---"
-# Use AWS CLI if available, otherwise curl with presigned
-if command -v aws &>/dev/null; then
-  aws --endpoint-url "$S3_ENDPOINT" s3api create-bucket --bucket "$BUCKET" 2>&1 || \
-  aws --endpoint-url "$S3_ENDPOINT" s3 mb "s3://$BUCKET" 2>&1
-else
-  # Fallback: use curl with S3 presigned URL via the gateway
-  curl -X PUT "$S3_ENDPOINT/$BUCKET" -H "x-amz-acl: private" -w "%{http_code}" -o /dev/null
-fi
-echo ""
+python3 -c "
+import hashlib, hmac, datetime, urllib.request
+ak = '$ACCESS_KEY'; sk = '$SECRET_KEY'; ep = '$S3_ENDPOINT'; b = '$BUCKET'
+def sign(m, p, h, bd=b''):
+    n = datetime.datetime.now(datetime.timezone.utc)
+    d = n.strftime('%Y%m%dT%H%M%SZ'); ds = n.strftime('%Y%m%d')
+    h['host'] = 'localhost:8081'; h['x-amz-date'] = d
+    h['x-amz-content-sha256'] = hashlib.sha256(bd).hexdigest()
+    ch = ''.join(f'{k.lower()}:{v.strip()}\n' for k,v in sorted(h.items()))
+    sh = ';'.join(sorted(k.lower() for k in h))
+    cr = f'{m}\n{p}\n\n{ch}\n{sh}\n{h[\"x-amz-content-sha256\"]}'
+    cs = f'{ds}/us-east-1/s3/aws4_request'
+    sts = f'AWS4-HMAC-SHA256\n{d}\n{cs}\n{hashlib.sha256(cr.encode()).hexdigest()}'
+    def skf(k, m): return hmac.new(k, m.encode(), hashlib.sha256).digest()
+    kd = skf(('AWS4'+sk).encode(), ds); kr = skf(kd, 'us-east-1')
+    ks = skf(kr, 's3'); kg = skf(ks, 'aws4_request')
+    sg = hmac.new(kg, sts.encode(), hashlib.sha256).hexdigest()
+    h['Authorization'] = f'AWS4-HMAC-SHA256 Credential={ak}/{cs}, SignedHeaders={sh}, Signature={sg}'
+    return h
+try:
+    r = urllib.request.urlopen(urllib.request.Request(f'{ep}/{b}', headers=sign('PUT', f'/{b}', {}), method='PUT'))
+    print(f'Create bucket: {r.status}')
+except Exception as e: print(f'Create bucket: {e}')
+" 2>&1
 
 # 8. Write and read back a test file
 echo "--- Step 8: Write + read back test file ---"
 dd if=/dev/urandom bs=1M count=1 of="$TEST_FILE" 2>/dev/null
 echo "Generated 1MiB test file"
 
-if command -v aws &>/dev/null; then
-  aws --endpoint-url "$S3_ENDPOINT" s3 cp "$TEST_FILE" "s3://$BUCKET/test-object" 2>&1
-  aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://$BUCKET/test-object" "$TEST_FILE_DL" 2>&1
-else
-  curl -X PUT -T "$TEST_FILE" "$S3_ENDPOINT/$BUCKET/test-object" -w "%{http_code}" -o /dev/null
-  curl -o "$TEST_FILE_DL" "$S3_ENDPOINT/$BUCKET/test-object" -w "%{http_code}"
-fi
-echo ""
+python3 -c "
+import hashlib, hmac, datetime, urllib.request, os
+ak = '$ACCESS_KEY'; sk = '$SECRET_KEY'; ep = '$S3_ENDPOINT'; b = '$BUCKET'
+k = 'test-object'; tf = '$TEST_FILE'; tdl = '$TEST_FILE_DL'
+def sign(m, p, h, bd=b''):
+    n = datetime.datetime.now(datetime.timezone.utc)
+    d = n.strftime('%Y%m%dT%H%M%SZ'); ds = n.strftime('%Y%m%d')
+    h['host'] = 'localhost:8081'; h['x-amz-date'] = d
+    h['x-amz-content-sha256'] = hashlib.sha256(bd).hexdigest()
+    ch = ''.join(f'{k.lower()}:{v.strip()}\n' for k,v in sorted(h.items()))
+    sh = ';'.join(sorted(k.lower() for k in h))
+    cr = f'{m}\n{p}\n\n{ch}\n{sh}\n{h[\"x-amz-content-sha256\"]}'
+    cs = f'{ds}/us-east-1/s3/aws4_request'
+    sts = f'AWS4-HMAC-SHA256\n{d}\n{cs}\n{hashlib.sha256(cr.encode()).hexdigest()}'
+    def skf(k, m): return hmac.new(k, m.encode(), hashlib.sha256).digest()
+    kd = skf(('AWS4'+sk).encode(), ds); kr = skf(kd, 'us-east-1')
+    ks = skf(kr, 's3'); kg = skf(ks, 'aws4_request')
+    sg = hmac.new(kg, sts.encode(), hashlib.sha256).hexdigest()
+    h['Authorization'] = f'AWS4-HMAC-SHA256 Credential={ak}/{cs}, SignedHeaders={sh}, Signature={sg}'
+    return h
+data = open(tf, 'rb').read()
+# PUT with content-type
+hs = sign('PUT', f'/{b}/{k}', {'content-type': 'application/octet-stream'}, data)
+try:
+    r = urllib.request.urlopen(urllib.request.Request(f'{ep}/{b}/{k}', data=data, headers=hs, method='PUT'))
+    print(f'PUT object: {r.status}')
+except Exception as e: print(f'PUT object: {e}')
+# GET
+hs = sign('GET', f'/{b}/{k}', {})
+try:
+    r = urllib.request.urlopen(urllib.request.Request(f'{ep}/{b}/{k}', headers=hs, method='GET'))
+    open(tdl, 'wb').write(r.read())
+    print(f'GET object: {r.status}, size={os.path.getsize(tdl)}')
+except Exception as e: print(f'GET object: {e}')
+" 2>&1
 
 # 9. Verify byte-exact
 echo "--- Step 9: Verify byte-exact ---"

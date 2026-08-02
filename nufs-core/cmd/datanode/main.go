@@ -40,6 +40,7 @@ func main() {
 		configPath           = flag.String("config", "", "Path to YAML config file")
 		nodeID               = flag.String("node-id", "auto", "Unique data node ID or 'auto'")
 		listenAddr           = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
+		registerAddrFlag     = flag.String("register-addr", "", "Address registered with metadata (routable host:port; empty = listen addr)")
 		opsAddr              = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
 		dataDir              = flag.String("data-dir", "/var/lib/dfs/data", "Chunk storage root directory")
 		dataDirs             = flag.String("data-dirs", "", "Comma-separated data directories for JBOD multi-disk mode")
@@ -103,6 +104,7 @@ func main() {
 	runDataNode(datanode.Config{
 		NodeID:              nid,
 		ListenAddr:          *listenAddr,
+		RegisterAddr:        *registerAddrFlag,
 		OpsListenAddr:       *opsAddr,
 		DataDir:             singleDir,
 		DataDirs:            dirs,
@@ -175,6 +177,16 @@ func splitAndClean(s string) []string {
 		}
 	}
 	return out
+}
+
+// registerAddr returns the address registered with the metadata service:
+// RegisterAddr when set (containerized deployments must register a
+// routable host:port, not the 0.0.0.0 bind address), else ListenAddr.
+func registerAddr(cfg datanode.Config) string {
+	if cfg.RegisterAddr != "" {
+		return cfg.RegisterAddr
+	}
+	return cfg.ListenAddr
 }
 
 func readMachineID() string {
@@ -308,7 +320,7 @@ func runDataNode(cfg datanode.Config) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	err = metaStore.RegisterNode(ctx, &metadata.NodeInfo{
 		ID:         cfg.NodeID,
-		Addr:       cfg.ListenAddr,
+		Addr:       registerAddr(cfg),
 		DataDir:    cfg.DataDir,
 		Rack:       cfg.Rack,
 		Zone:       cfg.Zone,
@@ -485,7 +497,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	ctx := context.Background()
 	if err := metaStore.RegisterNode(ctx, &metadata.NodeInfo{
 		ID:      cfg.NodeID,
-		Addr:    cfg.ListenAddr,
+		Addr:    registerAddr(cfg),
 		State:   metadata.NodeOnline,
 	}); err != nil {
 		log.Error("failed to register with metadata service", "error", err)
