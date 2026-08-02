@@ -9,6 +9,18 @@ import (
 	"github.com/example/dfs/metadata"
 )
 
+// HeartbeatStore is the subset of ChunkStore the HeartbeatReporter
+// needs. It is an interface so the V2.1 engine (via V2Store) can also be
+// heartbeated and stay online for placement selection.
+type HeartbeatStore interface {
+	Stats() (totalBytes int64, chunkCount int64)
+	DiskManager() *DiskManager
+	ChunkStateSnapshot() map[metadata.ChunkID]metadata.ReplicaState
+	StateVersion() uint64
+	DiskStats() []DiskStatsItem
+	WriteErrorRate() float64
+}
+
 // HeartbeatReporter periodically sends node status and chunk state
 // to the metadata service.
 //
@@ -22,7 +34,7 @@ import (
 type HeartbeatReporter struct {
 	cfg        Config
 	meta       HeartbeatMeta
-	chunkSt    *ChunkStore
+	chunkSt    HeartbeatStore
 	interval   time.Duration
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -60,7 +72,7 @@ type HeartbeatReporter struct {
 const defaultFullSyncInterval = 6 // every 6th heartbeat (~1 min at 10s interval)
 
 // NewHeartbeatReporter creates a new heartbeat reporter.
-func NewHeartbeatReporter(cfg Config, metaStore HeartbeatMeta, chunkStore *ChunkStore) *HeartbeatReporter {
+func NewHeartbeatReporter(cfg Config, metaStore HeartbeatMeta, chunkStore HeartbeatStore) *HeartbeatReporter {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &HeartbeatReporter{
 		cfg:              cfg,

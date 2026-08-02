@@ -102,5 +102,33 @@ func (v *V2Store) Stats() (totalBytes int64, chunkCount int64) {
 	return 0, 0
 }
 
+// DiskManager returns nil — the V2 engine manages its own disk layout.
+func (v *V2Store) DiskManager() *DiskManager {
+	return nil
+}
+
+// ChunkStateSnapshot returns an empty snapshot. The V2 engine does not
+// expose per-chunk replica state in the legacy format.
+func (v *V2Store) ChunkStateSnapshot() map[metadata.ChunkID]metadata.ReplicaState {
+	return map[metadata.ChunkID]metadata.ReplicaState{}
+}
+
+// StateVersion returns 0 — V2 chunks are durable atomically and there
+// is no versioned chunk-state set to diff.
+func (v *V2Store) StateVersion() uint64 {
+	return 0
+}
+
+// DiskStats returns an empty per-disk breakdown.
+func (v *V2Store) DiskStats() []DiskStatsItem {
+	return nil
+}
+
+// WriteErrorRate returns 0 — the V2 engine reports per-stream error
+// rates through its own metrics.
+func (v *V2Store) WriteErrorRate() float64 {
+	return 0
+}
+
 // Compile-time interface check.
 var _ LocalChunkStore = (*V2Store)(nil)

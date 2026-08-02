@@ -493,13 +493,16 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	metaStore := metadata.NewHTTPClient(metaURL, 30*time.Second)
 	metaStore.SetAuthToken(cfg.MetadataAuthToken)
 
-	// Register with metadata service.
+	// Register with metadata service. On re-registration after a restart
+	// the node already exists (metadata persists nodes across restarts);
+	// treat ErrNodeAlreadyExists as success so the TCP server and
+	// heartbeat still start. The address is refreshed via heartbeat.
 	ctx := context.Background()
 	if err := metaStore.RegisterNode(ctx, &metadata.NodeInfo{
 		ID:      cfg.NodeID,
 		Addr:    registerAddr(cfg),
 		State:   metadata.NodeOnline,
-	}); err != nil {
+	}); err != nil && err != metadata.ErrNodeAlreadyExists {
 		log.Error("failed to register with metadata service", "error", err)
 		os.Exit(1)
 	}
@@ -515,6 +518,13 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		os.Exit(1)
 	}
 	log.Info("TCP server listening", "addr", srv.Addr())
+
+	// Start the heartbeat reporter so the metadata service's lease keeps
+	// this node online and the placement engine selects it as a replica
+	// (§6.3). Without it the node would be marked offline and never
+	// receive writes.
+	heartbeat := datanode.NewHeartbeatReporter(cfg, metaStore, v2Store)
+	heartbeat.Start()
 
 	// Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)

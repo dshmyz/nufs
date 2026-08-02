@@ -2392,6 +2392,18 @@ func (s *PebbleStore) RegisterNode(ctx context.Context, info *NodeInfo) error {
 		return err
 	}
 	if exists {
+		// The same node is re-registering (process restart, container
+		// recreation). Refresh its address and liveness so peers can
+		// route to the current reachable endpoint — the address may have
+		// changed (e.g. new container hostname/port).
+		if info.Addr != "" && info.Addr != existing.Addr {
+			existing.Addr = info.Addr
+			if err := s.putMsgpack(key, &existing); err != nil {
+				return err
+			}
+			s.placement.UpdateNode(&existing)
+			s.publishNodeEvent(key, &existing)
+		}
 		return ErrNodeAlreadyExists
 	}
 	info.State = NodeOnline
