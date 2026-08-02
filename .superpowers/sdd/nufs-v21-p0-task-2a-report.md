@@ -72,3 +72,84 @@ not be opened by the V3 recovery path.
   unsupported-format error rather than attempting recovery or truncation.
 - Tombstone commits now write a zero-frame record so their declared one-record
   descriptor can pass the same strict BatchCommit validation as data records.
+
+## Fix 1 — Independent Review Findings
+
+### Scope
+
+This follow-up fixes all evidence-backed Task 2A review findings without
+adding Task 2B DataReady or production recovery-budget plumbing. The V3
+format remains version 3: its still-unreleased record and descriptor layouts
+now include a durable operation field instead of introducing another format
+bump. V2 remains explicitly unsupported with no fallback.
+
+### RED / GREEN evidence
+
+RED command:
+
+```bash
+go test ./datanode/storage/segment -run 'TestRecoverStreaming_(SafeOffsetSkipsCommittedPrefix|CorruptTailWithVersion2ByteIsTruncated)|TestRecordTrailerGolden|TestDelete_RecoveredTombstoneRemainsDeleted|TestStoreRecoveryRestoresStreamSequence' -count=1 -timeout 60s
+```
+
+Before the fix it failed for all five review regressions:
+
+- `TestRecordTrailerGolden`: corruption in bytes 8..11 was accepted.
+- `TestRecoverStreaming_SafeOffsetSkipsCommittedPrefix`: recovery reported two
+  commits, proving it parsed and counted the safe prefix.
+- `TestRecoverStreaming_CorruptTailWithVersion2ByteIsTruncated`: an invalid
+  tail was returned as unsupported V2 solely because byte 4 was 2.
+- `TestDelete_CrashReopenTombstoneRemainsDeleted`: recovered delete returned
+  an empty live extent rather than `ErrExtentNotFound`.
+- `TestStoreRecoveryRestoresStreamSequence`: recovered stream sequence was 0
+  after a prior committed sequence of 1.
+
+GREEN evidence:
+
+- The same focused test set passed after the fix.
+- `go test ./datanode/storage/segment -count=1 -timeout 180s` passed after
+  formatting and updating every V3 layout consumer.
+- `go test -race ./datanode/storage/segment -run 'Recover|Crash|CommitLayout|Tombstone|Delete' -count=10 -timeout 180s` passed.
+- `go test -race ./datanode/storage/segment -count=1 -timeout 240s` passed.
+
+### Fixes and regressions
+
+- Added `RecordOp` (`RecordPut`, `RecordDelete`) to the V3 record header and
+  to `journal.BatchDescriptor`; both header CRC and descriptor CRC cover it.
+  Delete now uses the normal group-commit coordinator with a zero-frame
+  `RecordDelete`, and recovery maps it to `ExtentTombstoned`.
+- `RecoverFromSegmentLog` now begins at `max(SegmentHeaderSize, SafeOffset)`,
+  validates a non-header checkpoint start, initializes its valid boundary at
+  that offset, and never parses/counts/replays the trusted prefix or truncates
+  below it.
+- Parser record accounting now has a hard 100,000-record bound even when
+  `MaxRecords` is zero; explicit smaller limits remain effective.
+- V2 record classification now requires a valid legacy magic and header CRC.
+  Invalid/torn tails with a version-like fifth byte are truncated and synced;
+  genuine V2 remains an explicit unsupported-format error.
+- Active recovery restores `streamSeq` from `RecoverResult.LastSeq`, so the
+  next append continues the stream-local commit sequence.
+- The 12-byte trailer writes deterministic zero reserved bytes and rejects
+  nonzero bytes 8..11.
+
+Regression coverage was added or extended in:
+
+- `nufs-core/datanode/storage/segment/recover_stream_test.go`
+- `nufs-core/datanode/storage/segment/store_test.go`
+- `nufs-core/datanode/storage/segment/record_test.go`
+- `nufs-core/datanode/storage/segment/commit_layout_test.go`
+
+### Files
+
+- `nufs-core/datanode/storage/journal/commit.go`
+- `nufs-core/datanode/storage/segment/record.go`
+- `nufs-core/datanode/storage/segment/recover.go`
+- `nufs-core/datanode/storage/segment/store.go`
+- the regression test files listed above
+
+### Concerns
+
+- This deliberately changes the V3 record and descriptor layout while V3 is
+  still the approved incompatible V2.1 correction. Existing V3 test data is
+  not compatible, but no additional format-version bump was introduced.
+- The parser bound is local to `RecoverFromSegmentLog`; Task 2B remains
+  responsible for production integration budgets and DataReady state.

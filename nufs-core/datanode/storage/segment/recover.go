@@ -18,6 +18,10 @@ var ErrRecoveryBudgetExceeded = errors.New("storage: recovery budget exceeded")
 
 var errUnsupportedRecoveryFormat = errors.New("storage: unsupported recovery format")
 
+// recoveryMaxRecords bounds both parser work and pending descriptor memory
+// even when callers leave RecoverOptions.MaxRecords unset.
+const recoveryMaxRecords uint64 = 100000
+
 // RecoverOptions bounds and identifies active-segment recovery.
 type RecoverOptions struct {
 	StreamID         uint8
@@ -66,17 +70,18 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 		return nil, fmt.Errorf("storage: safe offset %d outside segment size %d", opts.SafeOffset, size)
 	}
 
-	state := recoveryState{
-		path: path, opts: opts, size: size, lastValid: int64(storage.SegmentHeaderSize),
-		lastSeq: 0, safeSeq: opts.SafeSeq,
-	}
-	off := int64(storage.SegmentHeaderSize)
-	for off < size {
-		entryApply := apply
-		if off < start {
-			entryApply = nil
+	if start > int64(storage.SegmentHeaderSize) {
+		if err := validateSafeRecoveryStart(f, start, size); err != nil {
+			return nil, fmt.Errorf("storage: safe offset %d is not an encoded boundary: %w", opts.SafeOffset, err)
 		}
-		next, commit, indexSafe, err := state.parseEntry(f, off, entryApply)
+	}
+	state := recoveryState{
+		path: path, opts: opts, size: size, lastValid: start,
+		lastSeq: opts.SafeSeq, safeSeq: opts.SafeSeq, recordLimit: recoveryRecordLimit(opts),
+	}
+	off := start
+	for off < size {
+		next, commit, indexSafe, err := state.parseEntry(f, off, apply)
 		if err != nil {
 			if errors.Is(err, ErrRecoveryBudgetExceeded) {
 				return nil, err
@@ -84,26 +89,13 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 			if errors.Is(err, errUnsupportedRecoveryFormat) {
 				return nil, err
 			}
-			if off < start {
-				return nil, fmt.Errorf("storage: safe offset %d is not an encoded boundary: %w", opts.SafeOffset, err)
-			}
 			break
-		}
-		if next > start && off < start {
-			return nil, fmt.Errorf("storage: safe offset %d is inside encoded entry [%d,%d)", opts.SafeOffset, off, next)
-		}
-		if off == start && off > int64(storage.SegmentHeaderSize) {
-			state.lastValid = start
 		}
 		off = next
 		if commit || indexSafe {
 			state.lastValid = off
 		}
 	}
-	if off != start && start != int64(storage.SegmentHeaderSize) && off < start {
-		return nil, fmt.Errorf("storage: safe offset %d is not an encoded boundary", opts.SafeOffset)
-	}
-
 	trailing := size - state.lastValid
 	if opts.MaxTrailingBytes > 0 && trailing > opts.MaxTrailingBytes {
 		return nil, ErrRecoveryBudgetExceeded
@@ -137,6 +129,40 @@ type recoveryState struct {
 	applied     int
 	records     uint64
 	replayBytes int64
+	recordLimit uint64
+}
+
+func recoveryRecordLimit(opts RecoverOptions) uint64 {
+	if opts.MaxRecords == 0 || opts.MaxRecords > recoveryMaxRecords {
+		return recoveryMaxRecords
+	}
+	return opts.MaxRecords
+}
+
+// validateSafeRecoveryStart verifies that a caller-supplied checkpoint offset
+// starts a V3 record (or exactly reaches EOF) without parsing or replaying its
+// trusted prefix. BatchCommit and INDEX_SAFE entries are boundaries but not
+// valid replay starts: a checkpoint must point after them.
+func validateSafeRecoveryStart(f *os.File, off, size int64) error {
+	if off == size {
+		return nil
+	}
+	var prefix [5]byte
+	if err := readFullAt(f, prefix[:], off); err != nil {
+		return err
+	}
+	if beUint32(prefix[:4]) != storage.RecordMagic {
+		return fmt.Errorf("storage: safe offset does not start a record")
+	}
+	if prefix[4] == 2 {
+		return validateV2RecordHeader(f, off)
+	}
+	var headerBuf [RecordHeaderSize]byte
+	if err := readFullAt(f, headerBuf[:], off); err != nil {
+		return err
+	}
+	var header RecordHeader
+	return header.Decode(headerBuf[:])
 }
 
 // parseEntry validates one record, commit, or INDEX_SAFE marker. It never
@@ -172,14 +198,24 @@ func (s *recoveryState) parseEntry(f *os.File, off int64, apply func(CommitDescr
 }
 
 func (s *recoveryState) parseRecord(f *os.File, off int64) (int64, bool, bool, error) {
+	var prefix [5]byte
+	if err := readFullAt(f, prefix[:], off); err != nil {
+		return 0, false, false, err
+	}
+	if beUint32(prefix[:4]) != storage.RecordMagic {
+		return 0, false, false, fmt.Errorf("storage: bad record magic 0x%x", beUint32(prefix[:4]))
+	}
+	if prefix[4] == 2 {
+		if err := validateV2RecordHeader(f, off); err != nil {
+			return 0, false, false, err
+		}
+		return 0, false, false, fmt.Errorf("%w: record version 2", errUnsupportedRecoveryFormat)
+	}
 	var headerBuf [RecordHeaderSize]byte
 	if err := readFullAt(f, headerBuf[:], off); err != nil {
 		return 0, false, false, err
 	}
 	var header RecordHeader
-	if headerBuf[4] == 2 {
-		return 0, false, false, fmt.Errorf("%w: record version %d", errUnsupportedRecoveryFormat, headerBuf[4])
-	}
 	if err := header.Decode(headerBuf[:]); err != nil {
 		return 0, false, false, err
 	}
@@ -190,6 +226,9 @@ func (s *recoveryState) parseRecord(f *os.File, off int64) (int64, bool, bool, e
 	}
 	if header.FrameCount == 0 && header.StoredLen != 0 {
 		return 0, false, false, fmt.Errorf("storage: zero-frame record has stored bytes")
+	}
+	if header.Op == RecordDelete && (header.StoredLen != 0 || header.LogicalLen != 0 || header.FrameCount != 0) {
+		return 0, false, false, fmt.Errorf("storage: delete record carries payload")
 	}
 	framing := int64(RecordHeaderSize) + indexBytes + int64(header.StoredLen) + int64(RecordTrailerSize)
 	if framing < int64(RecordHeaderSize) || off > s.size-framing {
@@ -229,16 +268,36 @@ func (s *recoveryState) parseRecord(f *os.File, off int64) (int64, bool, bool, e
 		}
 		return 0, false, false, fmt.Errorf("storage: record trailer framing mismatch")
 	}
-	if s.opts.MaxRecords > 0 && s.records == s.opts.MaxRecords {
+	if s.records == s.recordLimit {
 		return 0, false, false, ErrRecoveryBudgetExceeded
 	}
 	s.records++
 	s.pending = append(s.pending, CommitDescriptor{
 		ExtentID: header.ExtentID, Generation: header.Generation, SegmentID: segIDFromPath(s.path),
 		Offset: off, StoredLen: header.StoredLen, LogicalLen: header.LogicalLen,
-		Checksum: header.PayloadChecksum,
+		Checksum: header.PayloadChecksum, Op: header.Op,
 	})
 	return off + framing, false, false, nil
+}
+
+// validateV2RecordHeader recognizes only a genuine legacy V2 header. A
+// corrupt tail whose fifth byte happens to be 2 is therefore truncated like
+// any other torn record rather than being misreported as an unsupported V2
+// segment.
+func validateV2RecordHeader(f *os.File, off int64) error {
+	const v2RecordHeaderSize = 50
+	var buf [v2RecordHeaderSize]byte
+	if err := readFullAt(f, buf[:], off); err != nil {
+		return err
+	}
+	if beUint32(buf[0:4]) != storage.RecordMagic || buf[4] != 2 {
+		return fmt.Errorf("storage: invalid V2 record header")
+	}
+	wantCRC := binary.BigEndian.Uint32(buf[42:46])
+	if gotCRC := crc32.ChecksumIEEE(buf[0:42]); gotCRC != wantCRC {
+		return fmt.Errorf("storage: invalid V2 record header crc")
+	}
+	return nil
 }
 
 func (s *recoveryState) parseCommit(f *os.File, off int64, apply func(CommitDescriptor) error) (int64, bool, bool, error) {
@@ -300,6 +359,7 @@ func pendingDescriptorsCRC(pending []CommitDescriptor) uint32 {
 		binary.BigEndian.PutUint32(buf[32:36], d.StoredLen)
 		binary.BigEndian.PutUint32(buf[36:40], d.LogicalLen)
 		binary.BigEndian.PutUint32(buf[40:44], d.Checksum)
+		buf[44] = byte(d.Op)
 		_, _ = h.Write(buf[:])
 	}
 	return h.Sum32()
@@ -341,6 +401,7 @@ type CommitDescriptor struct {
 	StoredLen  uint32
 	LogicalLen uint32
 	Checksum   uint32
+	Op         RecordOp
 }
 
 // segIDFromPath extracts the segment ID from a `{id}.seg` filename.

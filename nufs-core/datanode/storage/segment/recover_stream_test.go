@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"encoding/binary"
 	"errors"
 	"hash/crc32"
 	"os"
@@ -166,6 +167,18 @@ func TestRecoverStreaming_EnforcesRecordAndReplayBudgets(t *testing.T) {
 	})
 }
 
+func TestRecoverStreaming_DefaultRecordLimitIsBounded(t *testing.T) {
+	if got := recoveryRecordLimit(RecoverOptions{}); got == 0 || got != recoveryMaxRecords {
+		t.Fatalf("zero-option record limit = %d, want hard limit %d", got, recoveryMaxRecords)
+	}
+	if got := recoveryRecordLimit(RecoverOptions{MaxRecords: 7}); got != 7 {
+		t.Fatalf("explicit tighter record limit = %d, want 7", got)
+	}
+	if got := recoveryRecordLimit(RecoverOptions{MaxRecords: recoveryMaxRecords + 1}); got != recoveryMaxRecords {
+		t.Fatalf("oversized record limit = %d, want hard limit %d", got, recoveryMaxRecords)
+	}
+}
+
 func TestRecoverStreaming_RejectsFormatVersion2(t *testing.T) {
 	t.Run("segment", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "7.seg")
@@ -196,11 +209,7 @@ func TestRecoverStreaming_RejectsFormatVersion2(t *testing.T) {
 		if err := segmentHeader.Encode(segmentBuf); err != nil {
 			t.Fatal(err)
 		}
-		legacyRecord := RecordHeader{Magic: storage.RecordMagic, Version: 2}
-		recordBuf := make([]byte, RecordHeaderSize)
-		if err := legacyRecord.Encode(recordBuf); err != nil {
-			t.Fatal(err)
-		}
+		recordBuf := validV2RecordHeaderBytes()
 		if err := os.WriteFile(path, append(segmentBuf, recordBuf...), 0644); err != nil {
 			t.Fatal(err)
 		}
@@ -211,6 +220,16 @@ func TestRecoverStreaming_RejectsFormatVersion2(t *testing.T) {
 	})
 }
 
+func TestBatchDescriptorCRCIncludesOperation(t *testing.T) {
+	put := journal.BatchDescriptor{ExtentID: 1, Generation: 2, SegmentID: 3, Offset: 4, StoredLen: 5, LogicalLen: 6, Checksum: 7, Op: uint8(RecordPut)}
+	delete := put
+	delete.Op = uint8(RecordDelete)
+	putCRC := descriptorCRC([]journal.BatchDescriptor{put})
+	if deleteCRC := descriptorCRC([]journal.BatchDescriptor{delete}); deleteCRC == putCRC {
+		t.Fatal("descriptor checksum does not bind operation")
+	}
+}
+
 func TestRecoverStreaming_RejectsUnsafeSafeOffset(t *testing.T) {
 	path, _, committedEnd := writeRecoveryFixture(t, 0, 1, nil)
 	for _, safeOffset := range []int64{int64(SegmentHeaderSize) + 1, committedEnd + 1} {
@@ -219,6 +238,43 @@ func TestRecoverStreaming_RejectsUnsafeSafeOffset(t *testing.T) {
 			t.Fatalf("safe offset %d was accepted", safeOffset)
 		}
 	}
+}
+
+func TestRecoverStreaming_SafeOffsetSkipsCommittedPrefix(t *testing.T) {
+	path, _, safeOffset := writeRecoveryFixture(t, 0, 1, nil)
+	appendRecoveryRecord(t, path, safeOffset, 2)
+
+	var applied []CommitDescriptor
+	res, err := RecoverFromSegmentLog(path, RecoverOptions{StreamID: 0, SafeOffset: safeOffset}, func(d CommitDescriptor) error {
+		applied = append(applied, d)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) != 1 || applied[0].ExtentID != 12 {
+		t.Fatalf("applied = %+v, want only the suffix descriptor", applied)
+	}
+	if res.Commits != 1 || res.LastSeq != 2 {
+		t.Fatalf("result counted the safe prefix: %+v", res)
+	}
+}
+
+func TestRecoverStreaming_CorruptTailWithVersion2ByteIsTruncated(t *testing.T) {
+	path, _, committedEnd := writeRecoveryFixture(t, 0, 1, nil)
+	tail := make([]byte, RecordHeaderSize)
+	binary.BigEndian.PutUint32(tail[0:4], storage.RecordMagic)
+	tail[4] = 2
+	appendRecoveryBytes(t, path, tail)
+
+	res, err := RecoverFromSegmentLog(path, RecoverOptions{StreamID: 0}, nil)
+	if err != nil {
+		t.Fatalf("corrupt tail returned unsupported format: %v", err)
+	}
+	if res.TrailingBytes != int64(len(tail)) {
+		t.Fatalf("trailing bytes = %d, want %d", res.TrailingBytes, len(tail))
+	}
+	assertRecoverySize(t, path, committedEnd)
 }
 
 func TestRecoverStreaming_IndexSafeAdvancesValidBoundary(t *testing.T) {
@@ -271,6 +327,7 @@ func writeRecoveryFixture(t *testing.T, streamID uint8, seq uint64, mutate func(
 	payloadChecksum := crc32.ChecksumIEEE(payload)
 	record := &RecordHeader{
 		Magic: storage.RecordMagic, Version: storage.FormatVersion,
+		Op:       RecordPut,
 		ExtentID: 11, Generation: 3, LogicalLen: uint32(len(payload)), StoredLen: uint32(len(payload)),
 		FrameCount: 1, FrameIndexCRC: idx.CRC, PayloadChecksum: payloadChecksum,
 	}
@@ -283,7 +340,7 @@ func writeRecoveryFixture(t *testing.T, streamID uint8, seq uint64, mutate func(
 	batch := &journal.BatchCommit{Magic: journal.BatchCommitMagic, Version: storage.FormatVersion, StreamID: streamID, Seq: seq, RecordCount: 1, FirstOffset: off, LastOffset: commitOff}
 	batch.DescriptorsCRC = descriptorCRC([]journal.BatchDescriptor{{
 		ExtentID: desc.ExtentID, Generation: desc.Generation, SegmentID: desc.SegmentID,
-		Offset: desc.Offset, StoredLen: desc.StoredLen, LogicalLen: desc.LogicalLen, Checksum: desc.Checksum,
+		Offset: desc.Offset, StoredLen: desc.StoredLen, LogicalLen: desc.LogicalLen, Checksum: desc.Checksum, Op: uint8(RecordPut),
 	}})
 	if mutate != nil {
 		mutate(batch)
@@ -306,7 +363,7 @@ func tornRecordBytes(t *testing.T, n int) []byte {
 	if err := idx.Encode(idxBuf); err != nil {
 		t.Fatal(err)
 	}
-	h := RecordHeader{Magic: storage.RecordMagic, Version: storage.FormatVersion, StoredLen: 1, LogicalLen: 1, FrameCount: 1, FrameIndexCRC: idx.CRC, PayloadChecksum: frameCRC}
+	h := RecordHeader{Magic: storage.RecordMagic, Version: storage.FormatVersion, Op: RecordPut, StoredLen: 1, LogicalLen: 1, FrameCount: 1, FrameIndexCRC: idx.CRC, PayloadChecksum: frameCRC}
 	hdr := make([]byte, RecordHeaderSize)
 	if err := h.Encode(hdr); err != nil {
 		t.Fatal(err)
@@ -348,13 +405,13 @@ func appendRecoveryRecord(t *testing.T, path string, off int64, seq uint64) {
 	if err := idx.Encode(idxBuf); err != nil {
 		t.Fatal(err)
 	}
-	header := &RecordHeader{Magic: storage.RecordMagic, Version: storage.FormatVersion, ExtentID: storage.ExtentID(10 + seq), Generation: 3, LogicalLen: uint32(len(payload)), StoredLen: uint32(len(payload)), FrameCount: 1, FrameIndexCRC: idx.CRC, PayloadChecksum: checksum}
+	header := &RecordHeader{Magic: storage.RecordMagic, Version: storage.FormatVersion, Op: RecordPut, ExtentID: storage.ExtentID(10 + seq), Generation: 3, LogicalLen: uint32(len(payload)), StoredLen: uint32(len(payload)), FrameCount: 1, FrameIndexCRC: idx.CRC, PayloadChecksum: checksum}
 	if _, err := w.WriteRecordFramed(off, header, idxBuf, payload, DefaultFrameSize); err != nil {
 		t.Fatal(err)
 	}
 	commitOff := off + int64(RecordFraming(header.StoredLen, DefaultFrameSize, 1))
 	batch := &journal.BatchCommit{Magic: journal.BatchCommitMagic, Version: storage.FormatVersion, Seq: seq, RecordCount: 1, FirstOffset: off, LastOffset: commitOff}
-	batch.DescriptorsCRC = descriptorCRC([]journal.BatchDescriptor{{ExtentID: header.ExtentID, Generation: header.Generation, SegmentID: 7, Offset: off, StoredLen: header.StoredLen, LogicalLen: header.LogicalLen, Checksum: header.PayloadChecksum}})
+	batch.DescriptorsCRC = descriptorCRC([]journal.BatchDescriptor{{ExtentID: header.ExtentID, Generation: header.Generation, SegmentID: 7, Offset: off, StoredLen: header.StoredLen, LogicalLen: header.LogicalLen, Checksum: header.PayloadChecksum, Op: uint8(RecordPut)}})
 	if err := w.WriteBatchCommit(commitOff, batch); err != nil {
 		t.Fatal(err)
 	}
@@ -372,4 +429,13 @@ func assertRecoverySize(t *testing.T, path string, want int64) {
 	if info.Size() != want {
 		t.Fatalf("file size = %d, want %d", info.Size(), want)
 	}
+}
+
+func validV2RecordHeaderBytes() []byte {
+	const v2RecordHeaderSize = 50
+	buf := make([]byte, v2RecordHeaderSize)
+	binary.BigEndian.PutUint32(buf[0:4], storage.RecordMagic)
+	buf[4] = 2
+	binary.BigEndian.PutUint32(buf[42:46], crc32.ChecksumIEEE(buf[0:42]))
+	return buf
 }

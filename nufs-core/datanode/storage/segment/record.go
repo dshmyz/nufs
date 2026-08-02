@@ -25,8 +25,8 @@ import (
 // DefaultFrameSize is the per-frame payload size (§16).
 const DefaultFrameSize = 64 << 10 // 64 KiB
 
-// RecordHeaderSize is the fixed on-disk size of RecordHeader (V2.1).
-const RecordHeaderSize = 4 + 1 + 8 + 8 + 4 + 4 + 1 + 8 + 2 + 2 + 4 + 4 + 4 // 54
+// RecordHeaderSize is the fixed on-disk size of RecordHeader (V3).
+const RecordHeaderSize = 4 + 1 + 1 + 8 + 8 + 4 + 4 + 1 + 8 + 2 + 2 + 4 + 4 + 4 // 55
 
 // RecordTrailerSize is the fixed on-disk size of RecordTrailer.
 const RecordTrailerSize = 8 + 4 // 12
@@ -38,6 +38,7 @@ const FrameIndexEntrySize = 4 + 4 + 1 + 4 // offset + stored_len + codec + crc
 type RecordHeader struct {
 	Magic      uint32                   // RecordMagic
 	Version    uint8                    // FormatVersion
+	Op         RecordOp                 // durable mutation operation
 	ExtentID   storage.ExtentID         // 8 bytes
 	Generation storage.Generation       // 8 bytes
 	LogicalLen uint32                   // logical payload length
@@ -53,11 +54,25 @@ type RecordHeader struct {
 	FrameIndexCRC   uint32 // CRC32C of the frame-index bytes
 }
 
+// RecordOp identifies the durable mutation represented by a record.
+// It is part of both the record-header and BatchCommit descriptor CRCs.
+type RecordOp uint8
+
+const (
+	RecordPut RecordOp = iota + 1
+	RecordDelete
+)
+
+func (op RecordOp) valid() bool {
+	return op == RecordPut || op == RecordDelete
+}
+
 // RecordTrailer is appended after the payload. It carries the framing
 // length so a reader can detect truncation and skip records.
 type RecordTrailer struct {
 	FramingLen uint32 // total record length incl. header + index + frames + trailer
 	TrailerCRC uint32 // CRC32C of FramingLen
+	Reserved   uint32 // must be zero
 }
 
 // Encode writes the header as fixed-size big-endian bytes. HeaderCRC is
@@ -66,21 +81,25 @@ func (h *RecordHeader) Encode(dst []byte) error {
 	if len(dst) < RecordHeaderSize {
 		return fmt.Errorf("storage: record header buffer too small: %d < %d", len(dst), RecordHeaderSize)
 	}
+	if !h.Op.valid() {
+		return fmt.Errorf("storage: unsupported record operation %d", h.Op)
+	}
 	binary.BigEndian.PutUint32(dst[0:4], h.Magic)
 	dst[4] = h.Version
-	binary.BigEndian.PutUint64(dst[5:13], uint64(h.ExtentID))
-	binary.BigEndian.PutUint64(dst[13:21], uint64(h.Generation))
-	binary.BigEndian.PutUint32(dst[21:25], h.LogicalLen)
-	binary.BigEndian.PutUint32(dst[25:29], h.StoredLen)
-	dst[29] = byte(h.Codec)
-	binary.BigEndian.PutUint64(dst[30:38], h.KeyID)
-	binary.BigEndian.PutUint16(dst[38:40], h.FrameSize)
-	binary.BigEndian.PutUint16(dst[40:42], h.FrameCount)
-	// HeaderCRC covers bytes [0, 46); then write both checksums.
-	binary.BigEndian.PutUint32(dst[42:46], h.PayloadChecksum)
-	hdrCRC := crc32.ChecksumIEEE(dst[0:46])
-	binary.BigEndian.PutUint32(dst[46:50], hdrCRC)
-	binary.BigEndian.PutUint32(dst[50:54], h.FrameIndexCRC)
+	dst[5] = byte(h.Op)
+	binary.BigEndian.PutUint64(dst[6:14], uint64(h.ExtentID))
+	binary.BigEndian.PutUint64(dst[14:22], uint64(h.Generation))
+	binary.BigEndian.PutUint32(dst[22:26], h.LogicalLen)
+	binary.BigEndian.PutUint32(dst[26:30], h.StoredLen)
+	dst[30] = byte(h.Codec)
+	binary.BigEndian.PutUint64(dst[31:39], h.KeyID)
+	binary.BigEndian.PutUint16(dst[39:41], h.FrameSize)
+	binary.BigEndian.PutUint16(dst[41:43], h.FrameCount)
+	// HeaderCRC covers bytes [0, 47); then write both checksums.
+	binary.BigEndian.PutUint32(dst[43:47], h.PayloadChecksum)
+	hdrCRC := crc32.ChecksumIEEE(dst[0:47])
+	binary.BigEndian.PutUint32(dst[47:51], hdrCRC)
+	binary.BigEndian.PutUint32(dst[51:55], h.FrameIndexCRC)
 	return nil
 }
 
@@ -92,17 +111,18 @@ func (h *RecordHeader) Decode(src []byte) error {
 	}
 	h.Magic = binary.BigEndian.Uint32(src[0:4])
 	h.Version = src[4]
-	h.ExtentID = storage.ExtentID(binary.BigEndian.Uint64(src[5:13]))
-	h.Generation = storage.Generation(binary.BigEndian.Uint64(src[13:21]))
-	h.LogicalLen = binary.BigEndian.Uint32(src[21:25])
-	h.StoredLen = binary.BigEndian.Uint32(src[25:29])
-	h.Codec = storage.CompressionCodec(src[29])
-	h.KeyID = binary.BigEndian.Uint64(src[30:38])
-	h.FrameSize = binary.BigEndian.Uint16(src[38:40])
-	h.FrameCount = binary.BigEndian.Uint16(src[40:42])
-	h.PayloadChecksum = binary.BigEndian.Uint32(src[42:46])
-	wantCRC := binary.BigEndian.Uint32(src[46:50])
-	h.FrameIndexCRC = binary.BigEndian.Uint32(src[50:54])
+	h.Op = RecordOp(src[5])
+	h.ExtentID = storage.ExtentID(binary.BigEndian.Uint64(src[6:14]))
+	h.Generation = storage.Generation(binary.BigEndian.Uint64(src[14:22]))
+	h.LogicalLen = binary.BigEndian.Uint32(src[22:26])
+	h.StoredLen = binary.BigEndian.Uint32(src[26:30])
+	h.Codec = storage.CompressionCodec(src[30])
+	h.KeyID = binary.BigEndian.Uint64(src[31:39])
+	h.FrameSize = binary.BigEndian.Uint16(src[39:41])
+	h.FrameCount = binary.BigEndian.Uint16(src[41:43])
+	h.PayloadChecksum = binary.BigEndian.Uint32(src[43:47])
+	wantCRC := binary.BigEndian.Uint32(src[47:51])
+	h.FrameIndexCRC = binary.BigEndian.Uint32(src[51:55])
 
 	if h.Magic != storage.RecordMagic {
 		return fmt.Errorf("storage: bad record magic 0x%x", h.Magic)
@@ -110,9 +130,12 @@ func (h *RecordHeader) Decode(src []byte) error {
 	if h.Version != storage.FormatVersion {
 		return fmt.Errorf("storage: unsupported record version %d", h.Version)
 	}
-	gotCRC := crc32.ChecksumIEEE(src[0:46])
+	gotCRC := crc32.ChecksumIEEE(src[0:47])
 	if gotCRC != wantCRC {
 		return fmt.Errorf("storage: record header crc mismatch: got %d want %d", gotCRC, wantCRC)
+	}
+	if !h.Op.valid() {
+		return fmt.Errorf("storage: unsupported record operation %d", h.Op)
 	}
 	return nil
 }
@@ -215,7 +238,10 @@ func (t *RecordTrailer) Encode(dst []byte) error {
 		return fmt.Errorf("storage: record trailer buffer too small")
 	}
 	binary.BigEndian.PutUint32(dst[0:4], t.FramingLen)
-	binary.BigEndian.PutUint32(dst[4:8], crc32.ChecksumIEEE(dst[0:4]))
+	t.TrailerCRC = crc32.ChecksumIEEE(dst[0:4])
+	binary.BigEndian.PutUint32(dst[4:8], t.TrailerCRC)
+	binary.BigEndian.PutUint32(dst[8:12], 0)
+	t.Reserved = 0
 	return nil
 }
 
@@ -225,10 +251,15 @@ func (t *RecordTrailer) Decode(src []byte) error {
 		return fmt.Errorf("storage: record trailer too short")
 	}
 	t.FramingLen = binary.BigEndian.Uint32(src[0:4])
-	wantCRC := binary.BigEndian.Uint32(src[4:8])
+	t.TrailerCRC = binary.BigEndian.Uint32(src[4:8])
+	wantCRC := t.TrailerCRC
 	gotCRC := crc32.ChecksumIEEE(src[0:4])
 	if gotCRC != wantCRC {
 		return fmt.Errorf("storage: record trailer crc mismatch")
+	}
+	t.Reserved = binary.BigEndian.Uint32(src[8:12])
+	if t.Reserved != 0 {
+		return fmt.Errorf("storage: record trailer reserved bytes are non-zero")
 	}
 	return nil
 }

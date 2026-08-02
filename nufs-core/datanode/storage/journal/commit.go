@@ -53,10 +53,12 @@ type BatchDescriptor struct {
 	StoredLen  uint32
 	LogicalLen uint32
 	Checksum   uint32
+	// Op binds the durable mutation type to the BatchCommit checksum.
+	Op uint8
 }
 
 // BatchDescriptorSize is the fixed on-disk size of one descriptor.
-const BatchDescriptorSize = 8 + 8 + 8 + 8 + 4 + 4 + 4 // 44
+const BatchDescriptorSize = 8 + 8 + 8 + 8 + 4 + 4 + 4 + 1 // 45
 
 // Encode writes the BatchCommit body.
 func (b *BatchCommit) Encode(dst []byte) error {
@@ -117,6 +119,7 @@ func EncodeDescriptors(dst []byte, descs []BatchDescriptor) (uint32, error) {
 		binary.BigEndian.PutUint32(dst[base+32:base+36], d.StoredLen)
 		binary.BigEndian.PutUint32(dst[base+36:base+40], d.LogicalLen)
 		binary.BigEndian.PutUint32(dst[base+40:base+44], d.Checksum)
+		dst[base+44] = d.Op
 	}
 	used := len(descs) * BatchDescriptorSize
 	return crc32.ChecksumIEEE(dst[0:used]), nil
@@ -138,6 +141,7 @@ func DecodeDescriptors(src []byte) ([]BatchDescriptor, error) {
 			StoredLen:  binary.BigEndian.Uint32(src[base+32 : base+36]),
 			LogicalLen: binary.BigEndian.Uint32(src[base+36 : base+40]),
 			Checksum:   binary.BigEndian.Uint32(src[base+40 : base+44]),
+			Op:         src[base+44],
 		}
 	}
 	return out, nil

@@ -3,6 +3,7 @@ package segment
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/example/dfs/datanode/storage"
@@ -136,6 +137,66 @@ func TestDeleteGenerationFenced(t *testing.T) {
 	}
 }
 
+// TestDelete_CrashReopenTombstoneRemainsDeleted uses a fresh in-memory index
+// after the acknowledged delete so only durable segment-log recovery can
+// preserve the tombstone.
+func TestDelete_CrashReopenTombstoneRemainsDeleted(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	s, err := New(Config{Dir: dir, UseMemIndex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: 71, Generation: 1, Data: []byte("data")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, &storage.DeleteRequest{ExtentID: 71, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(Config{Dir: dir, UseMemIndex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.Read(ctx, &storage.ReadRequest{ExtentID: 71, Generation: 1}); !errors.Is(err, storage.ErrExtentNotFound) {
+		t.Fatalf("read after recovered delete = %v, want ErrExtentNotFound", err)
+	}
+}
+
+func TestStoreRecoveryRestoresStreamSequence(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	s, err := New(Config{Dir: dir, UseMemIndex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: 81, Generation: 1, Data: []byte("first")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(Config{Dir: dir, UseMemIndex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.streamSeq; got != 1 {
+		t.Fatalf("recovered stream sequence = %d, want 1", got)
+	}
+	if _, err := reopened.Write(ctx, &storage.WriteRequest{ExtentID: 82, Generation: 1, Data: []byte("second")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.streamSeq; got != 2 {
+		t.Fatalf("stream sequence after append = %d, want 2", got)
+	}
+}
+
 func TestSegmentSealAndNew(t *testing.T) {
 	s := newTestStore(t, nil)
 	ctx := context.Background()
@@ -145,9 +206,9 @@ func TestSegmentSealAndNew(t *testing.T) {
 	var lastRec *storage.DurableReceipt
 	for i := 0; i < 200; i++ {
 		rec, err := s.Write(ctx, &storage.WriteRequest{
-			ExtentID: storage.ExtentID(100 + i),
+			ExtentID:   storage.ExtentID(100 + i),
 			Generation: 1,
-			Data:    bytes.Repeat([]byte("x"), 4096),
+			Data:       bytes.Repeat([]byte("x"), 4096),
 		})
 		if err != nil {
 			t.Fatalf("write %d: %v", i, err)

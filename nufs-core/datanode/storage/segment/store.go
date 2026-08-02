@@ -213,12 +213,16 @@ func (s *Store) recoverActiveSegment(path string) error {
 		// Replay into the overlay (read authority). Committed-but-
 		// unflushed records are served from the overlay until the async
 		// apply loop or a later flush persists them to Pebble.
+		state := storage.ExtentDurable
+		if d.Op == RecordDelete {
+			state = storage.ExtentTombstoned
+		}
 		s.overlay.Put(index.Key(d.ExtentID, d.Generation), index.Value{
 			SegmentID:  d.SegmentID,
 			Offset:     d.Offset,
 			StoredLen:  d.StoredLen,
 			LogicalLen: d.LogicalLen,
-			State:      storage.ExtentDurable,
+			State:      state,
 			Checksum:   d.Checksum,
 		})
 		return nil
@@ -230,6 +234,11 @@ func (s *Store) recoverActiveSegment(path string) error {
 	// what is already persisted in Pebble.
 	if res.SafeSeq > 0 {
 		s.safeSeq.Store(res.SafeSeq)
+	}
+	// Commit sequences are stream-local, including across segment rotation.
+	// The next fresh active segment must continue after recovered commits.
+	if res.LastSeq > s.streamSeq {
+		s.streamSeq = res.LastSeq
 	}
 	return nil
 }
@@ -359,6 +368,7 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 	header := &RecordHeader{
 		Magic:           storage.RecordMagic,
 		Version:         storage.FormatVersion,
+		Op:              RecordPut,
 		ExtentID:        req.ExtentID,
 		Generation:      req.Generation,
 		LogicalLen:      uint32(len(req.Data)),
@@ -534,7 +544,7 @@ func batchDescriptorsCRC(batch []*pendingWrite) uint32 {
 		descs[i] = journal.BatchDescriptor{
 			ExtentID: pw.extentID, Generation: pw.generation, SegmentID: pw.segID,
 			Offset: pw.offset, StoredLen: pw.storedLen, LogicalLen: pw.logicalLen,
-			Checksum: pw.payloadCRC,
+			Checksum: pw.payloadCRC, Op: uint8(pw.header.Op),
 		}
 	}
 	buf := make([]byte, len(descs)*journal.BatchDescriptorSize)
@@ -603,6 +613,7 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 	header := &RecordHeader{
 		Magic:           storage.RecordMagic,
 		Version:         storage.FormatVersion,
+		Op:              RecordPut,
 		ExtentID:        extentID,
 		Generation:      gen,
 		LogicalLen:      uint32(len(data)),
@@ -632,7 +643,7 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 		LastOffset:  commitOffset,
 		DescriptorsCRC: descriptorCRC([]journal.BatchDescriptor{{
 			ExtentID: extentID, Generation: gen, SegmentID: segID, Offset: off,
-			StoredLen: storedLen, LogicalLen: uint32(len(data)), Checksum: checksumOf(data),
+			StoredLen: storedLen, LogicalLen: uint32(len(data)), Checksum: checksumOf(data), Op: uint8(RecordPut),
 		}}),
 	}
 	if err := writer.WriteBatchCommit(commitOffset, bc); err != nil {
@@ -768,66 +779,25 @@ func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
 		}
 		return err
 	}
-	// Append tombstone + BatchCommit in one barrier.
-	// (Full tombstone-batch support lands with compaction in phase 4;
-	// here we mark the overlay/index directly after a durable commit.)
-	if _, err := s.appendTombstone(req.ExtentID, req.Generation, v); err != nil {
+	// Submit a zero-frame delete record through the normal coordinator so it
+	// remains contiguous with writes and shares the exact one-sync batch
+	// durability rule.
+	pw := &pendingWrite{
+		extentID:   req.ExtentID,
+		generation: req.Generation,
+		header: &RecordHeader{
+			Magic: storage.RecordMagic, Version: storage.FormatVersion,
+			Op: RecordDelete, ExtentID: req.ExtentID, Generation: req.Generation,
+			FrameIndexCRC: crc32ChecksumIEEE(nil),
+		},
+		frameSize: DefaultFrameSize,
+	}
+	if err := s.group.Submit(pw, s.commitBatch); err != nil {
 		return err
 	}
 	v.State = storage.ExtentTombstoned
 	s.overlay.Put(index.Key(req.ExtentID, req.Generation), *v)
 	return s.enqueueApply([]index.Mutation{{ExtentID: req.ExtentID, Generation: req.Generation, Value: *v}})
-}
-
-// appendTombstone writes a zero-frame record plus one validating BatchCommit.
-func (s *Store) appendTombstone(extentID storage.ExtentID, gen storage.Generation, _ *index.Value) (*storage.DurableReceipt, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	framing := RecordFraming(0, DefaultFrameSize, 0)
-	required := int64(framing) + int64(journal.BatchCommitSize)
-	if !s.alloc.CanReserveBatch(required) || !s.alloc.CanReserveRecords(1) {
-		if err := s.sealActiveLocked(); err != nil {
-			return nil, err
-		}
-		if !s.alloc.CanReserveBatch(required) || !s.alloc.CanReserveRecords(1) {
-			return nil, storage.ErrSegmentFull
-		}
-	}
-	recordOff, err := s.alloc.Reserve(framing, extentID, 0)
-	if err != nil {
-		return nil, err
-	}
-	commitOff, err := s.alloc.ReserveCommit(uint32(journal.BatchCommitSize))
-	if err != nil {
-		return nil, err
-	}
-	segID := s.alloc.State().SegmentID
-	header := &RecordHeader{
-		Magic: storage.RecordMagic, Version: storage.FormatVersion,
-		ExtentID: extentID, Generation: gen, FrameIndexCRC: crc32ChecksumIEEE(nil),
-	}
-	if _, err := s.writer.WriteRecordFramed(recordOff, header, nil, nil, DefaultFrameSize); err != nil {
-		return nil, err
-	}
-	bc := &journal.BatchCommit{
-		Magic:          journal.BatchCommitMagic,
-		Version:        storage.FormatVersion,
-		StreamID:       s.streamID,
-		Seq:            s.streamSeq + 1,
-		RecordCount:    1,
-		FirstOffset:    recordOff,
-		LastOffset:     commitOff,
-		DescriptorsCRC: descriptorCRC([]journal.BatchDescriptor{{ExtentID: extentID, Generation: gen, SegmentID: segID, Offset: recordOff}}),
-	}
-	if err := s.writer.WriteBatchCommit(commitOff, bc); err != nil {
-		return nil, err
-	}
-	if err := s.writer.Sync(); err != nil {
-		return nil, err
-	}
-	s.streamSeq++
-	s.alloc.RecordCommit(s.streamSeq)
-	return &storage.DurableReceipt{ExtentID: extentID, Generation: gen, SegmentID: segID, Offset: recordOff, Seq: s.streamSeq}, nil
 }
 
 // Stat implements storage.Store.Stat.

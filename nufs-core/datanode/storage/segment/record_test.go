@@ -15,6 +15,7 @@ func TestRecordHeaderGolden(t *testing.T) {
 	h := RecordHeader{
 		Magic:           storage.RecordMagic,
 		Version:         storage.FormatVersion,
+		Op:              RecordPut,
 		ExtentID:        0x1122334455667788,
 		Generation:      0xdeadbeef,
 		LogicalLen:      65536,
@@ -54,7 +55,7 @@ func TestRecordHeaderGolden(t *testing.T) {
 }
 
 func TestRecordTrailerGolden(t *testing.T) {
-	trailer := RecordTrailer{FramingLen: 54 + 4096 + 12}
+	trailer := RecordTrailer{FramingLen: 55 + 4096 + 12}
 	buf := make([]byte, RecordTrailerSize)
 	if err := trailer.Encode(buf); err != nil {
 		t.Fatal(err)
@@ -65,6 +66,10 @@ func TestRecordTrailerGolden(t *testing.T) {
 	}
 	if decoded != trailer {
 		t.Fatalf("roundtrip mismatch: got %+v want %+v", decoded, trailer)
+	}
+	buf[8] ^= 0xFF
+	if err := decoded.Decode(buf); err == nil {
+		t.Fatal("expected final trailer padding corruption to be rejected")
 	}
 }
 

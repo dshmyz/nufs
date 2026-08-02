@@ -125,8 +125,8 @@ func TestCommitLayout_ConcurrentBatchIsContiguous(t *testing.T) {
 		t.Fatal(err)
 	}
 	descs := []journal.BatchDescriptor{
-		{ExtentID: firstHeader.ExtentID, Generation: firstHeader.Generation, SegmentID: receipts[0].SegmentID, Offset: firstOffset, StoredLen: firstHeader.StoredLen, LogicalLen: firstHeader.LogicalLen, Checksum: firstHeader.PayloadChecksum},
-		{ExtentID: secondHeader.ExtentID, Generation: secondHeader.Generation, SegmentID: receipts[1].SegmentID, Offset: secondOffset, StoredLen: secondHeader.StoredLen, LogicalLen: secondHeader.LogicalLen, Checksum: secondHeader.PayloadChecksum},
+		{ExtentID: firstHeader.ExtentID, Generation: firstHeader.Generation, SegmentID: receipts[0].SegmentID, Offset: firstOffset, StoredLen: firstHeader.StoredLen, LogicalLen: firstHeader.LogicalLen, Checksum: firstHeader.PayloadChecksum, Op: uint8(firstHeader.Op)},
+		{ExtentID: secondHeader.ExtentID, Generation: secondHeader.Generation, SegmentID: receipts[1].SegmentID, Offset: secondOffset, StoredLen: secondHeader.StoredLen, LogicalLen: secondHeader.LogicalLen, Checksum: secondHeader.PayloadChecksum, Op: uint8(secondHeader.Op)},
 	}
 	descBuf := make([]byte, len(descs)*journal.BatchDescriptorSize)
 	wantCRC, err := journal.EncodeDescriptors(descBuf, descs)
