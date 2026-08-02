@@ -66,6 +66,9 @@ func TestRecordHeaderGolden(t *testing.T) {
 }
 
 func TestRecordRelocateGolden(t *testing.T) {
+	if RecordPut != 1 || RecordDelete != 2 || RecordRelocate != 3 {
+		t.Fatalf("record operation wire values = put:%d delete:%d relocate:%d, want 1, 2, 3", RecordPut, RecordDelete, RecordRelocate)
+	}
 	h := RecordHeader{
 		Magic:      storage.RecordMagic,
 		Version:    storage.FormatVersion,

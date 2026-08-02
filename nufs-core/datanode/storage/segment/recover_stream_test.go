@@ -112,6 +112,25 @@ func TestStoreRecovery_RelocateFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRecoverStreaming_ApplyErrorPreservesCommittedBatch(t *testing.T) {
+	path, _, committedEnd := writeRecoveryFixture(t, 0, 1, nil)
+	applyErr := errors.New("apply committed batch")
+
+	res, err := RecoverFromSegmentLog(path, RecoverOptions{StreamID: 0}, func(CommitDescriptor) error {
+		return applyErr
+	})
+	if !errors.Is(err, applyErr) {
+		t.Fatalf("recovery error = %v, want apply error", err)
+	}
+	if res == nil || res.DataReady {
+		t.Fatalf("recovery result = %+v, want DataReady false", res)
+	}
+	if res.LastCommittedOffset != committedEnd || res.TrailingBytes != 0 {
+		t.Fatalf("recovery result = %+v, want committed boundary %d without trailing bytes", res, committedEnd)
+	}
+	assertRecoverySize(t, path, committedEnd)
+}
+
 func TestRecoverStreaming_TruncatesTornRecordAndCommitTails(t *testing.T) {
 	for name, tail := range map[string][]byte{
 		"header":  tornRecordBytes(t, 0),

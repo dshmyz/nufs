@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/example/dfs/datanode/storage/journal"
@@ -20,7 +21,7 @@ type Writer struct {
 // The allocator owns offsets, so the file is opened without O_APPEND to
 // allow WriteAt.
 func OpenWriter(path string) (*Writer, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -87,11 +88,30 @@ func (w *Writer) Path() string { return w.path }
 
 // WriteFooter appends the footer at the sealed offset and syncs.
 func (w *Writer) WriteFooter(offset int64, footer *SegmentFooter) error {
-	buf := make([]byte, SegmentFooterSize)
-	if err := footer.Encode(buf); err != nil {
+	info, err := w.f.Stat()
+	if err != nil {
 		return err
 	}
-	if _, err := w.f.WriteAt(buf, offset); err != nil {
+	if info.Size() != offset {
+		return fmt.Errorf("storage: seal offset %d does not match segment size %d", offset, info.Size())
+	}
+	var buf [SegmentFooterSize]byte
+	footer.SegmentCRC = 0
+	if err := footer.Encode(buf[:]); err != nil {
+		return err
+	}
+	crc, err := sealedSegmentCRC(w.f, offset, buf[:segmentFooterCRCOffset])
+	if err != nil {
+		return err
+	}
+	if crc == 0 {
+		return fmt.Errorf("storage: refusing to seal segment with unset crc")
+	}
+	footer.SegmentCRC = crc
+	if err := footer.Encode(buf[:]); err != nil {
+		return err
+	}
+	if _, err := w.f.WriteAt(buf[:], offset); err != nil {
 		return err
 	}
 	return w.f.Sync()

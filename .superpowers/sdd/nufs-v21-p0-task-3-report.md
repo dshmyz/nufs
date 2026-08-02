@@ -76,3 +76,81 @@ The 180-second rerun is the minimum justified larger cap: the required
   the documented 180-second rerun is clean.
 - Task 3 itself is complete within scope. No Task 4 range-read work, S3 work,
   format changes, or version bump was introduced.
+
+## Fix Round 1
+
+Fixed the three Important findings against the not-live V3 format without a
+version bump or compatibility fallback:
+
+- `RecordRelocate` is now the exact value `3`; V3 header encode/decode accepts
+  it, while startup recovery returns `storage.ErrUnsupportedRecordOperation`
+  rather than treating a recognized relocation as corruption or replaying it as
+  a put/delete.
+- Added the shared `storage.CRC32C`/`storage.NewCRC32C` Castagnoli seam and
+  converted every current V3 segment safety checksum path: segment headers,
+  record headers, frame/index/payload checksums, trailers, `BatchCommit` and
+  descriptor CRCs, INDEX_SAFE commit records, recovery validation, and the
+  recovery-checkpoint sidecar. Legacy V2 recovery-header validation and the
+  unrelated change journal intentionally remain IEEE.
+- Replaced the pre-sync delete test's in-process visibility assertion with an
+  abrupt descriptor/index close, deterministic truncation to the pre-delete
+  synced segment length, and restart. The failed delete has no acknowledgement
+  and the old value is readable after restart. The existing copied
+  pre-delete-index post-sync test remains in place.
+
+The strict wire tests prove Castagnoli record/commit/checkpoint bytes are
+accepted and matching IEEE-encoded V3 bytes are rejected. The record-header
+golden vector was updated to the Castagnoli value.
+
+Exact Fix Round 1 results (run from `nufs-core`):
+
+```text
+go test -race ./datanode/storage/segment -run 'Record|CommitLayout|Delete|Generation|Crash|Recover|CRC' -count=20 -timeout 240s
+# PASS (exit 0)
+
+go test -race ./datanode/storage/segment ./datanode/storage/journal ./datanode/storage/index -count=1 -timeout 300s
+# PASS (exit 0)
+
+git diff --check
+# PASS (exit 0; no output)
+```
+
+See `nufs-v21-p0-task-3-fix1-report.md` for the focused file inventory and
+test details.
+
+## Fix Round 2
+
+Hardened recovery and sealed-segment integrity handling:
+
+- Recovery now distinguishes an apply failure from a malformed/torn tail.
+  A callback failure is returned directly with `DataReady=false`; recovery
+  does not truncate the structurally valid committed batch. Startup therefore
+  fails closed for committed `RecordRelocate` entries, leaving no usable Store.
+- Sealing computes `SegmentFooter.SegmentCRC` with the shared Castagnoli CRC32C
+  implementation over bytes from the segment header through the footer byte
+  before `SegmentCRC`. The computation streams a fixed 64 KiB buffer and is
+  completed before the footer is written and synced.
+- `ValidateSealedSegment` validates the file-context checksum whenever a
+  reader opens an encoded sealed footer (and for every file in the sealed
+  namespace). Footer decode remains field parsing only; it is not treated as
+  full-file integrity validation.
+- Footer tests cover a valid seal, corruption in header/body/footer-covered
+  bytes, a mismatch limited to the excluded CRC field, and a zero/unset CRC.
+  Record operation tests pin the literal wire values Put=1, Delete=2, and
+  Relocate=3.
+
+Exact Fix Round 2 results (run from `nufs-core`):
+
+```text
+go test -race ./datanode/storage/segment -run 'Relocate|Recover|Footer|Seal|CRC|Delete|Crash' -count=20 -timeout 240s
+# PASS (exit 0)
+
+go test -race ./datanode/storage/segment ./datanode/storage/journal ./datanode/storage/index -count=1 -timeout 300s
+# PASS (exit 0)
+
+git diff --check
+# PASS (exit 0; no output)
+```
+
+See `nufs-v21-p0-task-3-fix2-report.md` for the focused file inventory and
+validation details.

@@ -3,6 +3,8 @@ package segment
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
+	"os"
 
 	"github.com/example/dfs/datanode/storage"
 )
@@ -22,6 +24,13 @@ const SegmentHeaderSize = storage.SegmentHeaderSize
 
 // SegmentFooterSize is the fixed on-disk size of SegmentFooter.
 const SegmentFooterSize = storage.SegmentFooterSize
+
+const (
+	// segmentFooterCRCOffset is the first byte excluded from SegmentCRC.
+	// SegmentCRC covers byte range [0, footerOffset+segmentFooterCRCOffset).
+	segmentFooterCRCOffset = SegmentFooterSize - 4
+	segmentCRCBufferSize   = 64 << 10
+)
 
 // SegmentHeader is the immutable header of a segment file.
 type SegmentHeader struct {
@@ -106,7 +115,9 @@ func (f *SegmentFooter) Encode(dst []byte) error {
 	return nil
 }
 
-// Decode parses and validates a segment footer.
+// Decode parses the fixed footer fields only. A decoded footer does not prove
+// that the containing sealed segment is intact; callers that trust a sealed
+// file must use ValidateSealedSegment.
 func (f *SegmentFooter) Decode(src []byte) error {
 	if len(src) < SegmentFooterSize {
 		return fmt.Errorf("storage: segment footer too short")
@@ -128,4 +139,94 @@ func (f *SegmentFooter) Decode(src []byte) error {
 		return fmt.Errorf("storage: unsupported segment footer version %d", f.Version)
 	}
 	return nil
+}
+
+// ValidateSealedSegment validates the header, footer, and SegmentCRC of a
+// sealed segment. SegmentCRC is CRC32C over the complete file from byte zero
+// through the footer byte immediately before the SegmentCRC field.
+func ValidateSealedSegment(f *os.File) (*SegmentFooter, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() < int64(SegmentHeaderSize+SegmentFooterSize) {
+		return nil, fmt.Errorf("storage: sealed segment shorter than header and footer")
+	}
+	footerOffset := info.Size() - int64(SegmentFooterSize)
+	var headerBuf [SegmentHeaderSize]byte
+	if err := readFullAt(f, headerBuf[:], 0); err != nil {
+		return nil, err
+	}
+	var header SegmentHeader
+	if err := header.Decode(headerBuf[:]); err != nil {
+		return nil, err
+	}
+	var footerBuf [SegmentFooterSize]byte
+	if err := readFullAt(f, footerBuf[:], footerOffset); err != nil {
+		return nil, err
+	}
+	var footer SegmentFooter
+	if err := footer.Decode(footerBuf[:]); err != nil {
+		return nil, err
+	}
+	if footer.SegmentCRC == 0 {
+		return nil, fmt.Errorf("%w: sealed segment crc is unset", storage.ErrChecksumMismatch)
+	}
+	got, err := sealedSegmentCRC(f, footerOffset, footerBuf[:segmentFooterCRCOffset])
+	if err != nil {
+		return nil, err
+	}
+	if got != footer.SegmentCRC {
+		return nil, fmt.Errorf("%w: sealed segment crc got %08x want %08x", storage.ErrChecksumMismatch, got, footer.SegmentCRC)
+	}
+	return &footer, nil
+}
+
+// hasEncodedSegmentFooter recognizes a decodable footer at EOF without
+// treating decoding as integrity validation. Readers use it only to decide
+// whether they must invoke ValidateSealedSegment before serving the file.
+func hasEncodedSegmentFooter(f *os.File, size int64) (bool, error) {
+	if size < int64(SegmentHeaderSize+SegmentFooterSize) {
+		return false, nil
+	}
+	var prefix [5]byte
+	if err := readFullAt(f, prefix[:], size-int64(SegmentFooterSize)); err != nil {
+		return false, err
+	}
+	return beUint32(prefix[:4]) == storage.SegmentMagic && prefix[4] == storage.FormatVersion, nil
+}
+
+// sealedSegmentCRC is shared by the sealer and validator so the excluded
+// SegmentCRC field is defined in exactly one place. It streams fixed-size
+// chunks and therefore never allocates in proportion to segment size.
+func sealedSegmentCRC(r io.ReaderAt, footerOffset int64, footerPrefix []byte) (uint32, error) {
+	if footerOffset < int64(SegmentHeaderSize) || len(footerPrefix) != segmentFooterCRCOffset {
+		return 0, fmt.Errorf("storage: invalid sealed segment crc range")
+	}
+	h := storage.NewCRC32C()
+	var buf [segmentCRCBufferSize]byte
+	for off := int64(0); off < footerOffset; {
+		n := int64(len(buf))
+		if remaining := footerOffset - off; remaining < n {
+			n = remaining
+		}
+		read, err := r.ReadAt(buf[:n], off)
+		if read != int(n) {
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			return 0, err
+		}
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+		if _, err := h.Write(buf[:n]); err != nil {
+			return 0, err
+		}
+		off += n
+	}
+	if _, err := h.Write(footerPrefix); err != nil {
+		return 0, err
+	}
+	return h.Sum32(), nil
 }

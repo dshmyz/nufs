@@ -20,6 +20,18 @@ var ErrRecoveryBudgetExceeded = storage.ErrRecoveryBudgetExceeded
 
 var errUnsupportedRecoveryFormat = errors.New("storage: unsupported recovery format")
 
+// recoveryApplyError distinguishes a failure to install a structurally valid,
+// committed batch from a malformed or torn on-disk tail. Only the latter may
+// be discarded during recovery.
+type recoveryApplyError struct {
+	err          error
+	committedEnd int64
+	seq          uint64
+}
+
+func (e *recoveryApplyError) Error() string { return e.err.Error() }
+func (e *recoveryApplyError) Unwrap() error { return e.err }
+
 // recoveryMaxRecords bounds both parser work and pending descriptor memory
 // even when callers leave RecoverOptions.MaxRecords unset.
 const recoveryMaxRecords = storage.MaxRecoveryRecords
@@ -116,6 +128,13 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 		if err != nil {
 			if errors.Is(err, ErrRecoveryBudgetExceeded) {
 				return state.result(false), err
+			}
+			var applyErr *recoveryApplyError
+			if errors.As(err, &applyErr) {
+				state.lastValid = applyErr.committedEnd
+				state.lastCommittedSeq = applyErr.seq
+				state.commits++
+				return state.result(false), applyErr.err
 			}
 			if errors.Is(err, errUnsupportedRecoveryFormat) {
 				return nil, err
@@ -433,7 +452,11 @@ func (s *recoveryState) parseCommit(f *os.File, off int64, apply func(CommitDesc
 					return 0, false, false, ErrRecoveryBudgetExceeded
 				}
 				if err := apply(d); err != nil {
-					return 0, false, false, err
+					return 0, false, false, &recoveryApplyError{
+						err:          err,
+						committedEnd: off + int64(journal.BatchCommitSize),
+						seq:          commit.Seq,
+					}
 				}
 				s.applied++
 			}

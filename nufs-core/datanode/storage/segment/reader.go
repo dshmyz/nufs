@@ -2,6 +2,7 @@ package segment
 
 import (
 	"os"
+	"path/filepath"
 
 	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/datanode/storage/encryption"
@@ -36,6 +37,20 @@ func OpenReaderWithEnc(path string, enc *encryption.KeyRegistry) (*Reader, error
 	if err != nil {
 		f.Close()
 		return nil, err
+	}
+	sealed := filepath.Base(filepath.Dir(path)) == "sealed"
+	if !sealed {
+		sealed, err = hasEncodedSegmentFooter(f, st.Size())
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	if sealed {
+		if _, err := ValidateSealedSegment(f); err != nil {
+			f.Close()
+			return nil, err
+		}
 	}
 	return &Reader{f: f, path: path, sizeBytes: st.Size(), enc: enc}, nil
 }
