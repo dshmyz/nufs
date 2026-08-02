@@ -44,8 +44,11 @@ type pendingWrite struct {
 	segID     storage.SegmentID
 	offset    int64
 	streamSeq uint64
-	err       error
-	done      chan struct{}
+	// recoveryBatch coordinates publication of every member of one durable
+	// BatchCommit into the overlay before that batch can advance SafeSeq.
+	recoveryBatch *recoveryPublishBatch
+	err           error
+	done          chan struct{}
 }
 
 type commitRequest struct {

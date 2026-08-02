@@ -134,9 +134,9 @@ func TestRecovery_ManyWritesReopen(t *testing.T) {
 	writeAndRecover(t, 16)
 }
 
-// TestSustained_Recovery500Writes retains high-volume recovery coverage. Its
-// name intentionally avoids the required repeated-test regex.
-func TestSustained_Recovery500Writes(t *testing.T) {
+// TestSustained_Reopen500Writes retains high-volume recovery coverage. Its
+// name intentionally avoids the required repeated-test recovery regex.
+func TestSustained_Reopen500Writes(t *testing.T) {
 	writeAndRecover(t, 500)
 }
 

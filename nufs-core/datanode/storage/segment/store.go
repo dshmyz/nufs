@@ -56,10 +56,12 @@ type Store struct {
 	dataReady atomic.Bool
 	// recoveryResult is immutable after New succeeds and records actual
 	// parser replay/truncation work rather than checkpoint validation alone.
-	recoveryResult    RecoverResult
-	recoveryClock     func() time.Time
-	recoveryStartedAt time.Time
-	recoveryDeadline  time.Time
+	recoveryResult     RecoverResult
+	recoveryClock      func() time.Time
+	recoveryStartedAt  time.Time
+	recoveryDeadline   time.Time
+	recoveryPolicy     recoveryStartupPolicy
+	recoveryCheckpoint *index.RecoveryCheckpoint
 
 	nextSeg uint64
 	segDir  string
@@ -87,7 +89,13 @@ type Store struct {
 	// index can lag the committed log.
 	flushSeq       atomic.Uint64
 	flushMutations atomic.Int64
-	flushInterval  time.Duration
+	// publicationMu orders completed overlay publications. A batch may wake
+	// several writers concurrently; SafeSeq may advance only once every
+	// mutation in the prior contiguous BatchCommit reached the overlay.
+	publicationMu sync.Mutex
+	publishedSeq  uint64
+	readyBatches  map[uint64]*recoveryPublishBatch
+	flushInterval time.Duration
 	// safeSeq is the last sequence covered by an INDEX_SAFE record.
 	safeSeq atomic.Uint64
 	// flushLoopDone signals the background flush loop.
@@ -136,6 +144,32 @@ type Config struct {
 	// RecoveryClock supplies startup time for deterministic deadline tests.
 	// Nil uses time.Now.
 	RecoveryClock func() time.Time
+	// recoveryPolicy is a package-private test seam. Production always uses
+	// the exact storage recovery limits and 30-second startup budget.
+	recoveryPolicy recoveryStartupPolicy
+}
+
+type recoveryStartupPolicy struct {
+	maxRecords       uint64
+	maxReplayBytes   int64
+	maxTrailingBytes int64
+	budget           time.Duration
+}
+
+func (p recoveryStartupPolicy) withProductionDefaults() recoveryStartupPolicy {
+	if p.maxRecords == 0 {
+		p.maxRecords = storage.MaxRecoveryRecords
+	}
+	if p.maxReplayBytes == 0 {
+		p.maxReplayBytes = storage.MaxRecoveryReplayBytes
+	}
+	if p.maxTrailingBytes == 0 {
+		p.maxTrailingBytes = storage.MaxRecoveryTrailingBytes
+	}
+	if p.budget == 0 {
+		p.budget = storage.RecoveryBudget
+	}
+	return p
 }
 
 // New opens (creating if needed) a Store for one commit stream.
@@ -144,6 +178,7 @@ type Config struct {
 // segment records after the safe sequence are replayed into the overlay
 // (recovery module). Segment IDs are seeded past surviving files.
 func New(cfg Config) (*Store, error) {
+	policy := cfg.recoveryPolicy.withProductionDefaults()
 	recoveryClock := cfg.RecoveryClock
 	if recoveryClock == nil {
 		recoveryClock = time.Now
@@ -161,20 +196,28 @@ func New(cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	checkpoint, err := index.LoadRecoveryCheckpoint(ix, cfg.StreamID)
+	if err != nil {
+		_ = ix.Close()
+		return nil, err
+	}
 	s := &Store{
-		index:             ix,
-		overlay:           NewOverlay(),
-		segDir:            filepath.Join(cfg.Dir, "segments"),
-		streamID:          cfg.StreamID,
-		faults:            cfg.Faults,
-		enc:               cfg.Enc,
-		applyCh:           make(chan []index.Mutation, 256),
-		stopCh:            make(chan struct{}),
-		flushDone:         make(chan struct{}),
-		flushInterval:     cfg.FlushInterval,
-		recoveryClock:     recoveryClock,
-		recoveryStartedAt: recoveryStartedAt,
-		recoveryDeadline:  recoveryStartedAt.Add(storage.RecoveryBudget),
+		index:              ix,
+		overlay:            NewOverlay(),
+		segDir:             filepath.Join(cfg.Dir, "segments"),
+		streamID:           cfg.StreamID,
+		faults:             cfg.Faults,
+		enc:                cfg.Enc,
+		applyCh:            make(chan []index.Mutation, 256),
+		stopCh:             make(chan struct{}),
+		flushDone:          make(chan struct{}),
+		readyBatches:       make(map[uint64]*recoveryPublishBatch),
+		flushInterval:      cfg.FlushInterval,
+		recoveryClock:      recoveryClock,
+		recoveryStartedAt:  recoveryStartedAt,
+		recoveryDeadline:   recoveryStartedAt.Add(policy.budget),
+		recoveryPolicy:     policy,
+		recoveryCheckpoint: checkpoint,
 	}
 	if s.flushInterval <= 0 {
 		s.flushInterval = 2 * time.Second
@@ -207,17 +250,15 @@ func New(cfg Config) (*Store, error) {
 		ix.Close()
 		return nil, err
 	}
-	if s.recoveryClock().After(s.recoveryDeadline) {
-		s.recoveryResult.DataReady = false
+	if err := s.finishRecoveryStartup(); err != nil {
 		_ = s.writer.Close()
 		s.group.close()
 		s.segCache.Close()
 		ix.Close()
-		return nil, storage.ErrRecoveryBudgetExceeded
+		return nil, err
 	}
 	// A Store is not returned until recovery replay/truncation and opening the
 	// new active writer both succeeded. This is the serving-state transition.
-	s.dataReady.Store(true)
 	s.applyWG.Add(1)
 	go s.applyLoop()
 	s.flushWG.Add(1)
@@ -240,19 +281,25 @@ func (s *Store) recoverActiveSegment(path string) error {
 		if s.recoveryClock().After(s.recoveryDeadline) {
 			return storage.ErrRecoveryBudgetExceeded
 		}
-		s.recoveryResult.DataReady = true
 		return nil
 	}
+	safeOffset := int64(storage.SegmentHeaderSize)
+	safeSeq := uint64(0)
+	if checkpoint := s.recoveryCheckpoint; checkpoint != nil && checkpoint.SegmentID == segIDFromPath(path) {
+		safeOffset = checkpoint.SafeOffset
+		safeSeq = checkpoint.SafeSeq
+	}
 	res, err := RecoverFromSegmentLog(path, RecoverOptions{
-		StreamID:         s.streamID,
-		SafeOffset:       int64(storage.SegmentHeaderSize),
-		SafeSeq:          s.safeSeq.Load(),
-		MaxRecords:       storage.MaxRecoveryRecords,
-		MaxReplayBytes:   storage.MaxRecoveryReplayBytes,
-		MaxTrailingBytes: storage.MaxRecoveryTrailingBytes,
-		Clock:            s.recoveryClock,
-		StartedAt:        startedAt,
-		Deadline:         s.recoveryDeadline,
+		StreamID:          s.streamID,
+		SafeOffset:        safeOffset,
+		SafeSeq:           safeSeq,
+		RequireSafeMarker: safeOffset > int64(storage.SegmentHeaderSize),
+		MaxRecords:        s.recoveryPolicy.maxRecords,
+		MaxReplayBytes:    s.recoveryPolicy.maxReplayBytes,
+		MaxTrailingBytes:  s.recoveryPolicy.maxTrailingBytes,
+		Clock:             s.recoveryClock,
+		StartedAt:         startedAt,
+		Deadline:          s.recoveryDeadline,
 	}, func(d CommitDescriptor) error {
 		// Replay into the overlay (read authority). Committed-but-
 		// unflushed records are served from the overlay until the async
@@ -287,6 +334,27 @@ func (s *Store) recoverActiveSegment(path string) error {
 	if res.LastSeq > s.streamSeq {
 		s.streamSeq = res.LastSeq
 	}
+	if res.LastSeq > 0 {
+		s.publicationMu.Lock()
+		s.publishedSeq = res.LastSeq
+		s.publicationMu.Unlock()
+		s.flushSeq.Store(res.LastSeq)
+	}
+	return nil
+}
+
+// finishRecoveryStartup records the elapsed interval through active-writer
+// setup and performs the final inclusive deadline check immediately before
+// publishing DataReady.
+func (s *Store) finishRecoveryStartup() error {
+	now := s.recoveryClock()
+	s.recoveryResult.Duration = now.Sub(s.recoveryStartedAt)
+	if now.After(s.recoveryDeadline) {
+		s.recoveryResult.DataReady = false
+		return storage.ErrRecoveryBudgetExceeded
+	}
+	s.recoveryResult.DataReady = true
+	s.dataReady.Store(true)
 	return nil
 }
 
@@ -472,6 +540,7 @@ func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.Du
 	if err := s.faultStage(storage.CrashAfterOverlayApply); err != nil {
 		return nil, err
 	}
+	s.publishRecoveryBatch(pw.recoveryBatch)
 
 	// Phase 6: schedule async Pebble apply (§6.1 step 8).
 	s.enqueueApply([]index.Mutation{{
@@ -585,11 +654,52 @@ func (s *Store) commitBatch(batch []*pendingWrite) error {
 		return err
 	}
 	s.alloc.RecordCommit(s.streamSeq)
-	// Track the committed sequence + mutation count for the flush
-	// trigger (§7.4).
-	s.flushSeq.Store(s.streamSeq)
-	s.flushMutations.Add(int64(len(batch)))
+	publication := &recoveryPublishBatch{
+		previousSeq: bc.Seq - uint64(len(batch)),
+		seq:         bc.Seq,
+		remaining:   len(batch),
+		mutations:   len(batch),
+	}
+	for _, pw := range batch {
+		pw.recoveryBatch = publication
+	}
 	return nil
+}
+
+// recoveryPublishBatch represents one durable BatchCommit awaiting overlay
+// publication. Its sequence is the cumulative stream sequence recorded by
+// that BatchCommit, while previousSeq is the preceding cumulative sequence.
+type recoveryPublishBatch struct {
+	previousSeq uint64
+	seq         uint64
+	remaining   int
+	mutations   int
+}
+
+// publishRecoveryBatch advances the flush watermark only through contiguous
+// batches whose every mutation has been published to the overlay. This is the
+// index-durability precondition for an INDEX_SAFE sidecar checkpoint.
+func (s *Store) publishRecoveryBatch(batch *recoveryPublishBatch) {
+	if batch == nil {
+		return
+	}
+	s.publicationMu.Lock()
+	defer s.publicationMu.Unlock()
+	batch.remaining--
+	if batch.remaining != 0 {
+		return
+	}
+	s.readyBatches[batch.previousSeq] = batch
+	for {
+		next := s.readyBatches[s.publishedSeq]
+		if next == nil {
+			return
+		}
+		delete(s.readyBatches, s.publishedSeq)
+		s.publishedSeq = next.seq
+		s.flushSeq.Store(next.seq)
+		s.flushMutations.Add(int64(next.mutations))
+	}
 }
 
 // batchDescriptorsCRC binds every location and checksum committed by a batch.
@@ -717,6 +827,7 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 		State:      storage.ExtentDurable,
 		Checksum:   checksumOf(data),
 	})
+	s.publishRecoveryBatch(&recoveryPublishBatch{previousSeq: streamSeq, seq: streamSeq + 1, remaining: 1, mutations: 1})
 	s.enqueueApply([]index.Mutation{{
 		ExtentID:   extentID,
 		Generation: gen,
@@ -858,6 +969,7 @@ func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
 	// into that cache as part of the durable-delete visibility update so a
 	// prior live cache entry cannot outlive an acknowledged delete.
 	s.locCache.Put(key, &tombstone)
+	s.publishRecoveryBatch(pw.recoveryBatch)
 	return s.enqueueApply([]index.Mutation{{ExtentID: req.ExtentID, Generation: req.Generation, Value: tombstone}})
 }
 

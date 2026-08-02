@@ -13,7 +13,9 @@ import (
 // authority for where a record lives. It is a Pebble database keyed by
 // (extent_id, generation) with fixed-size values.
 type Index struct {
-	db *pebble.DB
+	db         *pebble.DB
+	dir        string
+	persistent bool
 }
 
 // Options configures the index database.
@@ -42,7 +44,7 @@ func Open(opts Options) (*Index, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage: open index: %w", err)
 	}
-	return &Index{db: db}, nil
+	return &Index{db: db, dir: opts.Dir, persistent: !opts.UseInMemory}, nil
 }
 
 // Get returns the value for an exact (extent_id, generation) key.

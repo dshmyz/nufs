@@ -26,12 +26,17 @@ const recoveryMaxRecords = storage.MaxRecoveryRecords
 
 // RecoverOptions bounds and identifies active-segment recovery.
 type RecoverOptions struct {
-	StreamID         uint8
-	SafeOffset       int64
-	SafeSeq          uint64
-	MaxRecords       uint64
-	MaxReplayBytes   int64
-	MaxTrailingBytes int64
+	StreamID   uint8
+	SafeOffset int64
+	SafeSeq    uint64
+	// RequireSafeMarker requires SafeOffset to be immediately after the
+	// INDEX_SAFE marker matching SafeSeq. Store.New enables it only for the
+	// index-owned persisted checkpoint; ordinary parser callers may resume
+	// after any validated BatchCommit boundary.
+	RequireSafeMarker bool
+	MaxRecords        uint64
+	MaxReplayBytes    int64
+	MaxTrailingBytes  int64
 	// Clock and Deadline form a deterministic elapsed-time seam. A nil Clock
 	// uses wall time; zero Deadline defaults to storage.RecoveryBudget.
 	Clock     func() time.Time
@@ -86,16 +91,20 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 
 	var checkpointSeq uint64
 	if start > int64(storage.SegmentHeaderSize) {
+		var isIndexSafe bool
 		var err error
-		checkpointSeq, err = validateSafeRecoveryStart(f, start, opts.StreamID)
+		checkpointSeq, isIndexSafe, err = validateSafeRecoveryStart(f, start, opts.StreamID)
 		if err != nil {
 			return nil, fmt.Errorf("storage: safe offset %d is not an encoded boundary: %w", opts.SafeOffset, err)
+		}
+		if opts.RequireSafeMarker && (!isIndexSafe || checkpointSeq != opts.SafeSeq) {
+			return nil, fmt.Errorf("storage: safe offset %d does not match index-safe checkpoint", opts.SafeOffset)
 		}
 	}
 	state := recoveryState{
 		path: path, opts: opts, size: size, lastValid: start,
 		lastCommittedSeq: checkpointSeq, safeSeq: opts.SafeSeq, recordLimit: recoveryRecordLimit(opts),
-		startedAt: startedAt,
+		safeOffset: start, startedAt: startedAt,
 	}
 	off := start
 	for off < size {
@@ -139,11 +148,13 @@ func RecoverFromSegmentLog(path string, opts RecoverOptions, apply func(CommitDe
 }
 
 type recoveryState struct {
-	path      string
-	opts      RecoverOptions
-	size      int64
-	pending   []CommitDescriptor
-	lastValid int64
+	path         string
+	opts         RecoverOptions
+	size         int64
+	pending      []CommitDescriptor
+	pendingBytes int64
+	lastValid    int64
+	safeOffset   int64
 	// lastCommittedSeq is structural validation state. It advances for every
 	// valid BatchCommit, including commits suppressed by SafeSeq. It is seeded
 	// only from a proven SafeOffset checkpoint, never from SafeSeq itself.
@@ -180,7 +191,9 @@ func (s *recoveryState) result(dataReady bool) *RecoverResult {
 		Commits:             s.commits,
 		Applied:             s.applied,
 		LastSeq:             s.lastCommittedSeq,
+		SafeOffset:          s.safeOffset,
 		SafeSeq:             s.safeSeq,
+		ReplayBytes:         s.replayBytes,
 		LastCommittedOffset: s.lastValid,
 		TrailingBytes:       s.size - s.lastValid,
 		Duration:            recoveryNow(s.opts).Sub(s.startedAt),
@@ -195,7 +208,7 @@ func (s *recoveryState) result(dataReady bool) *RecoverResult {
 // particular, a plausible RecordHeader at SafeOffset is not proof: identical
 // bytes can occur in a payload. This reads only a candidate fixed metadata
 // structure, never scans or loads payload frames.
-func validateSafeRecoveryStart(f *os.File, off int64, streamID uint8) (uint64, error) {
+func validateSafeRecoveryStart(f *os.File, off int64, streamID uint8) (uint64, bool, error) {
 	commitOff := off - int64(journal.BatchCommitSize)
 	if commitOff >= int64(storage.SegmentHeaderSize) {
 		var buf [journal.BatchCommitSize]byte
@@ -203,14 +216,14 @@ func validateSafeRecoveryStart(f *os.File, off int64, streamID uint8) (uint64, e
 			var commit journal.BatchCommit
 			if err := commit.Decode(buf[:]); err == nil {
 				if commit.Version != storage.FormatVersion {
-					return 0, fmt.Errorf("storage: unsupported checkpoint batchcommit version %d", commit.Version)
+					return 0, false, fmt.Errorf("storage: unsupported checkpoint batchcommit version %d", commit.Version)
 				}
 				if commit.StreamID != streamID || commit.Seq == 0 || commit.RecordCount == 0 ||
 					commit.FirstOffset < int64(storage.SegmentHeaderSize) ||
 					commit.FirstOffset >= commitOff || commit.LastOffset != commitOff {
-					return 0, fmt.Errorf("storage: invalid checkpoint batchcommit")
+					return 0, false, fmt.Errorf("storage: invalid checkpoint batchcommit")
 				}
-				return commit.Seq, nil
+				return commit.Seq, false, nil
 			}
 		}
 	}
@@ -221,11 +234,11 @@ func validateSafeRecoveryStart(f *os.File, off int64, streamID uint8) (uint64, e
 		if err := readFullAt(f, buf[:], markerOff); err == nil {
 			var marker journal.CommitRecord
 			if err := marker.Decode(buf[:]); err == nil && marker.Op == journal.OpIndexSafe && marker.Seq != 0 {
-				return marker.Seq, nil
+				return marker.Seq, true, nil
 			}
 		}
 	}
-	return 0, fmt.Errorf("storage: safe offset is not after a committed boundary")
+	return 0, false, fmt.Errorf("storage: safe offset is not after a committed boundary")
 }
 
 // parseEntry validates one record, commit, or INDEX_SAFE marker. It never
@@ -252,6 +265,9 @@ func (s *recoveryState) parseEntry(f *os.File, off int64, apply func(CommitDescr
 				}
 				if record.Seq > s.safeSeq {
 					s.safeSeq = record.Seq
+				}
+				if err := s.addReplayBytes(int64(journal.CommitRecordSize)); err != nil {
+					return 0, false, false, err
 				}
 				return off + int64(journal.CommitRecordSize), false, true, nil
 			}
@@ -335,6 +351,7 @@ func (s *recoveryState) parseRecord(f *os.File, off int64) (int64, bool, bool, e
 		return 0, false, false, ErrRecoveryBudgetExceeded
 	}
 	s.records++
+	s.pendingBytes += framing
 	s.pending = append(s.pending, CommitDescriptor{
 		ExtentID: header.ExtentID, Generation: header.Generation, SegmentID: segIDFromPath(s.path),
 		Offset: off, StoredLen: header.StoredLen, LogicalLen: header.LogicalLen,
@@ -384,18 +401,17 @@ func (s *recoveryState) parseCommit(f *os.File, off int64, apply func(CommitDesc
 	if len(s.pending) == 0 || commit.FirstOffset != s.pending[0].Offset || commit.LastOffset != off {
 		return 0, false, false, fmt.Errorf("storage: invalid batchcommit offsets")
 	}
-	var batchBytes int64
-	for _, d := range s.pending {
+	for range s.pending {
 		if s.deadlineExceeded() {
 			return 0, false, false, ErrRecoveryBudgetExceeded
 		}
-		batchBytes += int64(d.StoredLen)
 	}
+	batchBytes := s.pendingBytes + int64(journal.BatchCommitSize)
 	if commit.DescriptorsCRC != pendingDescriptorsCRC(s.pending) {
 		return 0, false, false, fmt.Errorf("storage: batch descriptor crc mismatch")
 	}
 	if commit.Seq > s.opts.SafeSeq {
-		if s.opts.MaxReplayBytes > 0 && batchBytes > s.opts.MaxReplayBytes-s.replayBytes {
+		if err := s.addReplayBytes(batchBytes); err != nil {
 			return 0, false, false, ErrRecoveryBudgetExceeded
 		}
 		if apply != nil {
@@ -409,12 +425,23 @@ func (s *recoveryState) parseCommit(f *os.File, off int64, apply func(CommitDesc
 				s.applied++
 			}
 		}
-		s.replayBytes += batchBytes
 	}
 	s.pending = s.pending[:0]
+	s.pendingBytes = 0
 	s.lastCommittedSeq = commit.Seq
 	s.commits++
 	return off + int64(journal.BatchCommitSize), true, false, nil
+}
+
+// addReplayBytes is the single accounting rule for unindexed committed
+// on-disk bytes: each committed record's complete framing, its BatchCommit,
+// and any committed INDEX_SAFE metadata after the persisted checkpoint.
+func (s *recoveryState) addReplayBytes(n int64) error {
+	if n < 0 || (s.opts.MaxReplayBytes > 0 && n > s.opts.MaxReplayBytes-s.replayBytes) {
+		return ErrRecoveryBudgetExceeded
+	}
+	s.replayBytes += n
+	return nil
 }
 
 func pendingDescriptorsCRC(pending []CommitDescriptor) uint32 {
@@ -456,9 +483,11 @@ type RecoverResult struct {
 	Commits             int
 	Applied             int
 	LastSeq             uint64
+	SafeOffset          int64
 	LastCommittedOffset int64
 	TrailingBytes       int64
 	SafeSeq             uint64
+	ReplayBytes         int64
 	Duration            time.Duration
 	DataReady           bool
 }

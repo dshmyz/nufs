@@ -59,6 +59,10 @@ func (s *Store) flushLoop() {
 // flush applies all committed mutations to Pebble, syncs, and publishes
 // an INDEX_SAFE record for the current safe sequence.
 func (s *Store) flush() error {
+	// Snapshot the overlay-published watermark before the drain. Mutations
+	// arriving later may be indexed by this flush, but are deliberately not
+	// certified by this marker/sidecar and will replay conservatively.
+	safe := s.flushSeq.Load()
 	muts := s.overlay.Drain()
 	if len(muts) == 0 {
 		return nil
@@ -79,9 +83,15 @@ func (s *Store) flush() error {
 	if err := s.index.DB().Flush(); err != nil {
 		return err
 	}
-	// Publish INDEX_SAFE with the safe sequence.
-	safe := s.flushSeq.Load()
-	if err := s.writeIndexSafe(safe); err != nil {
+	// Publish INDEX_SAFE with the safe sequence, then atomically persist the
+	// matching marker-end offset in the index-owned recovery checkpoint. The
+	// ordering is intentional: the sidecar is never durable unless both the
+	// index and marker it certifies are already durable.
+	checkpoint, err := s.writeIndexSafe(safe)
+	if err != nil {
+		return err
+	}
+	if err := index.StoreRecoveryCheckpoint(s.index, checkpoint); err != nil {
 		return err
 	}
 	s.safeSeq.Store(safe)
@@ -92,7 +102,7 @@ func (s *Store) flush() error {
 
 // writeIndexSafe appends an INDEX_SAFE record to the commit log and
 // syncs it, making the safe sequence durable in the segment.
-func (s *Store) writeIndexSafe(safeSeq uint64) error {
+func (s *Store) writeIndexSafe(safeSeq uint64) (index.RecoveryCheckpoint, error) {
 	// The INDEX_SAFE record carries the safe sequence in its Seq field
 	// (§7.1 OpIndexSafe). It is written into the active segment so
 	// recovery reads it during segment-log replay.
@@ -105,20 +115,25 @@ func (s *Store) writeIndexSafe(safeSeq uint64) error {
 	// Serialize into the segment tail.
 	body := make([]byte, journal.CommitRecordSize)
 	if err := rec.Encode(body); err != nil {
-		return err
+		return index.RecoveryCheckpoint{}, err
 	}
 	tail, err := s.alloc.CurrentTail()
 	if err != nil {
-		return err
+		return index.RecoveryCheckpoint{}, err
 	}
 	if _, err := s.writer.WriteAt(body, tail); err != nil {
-		return err
+		return index.RecoveryCheckpoint{}, err
 	}
 	if err := s.writer.Sync(); err != nil {
-		return err
+		return index.RecoveryCheckpoint{}, err
 	}
 	s.alloc.Consume(int64(journal.CommitRecordSize))
-	return nil
+	return index.RecoveryCheckpoint{
+		StreamID:   s.streamID,
+		SegmentID:  s.alloc.State().SegmentID,
+		SafeOffset: tail + int64(journal.CommitRecordSize),
+		SafeSeq:    safeSeq,
+	}, nil
 }
 
 // cfgFlushMaxMutations returns the flush mutation guardrail.

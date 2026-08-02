@@ -102,3 +102,45 @@ go test ./datanode/storage/segment ./datanode/storage/recovery -count=1 -timeout
 - A deadline can occur after a valid tail has been truncated and synced. In
   that case recovery still returns the budget error and `DataReady=false`, so
   the node never serves after missing the elapsed startup budget.
+
+## Fix Round 1
+
+The interrupted follow-up added the index-owned per-stream recovery
+checkpoint sidecar and repaired the Task 2B verification path. The sidecar
+contains version, stream ID, segment ID, safe offset, safe sequence, and CRC;
+it is atomically published after the synced `INDEX_SAFE` marker with a synced
+temporary file, rename, and parent-directory sync. `Store.New` trusts it only
+when it names the active segment, otherwise replays from the header; malformed
+or CRC-invalid sidecars fail closed.
+
+Recovery now accounts for complete committed on-disk bytes (record framing,
+`BatchCommit`, and replayed `INDEX_SAFE` metadata), exposes `SafeOffset` and
+`SafeSeq`, and measures duration through active-writer setup and the final
+`DataReady` transition. The package-private startup-policy seam keeps
+production limits unchanged while allowing small deterministic Store.New
+boundary tests. The production-log helper keeps every generated batch at or
+below `MaxBatch` (256); its delete records have zero payload and therefore
+remain within the 16 MiB extent limit.
+
+The first required focused race command initially timed out because
+`TestSustained_Recovery500Writes` accidentally matched `Recover` despite its
+comment saying it should not. It was renamed to
+`TestSustained_Reopen500Writes`; the test remains in the full suite. A full
+race run then exposed `TestDrill_CorruptReadNeverSucceeds`: its bit flip can
+damage the `INDEX_SAFE` marker certified by the sidecar. The drill now treats
+fail-closed startup as a successful corrupt-data rejection.
+
+Final verification:
+
+```bash
+cd /Users/gracegaoya/work/project/nufs/nufs-core
+go test -race ./datanode/storage/segment ./datanode/storage/recovery -run 'Recover|Budget|DataReady|Checkpoint' -count=10 -timeout 180s
+# PASS: segment 83.270s; recovery 2.864s
+
+go test -race ./datanode/storage/segment ./datanode/storage/recovery -count=1 -timeout 240s
+# PASS: segment 145.172s; recovery 3.881s
+
+cd /Users/gracegaoya/work/project/nufs
+git diff --check
+# PASS
+```
