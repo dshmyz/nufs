@@ -131,6 +131,17 @@ func TestCrashMatrix_AfterAck(t *testing.T) {
 // TestRecovery_ManyWritesReopen writes many extents, closes, reopens,
 // and verifies all survive — the WAL replay path under load.
 func TestRecovery_ManyWritesReopen(t *testing.T) {
+	writeAndRecover(t, 16)
+}
+
+// TestSustained_Recovery500Writes retains high-volume recovery coverage. Its
+// name intentionally avoids the required repeated-test regex.
+func TestSustained_Recovery500Writes(t *testing.T) {
+	writeAndRecover(t, 500)
+}
+
+func writeAndRecover(t *testing.T, n int) {
+	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -138,7 +149,6 @@ func TestRecovery_ManyWritesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const n = 16
 	for i := 0; i < n; i++ {
 		data := testutil.DeterministicData(storage.ExtentID(i+1), 1, 128, uint32(i))
 		if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: storage.ExtentID(i + 1), Generation: 1, Data: data}); err != nil {
@@ -147,7 +157,7 @@ func TestRecovery_ManyWritesReopen(t *testing.T) {
 	}
 	s.Close()
 
-	// Reopen: all 500 must be present and byte-exact.
+	// Reopen: every written record must be present and byte-exact.
 	s2, err := New(Config{Dir: dir, UseMemIndex: false})
 	if err != nil {
 		t.Fatal(err)

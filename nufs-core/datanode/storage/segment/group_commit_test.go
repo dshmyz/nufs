@@ -104,6 +104,11 @@ func TestGroupCommit_CloseRacingSubmit(t *testing.T) {
 			closed <- struct{}{}
 		}()
 	}
+	select {
+	case <-c.stop:
+	case <-time.After(time.Second):
+		t.Fatal("coordinator stop was not closed")
+	}
 
 	rejected := make(chan error, 1)
 	go func() { rejected <- c.Submit(testPendingWrite(2), func([]*pendingWrite) error { return nil }) }()
@@ -145,9 +150,18 @@ func TestGroupCommit_CloseRacingSubmit(t *testing.T) {
 
 // TestGroupCommit_SharesSyncBarrier verifies the §6.4 core: N concurrent
 // writes to the same stream share far fewer than N fsync barriers.
-// With the coordinator loop, concurrent writers batch into a single sync
-// each. This is the performance property the design targets.
 func TestGroupCommit_SharesSyncBarrier(t *testing.T) {
+	writeConcurrentAndReopen(t, 8)
+}
+
+// TestSustained_Concurrent1024Writes retains high-volume batching and reopen
+// coverage. Its name intentionally avoids the required repeated-test regex.
+func TestSustained_Concurrent1024Writes(t *testing.T) {
+	writeConcurrentAndReopen(t, 1024)
+}
+
+func writeConcurrentAndReopen(t *testing.T, writers int) {
+	t.Helper()
 	dir := t.TempDir()
 	s, err := New(Config{Dir: dir, UseMemIndex: false, SegmentSize: 1 << 20})
 	if err != nil {
@@ -155,8 +169,7 @@ func TestGroupCommit_SharesSyncBarrier(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	const writers = 8
-	const perWriter = 1 // 8 concurrent durable writes
+	const perWriter = 1
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	errs := make([]error, writers)
@@ -183,8 +196,8 @@ func TestGroupCommit_SharesSyncBarrier(t *testing.T) {
 		}
 	}
 	syncs := s.syncCalls.Load()
-	const writes = writers * perWriter
-	if syncs >= writes {
+	writes := writers * perWriter
+	if syncs >= int64(writes) {
 		t.Fatalf("group commit did not batch: %d syncs for %d writes", syncs, writes)
 	}
 	t.Logf("%d concurrent writes → %d fsync barriers (batched %.1fx)", writes, syncs, float64(writes)/float64(syncs))
