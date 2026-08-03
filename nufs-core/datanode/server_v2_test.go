@@ -1,6 +1,7 @@
 package datanode
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -283,5 +284,61 @@ func TestHeartbeatSamplerDiskIO_V2Store(t *testing.T) {
 	}
 	if util0 == 0 && util1 == 0 {
 		t.Fatalf("V2Store DiskIO not sampled (both 0) despite served traffic")
+	}
+}
+
+// failStore wraps a storage.Store and forces every Write to fail, letting
+// tests drive write-error rate / disk-health without a real wedge.
+type failStore struct{ storage.Store }
+
+func (f *failStore) Write(_ context.Context, _ *storage.WriteRequest) (*storage.DurableReceipt, error) {
+	return nil, storage.ErrStaleGeneration
+}
+
+// TestV2StoreWriteErrorRateRollingWindow pins that WriteErrorRate is a
+// rolling window: each call consumes (resets) the per-disk write counters,
+// matching the legacy ChunkStore (Swap(0)) rather than a lifetime ratio.
+func TestV2StoreWriteErrorRateRollingWindow(t *testing.T) {
+	v := NewV2Store(&failStore{})
+
+	// Three consecutive failing writes in the current window.
+	for i := 0; i < 3; i++ {
+		if err := v.Write(metadata.ChunkID(1), []byte("x")); err == nil {
+			t.Fatalf("expected write %d to fail", i)
+		}
+	}
+	if rate := v.WriteErrorRate(); rate != 1.0 {
+		t.Fatalf("rate after 3 failures=%v, want 1.0", rate)
+	}
+	// The window is now reset: a second call with no new writes reports 0
+	// (empty ops), proving the counters were consumed rather than cumulative.
+	if rate := v.WriteErrorRate(); rate != 0 {
+		t.Fatalf("rate after empty window=%v, want 0 (window reset)", rate)
+	}
+}
+
+// TestV2StoreDiskFailedPersistsAcrossRateReset verifies diskFailed and
+// WriteErrorRate use independent counters: a consecutive-failure streak
+// flags the disk even after WriteErrorRate resets its rolling window
+// (mirroring V1, where the rolling perf window and the disk health flag
+// never share state).
+func TestV2StoreDiskFailedPersistsAcrossRateReset(t *testing.T) {
+	v := NewV2Store(&failStore{})
+
+	for i := 0; i < 6; i++ {
+		if err := v.Write(metadata.ChunkID(1), []byte("x")); err == nil {
+			t.Fatalf("expected write %d to fail", i)
+		}
+	}
+	// Wedged: consecutive failures exceed the threshold.
+	if !v.diskFailed(0) {
+		t.Fatalf("disk 0 not flagged after 6 consecutive failures")
+	}
+	// Consuming the rolling rate window must NOT clear the health flag.
+	if r := v.WriteErrorRate(); r != 1.0 {
+		t.Fatalf("rate=%v want 1.0", r)
+	}
+	if !v.diskFailed(0) {
+		t.Fatalf("diskFailed cleared by WriteErrorRate reset")
 	}
 }

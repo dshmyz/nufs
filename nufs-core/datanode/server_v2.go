@@ -32,10 +32,19 @@ type diskBackend struct {
 	// for V2.1 backends via ListExtents.
 	usedByts  atomic.Int64
 	extCount  atomic.Int64
-	writeOps  atomic.Int64
-	writeErr  atomic.Int64
 	readByts  atomic.Int64
 	writeByts atomic.Int64
+
+	// Rolling write-error window, consumed (Swap'ed to 0) by WriteErrorRate
+	// each heartbeat — mirrors the legacy ChunkStore's rolling semantics.
+	writeOps atomic.Int64
+	writeErr atomic.Int64
+
+	// failCount is a PERSISTENT consecutive-write-failure counter (never
+	// reset by WriteErrorRate) used by diskFailed to flag a wedged disk.
+	// It is kept separate from the rolling writeOps/writeErr window so the
+	// rolling rate can reset each cycle without erasing the health signal.
+	failCount atomic.Int64
 }
 
 // chunkLoc records where a chunk lives and at what generation, so a
@@ -124,8 +133,11 @@ func (v *V2Store) Write(chunkID metadata.ChunkID, data []byte) error {
 		Data:       data,
 	}); err != nil {
 		b.writeErr.Add(1)
+		b.failCount.Add(1)
 		return err
 	}
+	// A successful write ends any consecutive-failure streak.
+	b.failCount.Store(0)
 	b.writeByts.Add(int64(len(data)))
 	if newChunk {
 		b.usedByts.Add(int64(len(data)))
@@ -345,21 +357,25 @@ func (v *V2Store) DiskStats() []DiskStatsItem {
 }
 
 // diskFailed reports whether a backend has been erroring (crude health
-// signal: all recent writes failed). Kept minimal — no disk lifecycle
-// management in this scope.
+// signal: a streak of consecutive write failures, cleared by any success).
+// Uses failCount, not the rolling write window, so WriteErrorRate's per-
+// cycle reset does not erase the health signal. Kept minimal — no disk
+// lifecycle management in this scope.
 func (v *V2Store) diskFailed(i int) bool {
-	b := v.disks[i]
-	ops := b.writeOps.Load()
-	return ops >= 5 && b.writeErr.Load() == ops
+	return v.disks[i].failCount.Load() >= 5
 }
 
 // WriteErrorRate returns the aggregate write error rate (0.0-1.0) across
-// all disks, computed from write attempts and failures.
+// all disks, as a rolling window since the last call. Like the legacy
+// ChunkStore, the per-disk write-op/error counters are reset (Swap'd to 0)
+// so each heartbeat reports the rate within its own cycle rather than a
+// lifetime cumulative ratio. Disk health (diskFailed) is unaffected — it
+// uses its own persistent failCount.
 func (v *V2Store) WriteErrorRate() float64 {
 	var ops, errs int64
 	for _, b := range v.disks {
-		ops += b.writeOps.Load()
-		errs += b.writeErr.Load()
+		ops += b.writeOps.Swap(0)
+		errs += b.writeErr.Swap(0)
 	}
 	if ops == 0 {
 		return 0
