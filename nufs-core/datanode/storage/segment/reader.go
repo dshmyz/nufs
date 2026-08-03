@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 
@@ -8,11 +9,19 @@ import (
 	"github.com/example/dfs/datanode/storage/encryption"
 )
 
+// readerAt is the subset of *os.File the reader needs. It exists so
+// tests can substitute a counting implementation and assert how many
+// payload bytes a range read actually pulls off disk (§19).
+type readerAt interface {
+	io.ReaderAt
+	io.Closer
+}
+
 // Reader reads and validates records from a segment via pread.
 // Range reads authenticate and checksum only the frames they return,
 // never an entire large extent (V2.1 §8, §19).
 type Reader struct {
-	f *os.File
+	f readerAt
 	// Path to the segment file.
 	path string
 	// SizeBytes is the sealed size; used to bound reads.
@@ -55,69 +64,157 @@ func OpenReaderWithEnc(path string, enc *encryption.KeyRegistry) (*Reader, error
 	return &Reader{f: f, path: path, sizeBytes: st.Size(), enc: enc}, nil
 }
 
+// recordLayout is the metadata needed to locate and authenticate any
+// single frame of a record: everything except the frame payloads
+// themselves. Reading it costs the header, the frame index, and the
+// trailer — never the payload — so a range read can resolve which
+// frames it needs without paying for the whole extent.
+type recordLayout struct {
+	header       RecordHeader
+	frameIndex   FrameIndex
+	firstFrameAt int64
+	totalStored  int64
+	decKey       []byte
+}
+
 // ReadPayloadFrames reads and validates the full record payload,
 // verifying the header, frame index, every frame CRC, and the framing.
 func (r *Reader) ReadPayloadFrames(offset int64, storedLen uint32, logicalLen uint32) ([]byte, error) {
-	header, frameIndex, payload, _, err := r.readRecord(offset, storedLen, logicalLen)
+	layout, err := r.readRecordLayout(offset, storedLen, logicalLen)
 	if err != nil {
 		return nil, err
 	}
-	// Whole-payload verification: for uncompressed records the logical
-	// payload is the concatenation of frame payloads; verify the last
-	// frame CRCs already did, and the record-level checksum is checked
-	// by the caller via v.Checksum. Here we re-verify per-frame.
-	_ = header
-	_ = frameIndex
+	payload := make([]byte, 0, logicalLen)
+	for i := range layout.frameIndex.Entries {
+		logical, err := r.readLogicalFrame(layout, i)
+		if err != nil {
+			return nil, err
+		}
+		payload = append(payload, logical...)
+	}
+	if uint32(len(payload)) != logicalLen {
+		return nil, storage.ErrIndexCorrupt
+	}
 	return payload, nil
 }
 
 // ReadRangeFrames reads a sub-range of the logical payload, fetching
-// and authenticating only the intersecting frames (§8). Returns the
-// requested bytes.
+// and authenticating only the intersecting frames (§8). Read
+// amplification is bounded by the requested length plus at most two
+// partially-overlapped frames (§19): frames outside the range are
+// never pulled off disk.
 func (r *Reader) ReadRangeFrames(offset int64, storedLen uint32, logicalLen uint32, logicalOffset int64, length int32) ([]byte, error) {
-	payload, err := r.ReadPayloadFrames(offset, storedLen, logicalLen)
+	// An out-of-range request used to fall back to returning the ENTIRE
+	// extent, which both breaks the amplification bound and hands the
+	// caller bytes it never asked for. Reject nonsense outright; clamp an
+	// overshooting length to the end of the payload, as a tail read at
+	// EOF legitimately asks for more than remains (POSIX short read).
+	if length <= 0 || logicalOffset < 0 || logicalOffset >= int64(logicalLen) {
+		return nil, storage.ErrInvalidRange
+	}
+	if logicalOffset+int64(length) > int64(logicalLen) {
+		length = int32(int64(logicalLen) - logicalOffset)
+	}
+
+	layout, err := r.readRecordLayout(offset, storedLen, logicalLen)
 	if err != nil {
 		return nil, err
 	}
-	if length <= 0 || logicalOffset < 0 || logicalOffset+int64(length) > int64(len(payload)) {
-		out := make([]byte, len(payload))
-		copy(out, payload)
-		return out, nil
+
+	// Frames partition the LOGICAL payload at fixed frameSize boundaries
+	// (see BuildFrames), so the intersecting frames are computed from the
+	// logical offsets alone — no need to decode preceding frames.
+	frameSize := int64(layout.header.EffectiveFrameSize())
+	first := int(logicalOffset / frameSize)
+	last := int((logicalOffset + int64(length) - 1) / frameSize)
+	if first < 0 || last >= len(layout.frameIndex.Entries) {
+		return nil, storage.ErrIndexCorrupt
 	}
-	out := make([]byte, length)
-	copy(out, payload[logicalOffset:logicalOffset+int64(length)])
+
+	out := make([]byte, 0, length)
+	for i := first; i <= last; i++ {
+		logical, err := r.readLogicalFrame(layout, i)
+		if err != nil {
+			return nil, err
+		}
+		// Trim this frame to its intersection with the request.
+		frameStart := int64(i) * frameSize
+		lo := logicalOffset - frameStart
+		if lo < 0 {
+			lo = 0
+		}
+		hi := logicalOffset + int64(length) - frameStart
+		if hi > int64(len(logical)) {
+			hi = int64(len(logical))
+		}
+		if lo >= hi {
+			return nil, storage.ErrIndexCorrupt
+		}
+		out = append(out, logical[lo:hi]...)
+	}
+	if len(out) != int(length) {
+		return nil, storage.ErrIndexCorrupt
+	}
 	return out, nil
 }
 
-// readRecord reads header + frame index + frames + trailer and verifies
-// all checksums. It returns the decoded header, frame index, and the
-// concatenated frame payloads (compressed frames are decompressed).
-func (r *Reader) readRecord(offset int64, storedLen uint32, logicalLen uint32) (*RecordHeader, *FrameIndex, []byte, uint32, error) {
+// readLogicalFrame reads exactly one frame off disk and returns its
+// logical bytes, verifying its CRC and then decrypting and
+// decompressing it (§5.3: both are per-frame and independent).
+func (r *Reader) readLogicalFrame(layout *recordLayout, i int) ([]byte, error) {
+	e := layout.frameIndex.Entries[i]
+	if int64(e.Offset)+int64(e.StoredLen) > layout.totalStored {
+		return nil, storage.ErrIndexCorrupt
+	}
+	frame := make([]byte, e.StoredLen)
+	if _, err := r.f.ReadAt(frame, layout.firstFrameAt+int64(e.Offset)); err != nil {
+		return nil, err
+	}
+	if err := VerifyFrameCRC(frame, e.CRC); err != nil {
+		return nil, err
+	}
+	if layout.decKey != nil {
+		open, err := DecryptFrame(layout.decKey, frame)
+		if err != nil {
+			return nil, err
+		}
+		frame = open
+	}
+	if e.Codec == storage.CompressionZstd {
+		return DecompressFrame(frame)
+	}
+	return frame, nil
+}
+
+// readRecordLayout reads and verifies the header, frame index, and
+// trailer of a record. It deliberately does NOT read frame payloads:
+// callers fetch only the frames they need via readLogicalFrame.
+func (r *Reader) readRecordLayout(offset int64, storedLen uint32, logicalLen uint32) (*recordLayout, error) {
 	// Read the header first to learn the frame layout.
 	if offset < int64(SegmentHeaderSize) {
-		return nil, nil, nil, 0, storage.ErrIndexCorrupt
+		return nil, storage.ErrIndexCorrupt
 	}
 	hb := make([]byte, RecordHeaderSize)
 	if _, err := r.f.ReadAt(hb, offset); err != nil {
-		return nil, nil, nil, 0, err
+		return nil, err
 	}
 	var header RecordHeader
 	if err := header.Decode(hb); err != nil {
-		return nil, nil, nil, 0, err
+		return nil, err
 	}
 	if header.LogicalLen != logicalLen {
-		return nil, nil, nil, 0, storage.ErrIndexCorrupt
+		return nil, storage.ErrIndexCorrupt
 	}
 
 	frameCount := int(header.FrameCount)
 	indexBytes := frameCount * FrameIndexEntrySize
 	idxBuf := make([]byte, indexBytes)
 	if _, err := r.f.ReadAt(idxBuf, offset+int64(RecordHeaderSize)); err != nil {
-		return nil, nil, nil, 0, err
+		return nil, err
 	}
 	var fi FrameIndex
 	if err := fi.Decode(idxBuf, header.FrameIndexCRC); err != nil {
-		return nil, nil, nil, 0, err
+		return nil, err
 	}
 
 	// Frames start after the index. Sum the stored frame lengths; this
@@ -128,75 +225,47 @@ func (r *Reader) readRecord(offset int64, storedLen uint32, logicalLen uint32) (
 		totalStored += int64(e.StoredLen)
 	}
 	if totalStored != int64(storedLen) {
-		return nil, nil, nil, 0, storage.ErrIndexCorrupt
+		return nil, storage.ErrIndexCorrupt
 	}
 	if firstFrameOff+totalStored+int64(RecordTrailerSize) > r.sizeBytes {
-		return nil, nil, nil, 0, storage.ErrIndexCorrupt
-	}
-	raw := make([]byte, totalStored)
-	if _, err := r.f.ReadAt(raw, firstFrameOff); err != nil {
-		return nil, nil, nil, 0, err
+		return nil, storage.ErrIndexCorrupt
 	}
 
-	// Read and validate each frame individually, decrypting and then
-	// decompressing frames (§5.3: compression and encryption are
-	// independent per frame).
 	var decKey []byte
 	if header.KeyID != 0 {
 		if r.enc == nil {
-			return nil, nil, nil, 0, storage.ErrDecryptFailed
+			return nil, storage.ErrDecryptFailed
 		}
 		var err error
 		decKey, err = r.enc.ResolveNumeric(header.KeyID)
 		if err != nil {
-			return nil, nil, nil, 0, err
+			return nil, err
 		}
-	}
-	payload := make([]byte, 0, logicalLen)
-	for _, e := range fi.Entries {
-		frame := raw[e.Offset : e.Offset+uint32(e.StoredLen)]
-		if err := VerifyFrameCRC(frame, e.CRC); err != nil {
-			return nil, nil, nil, 0, err
-		}
-		if decKey != nil {
-			open, err := DecryptFrame(decKey, frame)
-			if err != nil {
-				return nil, nil, nil, 0, err
-			}
-			frame = open
-		}
-		var logical []byte
-		if e.Codec == storage.CompressionZstd {
-			dec, err := DecompressFrame(frame)
-			if err != nil {
-				return nil, nil, nil, 0, err
-			}
-			logical = dec
-		} else {
-			logical = frame
-		}
-		payload = append(payload, logical...)
-	}
-	if uint32(len(payload)) != logicalLen {
-		return nil, nil, nil, 0, storage.ErrIndexCorrupt
 	}
 
-	// Verify the trailer.
+	// Verify the trailer: it binds the framing length, so a truncated or
+	// mis-sized record is rejected before any frame is trusted.
 	trailerOff := firstFrameOff + totalStored
 	tr := make([]byte, RecordTrailerSize)
 	if _, err := r.f.ReadAt(tr, trailerOff); err != nil {
-		return nil, nil, nil, 0, err
+		return nil, err
 	}
 	var trailer RecordTrailer
 	if err := trailer.Decode(tr); err != nil {
-		return nil, nil, nil, 0, err
+		return nil, err
 	}
 	framing := RecordHeaderSize + indexBytes + int(totalStored) + RecordTrailerSize
 	if trailer.FramingLen != uint32(framing) {
-		return nil, nil, nil, 0, storage.ErrIndexCorrupt
+		return nil, storage.ErrIndexCorrupt
 	}
 
-	return &header, &fi, payload, trailer.FramingLen, nil
+	return &recordLayout{
+		header:       header,
+		frameIndex:   fi,
+		firstFrameAt: firstFrameOff,
+		totalStored:  totalStored,
+		decKey:       decKey,
+	}, nil
 }
 
 // Close closes the reader.

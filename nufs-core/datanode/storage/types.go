@@ -206,6 +206,10 @@ var (
 	// ErrStoreClosed rejects operations submitted once shutdown has begun.
 	// Shutdown must fail these cleanly: touching a closed index panics.
 	ErrStoreClosed = errors.New("storage: store closed")
+	// ErrInvalidRange rejects a range read whose offset falls outside the
+	// logical payload. Returning the whole extent instead would break the
+	// §19 amplification bound and hand back unrequested bytes.
+	ErrInvalidRange = errors.New("storage: invalid read range")
 )
 
 // ========== DurableReceipt ==========
