@@ -1,4 +1,4 @@
-.PHONY: build test vet clean docker docker-up docker-down fmt lint help
+.PHONY: build test vet clean docker docker-up docker-down fmt lint help test-storage-p0 test-storage-crash
 
 # Binary output directory
 BIN_DIR := bin
@@ -47,6 +47,12 @@ test-cover: ## Run tests with coverage report
 	go test -race -coverprofile=coverage/cover.out -timeout 120s ./...
 	go tool cover -html=coverage/cover.out -o coverage/cover.html
 	@echo "Coverage report: coverage/cover.html"
+
+test-storage-p0: ## P0 storage correctness gate (race, 20x): close/range/recovery
+	go test -race -count=20 -timeout 120s ./datanode/storage/segment/... ./datanode/storage/recovery/...
+
+test-storage-crash: ## P0 abrupt-process-crash (SIGKILL) recovery gate (50x)
+	go test -count=50 -timeout 10m ./datanode/storage/segment -run TestProcessCrash_AcknowledgedMutationsRecover
 
 vet: ## Run go vet
 	go vet ./...

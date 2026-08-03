@@ -66,6 +66,56 @@ kill -9 <datanode-pid>
 Automated equivalent: `storage/segment/crash_test.go` (crash matrix at
 every §18.2 point) + `TestRecovery_ManyWritesReopen`.
 
+#### 3.1.1 Abrupt-process-crash acceptance drill (SIGKILL, no Close)
+
+A clean `Store.Close()` proves nothing about crash recovery: it flushes
+the committed-delta overlay into Pebble, so a test that closes the store
+exercises only the graceful path. The acceptance drill kills a real
+subprocess that has acknowledged mutations but never called `Close()` and
+installed no signal handler, so SIGKILL leaves exactly the on-disk state
+an abrupt process death produces.
+
+**Command** (run from `nufs-core/`):
+
+```bash
+make test-storage-crash
+# Equivalent to:
+#   go test -count=50 -timeout 10m ./datanode/storage/segment \
+#     -run TestProcessCrash_AcknowledgedMutationsRecover
+```
+
+**Successful output requirements:**
+
+1. Every iteration prints `PASS: all N acknowledged final-state extents
+   recovered correctly` and exits 0. `N` equals the helper's distinct
+   `(extent_id, generation)` keys after collapsing the put→delete
+   sequence to the final state of each extent.
+2. `lost = 0`: no acknowledged put is missing after reopen.
+3. `corrupt reads = 0`: every recovered put reads back byte-exact
+   (checksum matches).
+4. `wrong state = 0`: every acknowledged delete is tombstoned or
+   not-found (both are valid final states).
+
+**How it works:** `tests/storage-crash-helper/main.go` drives a real
+`segment.Store` in a child process, printing one flushed JSON line per
+acknowledged mutation
+(`{"op":"put","extent_id":N,"generation":1,"checksum":C,"ack":true}`).
+After all work is acknowledged it prints `{"op":"ready"}` and blocks.
+The parent test (`segment/process_crash_test.go`) captures the full ack
+sequence (until `ready`, so there is no in-flight put→delete ambiguity),
+SIGKILLs the child, reopens the store, and verifies every acknowledged
+mutation. `TestProcessCrash_IndexRollback` additionally removes the
+Pebble index directory before reopen to force pure segment-log replay.
+
+**Retained artifacts:** the test uses `t.TempDir()` for both the store
+directory and the helper binary; Go cleans these up on success. On
+failure the temp dirs are preserved and their path is printed in the
+test output for post-mortem inspection of the segment files and index.
+
+**Rule:** a clean `Close()` test does **not** count as process-crash
+evidence. Only this drill (or an equivalent that SIGKILLs a process
+holding acknowledged-but-unclosed state) qualifies.
+
 ### 3.2 Power loss
 
 ```bash
