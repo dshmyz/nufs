@@ -453,8 +453,23 @@ func runDataNode(cfg datanode.Config) {
 // ChunkStore path, activated by --storage-version=v2.1.
 func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// Initialize one V2.1 segment.Store per disk.
-	stores := make([]storage.Store, len(dataDirs))
-	for i, dir := range dataDirs {
+	//
+	// Shutdown has a single owner: closeStores below. Initialization
+	// failures close what was already opened and exit; the normal path
+	// closes the same set once, after the servers and heartbeat stop. A
+	// deferred per-store close here would be a second owner and would not
+	// run at all on the os.Exit paths.
+	stores := make([]storage.Store, 0, len(dataDirs))
+	closeStores := func() {
+		for _, st := range stores {
+			if closer, ok := st.(interface{ Close() error }); ok {
+				if err := closer.Close(); err != nil {
+					log.Warn("V2.1 store close error", "error", err)
+				}
+			}
+		}
+	}
+	for _, dir := range dataDirs {
 		segCfg := segment.Config{
 			Dir:         dir,
 			SegmentSize: storage.DefaultDataSegmentSize,
@@ -465,11 +480,13 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		if cfg.EncryptAtRest {
 			if !cfg.AllowLocalKMS {
 				log.Error("at-rest encryption requires a production KMS; LocalKMS is in-memory/dev-only and loses keys on restart")
+				closeStores()
 				os.Exit(1)
 			}
 			kms, err := crypto.NewLocalKMS()
 			if err != nil {
 				log.Error("failed to init encryption KMS", "error", err)
+				closeStores()
 				os.Exit(1)
 			}
 			segCfg.Enc = encryption.NewKeyRegistry(kms)
@@ -477,10 +494,10 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		s, err := segment.New(segCfg)
 		if err != nil {
 			log.Error("failed to init V2.1 store", "disk", dir, "error", err)
+			closeStores()
 			os.Exit(1)
 		}
-		stores[i] = s
-		defer s.Close()
+		stores = append(stores, s)
 	}
 	log.Info("V2.1 storage engine ready", "disks", len(dataDirs))
 
@@ -504,6 +521,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		State:   metadata.NodeOnline,
 	}); err != nil && err != metadata.ErrNodeAlreadyExists {
 		log.Error("failed to register with metadata service", "error", err)
+		closeStores()
 		os.Exit(1)
 	}
 	log.Info("registered with metadata service", "url", metaURL, "node_id", cfg.NodeID)
@@ -515,6 +533,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	srv := datanode.NewServer(srvCfg, v2Store)
 	if err := srv.Start(); err != nil {
 		log.Error("failed to start TCP server", "error", err)
+		closeStores()
 		os.Exit(1)
 	}
 	log.Info("TCP server listening", "addr", srv.Addr())
@@ -532,13 +551,12 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	sig := <-sigCh
 	log.Info("shutting down", "signal", sig)
 
-	// Graceful shutdown.
+	// Graceful shutdown, in dependency order: stop accepting requests and
+	// drain in-flight ones, stop the heartbeat (it reads store state, so
+	// it must not outlive the stores), then close the stores exactly once.
 	srv.Stop()
-	for _, st := range stores {
-		if closer, ok := st.(interface{ Close() error }); ok {
-			closer.Close()
-		}
-	}
+	heartbeat.Stop()
+	closeStores()
 
 	deregCtx, deregCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := metaStore.RegisterNode(deregCtx, &metadata.NodeInfo{

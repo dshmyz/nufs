@@ -203,6 +203,9 @@ var (
 	// ErrRecoveryBudgetExceeded rejects startup recovery that exceeds one of
 	// the bounded replay, tail, record, or elapsed-time limits.
 	ErrRecoveryBudgetExceeded = errors.New("storage: recovery budget exceeded")
+	// ErrStoreClosed rejects operations submitted once shutdown has begun.
+	// Shutdown must fail these cleanly: touching a closed index panics.
+	ErrStoreClosed = errors.New("storage: store closed")
 )
 
 // ========== DurableReceipt ==========

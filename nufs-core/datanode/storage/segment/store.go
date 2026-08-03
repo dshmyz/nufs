@@ -131,6 +131,23 @@ type Store struct {
 	// configured (production deployments should always provide one).
 	changeJournal *journal.ChangeJournal
 
+	// closeOnce runs the shutdown body exactly once. closeDone is closed
+	// when that body returns, so concurrent callers wait for the real
+	// shutdown instead of racing past it, and closeErr is the single
+	// terminal error every caller observes.
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
+
+	// closing is set before shutdown tears anything down, so new requests
+	// are rejected with ErrStoreClosed instead of reaching a closed index.
+	// gate is held for read by every request that touches the index or the
+	// writer; shutdown takes it for write, which waits for in-flight
+	// requests to drain. Without it a request that passed the closing check
+	// could still reach Pebble after index.Close() and panic the process.
+	closing atomic.Bool
+	gate    sync.RWMutex
+
 	faults storage.FaultHook
 }
 
@@ -238,6 +255,7 @@ func New(cfg Config) (*Store, error) {
 		applyCh:             make(chan []index.Mutation, 256),
 		stopCh:              make(chan struct{}),
 		flushDone:           make(chan struct{}),
+		closeDone:           make(chan struct{}),
 		readyBatches:        make(map[uint64]*recoveryPublishBatch),
 		flushInterval:       cfg.FlushInterval,
 		disableAsyncApply:   cfg.disableAsyncApply,
@@ -543,6 +561,11 @@ func maxSegmentID(dir string) uint64 {
 
 // Write implements storage.Store.Write (V2.1 §6.1 single barrier).
 func (s *Store) Write(_ context.Context, req *storage.WriteRequest) (*storage.DurableReceipt, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+	defer s.leave()
+
 	// Phase 0: idempotency + generation fencing against the overlay
 	// (read authority) and the derived index.
 	if v, err := s.lookup(req.ExtentID, req.Generation); err == nil {
@@ -837,6 +860,11 @@ func batchDescriptorsCRC(batch []*pendingWrite) uint32 {
 // compressed records are not recompressed; encryption uses the store's
 // active key.
 func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, data []byte, codec storage.CompressionCodec) (*storage.Reloc, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+	defer s.leave()
+
 	// Resolve the active encryption key (nil when encryption is off).
 	var encKey []byte
 	keyID := uint64(0)
@@ -955,6 +983,11 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 // compaction (§10.3 step 6), applying only if the old location still
 // matches.
 func (s *Store) Relocate(relocs []storage.Reloc) error {
+	if err := s.enter(); err != nil {
+		return err
+	}
+	defer s.leave()
+
 	for _, r := range relocs {
 		s.overlay.Put(index.Key(r.ExtentID, r.Generation), index.Value{
 			SegmentID:  r.SegmentID,
@@ -982,6 +1015,11 @@ func (s *Store) lookup(extentID storage.ExtentID, generation storage.Generation)
 // to avoid Pebble lookups and the segment descriptor cache to avoid
 // os.Open on every read.
 func (s *Store) Read(_ context.Context, req *storage.ReadRequest) (*storage.ReadResult, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+	defer s.leave()
+
 	v, err := s.cachedLookup(req.ExtentID, req.Generation)
 	if err != nil {
 		return nil, err
@@ -1044,6 +1082,11 @@ func (s *Store) cachedLookup(extentID storage.ExtentID, generation storage.Gener
 // tombstone is appended and committed in the stream, synced once,
 // before acknowledging (§10.1).
 func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
+	if err := s.enter(); err != nil {
+		return err
+	}
+	defer s.leave()
+
 	v, err := s.lookup(req.ExtentID, req.Generation)
 	if err != nil {
 		if err == storage.ErrExtentNotFound {
@@ -1080,6 +1123,11 @@ func (s *Store) Delete(_ context.Context, req *storage.DeleteRequest) error {
 
 // Stat implements storage.Store.Stat.
 func (s *Store) Stat(_ context.Context, req *storage.StatRequest) (*storage.StatResult, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+	defer s.leave()
+
 	v, err := s.lookup(req.ExtentID, req.Generation)
 	if err != nil {
 		return nil, err
@@ -1104,7 +1152,49 @@ func (s *Store) Overlay() *Overlay { return s.overlay }
 // durability barrier: any committed overlay entries not yet applied to
 // Pebble are flushed synchronously before the DB closes, so no
 // acknowledged write is lost across a clean shutdown.
+//
+// Close is idempotent and safe to call concurrently. The shutdown body
+// runs exactly once; every other caller blocks until it finishes and
+// then observes the same terminal error.
 func (s *Store) Close() error {
+	s.closeOnce.Do(func() {
+		defer close(s.closeDone)
+		s.closeErr = s.closeInternal()
+	})
+	<-s.closeDone
+	return s.closeErr
+}
+
+// enter admits a request into the store for the duration of one
+// operation. It fails with ErrStoreClosed once shutdown has begun, and
+// otherwise holds the gate so shutdown cannot close the index underneath
+// the caller. Every caller that succeeds must call leave.
+func (s *Store) enter() error {
+	if s.closing.Load() {
+		return storage.ErrStoreClosed
+	}
+	s.gate.RLock()
+	// Re-check under the gate: shutdown may have set closing and drained
+	// between the check above and acquiring the lock.
+	if s.closing.Load() {
+		s.gate.RUnlock()
+		return storage.ErrStoreClosed
+	}
+	return nil
+}
+
+func (s *Store) leave() { s.gate.RUnlock() }
+
+// closeInternal performs the actual shutdown. It runs under closeOnce,
+// so it never executes concurrently with itself.
+func (s *Store) closeInternal() error {
+	// Refuse new requests, then take the gate for write to wait until
+	// every in-flight request has left. Only after that is it safe to
+	// close the index: Pebble panics rather than erroring on use-after-close.
+	s.closing.Store(true)
+	s.gate.Lock()
+	s.gate.Unlock()
+
 	// Close the group-commit coordinator first: it wakes any queued
 	// followers so they do not block forever on a closed store.
 	if s.group != nil {
