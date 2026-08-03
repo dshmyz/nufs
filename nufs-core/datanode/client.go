@@ -101,12 +101,20 @@ func (c *Client) IsClosed() bool {
 
 // WriteChunk sends a chunk write request.
 func (c *Client) WriteChunk(chunkID metadata.ChunkID, data []byte) (*Response, error) {
+	return c.WriteChunkGen(chunkID, 0, data)
+}
+
+// WriteChunkGen sends a chunk write request carrying a metadata-issued
+// generation (Metadata V2 fencing). A generation of 0 leaves the receiving
+// datanode to its local generation (legacy behavior).
+func (c *Client) WriteChunkGen(chunkID metadata.ChunkID, generation uint64, data []byte) (*Response, error) {
 	header := &Header{
-		Type:      ReqWriteChunk,
-		ChunkID:   chunkID,
-		Length:    int32(len(data)),
-		Checksum:  crc32.ChecksumIEEE(data),
-		RequestID: c.seq.Add(1),
+		Type:       ReqWriteChunk,
+		ChunkID:    chunkID,
+		Generation: generation,
+		Length:     int32(len(data)),
+		Checksum:   crc32.ChecksumIEEE(data),
+		RequestID:  c.seq.Add(1),
 	}
 	return c.sendRequest(header, data)
 }
@@ -125,12 +133,21 @@ func (c *Client) ReadChunk(chunkID metadata.ChunkID, offset int64, length int32)
 
 // ReplicateChunk sends a chunk replication request.
 func (c *Client) ReplicateChunk(chunkID metadata.ChunkID, data []byte) (*Response, error) {
+	return c.ReplicateChunkGen(chunkID, 0, data)
+}
+
+// ReplicateChunkGen sends a chunk replication request carrying a
+// metadata-issued generation (Metadata V2 fencing). A generation of 0 means
+// "unspecified" and the receiving datanode keeps its own local generation
+// (legacy behavior).
+func (c *Client) ReplicateChunkGen(chunkID metadata.ChunkID, generation uint64, data []byte) (*Response, error) {
 	header := &Header{
-		Type:      ReqReplicateChunk,
-		ChunkID:   chunkID,
-		Length:    int32(len(data)),
-		Checksum:  crc32.ChecksumIEEE(data),
-		RequestID: c.seq.Add(1),
+		Type:       ReqReplicateChunk,
+		ChunkID:    chunkID,
+		Generation: generation,
+		Length:     int32(len(data)),
+		Checksum:   crc32.ChecksumIEEE(data),
+		RequestID:  c.seq.Add(1),
 	}
 	return c.sendRequest(header, data)
 }

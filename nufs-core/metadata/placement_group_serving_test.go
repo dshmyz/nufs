@@ -54,6 +54,9 @@ func TestAllocateChunkViaPG_RecordsPGOnChunkMeta(t *testing.T) {
 	if chunk.Epoch != 1 {
 		t.Fatalf("epoch=%d, want 1 (freshly created PG)", chunk.Epoch)
 	}
+	if chunk.Generation != 1 {
+		t.Fatalf("generation=%d, want 1 (metadata-issued initial generation)", chunk.Generation)
+	}
 	if len(chunk.Replicas) != 3 {
 		t.Fatalf("replicas=%d, want 3", len(chunk.Replicas))
 	}

@@ -23,7 +23,8 @@ import (
 
 // PipelineConfig holds configuration for WritePipeline.
 type PipelineConfig struct {
-	Quorum int // number of replicas that must succeed (0 = all)
+	Quorum     int    // number of replicas that must succeed (0 = all)
+	Generation uint64 // metadata-issued generation (0 = legacy local-gen)
 }
 
 // PipelineOption configures a PipelineConfig.
@@ -36,11 +37,21 @@ func WithQuorum(n int) PipelineOption {
 	}
 }
 
+// WithGeneration sets the metadata-issued write generation carried to every
+// replica (Metadata V2 fencing). 0 leaves each datanode to its own local
+// generation (legacy behavior).
+func WithGeneration(g uint64) PipelineOption {
+	return func(cfg *PipelineConfig) {
+		cfg.Generation = g
+	}
+}
+
 // WritePipeline dispatches chunk writes to multiple replicas in parallel.
 type WritePipeline struct {
 	pool    *ClientPool
 	timeout time.Duration
-	quorum  int // 0 means all replicas must succeed
+	quorum  int    // 0 means all replicas must succeed
+	gen     uint64 // metadata-issued generation (0 = legacy)
 }
 
 // NewWritePipeline creates a write pipeline backed by the given connection pool.
@@ -53,6 +64,7 @@ func NewWritePipeline(pool *ClientPool, timeout time.Duration, opts ...PipelineO
 		pool:    pool,
 		timeout: timeout,
 		quorum:  cfg.Quorum,
+		gen:     cfg.Generation,
 	}
 }
 
@@ -85,7 +97,7 @@ func (pp *WritePipeline) Write(ctx context.Context, chunkID metadata.ChunkID, da
 				results <- result{nodeID: r.NodeID, err: fmt.Errorf("connect %s: %w", r.Addr, err)}
 				return
 			}
-			resp, err := client.ReplicateChunk(chunkID, data)
+			resp, err := client.ReplicateChunkGen(chunkID, pp.gen, data)
 			pp.pool.Put(r.Addr, client)
 
 			if err != nil {

@@ -140,6 +140,38 @@ func NewMultiV2Store(stores []storage.Store, dirs ...string) *V2Store {
 // accounting.
 func (v *V2Store) Write(chunkID metadata.ChunkID, data []byte) error {
 	disk, gen := v.nextLoc(chunkID)
+	return v.writeTo(chunkID, disk, gen, data)
+}
+
+// WriteGen implements LocalChunkStore.WriteGen (Metadata V2 fencing). Unlike
+// Write — which derives the next generation locally (gen+1) — WriteGen writes
+// under the generation the metadata service issued for this chunk. The
+// metadata service is the generation authority: it hands each overwrite a new
+// generation, so a stale or duplicate replica write lands on that exact
+// generation and the segment store's phase-0 fencing rejects any older write
+// whose payload doesn't match. This keeps all replicas of a chunk on the same
+// authoritative generation instead of each datanode bumping its own counter.
+func (v *V2Store) WriteGen(chunkID metadata.ChunkID, generation uint64, data []byte) error {
+	gen := storage.Generation(generation)
+	v.mu.RLock()
+	loc, ok := v.locOf[chunkID]
+	v.mu.RUnlock()
+	if ok {
+		// Overwrite existing chunk: keep disk locality, honor metadata gen.
+		return v.writeTo(chunkID, loc.disk, gen, data)
+	}
+	// New chunk: least-used disk at the metadata-issued generation.
+	best, _ := v.nextLoc(chunkID)
+	return v.writeTo(chunkID, best, gen, data)
+}
+
+// writeTo durably writes data for chunkID to a specific disk under a specific
+// generation, updating location and accounting. newChunk (gen==1) is inferred
+// from the generation.
+func (v *V2Store) writeTo(chunkID metadata.ChunkID, disk int, gen storage.Generation, data []byte) error {
+	if disk < 0 || disk >= len(v.disks) {
+		disk = 0
+	}
 	newChunk := gen == 1
 	b := v.disks[disk]
 	b.writeOps.Add(1)
@@ -162,10 +194,12 @@ func (v *V2Store) Write(chunkID metadata.ChunkID, data []byte) error {
 		// Overwrite: the prior generation still occupies index space; drop
 		// its size so used-bytes tracks the chunk's current live size rather
 		// than the sum of all generations.
-		if old, err := b.store.Stat(context.Background(), &storage.StatRequest{
-			ExtentID: storage.ExtentID(chunkID), Generation: gen - 1,
-		}); err == nil {
-			b.usedByts.Add(-int64(old.LogicalLen))
+		if gen > 1 {
+			if old, err := b.store.Stat(context.Background(), &storage.StatRequest{
+				ExtentID: storage.ExtentID(chunkID), Generation: gen - 1,
+			}); err == nil {
+				b.usedByts.Add(-int64(old.LogicalLen))
+			}
 		}
 		b.usedByts.Add(int64(len(data)))
 	}

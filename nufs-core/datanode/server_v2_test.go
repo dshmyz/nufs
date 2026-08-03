@@ -412,3 +412,68 @@ func TestV2StoreVerifyChunkData(t *testing.T) {
 		t.Fatalf("verify of missing chunk returned nil error")
 	}
 }
+
+// TestV2StoreWriteGen_MetadataAuthoritativeGeneration proves the Metadata V2
+// fencing contract: WriteGen places a chunk under the generation issued by the
+// metadata service, so all replicas land on the same authoritative generation,
+// and an overwrite changes generation based on the metadata value, not a local
+// gen+1 bump.
+func TestV2StoreWriteGen_MetadataAuthoritativeGeneration(t *testing.T) {
+	v, _ := newTestMultiStore(t, 2)
+
+	// Fresh chunk written under metadata generation 1.
+	if err := v.WriteGen(metadata.ChunkID(501), 1, []byte("gen-one")); err != nil {
+		t.Fatalf("WriteGen gen1: %v", err)
+	}
+	v.mu.RLock()
+	loc := v.locOf[metadata.ChunkID(501)]
+	v.mu.RUnlock()
+	if loc.gen != 1 {
+		t.Fatalf("chunk 501 gen=%d, want 1 (metadata-issued)", loc.gen)
+	}
+
+	// Overwrite with a metadata-issued generation 3 (not local 2). The store
+	// must honor exactly that generation.
+	if err := v.WriteGen(metadata.ChunkID(501), 3, []byte("gen-three-payload")); err != nil {
+		t.Fatalf("WriteGen gen3: %v", err)
+	}
+	v.mu.RLock()
+	loc = v.locOf[metadata.ChunkID(501)]
+	v.mu.RUnlock()
+	if loc.gen != 3 {
+		t.Fatalf("chunk 501 gen=%d after overwrite, want 3 (metadata-issued, not local bump)", loc.gen)
+	}
+
+	// The latest generation is what reads resolve.
+	data, _, err := v.Read(metadata.ChunkID(501), 0, 0)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(data) != "gen-three-payload" {
+		t.Fatalf("read=%q, want latest metadata-issued generation payload", data)
+	}
+}
+
+// TestV2StoreWriteGen_StaleGenerationFenced proves that an idempotent replay
+// (same generation + same data) succeeds, while a stale generation write whose
+// payload differs from the already-committed one is rejected by the segment
+// store's fencing — the datanode reflects that error upward instead of
+// silently overwriting.
+func TestV2StoreWriteGen_StaleGenerationFenced(t *testing.T) {
+	v, _ := newTestMultiStore(t, 1)
+
+	if err := v.WriteGen(metadata.ChunkID(601), 1, []byte("committed-at-gen-1")); err != nil {
+		t.Fatalf("initial WriteGen: %v", err)
+	}
+
+	// Idempotent replay of the same (gen, payload) is accepted.
+	if err := v.WriteGen(metadata.ChunkID(601), 1, []byte("committed-at-gen-1")); err != nil {
+		t.Fatalf("idempotent replay should succeed, got: %v", err)
+	}
+
+	// Writing gen 1 again with a DIFFERENT payload must be fenced (the older
+	// generation has already been committed with a different checksum).
+	if err := v.WriteGen(metadata.ChunkID(601), 1, []byte("different-payload")); err == nil {
+		t.Fatalf("expected stale-generation write at gen 1 to be fenced, but it succeeded")
+	}
+}

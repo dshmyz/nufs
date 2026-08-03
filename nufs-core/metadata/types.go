@@ -210,6 +210,15 @@ type ChunkMeta struct {
 	// PlacementEngine path (V1, no placement groups).
 	PGID  uint32 `json:"pg_id,omitempty"`
 	Epoch uint64 `json:"epoch,omitempty"`
+	// Generation is the metadata-issued write generation for this chunk
+	// (Metadata V2 fencing, Task #56 Phase C / A2). The metadata service is
+	// the authority that hands each write its generation, so an overwrite
+	// chains the metadata generation rather than each datanode locally
+	// bumping its own counter — this keeps all replicas on the same
+	// generation and fences stale/duplicate writes deterministically. Zero
+	// for the legacy per-chunk path (V1), where datanodes keep their own
+	// local generation.
+	Generation uint64 `json:"generation,omitempty"`
 }
 
 // ChunkState represents the lifecycle state of a chunk.

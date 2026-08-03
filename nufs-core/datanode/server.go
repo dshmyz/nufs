@@ -24,6 +24,11 @@ import (
 // implement it, so the server can serve either engine.
 type LocalChunkStore interface {
 	Write(chunkID metadata.ChunkID, data []byte) error
+	// WriteGen writes chunk data under a metadata-issued generation
+	// (Metadata V2 fencing). generation==0 means "unspecified": the backend
+	// uses its own local generation (legacy V1 behavior). Backends without a
+	// generation concept may implement it as a plain Write.
+	WriteGen(chunkID metadata.ChunkID, generation uint64, data []byte) error
 	Read(chunkID metadata.ChunkID, offset int64, length int32) ([]byte, uint32, error)
 	Delete(chunkID metadata.ChunkID) error
 	Seal(chunkID metadata.ChunkID) (uint32, error)
@@ -273,7 +278,7 @@ func (s *Server) handleWrite(header *Header, data []byte) *Response {
 		}
 	}
 
-	if err := s.store.Write(header.ChunkID, data); err != nil {
+	if err := s.writeWithGen(header, data); err != nil {
 		return &Response{
 			RequestID: header.RequestID,
 			Status:    StatusError,
@@ -286,6 +291,16 @@ func (s *Server) handleWrite(header *Header, data []byte) *Response {
 		Status:    StatusOK,
 		Length:    int32(len(data)),
 	}
+}
+
+// writeWithGen routes a write to the store, honoring the metadata-issued
+// generation when the request carries one; otherwise it falls back to the
+// store's plain Write (legacy local-generation behavior).
+func (s *Server) writeWithGen(header *Header, data []byte) error {
+	if header.Generation != 0 {
+		return s.store.WriteGen(header.ChunkID, header.Generation, data)
+	}
+	return s.store.Write(header.ChunkID, data)
 }
 
 func (s *Server) handleRead(header *Header) *Response {
@@ -327,7 +342,7 @@ func (s *Server) handleDelete(header *Header) *Response {
 
 func (s *Server) handleReplicate(header *Header, data []byte) *Response {
 	// Replication write: same as regular write but marks chunk as replica
-	if err := s.store.Write(header.ChunkID, data); err != nil {
+	if err := s.writeWithGen(header, data); err != nil {
 		return &Response{
 			RequestID: header.RequestID,
 			Status:    StatusError,

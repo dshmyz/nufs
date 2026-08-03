@@ -165,6 +165,11 @@ type Header struct {
 	Length    int32             `json:"length"`     // data length (0 = entire chunk)
 	Checksum  uint32            `json:"checksum"`   // CRC32C of body data
 	RequestID uint64            `json:"request_id"` // for request/response correlation
+	// Generation is the metadata-issued write generation (Metadata V2
+	// fencing). 0 = unspecified → the receiving datanode keeps its own local
+	// generation (legacy V1 behavior). Obsolete (idempotent) writes are fenced
+	// on receipt.
+	Generation uint64            `json:"generation,omitempty"`
 	Extra     map[string]string `json:"extra,omitempty"`
 }
 

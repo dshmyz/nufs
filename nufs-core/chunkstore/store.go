@@ -85,7 +85,11 @@ func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.Chu
 
 	// Replication path: fan out the same data to all replicas
 	required := s.requiredReplicas(len(chunk.Replicas))
-	pp := datanode.NewWritePipeline(s.pool, 30*time.Second, datanode.WithQuorum(required))
+	// Carry the metadata-issued generation (Metadata V2 fencing) so every
+	// replica lands on the same authoritative generation. Zero (legacy V1
+	// chunks) leaves each datanode to its own local generation.
+	pp := datanode.NewWritePipeline(s.pool, 30*time.Second,
+		datanode.WithQuorum(required), datanode.WithGeneration(chunk.Generation))
 	return pp.Write(ctx, chunk.ID, data, chunk.Replicas)
 }
 

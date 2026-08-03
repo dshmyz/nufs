@@ -220,8 +220,7 @@ func (cs *ChunkStore) diskOf(chunkID metadata.ChunkID) *diskShard {
 
 // Write stores chunk data to local disk.
 // If WAL is configured, the write is logged before and committed after for crash recovery.
-func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) (writeErr error) {
-	cs.perf.writeOps.Add(1)
+func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) (writeErr error) {	cs.perf.writeOps.Add(1)
 	defer func() {
 		if writeErr != nil {
 			cs.perf.writeFailOps.Add(1)
@@ -354,6 +353,14 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) (writeErr err
 	}
 
 	return nil
+}
+
+// WriteGen implements LocalChunkStore.WriteGen. The legacy V1 ChunkStore has
+// no metadata-generation concept — each chunk is a single file and every
+// write overwrites it — so the generation is ignored and the write proceeds
+// as a plain Write. Metadata V2 fencing is a V2.1 (segment) concern.
+func (cs *ChunkStore) WriteGen(chunkID metadata.ChunkID, generation uint64, data []byte) error {
+	return cs.Write(chunkID, data)
 }
 
 // WriteChunkReq is a single chunk write request for WriteBatch.

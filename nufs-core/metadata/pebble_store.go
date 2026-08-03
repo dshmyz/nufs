@@ -2055,7 +2055,7 @@ func (s *PebbleStore) buildAllocatedChunks(ctx context.Context, offsets []int64,
 				return nil, err
 			}
 		}
-		chunk := &ChunkMeta{ID: id, Size: MaxChunkSize, State: ChunkCreated, Replicas: replicas, Tier: policy.StorageTier, CreateTime: time.Now().UnixNano(), PGID: pgID, Epoch: pgEpoch}
+		chunk := &ChunkMeta{ID: id, Size: MaxChunkSize, State: ChunkCreated, Replicas: replicas, Tier: policy.StorageTier, CreateTime: time.Now().UnixNano(), PGID: pgID, Epoch: pgEpoch, Generation: 1}
 		if groupID != "" {
 			chunk.ECGroup = &ECGroupInfo{GroupID: groupID, DataShards: policy.ECConfig.DataShards, ParityShards: policy.ECConfig.ParityShards}
 		}
