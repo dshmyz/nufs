@@ -208,3 +208,44 @@ func TestRangeRead_RejectsOutOfRange(t *testing.T) {
 		t.Fatalf("tail read returned %d bytes, want the final 10", len(got))
 	}
 }
+
+// TestReadAfterAppendAcrossCachedDescriptor pins a regression where the
+// descriptor cache returns ONE cached *Reader per active segment, and that
+// reader's sizeBytes is snapshotted at open. If an append happens after a
+// read has cached the descriptor, reading a record appended after that
+// snapshot used to fail with a spurious ErrIndexCorrupt (the stale size
+// bound rejected a valid record). The reader must refresh its live size
+// for active segments before declaring corruption.
+func TestReadAfterAppendAcrossCachedDescriptor(t *testing.T) {
+	s := newRangeTestStore(t)
+	ctx := context.Background()
+
+	// Two distinct sizes so the second record lands on a fresh boundary.
+	a := []byte("first-record-sixteen-bytes") // >1 frame? no, 24 bytes
+	if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: 1, Generation: 1, Data: a}); err != nil {
+		s.Close()
+		t.Fatalf("write 1: %v", err)
+	}
+	// Read "1" first: this opens (and caches) the reader while the segment
+	// is at the size that includes only record 1. Now append record 2.
+	if _, err := s.Read(ctx, &storage.ReadRequest{ExtentID: 1, Generation: 1}); err != nil {
+		s.Close()
+		t.Fatalf("read 1 (primes descriptor cache): %v", err)
+	}
+	b := bytes.Repeat([]byte("z"), 7000) // distinct, larger payload
+	if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: 2, Generation: 1, Data: b}); err != nil {
+		s.Close()
+		t.Fatalf("write 2: %v", err)
+	}
+	// Reading record 2 through the stale cached descriptor used to surface
+	// ErrIndexCorrupt. It must read back correctly.
+	got, err := s.Read(ctx, &storage.ReadRequest{ExtentID: 2, Generation: 1})
+	if err != nil {
+		s.Close()
+		t.Fatalf("read 2 after append: %v", err)
+	}
+	if !bytes.Equal(got.Data, b) {
+		s.Close()
+		t.Fatalf("read 2 mismatch: got %d bytes want %d", len(got.Data), len(b))
+	}
+}

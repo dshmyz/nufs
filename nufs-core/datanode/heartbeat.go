@@ -21,6 +21,17 @@ type HeartbeatStore interface {
 	WriteErrorRate() float64
 }
 
+// diskIOProvider is an optional capability a store may expose to feed the
+// heartbeat's DiskIO utilization sample with real served bytes. The legacy
+// ChunkStore never feeds its DiskManager byte counters on the serving path
+// (RecordRead/RecordWrite have no production callers), so its DiskIO is
+// always 0; V2Store implements this to produce a live metric. The heartbeat
+// samples a store that satisfies this interface ahead of the DiskManager
+// fallback.
+type diskIOProvider interface {
+	ReadWriteBytes() (readBytes int64, writeBytes int64)
+}
+
 // HeartbeatReporter periodically sends node status and chunk state
 // to the metadata service.
 //
@@ -123,21 +134,9 @@ func (h *HeartbeatReporter) send() {
 	totalBytes, chunkCount := h.chunkSt.Stats()
 	usedGB := totalBytes / (1024 * 1024 * 1024)
 
-	// Sample disk I/O utilization from DiskManager counters.
-	// Computes bytes/sec since last heartbeat, normalized to 0.0-1.0
-	// where 1.0 = 200 MB/s (a reasonable SSD sustained throughput).
-	if dm := h.chunkSt.DiskManager(); dm != nil {
-		stats := dm.Stats()
-		currentIO := stats.ReadBytes + stats.WriteBytes
-		delta := currentIO - h.lastIOBytes
-		h.lastIOBytes = currentIO
-		bytesPerSec := float64(delta) / h.interval.Seconds()
-		util := bytesPerSec / (200 * 1024 * 1024) // 200 MB/s = 1.0
-		if util > 1.0 {
-			util = 1.0
-		}
-		h.lastDiskIO = util
-	}
+	// Sample disk I/O utilization from the store's served-byte counters,
+	// storing the windowed utilization for the report.
+	_ = h.sampleDiskIO()
 
 	// Build the current replica-state snapshot only when the store
 	// reports a state change since the last snapshot. In steady state
@@ -245,6 +244,32 @@ func (h *HeartbeatReporter) send() {
 		h.fullSyncCounter++
 	}
 	h.stateMu.Unlock()
+}
+
+// sampleDiskIO samples the store's served-byte counters, computes
+// bytes/sec since the last sample normalized to 0.0-1.0 (1.0 = 200 MB/s,
+// a reasonable SSD sustained throughput), stores it as the report's DiskIO
+// figure, and returns it. A store exposing diskIOProvider (V2Store) yields
+// a live metric; the legacy ChunkStore falls back to its DiskManager
+// counters, which are never fed on the serving path, so V1 DiskIO remains 0.
+func (h *HeartbeatReporter) sampleDiskIO() float64 {
+	currentIO := int64(0)
+	if p, ok := h.chunkSt.(diskIOProvider); ok {
+		r, w := p.ReadWriteBytes()
+		currentIO = r + w
+	} else if dm := h.chunkSt.DiskManager(); dm != nil {
+		stats := dm.Stats()
+		currentIO = stats.ReadBytes + stats.WriteBytes
+	}
+	delta := currentIO - h.lastIOBytes
+	h.lastIOBytes = currentIO
+	bytesPerSec := float64(delta) / h.interval.Seconds()
+	util := bytesPerSec / (200 * 1024 * 1024) // 200 MB/s = 1.0
+	if util > 1.0 {
+		util = 1.0
+	}
+	h.lastDiskIO = util
+	return util
 }
 
 // ForceFullSync forces the next heartbeat to send the full chunk

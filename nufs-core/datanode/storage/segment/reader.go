@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/datanode/storage/encryption"
@@ -24,8 +25,11 @@ type Reader struct {
 	f readerAt
 	// Path to the segment file.
 	path string
-	// SizeBytes is the sealed size; used to bound reads.
-	sizeBytes int64
+	// SizeBytes is the current file size (may grow for active segments);
+	// used to bound reads. Atomic because a descriptor-cache reader is
+	// shared across concurrent reads and may be refreshed when the active
+	// segment grows.
+	sizeBytes atomic.Int64
 	// enc is the record encryption registry (nil = plaintext).
 	enc *encryption.KeyRegistry
 }
@@ -61,7 +65,9 @@ func OpenReaderWithEnc(path string, enc *encryption.KeyRegistry) (*Reader, error
 			return nil, err
 		}
 	}
-	return &Reader{f: f, path: path, sizeBytes: st.Size(), enc: enc}, nil
+	r := &Reader{f: f, path: path, enc: enc}
+	r.sizeBytes.Store(st.Size())
+	return r, nil
 }
 
 // recordLayout is the metadata needed to locate and authenticate any
@@ -227,8 +233,19 @@ func (r *Reader) readRecordLayout(offset int64, storedLen uint32, logicalLen uin
 	if totalStored != int64(storedLen) {
 		return nil, storage.ErrIndexCorrupt
 	}
-	if firstFrameOff+totalStored+int64(RecordTrailerSize) > r.sizeBytes {
-		return nil, storage.ErrIndexCorrupt
+	if firstFrameOff+totalStored+int64(RecordTrailerSize) > r.sizeBytes.Load() {
+		// The cached size may be stale for an ACTIVE segment that has been
+		// appended since the reader was opened (the reader cache holds one
+		// descriptor per segment; sealed segments never change, active ones
+		// grow). Refresh the live size before declaring corruption — a false
+		// ErrIndexCorrupt here would make freshly-written records unreadable.
+		if sz, err := r.refreshSize(); err == nil {
+			if firstFrameOff+totalStored+int64(RecordTrailerSize) > sz {
+				return nil, storage.ErrIndexCorrupt
+			}
+		} else {
+			return nil, err
+		}
 	}
 
 	var decKey []byte
@@ -272,4 +289,27 @@ func (r *Reader) readRecordLayout(offset int64, storedLen uint32, logicalLen uin
 func (r *Reader) Close() error { return r.f.Close() }
 
 // Size returns the segment file size in bytes.
-func (r *Reader) Size() int64 { return r.sizeBytes }
+func (r *Reader) Size() int64 { return r.sizeBytes.Load() }
+
+// statter is implemented by *os.File to report its current size; fakes
+// used in tests may omit it, in which case refreshSize is a no-op.
+type statter interface {
+	Stat() (os.FileInfo, error)
+}
+
+// refreshSize re-stats the underlying file and updates the cached size.
+// Used when the cached size is stale for an ACTIVE segment that grew after
+// the reader was opened (the descriptor cache holds one reader per segment;
+// sealed segments never change, active ones are appended to).
+func (r *Reader) refreshSize() (int64, error) {
+	sf, ok := r.f.(statter)
+	if !ok {
+		return r.sizeBytes.Load(), nil
+	}
+	st, err := sf.Stat()
+	if err != nil {
+		return r.sizeBytes.Load(), err
+	}
+	r.sizeBytes.Store(st.Size())
+	return r.sizeBytes.Load(), nil
+}

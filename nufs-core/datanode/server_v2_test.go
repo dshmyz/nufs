@@ -2,6 +2,7 @@ package datanode
 
 import (
 	"testing"
+	"time"
 
 	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/datanode/storage/segment"
@@ -205,5 +206,82 @@ func TestV2StoreOverwriteAccounting(t *testing.T) {
 	}
 	if chunks := v.ListChunks(); len(chunks) != 0 {
 		t.Fatalf("ListChunks after delete=%d, want 0", len(chunks))
+	}
+}
+
+// TestV2StoreReadWriteBytes verifies the cumulative served-byte counters
+// the heartbeat samples for disk I/O utilization: writes count the payload
+// on the serving path, reads count the bytes returned, and multiple disks
+// aggregate.
+func TestV2StoreReadWriteBytes(t *testing.T) {
+	v, _ := newTestMultiStore(t, 2)
+
+	if r, w := v.ReadWriteBytes(); r != 0 || w != 0 {
+		t.Fatalf("initial ReadWriteBytes = (%d,%d), want (0,0)", r, w)
+	}
+	// Write 5 bytes to disk 0, then 7 bytes to disk 1.
+	if err := v.Write(metadata.ChunkID(1), []byte("aaaaa")); err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	if err := v.Write(metadata.ChunkID(2), []byte("bbbbbbb")); err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
+	if r, w := v.ReadWriteBytes(); r != 0 || w != 12 {
+		t.Fatalf("after writes ReadWriteBytes = (%d,%d), want (0,12)", r, w)
+	}
+	// Read 5 bytes back from chunk 1.
+	if _, _, err := v.Read(metadata.ChunkID(1), 0, 0); err != nil {
+		t.Fatalf("read 1: %v", err)
+	}
+	if r, w := v.ReadWriteBytes(); r != 5 || w != 12 {
+		t.Fatalf("after read ReadWriteBytes = (%d,%d), want (5,12)", r, w)
+	}
+}
+
+// TestV2StoreImplementsDiskIOProvider pins that V2Store exposes the
+// capability heartbeat samples (and ChunkStore does not, so V1 falls back
+// to its always-zero DiskManager counters).
+func TestV2StoreImplementsDiskIOProvider(t *testing.T) {
+	var _ diskIOProvider = (*V2Store)(nil)
+}
+
+// TestHeartbeatSamplerDiskIO_V2Store verifies the heartbeat's disk-I/O
+// sampling path feeds a real (nonzero) utilization from a V2Store that
+// exposes ReadWriteBytes — closing the parity gap where ChunkStore's
+// always-zero DiskManager counters left DiskIO perpetually 0.
+func TestHeartbeatSamplerDiskIO_V2Store(t *testing.T) {
+	v, _ := newTestMultiStore(t, 1)
+	if err := v.Write(metadata.ChunkID(7), []byte("diskio-payload-16")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, _, err := v.Read(metadata.ChunkID(7), 0, 0); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	// Sample with a fresh reporter (baseline lastIOBytes starts at 0), so
+	// the first sample's delta equals the cumulative bytes served so far.
+	sample := func() float64 {
+		h := NewHeartbeatReporter(Config{NodeID: 1, HeartbeatInterval: time.Second}, &mockHeartbeatMeta{}, v)
+		defer h.Stop()
+		return h.sampleDiskIO()
+	}
+
+	util0 := sample()
+	if err := v.Write(metadata.ChunkID(8), []byte("more-traffic-13")); err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
+	if _, _, err := v.Read(metadata.ChunkID(8), 0, 0); err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	util1 := sample()
+
+	// Both samples must be non-negative and, given the served traffic is
+	// nonzero, at least one must be above zero — proving the V2.1 path
+	// produces a live DiskIO figure rather than V1's perpetual 0.
+	if util0 < 0 || util1 < 0 {
+		t.Fatalf("negative utilization: t0=%v t1=%v", util0, util1)
+	}
+	if util0 == 0 && util1 == 0 {
+		t.Fatalf("V2Store DiskIO not sampled (both 0) despite served traffic")
 	}
 }

@@ -30,10 +30,12 @@ type diskBackend struct {
 
 	// Accounting updated on the serving path and reconstructed at startup
 	// for V2.1 backends via ListExtents.
-	usedByts atomic.Int64
-	extCount atomic.Int64
-	writeOps atomic.Int64
-	writeErr atomic.Int64
+	usedByts  atomic.Int64
+	extCount  atomic.Int64
+	writeOps  atomic.Int64
+	writeErr  atomic.Int64
+	readByts  atomic.Int64
+	writeByts atomic.Int64
 }
 
 // chunkLoc records where a chunk lives and at what generation, so a
@@ -124,6 +126,7 @@ func (v *V2Store) Write(chunkID metadata.ChunkID, data []byte) error {
 		b.writeErr.Add(1)
 		return err
 	}
+	b.writeByts.Add(int64(len(data)))
 	if newChunk {
 		b.usedByts.Add(int64(len(data)))
 		b.extCount.Add(1)
@@ -184,7 +187,8 @@ func (v *V2Store) loc(chunkID metadata.ChunkID) chunkLoc {
 // Read implements LocalChunkStore.Read.
 func (v *V2Store) Read(chunkID metadata.ChunkID, offset int64, length int32) ([]byte, uint32, error) {
 	loc := v.loc(chunkID)
-	res, err := v.disks[loc.disk].store.Read(context.Background(), &storage.ReadRequest{
+	b := v.disks[loc.disk]
+	res, err := b.store.Read(context.Background(), &storage.ReadRequest{
 		ExtentID:      storage.ExtentID(chunkID),
 		Generation:    loc.gen,
 		LogicalOffset: offset,
@@ -193,6 +197,7 @@ func (v *V2Store) Read(chunkID metadata.ChunkID, offset int64, length int32) ([]
 	if err != nil {
 		return nil, 0, err
 	}
+	b.readByts.Add(int64(len(res.Data)))
 	return res.Data, res.Checksum, nil
 }
 
@@ -367,6 +372,19 @@ func (v *V2Store) WriteErrorRate() float64 {
 // provides the per-disk breakdown instead).
 func (v *V2Store) DiskManager() *DiskManager {
 	return nil
+}
+
+// ReadWriteBytes returns the cumulative bytes read and written on the
+// serving path since startup, across all disks. The heartbeat samples
+// these to compute a live DiskIO utilization — something the legacy
+// ChunkStore's DiskManager counters never feed (RecordRead/RecordWrite
+// have no serving-path callers), so V2.1 produces a real metric.
+func (v *V2Store) ReadWriteBytes() (read int64, write int64) {
+	for _, b := range v.disks {
+		read += b.readByts.Load()
+		write += b.writeByts.Load()
+	}
+	return read, write
 }
 
 // Compile-time interface checks.
