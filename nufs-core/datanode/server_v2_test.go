@@ -342,3 +342,73 @@ func TestV2StoreDiskFailedPersistsAcrossRateReset(t *testing.T) {
 		t.Fatalf("diskFailed cleared by WriteErrorRate reset")
 	}
 }
+
+// TestV2StoreDiskInfos verifies the management interface reports per-disk
+// Index/Dir/UsedBytes/ChunkCount, deriving the values from the real
+// accounting and the dirs passed at construction.
+func TestV2StoreDiskInfos(t *testing.T) {
+	// Build two stores with explicit dirs so DiskInfos can report them.
+	dirs := []string{t.TempDir(), t.TempDir()}
+	backends := make([]storage.Store, 2)
+	for i := range dirs {
+		s, err := segment.New(segment.Config{Dir: dirs[i], UseMemIndex: true, StreamID: 1})
+		if err != nil {
+			t.Fatalf("segment.New disk %d: %v", i, err)
+		}
+		backends[i] = s
+		defer s.Close()
+	}
+	v := NewMultiV2Store(backends, dirs...)
+	if err := v.Write(metadata.ChunkID(1), []byte("abc")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := v.Write(metadata.ChunkID(2), []byte("de")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	ds := v.DiskInfos()
+	if len(ds) != 2 {
+		t.Fatalf("DiskInfos len=%d, want 2", len(ds))
+	}
+	if ds[0].Dir != dirs[0] || ds[1].Dir != dirs[1] {
+		t.Fatalf("DiskInfos dirs=%q/%q, want %q/%q", ds[0].Dir, ds[1].Dir, dirs[0], dirs[1])
+	}
+	// Both chunks land on disk 0 (least-used, tie → index 0); across disks
+	// the chunk count and used bytes reflect the live payloads.
+	total := ds[0].ChunkCount + ds[1].ChunkCount
+	if total != 2 {
+		t.Fatalf("DiskInfos ChunkCount total=%d, want 2", total)
+	}
+	if ds[0].UsedBytes+ds[1].UsedBytes != 5 {
+		t.Fatalf("DiskInfos UsedBytes total=%d, want 5", ds[0].UsedBytes+ds[1].UsedBytes)
+	}
+	if ds[0].Failed || ds[1].Failed {
+		t.Fatalf("DiskInfos flagged healthy disks as failed: %v", ds)
+	}
+}
+
+// TestV2StoreVerifyChunkData verifies checksum validation re-reads the
+// chunk and reports integrity matching (or mismatch) against the recorded
+// checksum.
+func TestV2StoreVerifyChunkData(t *testing.T) {
+	v, _ := newTestMultiStore(t, 1)
+	if err := v.Write(metadata.ChunkID(5), []byte("verify me")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	ok, cksum, err := v.VerifyChunkData(metadata.ChunkID(5))
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !ok {
+		t.Fatalf("verify reported mismatch (cksum=%x)", cksum)
+	}
+	if cksum != storage.CRC32C([]byte("verify me")) {
+		t.Fatalf("verify checksum=%x, want %x", cksum, storage.CRC32C([]byte("verify me")))
+	}
+
+	// A missing chunk reports not-found.
+	if _, _, err := v.VerifyChunkData(metadata.ChunkID(999)); err == nil {
+		t.Fatalf("verify of missing chunk returned nil error")
+	}
+}

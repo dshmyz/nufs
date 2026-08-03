@@ -1050,16 +1050,24 @@ func (cs *ChunkStore) scanExisting() error {
 // DiskInfo is a read-only snapshot of one disk shard's metadata, returned
 // by DiskInfos for the management interface.
 type DiskInfo struct {
-	Index  int
-	Dir    string
-	Failed bool
+	Index      int
+	Dir        string
+	UsedBytes  int64
+	ChunkCount int64
+	Failed     bool
 }
 
 // DiskInfos returns a snapshot of all disk shards' metadata.
 func (cs *ChunkStore) DiskInfos() []DiskInfo {
 	infos := make([]DiskInfo, len(cs.disks))
 	for i, d := range cs.disks {
-		infos[i] = DiskInfo{Index: d.index, Dir: d.dataDir, Failed: d.failed.Load()}
+		infos[i] = DiskInfo{
+			Index:      d.index,
+			Dir:        d.dataDir,
+			UsedBytes:  d.usedBytes.Load(),
+			ChunkCount: d.chunkCount.Load(),
+			Failed:     d.failed.Load(),
+		}
 	}
 	return infos
 }

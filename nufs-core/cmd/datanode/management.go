@@ -35,17 +35,21 @@ type sockResp struct {
 // ============================================================
 
 // managementServer runs a unix-domain-socket listener that accepts
-// status/adopt/retire commands from the CLI.
+// status/adopt/retire commands from the CLI. It is engine-agnostic: store
+// is the OpsStore subset both V1 ChunkStore and V2.1 V2Store satisfy.
+// disk-lifecycle commands (adopt/retire/decommission/migrate/drain) are
+// gated on optional capability interfaces, so V2.1 (which has no disk
+// lifecycle yet) answers them with "unsupported" instead of panicking.
 type managementServer struct {
 	sockPath string
-	store    *datanode.ChunkStore
+	store    datanode.OpsStore
 	disk     *datanode.DiskManager
 	listener net.Listener
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 }
 
-func newManagementServer(sockPath string, store *datanode.ChunkStore, dm *datanode.DiskManager) *managementServer {
+func newManagementServer(sockPath string, store datanode.OpsStore, dm *datanode.DiskManager) *managementServer {
 	return &managementServer{
 		sockPath: sockPath,
 		store:    store,
@@ -168,7 +172,12 @@ func (ms *managementServer) handleAdopt(conn net.Conn, dir string) {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "path required"})
 		return
 	}
-	idx, err := ms.store.AddDisk(dir, 8, 8, nil)
+	lc, ok := ms.store.(datanode.DiskLifecycleOps)
+	if !ok {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk lifecycle unsupported by this engine"})
+		return
+	}
+	idx, err := lc.AddDisk(dir, 8, 8, nil)
 	if err != nil {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
 		return
@@ -183,13 +192,18 @@ func (ms *managementServer) handleRetire(conn net.Conn, dir string) {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "path required"})
 		return
 	}
+	lc, ok := ms.store.(datanode.DiskLifecycleOps)
+	if !ok {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk lifecycle unsupported by this engine"})
+		return
+	}
 	for _, di := range ms.store.DiskInfos() {
 		if di.Dir == dir {
 			if di.Failed {
 				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk already retired"})
 				return
 			}
-			if err := ms.store.RemoveDisk(di.Index); err != nil {
+			if err := lc.RemoveDisk(di.Index); err != nil {
 				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
 				return
 			}
@@ -209,6 +223,11 @@ func (ms *managementServer) handleDecommission(conn net.Conn, dir string) {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "path required"})
 		return
 	}
+	lc, ok := ms.store.(datanode.DiskLifecycleOps)
+	if !ok {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk lifecycle unsupported by this engine"})
+		return
+	}
 	for _, di := range ms.store.DiskInfos() {
 		if di.Dir == dir {
 			if di.Failed {
@@ -216,7 +235,7 @@ func (ms *managementServer) handleDecommission(conn net.Conn, dir string) {
 				return
 			}
 			// Phase 1: migrate data to other disks.
-			migrated, migErr := ms.store.MigrateDisk(di.Index)
+			migrated, migErr := lc.MigrateDisk(di.Index)
 			if migErr != nil {
 				json.NewEncoder(conn).Encode(sockResp{
 					Status: "error",
@@ -225,7 +244,7 @@ func (ms *managementServer) handleDecommission(conn net.Conn, dir string) {
 				return
 			}
 			// Phase 2: mark failed after successful migration.
-			if err := ms.store.RemoveDisk(di.Index); err != nil {
+			if err := lc.RemoveDisk(di.Index); err != nil {
 				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
 				return
 			}
@@ -245,9 +264,14 @@ func (ms *managementServer) handleMigrate(conn net.Conn, dir string) {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "path required"})
 		return
 	}
+	lc, ok := ms.store.(datanode.DiskLifecycleOps)
+	if !ok {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk lifecycle unsupported by this engine"})
+		return
+	}
 	for _, di := range ms.store.DiskInfos() {
 		if di.Dir == dir {
-			migrated, err := ms.store.MigrateDisk(di.Index)
+			migrated, err := lc.MigrateDisk(di.Index)
 			if err != nil {
 				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: fmt.Sprintf("migration error: %v (migrated %d)", err, migrated)})
 				return
@@ -260,9 +284,14 @@ func (ms *managementServer) handleMigrate(conn net.Conn, dir string) {
 }
 
 func (ms *managementServer) handleDrain(conn net.Conn) {
+	drain, ok := ms.store.(datanode.DrainOps)
+	if !ok {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "drain unsupported by this engine"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := ms.store.DrainWrites(ctx); err != nil {
+	if _, err := drain.DrainWrites(ctx); err != nil {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
 		return
 	}
@@ -386,7 +415,7 @@ func findSockPath(args []string) string {
 	return ""
 }
 
-func startManagementServer(store *datanode.ChunkStore, dm *datanode.DiskManager, dataDirs []string) (func(), error) {
+func startManagementServer(store datanode.OpsStore, dm *datanode.DiskManager, dataDirs []string) (func(), error) {
 	sockPath := filepath.Join(dataDirs[0], ".datanode.sock")
 	ms := newManagementServer(sockPath, store, dm)
 	if err := ms.Start(); err != nil {

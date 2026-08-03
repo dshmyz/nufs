@@ -35,10 +35,14 @@ type OpsMetadata interface {
 // Operations API — Production Cluster Management HTTP Interface
 // ============================================================
 
-// OpsServer exposes HTTP endpoints for cluster operations.
+// OpsServer exposes HTTP endpoints for cluster operations. It is
+// engine-agnostic: store is the OpsStore subset both V1 ChunkStore and V2.1
+// V2Store satisfy, so the same HTTP surface serves either engine. The V1-only
+// subsystems (disk manager, replicator, anti-entropy, repair worker) are
+// optional and nil-guarded; V2.1 passes nil for all of them.
 type OpsServer struct {
 	cfg        Config
-	store      *ChunkStore
+	store      OpsStore
 	meta       OpsMetadata
 	disk       *DiskManager
 	repl       *ParallelReplicator
@@ -50,13 +54,13 @@ type OpsServer struct {
 }
 
 // NewOpsServer creates the operations HTTP server.
-func NewOpsServer(cfg Config, store *ChunkStore, meta OpsMetadata,
+func NewOpsServer(cfg Config, store OpsStore, meta OpsMetadata,
 	disk *DiskManager, repl *ParallelReplicator, ae *AntiEntropy) *OpsServer {
 	return NewOpsServerWithRepair(cfg, store, meta, disk, repl, ae, nil)
 }
 
 // NewOpsServerWithRepair creates an ops server with repair worker integration.
-func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta OpsMetadata,
+func NewOpsServerWithRepair(cfg Config, store OpsStore, meta OpsMetadata,
 	disk *DiskManager, repl *ParallelReplicator, ae *AntiEntropy, repair *RepairWorker) *OpsServer {
 	mux := http.NewServeMux()
 
@@ -71,7 +75,7 @@ func NewOpsServerWithRepair(cfg Config, store *ChunkStore, meta OpsMetadata,
 	}
 
 	// Wire disk failure callback to trigger repair for chunks on failed disk
-	if repair != nil {
+	if repair != nil && disk != nil {
 		disk.SetOnDiskFailed(func(diskID string) {
 			slog.Warn("ops: disk failed, triggering chunk repairs", "diskID", diskID)
 			if err := repair.RepairChunksForDiskFailure(context.Background(), diskID); err != nil {
@@ -215,6 +219,43 @@ func (s *OpsServer) Stop() {
 
 // --- Handlers ---
 
+// replStats returns replication counters, defaulting to zero when the V1
+// replicator is absent (V2.1 passes nil).
+func (s *OpsServer) replStats() (writes, errors, avgLatency int64) {
+	if s.repl == nil {
+		return 0, 0, 0
+	}
+	return s.repl.Stats()
+}
+
+// aeStats returns anti-entropy counters, defaulting to zero when absent
+// (V2.1 passes nil).
+func (s *OpsServer) aeStats() (scanned, mismatches, repaired int64) {
+	if s.ae == nil {
+		return 0, 0, 0
+	}
+	return s.ae.Stats()
+}
+
+// diskStats returns the V1 disk-manager snapshot. V2.1 has no DiskManager,
+// so it defaults to an empty snapshot and reports per-disk state through
+// DiskStats/DiskInfos instead.
+func (s *OpsServer) diskStats() DiskStatsSnapshot {
+	if s.disk == nil {
+		return DiskStatsSnapshot{}
+	}
+	return s.disk.Stats()
+}
+
+// diskAlertLevel returns the V1 disk manager's fired alert level, or
+// AlertNone when the disk manager is absent (V2.1).
+func (s *OpsServer) diskAlertLevel() AlertLevel {
+	if s.disk == nil {
+		return AlertNone
+	}
+	return AlertLevel(s.disk.alertFired.Load())
+}
+
 type ClusterStatus struct {
 	NodeID      uint64             `json:"node_id"`
 	State       metadata.NodeState `json:"state"`
@@ -233,14 +274,14 @@ type ClusterStatus struct {
 }
 
 func (s *OpsServer) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
-	writes, errors, avgLatency := s.repl.Stats()
-	scanned, mismatches, repaired := s.ae.Stats()
+	writes, errors, avgLatency := s.replStats()
+	scanned, mismatches, repaired := s.aeStats()
 
 	status := ClusterStatus{
 		NodeID:    uint64(s.cfg.NodeID),
 		State:     metadata.NodeOnline,
 		Addr:      s.cfg.ListenAddr,
-		DiskStats: s.disk.Stats(),
+		DiskStats: s.diskStats(),
 	}
 	status.Replication.Writes = writes
 	status.Replication.Errors = errors
@@ -401,9 +442,9 @@ type OpsMetrics struct {
 }
 
 func (s *OpsServer) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
-	stats := s.disk.Stats()
-	writes, replErrors, avgLatency := s.repl.Stats()
-	scanned, mismatches, repaired := s.ae.Stats()
+	stats := s.diskStats()
+	writes, replErrors, avgLatency := s.replStats()
+	scanned, mismatches, repaired := s.aeStats()
 	totalBytes, chunkCount := s.store.Stats()
 	perf := s.store.PerfSnapshot()
 
@@ -514,13 +555,14 @@ func (s *OpsServer) handlePrometheusMetrics(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *OpsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	writes, errors, avgLatency := s.repl.Stats()
-	scanned, mismatches, repaired := s.ae.Stats()
+	writes, errors, avgLatency := s.replStats()
+	scanned, mismatches, repaired := s.aeStats()
 
 	m := OpsMetrics{}
-	m.Disk = s.disk.Stats()
-	m.Cache.ChunkCount = s.store.chunkCount.Load()
-	m.Cache.UsedBytes = s.store.totalBytes.Load()
+	m.Disk = s.diskStats()
+	tb, cc := s.store.Stats()
+	m.Cache.ChunkCount = cc
+	m.Cache.UsedBytes = tb
 	m.Perf = s.store.PerfSnapshot()
 	m.Replication.Writes = writes
 	m.Replication.Errors = errors
@@ -540,7 +582,7 @@ type HealthStatus struct {
 }
 
 func (s *OpsServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	disk := s.disk.Stats()
+	disk := s.diskStats()
 	healthy := disk.UsagePct < 0.95
 
 	status := HealthStatus{
@@ -561,8 +603,8 @@ func (s *OpsServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *OpsServer) handleCapacityAlerts(w http.ResponseWriter, r *http.Request) {
-	stats := s.disk.Stats()
-	alertLevel := AlertLevel(s.disk.alertFired.Load())
+	stats := s.diskStats()
+	alertLevel := s.diskAlertLevel()
 	s.writeJSON(w, map[string]interface{}{
 		"alert_level": alertLevel.String(),
 		"usage_pct":   fmt.Sprintf("%.1f%%", stats.UsagePct*100),
@@ -643,7 +685,12 @@ func (s *OpsServer) handleHTTPAdopt(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "path required")
 		return
 	}
-	idx, err := s.store.AddDisk(dir, 8, 8, nil)
+	lc, ok := s.store.(DiskLifecycleOps)
+	if !ok {
+		writeJSONError(w, http.StatusNotImplemented, "disk lifecycle unsupported by this engine")
+		return
+	}
+	idx, err := lc.AddDisk(dir, 8, 8, nil)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -661,13 +708,18 @@ func (s *OpsServer) handleHTTPRetire(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "path required")
 		return
 	}
+	lc, ok := s.store.(DiskLifecycleOps)
+	if !ok {
+		writeJSONError(w, http.StatusNotImplemented, "disk lifecycle unsupported by this engine")
+		return
+	}
 	for _, di := range s.store.DiskInfos() {
 		if di.Dir == dir {
 			if di.Failed {
 				writeJSONError(w, http.StatusConflict, "disk already retired")
 				return
 			}
-			if err := s.store.RemoveDisk(di.Index); err != nil {
+			if err := lc.RemoveDisk(di.Index); err != nil {
 				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
@@ -688,19 +740,24 @@ func (s *OpsServer) handleHTTPDecommission(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusBadRequest, "path required")
 		return
 	}
+	lc, ok := s.store.(DiskLifecycleOps)
+	if !ok {
+		writeJSONError(w, http.StatusNotImplemented, "disk lifecycle unsupported by this engine")
+		return
+	}
 	for _, di := range s.store.DiskInfos() {
 		if di.Dir == dir {
 			if di.Failed {
 				writeJSONError(w, http.StatusConflict, "disk already retired")
 				return
 			}
-			migrated, migErr := s.store.MigrateDisk(di.Index)
+			migrated, migErr := lc.MigrateDisk(di.Index)
 			if migErr != nil {
 				writeJSONError(w, http.StatusInternalServerError,
 					fmt.Sprintf("disk may be unreadable; use retire instead (migrated %d, error: %v)", migrated, migErr))
 				return
 			}
-			if err := s.store.RemoveDisk(di.Index); err != nil {
+			if err := lc.RemoveDisk(di.Index); err != nil {
 				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
@@ -721,9 +778,14 @@ func (s *OpsServer) handleHTTPMigrate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "path required")
 		return
 	}
+	lc, ok := s.store.(DiskLifecycleOps)
+	if !ok {
+		writeJSONError(w, http.StatusNotImplemented, "disk lifecycle unsupported by this engine")
+		return
+	}
 	for _, di := range s.store.DiskInfos() {
 		if di.Dir == dir {
-			migrated, err := s.store.MigrateDisk(di.Index)
+			migrated, err := lc.MigrateDisk(di.Index)
 			if err != nil {
 				writeJSONError(w, http.StatusInternalServerError,
 					fmt.Sprintf("error: %v (migrated %d)", err, migrated))
@@ -756,7 +818,12 @@ func (s *OpsServer) handleHTTPDrain(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	if _, err := s.store.DrainWrites(ctx); err != nil {
+	drain, ok := s.store.(DrainOps)
+	if !ok {
+		writeJSONError(w, http.StatusNotImplemented, "drain unsupported by this engine")
+		return
+	}
+	if _, err := drain.DrainWrites(ctx); err != nil {
 		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}

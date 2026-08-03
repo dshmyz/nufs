@@ -530,7 +530,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// adapter aggregates every disk (least-used placement, per-disk stats
 	// and heartbeat data), so a multi-disk --data-dirs node actually
 	// serves from all of them rather than only the first.
-	v2Store := datanode.NewMultiV2Store(stores)
+	v2Store := datanode.NewMultiV2Store(stores, dataDirs...)
 	srvCfg := cfg
 	srvCfg.ListenAddr = cfg.ListenAddr
 	srv := datanode.NewServer(srvCfg, v2Store)
@@ -547,6 +547,26 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// receive writes.
 	heartbeat := datanode.NewHeartbeatReporter(cfg, metaStore, v2Store)
 	heartbeat.Start()
+
+	// Operational channels: the unix-socket management server and the HTTP
+	// ops server. Both are engine-agnostic (they hold the OpsStore subset, so
+	// V2Store drives the same surface V1 exposes). V2.1 has no disk
+	// lifecycle/replicator/anti-entropy/repair, so those capability handlers
+	// answer "unsupported" and the V1-only subsystems are nil.
+	stopMgmt, err := startManagementServer(v2Store, nil, dataDirs)
+	if err != nil {
+		log.Error("failed to start management socket", "error", err)
+		closeStores()
+		os.Exit(1)
+	}
+	defer stopMgmt()
+	opsServer := datanode.NewOpsServerWithRepair(cfg, v2Store, metaStore, nil, nil, nil, nil)
+	if err := opsServer.Start(); err != nil {
+		log.Error("failed to start ops HTTP server", "error", err)
+		closeStores()
+		os.Exit(1)
+	}
+	defer opsServer.Stop()
 
 	// Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)

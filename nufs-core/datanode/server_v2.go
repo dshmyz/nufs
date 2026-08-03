@@ -2,6 +2,7 @@ package datanode
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,10 @@ type diskBackend struct {
 	store  storage.Store
 	lister extentLister
 	index  int
+	// dir is the disk root (segment store's Config.Dir) reported to the
+	// management/ops channel's DiskInfos/DiskInfo. Empty when the backend was
+	// constructed without a directory (single-disk/tests).
+	dir string
 
 	// Accounting updated on the serving path and reconstructed at startup
 	// for V2.1 backends via ListExtents.
@@ -81,11 +86,16 @@ type V2Store struct {
 	stateVersion atomic.Uint64
 }
 
-// NewV2Store wraps a single backend (legacy/plain single-disk use).
-func NewV2Store(store storage.Store) *V2Store {
+// NewV2Store wraps a single backend (legacy/plain single-disk use). An
+// optional dir is the disk root reported to DiskInfos when non-empty.
+func NewV2Store(store storage.Store, dir ...string) *V2Store {
 	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc)}
 	for _, s := range []storage.Store{store} {
-		b := &diskBackend{store: s}
+		d := ""
+		if len(dir) > 0 {
+			d = dir[0]
+		}
+		b := &diskBackend{store: s, dir: d}
 		if lister, ok := s.(extentLister); ok {
 			b.lister = lister
 		}
@@ -94,14 +104,20 @@ func NewV2Store(store storage.Store) *V2Store {
 	return v
 }
 
-// NewMultiV2Store wraps multiple backends for JBOD multi-disk mode. For
-// V2.1 segment backends it reconstructs the per-disk location/generation
-// map and usage accounting by enumerating each store's committed extents,
-// the equivalent of the legacy ChunkStore's startup disk scan.
-func NewMultiV2Store(stores []storage.Store) *V2Store {
+// NewMultiV2Store wraps multiple backends for JBOD multi-disk mode. dirs, if
+// provided, gives each backend's disk root in the same order as stores (used
+// for the management/ops DiskInfos). For V2.1 segment backends it
+// reconstructs the per-disk location/generation map and usage accounting by
+// enumerating each store's committed extents, the equivalent of the legacy
+// ChunkStore's startup disk scan.
+func NewMultiV2Store(stores []storage.Store, dirs ...string) *V2Store {
 	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc)}
 	for i, s := range stores {
-		b := &diskBackend{store: s, index: i}
+		d := ""
+		if i < len(dirs) {
+			d = dirs[i]
+		}
+		b := &diskBackend{store: s, index: i, dir: d}
 		if lister, ok := s.(extentLister); ok {
 			b.lister = lister
 			if extents, err := lister.ListExtents(); err == nil {
@@ -401,6 +417,50 @@ func (v *V2Store) ReadWriteBytes() (read int64, write int64) {
 		write += b.writeByts.Load()
 	}
 	return read, write
+}
+
+// DiskInfos returns per-disk metadata for the management/ops channel,
+// mirroring the legacy ChunkStore.DiskInfos. Each V2.1 disk is one segment
+// store; Index/Dir/UsedBytes/ChunkCount/Failed derive from its accounting.
+func (v *V2Store) DiskInfos() []DiskInfo {
+	out := make([]DiskInfo, len(v.disks))
+	for i, b := range v.disks {
+		out[i] = DiskInfo{
+			Index:      i,
+			Dir:        b.dir,
+			UsedBytes:  b.usedByts.Load(),
+			ChunkCount: b.extCount.Load(),
+			Failed:     v.diskFailed(i),
+		}
+	}
+	return out
+}
+
+// VerifyChunkData re-reads a chunk and reports whether its on-disk content
+// still matches the recorded checksum, mirroring the legacy ha.go Verify
+// semantics. Size is resolved from the owning backend's stat, so a full
+// re-read verifies every byte.
+func (v *V2Store) VerifyChunkData(chunkID metadata.ChunkID) (bool, uint32, error) {
+	info, ok := v.Info(chunkID)
+	if !ok {
+		return false, 0, fmt.Errorf("chunk %d not found locally", chunkID)
+	}
+	data, _, err := v.Read(chunkID, 0, int32(info.Size))
+	if err != nil {
+		return false, 0, err
+	}
+	// The V2.1 segment store records extent payload checksums as CRC32C
+	// (Castagnoli), so the integrity comparison must match that, not IEEE.
+	got := storage.CRC32C(data)
+	return got == info.Checksum, got, nil
+}
+
+// PerfSnapshot returns engine performance counters. The legacy V1 metrics
+// (fsync count/timing, semaphore waits) are chunk-file concerns V2.1 does
+// not have — its equivalents live in ReadWriteBytes/DiskStats — so this
+// reports an honest zero snapshot.
+func (v *V2Store) PerfSnapshot() ChunkStorePerfSnapshot {
+	return ChunkStorePerfSnapshot{}
 }
 
 // Compile-time interface checks.
