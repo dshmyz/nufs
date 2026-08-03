@@ -213,6 +213,10 @@ type PebbleStore struct {
 	db        *pebble.DB
 	cache     *pebble.DB // Optional read cache (nil if disabled)
 	placement *PlacementEngine
+	// pgStore is the placement-group authority for the Metadata V2 serving
+	// path (Task #56 Phase A). It shares this store's DB and is raft-backed
+	// like the other component stores. Built lazily in NewPebbleStore.
+	pgStore *PlacementGroupStore
 	chunkGen  *ChunkIDGenerator
 	inodeSeq  atomic.Uint64
 	closed    atomic.Bool
@@ -453,6 +457,8 @@ func NewPebbleStore(cfg PebbleStoreConfig) (*PebbleStore, error) {
 	dcfg := DefaultDynamicConfig()
 	s.dynCfg.Store(&dcfg)
 	s.placement.SetConfigProvider(s.GetDynamicConfig)
+	// Placement-group authority for the Metadata V2 serving path.
+	s.pgStore = NewPlacementGroupStore(s)
 
 	if err := s.initRootInode(); err != nil {
 		db.Close()
@@ -2027,36 +2033,87 @@ func (s *PebbleStore) buildAllocatedChunks(ctx context.Context, offsets []int64,
 	}
 	chunks := make([]*ChunkMeta, len(ids))
 	for i, id := range ids {
-		nodeIDs, err := s.placement.PlaceChunk(ecPolicy, nil)
-		if err != nil {
-			return nil, err
-		}
-		nodeInfos := s.placement.GetNodeInfosBatch(nodeIDs)
-		replicas := make([]ReplicaInfo, 0, len(nodeIDs))
-		for shard, nodeID := range nodeIDs {
-			addr := ""
-			if info := nodeInfos[shard]; info != nil {
-				addr = info.Addr
-			} else {
-				node, err := s.GetNode(ctx, nodeID)
-				if err != nil {
-					return nil, fmt.Errorf("allocate chunk: node %d not found: %w", nodeID, err)
-				}
-				addr = node.Addr
-			}
-			replica := ReplicaInfo{NodeID: nodeID, Addr: addr, State: ReplicaSyncing}
+		var replicas []ReplicaInfo
+		var pgID uint32
+		var pgEpoch uint64
+		if policy.PlacementGroups {
 			if groupID != "" {
-				replica.ShardIndex = shard
+				return nil, fmt.Errorf("allocate chunk: placement groups do not apply to EC chunks")
 			}
-			replicas = append(replicas, replica)
+			var err error
+			replicas, pgID, pgEpoch, err = s.allocateChunkViaPG(ctx, ecPolicy)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			nodeIDs, err := s.placement.PlaceChunk(ecPolicy, nil)
+			if err != nil {
+				return nil, err
+			}
+			replicas, err = s.buildReplicas(ctx, nodeIDs, groupID)
+			if err != nil {
+				return nil, err
+			}
 		}
-		chunk := &ChunkMeta{ID: id, Size: MaxChunkSize, State: ChunkCreated, Replicas: replicas, Tier: policy.StorageTier, CreateTime: time.Now().UnixNano()}
+		chunk := &ChunkMeta{ID: id, Size: MaxChunkSize, State: ChunkCreated, Replicas: replicas, Tier: policy.StorageTier, CreateTime: time.Now().UnixNano(), PGID: pgID, Epoch: pgEpoch}
 		if groupID != "" {
 			chunk.ECGroup = &ECGroupInfo{GroupID: groupID, DataShards: policy.ECConfig.DataShards, ParityShards: policy.ECConfig.ParityShards}
 		}
 		chunks[i] = chunk
 	}
 	return chunks, nil
+}
+
+// buildReplicas resolves node IDs (from PlacementEngine.PlaceChunk) into
+// ReplicaInfo entries with live addresses.
+func (s *PebbleStore) buildReplicas(ctx context.Context, nodeIDs []NodeID, groupID string) ([]ReplicaInfo, error) {
+	nodeInfos := s.placement.GetNodeInfosBatch(nodeIDs)
+	replicas := make([]ReplicaInfo, 0, len(nodeIDs))
+	for shard, nodeID := range nodeIDs {
+		addr := ""
+		if info := nodeInfos[shard]; info != nil {
+			addr = info.Addr
+		} else {
+			node, err := s.GetNode(ctx, nodeID)
+			if err != nil {
+				return nil, fmt.Errorf("allocate chunk: node %d not found: %w", nodeID, err)
+			}
+			addr = node.Addr
+		}
+		replica := ReplicaInfo{NodeID: nodeID, Addr: addr, State: ReplicaSyncing}
+		if groupID != "" {
+			replica.ShardIndex = shard
+		}
+		replicas = append(replicas, replica)
+	}
+	return replicas, nil
+}
+
+// allocateChunkViaPG resolves a chunk's placement through the placement-group
+// authority (Metadata V2 serving path). It selects the replica node set via
+// the PlacementEngine (reusing scoring + topology spread), derives a stable
+// PG ID from the sorted node set, and reuses / creates that PG as the durable
+// placement authority. Returns the replica set resolved at the PG's current
+// epoch plus the PGID/Epoch recorded on the ChunkMeta.
+func (s *PebbleStore) allocateChunkViaPG(ctx context.Context, policy PlacementPolicy) ([]ReplicaInfo, uint32, uint64, error) {
+	nodeIDs, err := s.placement.PlaceChunk(policy, nil)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	pgID := placementGroupIDForNodes(nodeIDs)
+	pg, err := s.pgStore.SelectOrCreatePG(pgID, nodeIDs)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("allocate chunk via PG: %w", err)
+	}
+	nodes, _, err := s.pgStore.ResolveReplicas(pg.ID, pg.Epoch)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("allocate chunk via PG: resolve: %w", err)
+	}
+	replicas, err := s.buildReplicas(ctx, nodes, "")
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return replicas, pg.ID, pg.Epoch, nil
 }
 
 func (s *PebbleStore) nextChunkID() ChunkID {

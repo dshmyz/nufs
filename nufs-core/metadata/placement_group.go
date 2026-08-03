@@ -134,6 +134,23 @@ func (s *PlacementGroupStore) CreatePG(id uint32, replicas []NodeID) (*Placement
 	return pg, nil
 }
 
+// SelectOrCreatePG returns the placement group with id, creating it with the
+// given initial replica set if it does not yet exist. This is the convergent
+// path the serving layer uses: the caller derives id deterministically from
+// the replica set (e.g. a content hash of the sorted node set), so the same
+// replica set always resolves to the same PG regardless of which node first
+// placed an extent — bounded PG growth, no unbounded per-extent scoring.
+func (s *PlacementGroupStore) SelectOrCreatePG(id uint32, replicas []NodeID) (*PlacementGroup, error) {
+	pg, err := s.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if pg != nil {
+		return pg, nil
+	}
+	return s.CreatePG(id, replicas)
+}
+
 // Rebalance starts a PG migration to a new replica set (§11.3): it
 // bumps the epoch, records the previous epoch for resolution, and marks
 // the PG migrating. Returns the migration record.
@@ -221,6 +238,27 @@ func migrationKey(pgID uint32) string {
 // in the high 16 bits (§11.4).
 func EncodeExtentIDV2(partition uint16, low uint64) ExtentIDV2 {
 	return ExtentIDV2(uint64(partition)<<48 | (low & 0x0000FFFFFFFFFFFF))
+}
+
+// placementGroupIDForNodes derives a stable placement-group ID from a replica
+// node set: the FNV hash of the node IDs sorted ascending. Content-addressed
+// so the same replica set always maps to the same PG regardless of which node
+// first placed an extent — deterministic across leader failover and bounded
+// (distinct replica sets converge to shared PGs rather than one PG per extent).
+func placementGroupIDForNodes(nodeIDs []NodeID) uint32 {
+	sorted := make([]NodeID, len(nodeIDs))
+	copy(sorted, nodeIDs)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	var h uint32 = 2166136261
+	for _, id := range sorted {
+		v := uint64(id)
+		for i := 0; i < 8; i++ {
+			h ^= uint32(v & 0xff)
+			h *= 16777619
+			v >>= 8
+		}
+	}
+	return h
 }
 
 var _ = binary.BigEndian

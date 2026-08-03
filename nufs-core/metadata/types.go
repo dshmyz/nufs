@@ -202,6 +202,14 @@ type ChunkMeta struct {
 	Tier       StorageTier   `json:"tier"`       // Target storage tier for this chunk
 	CreateTime int64         `json:"create_time"`
 	Checksum   uint32        `json:"checksum"` // CRC32C of chunk data
+
+	// PGID/Epoch record the placement group this chunk is placed under
+	// (Metadata V2 serving path, Task #56 Phase A). When set, Replicas are
+	// resolved from the PG's replica set at the recorded epoch; the fields
+	// are zero for chunks placed through the legacy per-chunk
+	// PlacementEngine path (V1, no placement groups).
+	PGID  uint32 `json:"pg_id,omitempty"`
+	Epoch uint64 `json:"epoch,omitempty"`
 }
 
 // ChunkState represents the lifecycle state of a chunk.
@@ -335,6 +343,12 @@ type PlacementPolicy struct {
 	WriteQuorum int `json:"write_quorum,omitempty"`
 	// CrossZoneReplication enables async replication to a remote zone.
 	CrossZoneReplication *CrossZoneConfig `json:"cross_zone_replication,omitempty"`
+	// PlacementGroups opts this bucket's chunks into the Metadata V2
+	// placement-group serving path (Task #56 Phase A): replicas are
+	// resolved from a durable PlacementGroup (PGID/Epoch recorded on each
+	// ChunkMeta) instead of a fresh per-chunk PlacementEngine decision.
+	// Default false = legacy per-chunk placement (V1), zero behavior change.
+	PlacementGroups bool `json:"placement_groups,omitempty"`
 }
 
 // CrossZoneConfig defines cross-zone (cross-DC) replication settings.
