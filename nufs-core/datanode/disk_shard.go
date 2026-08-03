@@ -171,8 +171,11 @@ func (d *diskShard) closeFdCache() {
 	d.fdList = newFdLRU(d.fdMax)
 }
 
-// writeMetaSidecar writes a JSON metadata sidecar file for the chunk.
-func (d *diskShard) writeMetaSidecar(chunkID metadata.ChunkID, info *LocalChunkInfo) {
+// writeMetaSidecar writes a JSON metadata sidecar file for the chunk. It
+// takes the info by value: callers must pass a snapshot captured under the
+// ChunkStore lock, so the marshal here never races a concurrent Seal/Write
+// mutating the shared *LocalChunkInfo in cs.chunks.
+func (d *diskShard) writeMetaSidecar(chunkID metadata.ChunkID, info LocalChunkInfo) {
 	data, err := json.Marshal(info)
 	if err != nil {
 		return

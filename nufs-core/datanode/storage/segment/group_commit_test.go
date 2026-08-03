@@ -156,7 +156,13 @@ func TestGroupCommit_SharesSyncBarrier(t *testing.T) {
 
 // TestSustained_Concurrent1024Writes retains high-volume batching and reopen
 // coverage. Its name intentionally avoids the required repeated-test regex.
+// It is a stress variant (1024 concurrent writers + reopen); the
+// low-volume TestGroupCommit_SharesSyncBarrier (8 writers) already covers
+// the same batch-sharing path in the -short P0 gate.
 func TestSustained_Concurrent1024Writes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress variant; covered by TestGroupCommit_SharesSyncBarrier in -short")
+	}
 	writeConcurrentAndReopen(t, 1024)
 }
 

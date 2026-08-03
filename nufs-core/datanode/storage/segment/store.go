@@ -1205,12 +1205,17 @@ func (s *Store) closeInternal() error {
 	close(s.stopCh)
 	s.flushWG.Wait()
 	s.applyWG.Wait()
-	// Flush the committed-delta overlay into Pebble synchronously.
+	// Flush the committed-delta overlay into Pebble synchronously. After
+	// flushWG.Wait the flush loop is dead, so no concurrent flushes exist,
+	// but Drain stages entries rather than discarding them. Since Close is
+	// shutting down, discard immediately after the apply succeeds to avoid
+	// leaking the draining set.
 	muts := s.overlay.Drain()
 	if len(muts) > 0 {
 		if err := s.applyNow(muts); err != nil {
 			return err
 		}
+		s.overlay.DiscardDrained()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

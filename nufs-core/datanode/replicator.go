@@ -36,6 +36,13 @@ type Replicator struct {
 	cancel    context.CancelFunc
 	tlsCfg    tlsutil.Config // TLS config for inter-node connections
 
+	// taskMu serializes channel sends (Submit) against the channel close in
+	// Stop. A worker's retry AfterFunc can fire concurrently with Stop, and
+	// close(taskCh) racing a chansend is a data race even when the send's
+	// panic is recovered; the mutex makes the close/send pair atomic so
+	// `-race` never observes them overlapping.
+	taskMu sync.Mutex
+
 	// Connection pool — avoids re-dialing for every replication task.
 	// Each addr has a stack of idle *Client connections; workers pop
 	// one off, use it, and push it back. If the stack is empty, a new
@@ -153,7 +160,11 @@ func (r *Replicator) Start() {
 // Stop gracefully shuts down the replicator.
 func (r *Replicator) Stop() {
 	r.cancel()
+	// Close under taskMu so a concurrent send from a retry AfterFunc cannot
+	// race the close. Workers drain taskCh until it is closed, then exit.
+	r.taskMu.Lock()
 	close(r.taskCh)
+	r.taskMu.Unlock()
 	r.wg.Wait()
 	r.pool.closeAll()
 	slog.Info("datanode: replicator stopped")
@@ -171,6 +182,12 @@ func (r *Replicator) Submit(task ReplicationTask) error {
 			// Channel closed, ignore
 		}
 	}()
+	// Send under taskMu so we never race Stop's close. Blocking on a full
+	// buffer with no reader would deadlock a worker's retry path, so keep
+	// the send non-blocking exactly as before (a requeue that finds the
+	// buffer full is dropped and logged by the caller).
+	r.taskMu.Lock()
+	defer r.taskMu.Unlock()
 	select {
 	case r.taskCh <- task:
 		return nil

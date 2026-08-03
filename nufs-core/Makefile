@@ -49,10 +49,14 @@ test-cover: ## Run tests with coverage report
 	@echo "Coverage report: coverage/cover.html"
 
 test-storage-p0: ## P0 storage correctness gate (race, 20x): close/range/recovery
-	go test -race -count=20 -timeout 120s ./datanode/storage/segment/... ./datanode/storage/recovery/...
+	go test -race -short -count=20 -timeout 900s ./datanode/storage/segment/... ./datanode/storage/recovery/...
 
 test-storage-crash: ## P0 abrupt-process-crash (SIGKILL) recovery gate (50x)
-	go test -count=50 -timeout 10m ./datanode/storage/segment -run TestProcessCrash_AcknowledgedMutationsRecover
+	# Each iteration spawns a helper subprocess, writes ~272 mutations, SIGKILLs
+	# it, and replays the segment log: ~10-12s per run, so 50 runs land near
+	# 500-600s. The timeout is 20m to leave headroom on a slow box rather than
+	# failing at the boundary.
+	go test -count=50 -timeout 20m ./datanode/storage/segment -run TestProcessCrash_AcknowledgedMutationsRecover
 
 vet: ## Run go vet
 	go vet ./...

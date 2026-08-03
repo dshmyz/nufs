@@ -80,9 +80,7 @@ func (s *Store) flush() error {
 		// Restore the overlay as well so the next flush retries the same
 		// checkpoint instead of dropping its pending count or publishing a
 		// later sidecar without these mutations.
-		for _, m := range muts {
-			s.overlay.Put(indexKeyFor(m), m.Value)
-		}
+		s.overlay.RestoreDrained()
 	}
 	if s.flushCheckpointHook != nil {
 		s.flushCheckpointHook()
@@ -116,6 +114,10 @@ func (s *Store) flush() error {
 		reinsert()
 		return err
 	}
+	// The checkpoint is durable; discard the staged entries so the overlay
+	// stays bounded. Keys committed after Drain are already in entries and
+	// are unaffected by this discard.
+	s.overlay.DiscardDrained()
 	s.safeSeq.Store(safe)
 	s.flushMutations.Add(-pending)
 	slog.Debug("storage: index flushed", "safe_seq", safe, "mutations", len(muts))
@@ -160,12 +162,6 @@ func (s *Store) writeIndexSafeLocked(safeSeq uint64) (index.RecoveryCheckpoint, 
 // cfgFlushMaxMutations returns the flush mutation guardrail.
 func (s *Store) cfgFlushMaxMutations() int64 {
 	return flushMaxMutationsDefault
-}
-
-// indexKeyFor builds the extent index key for a mutation (for overlay
-// re-insertion on a failed flush).
-func indexKeyFor(m index.Mutation) []byte {
-	return index.Key(m.ExtentID, m.Generation)
 }
 
 // cfgFlushInterval returns the flush interval.

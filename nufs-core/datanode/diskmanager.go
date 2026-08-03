@@ -985,7 +985,7 @@ func (tm *TierMigrator) executeMigration() {
 		if changed {
 			migrated++
 			if idx := chunk.DiskIndex; idx >= 0 && idx < len(tm.store.disks) {
-				tm.store.disks[idx].writeMetaSidecar(chunk.ChunkID, chunk)
+				tm.store.disks[idx].writeMetaSidecar(chunk.ChunkID, *chunk)
 			}
 		}
 	}

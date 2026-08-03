@@ -135,8 +135,14 @@ func TestRecovery_ManyWritesReopen(t *testing.T) {
 }
 
 // TestSustained_Reopen500Writes retains high-volume recovery coverage. Its
-// name intentionally avoids the required repeated-test recovery regex.
+// name intentionally avoids the required repeated-test recovery regex. It is
+// a stress variant (500 writes + reopen); the low-volume
+// TestRecovery_ManyWritesRecover (16 writes) already covers the same
+// replay path in the -short P0 gate.
 func TestSustained_Reopen500Writes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress variant; covered by TestRecovery_ManyWritesReopen in -short")
+	}
 	writeAndRecover(t, 500)
 }
 

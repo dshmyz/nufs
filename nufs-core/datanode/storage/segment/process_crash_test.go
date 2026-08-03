@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/example/dfs/datanode/storage"
+	"github.com/example/dfs/datanode/storage/index"
 )
 
 // TestProcessCrash_AcknowledgedMutationsRecover is the Task 7 gate:
@@ -214,8 +215,10 @@ func TestProcessCrash_AcknowledgedMutationsRecover(t *testing.T) {
 				// into the overlay (empty post-flush is expected) and what
 				// the recovery result recorded.
 				rr := s.RecoveryResult()
-				t.Errorf("delete extent %d gen 1 not tombstoned: state=%d (recovery: commits=%d applied=%d lastSeq=%d safeSeq=%d trailing=%d)",
-					eid, st.State, rr.Commits, rr.Applied, rr.LastSeq, rr.SafeSeq, rr.TrailingBytes)
+				ovHit, ovFound := s.Overlay().Get(index.Key(eid, 1))
+				t.Errorf("delete extent %d gen 1 not tombstoned: state=%d seg=%d off=%d storedLen=%d (recovery: commits=%d applied=%d lastSeq=%d safeSeq=%d trailing=%d; overlayHit=%v ovFound=%v)",
+					eid, st.State, st.SegmentID, st.Offset, st.StoredLen,
+					rr.Commits, rr.Applied, rr.LastSeq, rr.SafeSeq, rr.TrailingBytes, ovHit, ovFound)
 			}
 
 		default:

@@ -335,13 +335,16 @@ func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) (writeErr err
 	}
 	cs.chunks[chunkID] = info
 	cs.stateVersion++
+	// Snapshot under the lock: a concurrent Seal on replication may mutate
+	// info (the same struct now in cs.chunks) before we marshal it below.
+	meta := *info
 	cs.mu.Unlock()
 
 	cs.totalBytes.Add(int64(len(data)))
 	disk.usedBytes.Add(int64(len(data)))
 
 	// Write metadata sidecar
-	disk.writeMetaSidecar(chunkID, info)
+	disk.writeMetaSidecar(chunkID, meta)
 
 	// Phase 2: Commit in WAL - write is durable, safe to ack
 	if disk.wal != nil {
@@ -545,7 +548,7 @@ func (cs *ChunkStore) WriteBatch(reqs []WriteChunkReq) (batchErr error) {
 			LastAccess: time.Now(),
 			DiskIndex:  disk.index,
 		}
-		disk.writeMetaSidecar(of.req.ChunkID, info)
+		disk.writeMetaSidecar(of.req.ChunkID, *info)
 	}
 
 	// Phase 4: Commit all in WAL
@@ -789,6 +792,10 @@ func (cs *ChunkStore) Seal(chunkID metadata.ChunkID) (uint32, error) {
 	}
 	info.State = LocalSealed
 	info.Checksum = checksum
+	// Snapshot the sealed metadata under the lock. The sidecar marshal
+	// (writeMetaSidecar) must not read the shared struct after we release
+	// cs.mu, because a concurrent Write on replication could mutate it.
+	meta := *info
 	cs.stateVersion++
 	cs.mu.Unlock()
 
@@ -805,7 +812,7 @@ func (cs *ChunkStore) Seal(chunkID metadata.ChunkID) (uint32, error) {
 		wf.Close()
 	}
 
-	disk.writeMetaSidecar(chunkID, info)
+	disk.writeMetaSidecar(chunkID, meta)
 
 	return checksum, nil
 }
