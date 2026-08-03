@@ -123,6 +123,61 @@ func (ix *Index) LatestGeneration(extentID storage.ExtentID) (storage.Generation
 	return GenerationFromKey(iter.Key()), true
 }
 
+// Iterate invokes fn once per extent, yielding the generation and value
+// of its latest generation. Keys sort by (extent_id, generation), so a
+// forward scan visits every generation of an extent consecutively and
+// the last one seen is the latest. The caller filters on Value.State
+// (e.g. skipping ExtentTombstoned) as appropriate. fn's Value must not
+// be retained beyond the call.
+func (ix *Index) Iterate(fn func(extentID storage.ExtentID, generation storage.Generation, v Value) error) error {
+	iter, err := ix.db.NewIter(nil)
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	var (
+		curID  storage.ExtentID
+		curSet bool
+		curGen storage.Generation
+		curVal Value
+	)
+	finish := func() error {
+		if !curSet {
+			return nil
+		}
+		curSet = false
+		return fn(curID, curGen, curVal)
+	}
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := iter.Key()
+		if len(k) < KeyLen {
+			continue
+		}
+		id := ExtentFromKey(k)
+		if !curSet || id != curID {
+			if err := finish(); err != nil {
+				return err
+			}
+			curID = id
+			curSet = true
+			curGen = GenerationFromKey(k)
+		}
+		var v Value
+		if err := v.Decode(iter.Value()); err != nil {
+			return fmt.Errorf("%w: %v", storage.ErrIndexCorrupt, err)
+		}
+		// Keep overwriting so the last generation seen becomes the latest.
+		curVal = v
+		curGen = GenerationFromKey(k)
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	return finish()
+}
+
 // NewBatch creates a write batch.
 func (ix *Index) NewBatch() *pebble.Batch { return ix.db.NewBatch() }
 

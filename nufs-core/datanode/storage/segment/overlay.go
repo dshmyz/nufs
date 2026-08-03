@@ -114,3 +114,24 @@ func (o *Overlay) Len() int {
 	defer o.mu.RUnlock()
 	return len(o.entries)
 }
+
+// Snapshot returns a copy of the committed-delta view (entries plus any
+// staged-for-flush draining set), keyed by the raw 16-byte index key. It
+// matches Get's semantics: draining entries are still read authority
+// until the flush confirms them in Pebble, so enumeration over the
+// snapshot sees the same set a read would. The map is a copy; callers may
+// Mutate it freely.
+func (o *Overlay) Snapshot() map[string]index.Value {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	out := make(map[string]index.Value, len(o.entries)+len(o.draining))
+	for k, v := range o.entries {
+		out[k] = v
+	}
+	for k, v := range o.draining {
+		if _, ok := out[k]; !ok {
+			out[k] = v
+		}
+	}
+	return out
+}

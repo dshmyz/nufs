@@ -97,6 +97,33 @@ services:
       - nufs-data:/var/lib/dfs
     restart: unless-stopped
 
+  # V2.1 data node in JBOD multi-disk mode (--data-dirs=/d0,/d1). Proves
+  # the multi-disk parity gate: the V2 adapter aggregates every disk with
+  # least-used placement, so data lands on BOTH disks, not just the first.
+  # Excluded by default via the "multidisk" profile so the standard
+  # single-disk V2.1 integration run is unaffected.
+  datanode-v21-multi:
+    image: nufs:latest
+    entrypoint: /usr/local/bin/datanode
+    profiles: ["multidisk"]
+    command:
+      - --node-id=auto
+      - --listen=0.0.0.0:9103
+      - --register-addr=datanode-v21-multi:9103
+      - --data-dirs=/var/lib/dfs/d0,/var/lib/dfs/d1
+      - --metadata=metad:8091
+      - --rack=rack1
+      - --zone=zone1
+      - --capacity=500
+      - --storage-version=v2.1
+      - --log-level=info
+      - --log-json=true
+    depends_on:
+      - metad
+    volumes:
+      - nufs-data:/var/lib/dfs
+    restart: unless-stopped
+
   s3:
     image: nufs:latest
     entrypoint: /usr/local/bin/nufs-s3
@@ -115,7 +142,6 @@ services:
       - "8081:8080"
     depends_on:
       - metad
-      - datanode-v21
     volumes:
       - nufs-data:/var/lib/dfs
       - ${NUFS_CREDENTIALS_FILE:-./credentials/s3.yaml}:/etc/nufs/credentials.yaml:ro

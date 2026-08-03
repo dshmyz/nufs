@@ -1148,6 +1148,73 @@ func (s *Store) Index() *index.Index { return s.index }
 // Overlay exposes the committed-delta overlay.
 func (s *Store) Overlay() *Overlay { return s.overlay }
 
+// LiveExtent is one enumerated extent in the read-authority view,
+// carrying its latest generation so callers can route generation-fenced
+// operations.
+type LiveExtent struct {
+	ExtentID   storage.ExtentID
+	Generation storage.Generation
+	Value      index.Value
+}
+
+// ListExtents enumerates the extents of this store in the
+// read-authority view: the committed-delta overlay takes priority over
+// the flushed Pebble index (matching lookup). For each extent it yields
+// the single live generation with the highest generation number — the
+// same coalescing rule as Index.Iterate and the read path — so a
+// tombstone at any generation hides every live generation of that extent
+// (an acknowledged delete is immediately and durably invisible), and an
+// overwrite resolves to its newest payload. Tombstoned extents are
+// excluded; corrupt ones are kept so callers can surface them as
+// failed/repairable rather than silently dropping them. It takes the
+// store read gate so shutdown cannot race the enumeration against a
+// closing index.
+func (s *Store) ListExtents() ([]LiveExtent, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+	defer s.leave()
+
+	// Coalesce both sources (overlay + flushed Pebble) per extent to the
+	// highest generation. The overlay may hold several generations of one
+	// extent at once (only the newest key is overwritten by an overwrite or
+	// delete), so map-iteration order must not decide visibility — the max
+	// generation does.
+	merged := make(map[storage.ExtentID]LiveExtent)
+	update := func(e LiveExtent) {
+		cur, ok := merged[e.ExtentID]
+		if !ok || e.Generation > cur.Generation {
+			merged[e.ExtentID] = e
+		}
+	}
+	for k, v := range s.overlay.Snapshot() {
+		if len(k) < index.KeyLen {
+			continue
+		}
+		kb := []byte(k)
+		update(LiveExtent{
+			ExtentID:   index.ExtentFromKey(kb),
+			Generation: index.GenerationFromKey(kb),
+			Value:      v,
+		})
+	}
+	if err := s.index.Iterate(func(id storage.ExtentID, gen storage.Generation, v index.Value) error {
+		update(LiveExtent{ExtentID: id, Generation: gen, Value: v})
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	out := make([]LiveExtent, 0, len(merged))
+	for _, e := range merged {
+		if e.Value.State == storage.ExtentTombstoned {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
 // Close flushes pending index applies and closes the store. It is a
 // durability barrier: any committed overlay entries not yet applied to
 // Pebble are flushed synchronously before the DB closes, so no

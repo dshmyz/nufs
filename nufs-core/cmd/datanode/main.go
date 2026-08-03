@@ -526,8 +526,11 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	}
 	log.Info("registered with metadata service", "url", metaURL, "node_id", cfg.NodeID)
 
-	// Wrap the first store in a V2 adapter and start the TCP server.
-	v2Store := datanode.NewV2Store(stores[0])
+	// Wrap all stores in a V2 adapter and start the TCP server. The
+	// adapter aggregates every disk (least-used placement, per-disk stats
+	// and heartbeat data), so a multi-disk --data-dirs node actually
+	// serves from all of them rather than only the first.
+	v2Store := datanode.NewMultiV2Store(stores)
 	srvCfg := cfg
 	srvCfg.ListenAddr = cfg.ListenAddr
 	srv := datanode.NewServer(srvCfg, v2Store)

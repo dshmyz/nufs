@@ -137,6 +137,77 @@ func TestDeleteGenerationFenced(t *testing.T) {
 	}
 }
 
+// TestListExtentsCoalescesToLatestGeneration pins the read-authority
+// enumeration rule: for every extent ListExtents must surface the single
+// highest generation, so (a) a tombstone at any generation hides every
+// live generation (an acknowledged delete is immediately invisible) and
+// (b) an overwrite resolves to its newest payload. This is a regression
+// test for a bug where ListExtents iterated the overlay's per-key map in
+// arbitrary order and could surface a stale lower generation, resurrecting
+// an extent its own delete had just removed.
+func TestListExtentsCoalescesToLatestGeneration(t *testing.T) {
+	s := newTestStore(t, nil)
+	ctx := context.Background()
+
+	// Two extents hidden beneath a newer tombstone: one (41) where both the
+	// live gen-1 and tombstone gen-2 still sit in the overlay (single write +
+	// single delete, with the flush lagging), and one (42) where an
+	// intermediate generation was also written so the overlay holds several
+	// generations of the same extent at once.
+	for id, gens := range map[storage.ExtentID][]storage.Generation{
+		41: {1, 2},
+		42: {1, 2, 3},
+	} {
+		for _, gen := range gens {
+			if _, err := s.Write(ctx, &storage.WriteRequest{
+				ExtentID: id, Generation: gen,
+				Data: []byte{byte(id), byte(gen)},
+			}); err != nil {
+				t.Fatalf("write extent %d gen %d: %v", id, gen, err)
+			}
+		}
+	}
+	// Delete the latest generation of each, leaving the lower live ones.
+	for id, latest := range map[storage.ExtentID]storage.Generation{41: 2, 42: 3} {
+		if err := s.Delete(ctx, &storage.DeleteRequest{ExtentID: id, Generation: latest}); err != nil {
+			t.Fatalf("delete extent %d gen %d: %v", id, latest, err)
+		}
+	}
+
+	// A live extent with a genuinely newer live generation must resolve to
+	// that newest payload in the enumeration (overwrite coalescing).
+	if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: 43, Generation: 1, Data: []byte("a")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write(ctx, &storage.WriteRequest{ExtentID: 43, Generation: 2, Data: []byte("bb")}); err != nil {
+		t.Fatal(err)
+	}
+
+	exts, err := s.ListExtents()
+	if err != nil {
+		t.Fatalf("ListExtents: %v", err)
+	}
+	byID := make(map[storage.ExtentID]LiveExtent, len(exts))
+	for _, e := range exts {
+		byID[e.ExtentID] = e
+	}
+	// 41 and 42 were deleted at their newest generation: entirely gone.
+	if _, ok := byID[41]; ok {
+		t.Fatalf("extent 41 (deleted at gen 2) still enumerated: %+v", byID[41])
+	}
+	if _, ok := byID[42]; ok {
+		t.Fatalf("extent 42 (deleted at gen 3) still enumerated: %+v", byID[42])
+	}
+	// 43 must surface its newest generation 2 with that payload's size.
+	e, ok := byID[43]
+	if !ok {
+		t.Fatalf("live extent 43 not enumerated")
+	}
+	if e.Generation != 2 || e.Value.LogicalLen != 2 {
+		t.Fatalf("extent 43 = gen %d logical %d, want gen 2 logical 2", e.Generation, e.Value.LogicalLen)
+	}
+}
+
 func TestDelete_EvictsLiveLocationCacheAndSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
