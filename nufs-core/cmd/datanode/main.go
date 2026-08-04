@@ -652,24 +652,17 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	defer stopMgmt()
 	opsServer := datanode.NewOpsServerWithRepair(cfg, v2Store, metaStore, nil, nil, nil, repairWorker)
 
-	// Program A / S1: EC conversion authority + serving-path driver. The V2.1
-	// dev/single-node serving path drives the EC conversion transaction
-	// against an in-process Pebble-backed ECStore (the §14 placement and
-	// lifecycle state machine live there), so the ops control plane can
-	// convert replicated chunks to 6+3 without a round-trip to a remote
-	// authority. A production topology injects an HTTP authority over the
-	// same ECAuthority seam (S2) instead; this local store is the single-node
-	// stand-in and is documented as such (ec_service.go).
-	ecPB, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
-		Dir: filepath.Join(dataDirs[0], "ec-authority"), UseInMemory: false, UseBucketStats: false,
-	})
-	if err != nil {
-		log.Error("failed to init local EC authority", "error", err)
-		closeStores()
-		os.Exit(1)
-	}
-	defer ecPB.Close()
-	ecService := datanode.NewECService(v2Store, metadata.NewECStore(ecPB))
+	// Program A / S2: EC conversion authority + serving-path driver. The V2.1
+	// serving path drives the replication→6+3 conversion transaction against
+	// the *remote* metadata authority over HTTP (the production topology): the
+	// metad service owns the §14 placement decision and the transaction state
+	// machine (Preparing → Encoding → Syncing → Complete | RolledBack), and
+	// this node supplies the shard payloads. metaStore is the *metadata.HTTPClient
+	// already used for heartbeats/repair; its HTTPClient implements the
+	// metadata.ECAuthority seam (see metadata/client.go), so NewECService just
+	// takes it as the authority. This is the S2 replacement for the S1
+	// in-process local Pebble ECStore stand-in.
+	ecService := datanode.NewECService(v2Store, metaStore)
 	opsServer.SetECService(ecService)
 
 	if err := opsServer.Start(); err != nil {

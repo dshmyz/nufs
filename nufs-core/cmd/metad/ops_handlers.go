@@ -109,6 +109,15 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/chunks/migrate-replica", mut(s.handleMigrateReplica))
 	mux.HandleFunc("/api/v1/chunks/report-state", mut(s.handleReportChunkState))
 
+	// EC conversion lifecycle (S2): the metadata service is the remote
+	// authority for replication→6+3 conversions driven by a datanode over
+	// the ops HTTP surface. Each step mirrors metadata.ECAuthority.
+	mux.HandleFunc("/api/v1/ec/convert/begin", mut(s.handleECConvertBegin))
+	mux.HandleFunc("/api/v1/ec/convert/plan", mut(s.handleECConvertPlan))
+	mux.HandleFunc("/api/v1/ec/convert/mark-syncing", mut(s.handleECConvertMarkSyncing))
+	mux.HandleFunc("/api/v1/ec/convert/complete", mut(s.handleECConvertComplete))
+	mux.HandleFunc("/api/v1/ec/convert/rollback", mut(s.handleECConvertRollback))
+
 	// Watch — long-poll SSE stream of metadata change events
 	// (doesn't need leader check; followers already consume from their local EventBus)
 	mux.HandleFunc("/api/v1/watch", s.handleWatch)

@@ -1282,3 +1282,87 @@ func (c *HTTPClient) WatchEventsStream(ctx context.Context, prefix string) <-cha
 	}()
 	return ch
 }
+// --- EC conversion lifecycle authority (Program A / S2) ---
+//
+// These methods implement the metadata.ECAuthority seam (datanode/ec_service.go)
+// over HTTP to the metad service. On the V2.1 serving path the datanode drives
+// a replication→6+3 conversion through the remote authority (production
+// topology) instead of an in-process local ECStore (S1). Go interfaces are
+// structural, so *HTTPClient satisfies datanode.ECAuthority exactly as long as
+// these signatures match. Each mutation loads the authoritative stripe on the
+// server and returns the full updated stripe; the caller copies it back into
+// its local *ECStripe so the transaction view stays authoritative.
+
+// BeginConversion starts an EC conversion transaction on the remote authority.
+func (c *HTTPClient) BeginConversion(stripeID string, extentID uint64, gen uint64, checksum uint32) (*ECStripe, error) {
+	req := map[string]interface{}{"stripe_id": stripeID, "extent_id": extentID, "generation": gen, "checksum": checksum}
+	resp, err := c.doRequestWithRetry(context.Background(), http.MethodPost, "/api/v1/ec/convert/begin", req)
+	if err != nil {
+		return nil, err
+	}
+	var st ECStripe
+	if err := c.readResponse(resp, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// PlanShards fills the stripe's §14-diverse placement on the remote authority.
+func (c *HTTPClient) PlanShards(st *ECStripe, disks []ECDisk) error {
+	req := map[string]interface{}{"stripe_id": st.StripeID, "disks": disks}
+	resp, err := c.doRequestWithRetry(context.Background(), http.MethodPost, "/api/v1/ec/convert/plan", req)
+	if err != nil {
+		return err
+	}
+	var updated ECStripe
+	if err := c.readResponse(resp, &updated); err != nil {
+		return err
+	}
+	*st = updated
+	return nil
+}
+
+// MarkSyncing advances the transaction to Syncing on the remote authority.
+func (c *HTTPClient) MarkSyncing(st *ECStripe) error {
+	req := map[string]interface{}{"stripe_id": st.StripeID}
+	resp, err := c.doRequestWithRetry(context.Background(), http.MethodPost, "/api/v1/ec/convert/mark-syncing", req)
+	if err != nil {
+		return err
+	}
+	var updated ECStripe
+	if err := c.readResponse(resp, &updated); err != nil {
+		return err
+	}
+	*st = updated
+	return nil
+}
+
+// CompleteConversion finalizes the stripe as durable on the remote authority.
+func (c *HTTPClient) CompleteConversion(st *ECStripe, at time.Time) error {
+	req := map[string]interface{}{"stripe_id": st.StripeID, "at": at.UnixNano()}
+	resp, err := c.doRequestWithRetry(context.Background(), http.MethodPost, "/api/v1/ec/convert/complete", req)
+	if err != nil {
+		return err
+	}
+	var updated ECStripe
+	if err := c.readResponse(resp, &updated); err != nil {
+		return err
+	}
+	*st = updated
+	return nil
+}
+
+// RollbackConversion aborts a non-durable transaction on the remote authority.
+func (c *HTTPClient) RollbackConversion(st *ECStripe, reason string) error {
+	req := map[string]interface{}{"stripe_id": st.StripeID, "reason": reason}
+	resp, err := c.doRequestWithRetry(context.Background(), http.MethodPost, "/api/v1/ec/convert/rollback", req)
+	if err != nil {
+		return err
+	}
+	var updated ECStripe
+	if err := c.readResponse(resp, &updated); err != nil {
+		return err
+	}
+	*st = updated
+	return nil
+}
