@@ -501,11 +501,22 @@ func (s *Store) RecoveryResult() RecoverResult { return s.recoveryResult }
 
 var recoveryStat = os.Stat
 
+// streamClassDir maps a commit stream ID to its on-disk segment class
+// directory. Each stream gets its own <dir>/segments/<class>/active/
+// namespace, so the indices and segment logs of different streams are
+// physically disjoint. Stream 0 is the small-file stream, stream 1 the
+// data stream, and stream 2 the EC-shard stream (each EC shard is a
+// dedicated extent in its own class directory, so shard extents can never
+// collide with data-stream extents regardless of the chunk-ID layout).
 func streamClassDir(streamID uint8) string {
-	if streamID == 0 {
+	switch streamID {
+	case 0:
 		return "small"
+	case 2:
+		return "ecshard"
+	default:
+		return "data"
 	}
-	return "data"
 }
 
 func classForStream(streamID uint8) storage.SegmentClass {

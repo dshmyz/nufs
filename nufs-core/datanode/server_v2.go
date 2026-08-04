@@ -76,10 +76,21 @@ type chunkLoc struct {
 // so overwrites stay co-located and capacity spreads across disks.
 type V2Store struct {
 	disks []*diskBackend
-	// mu guards locOf. Reconstruction at startup and serving updates both
-	// mutate it; reads take RLock.
+	// shards holds the EC-shard stores, one per disk (StreamID 2, class dir
+	// "ecshard"), physically disjoint from the data-stream stores in disks.
+	// A shard store is a plain segment store too, so each shard is a durable,
+	// checksummed extent that survives a restart exactly like a data extent —
+	// it is just not accounted in disks/Stats/DiskStats nor reported as a
+	// replica, because a shard is a fragment, not a whole-chunk replica.
+	shards []*diskBackend
+
+	// mu guards locOf and shardDiskOf. Reconstruction at startup and serving
+	// updates both mutate them; reads take RLock.
 	mu    sync.RWMutex
 	locOf map[metadata.ChunkID]chunkLoc
+	// shardDiskOf records which disk hosts the shard stripe of a chunk, so
+	// ReadShard/DeleteShard route to the shard store that wrote it.
+	shardDiskOf map[metadata.ChunkID]int
 
 	// stateVersion increments on every durable state change (write or
 	// delete), so the heartbeat's incremental delta diff can detect change.
@@ -89,7 +100,7 @@ type V2Store struct {
 // NewV2Store wraps a single backend (legacy/plain single-disk use). An
 // optional dir is the disk root reported to DiskInfos when non-empty.
 func NewV2Store(store storage.Store, dir ...string) *V2Store {
-	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc)}
+	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc), shardDiskOf: make(map[metadata.ChunkID]int)}
 	for _, s := range []storage.Store{store} {
 		d := ""
 		if len(dir) > 0 {
@@ -111,7 +122,7 @@ func NewV2Store(store storage.Store, dir ...string) *V2Store {
 // enumerating each store's committed extents, the equivalent of the legacy
 // ChunkStore's startup disk scan.
 func NewMultiV2Store(stores []storage.Store, dirs ...string) *V2Store {
-	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc)}
+	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc), shardDiskOf: make(map[metadata.ChunkID]int)}
 	for i, s := range stores {
 		d := ""
 		if i < len(dirs) {
@@ -209,6 +220,145 @@ func (v *V2Store) writeTo(chunkID metadata.ChunkID, disk int, gen storage.Genera
 	v.stateVersion.Add(1)
 	return nil
 }
+
+// ============ EC shard I/O (V2.1 EC 6+3 service path, Phase E1) ============
+//
+// Each EC shard is stored as an independent, opaque extent in a dedicated
+// shard commit stream (segment StreamID 2, on-disk class dir "ecshard") that
+// is physically disjoint from the data stream (StreamID 1) — see
+// segment.streamClassDir. Disjointness therefore comes from namespace
+// separation, not from any property of the chunk-ID bits (a data-stream chunk
+// ID can be any 64-bit value, so no bit layout could ever guarantee it never
+// collides — hence the separate stream is the only sound isolation).
+//
+// Within a shard store the extent ID is the chunk's raw ID and the GENERATION
+// carries the shard index (gen = shardIndex+1). A whole-chunk data extent that
+// happens to share the same numeric ID lives in a different store, so the
+// collision is impossible; and every extent in a shard store is by definition
+// a shard, so reconstruction needs no marker bit. This works for any 64-bit
+// chunk ID and any shard count.
+//
+// A shard is otherwise a first-class extent: durable, CRC32C-checksummed, and
+// recoverable on restart like a data extent. Shard stores are NOT part of
+// disks/Stats/DiskStats and their extents are never reported as whole-chunk
+// replicas — a shard is a fragment. All shards of one chunk land on a single
+// shard disk (its "stripe home"), which WriteShard picks as the least-used
+// shard disk on first write and records in shardDiskOf.
+
+// shardGen maps a shard index to its generation within the shard store (gen 0
+// is reserved as the "no extent" sentinel, so shard 0 maps to gen 1).
+func shardGen(shardIndex int) storage.Generation {
+	return storage.Generation(shardIndex + 1)
+}
+
+// AttachShardStores wires EC-shard stores onto the V2Store, one per disk (in
+// the same order as the data stores passed to NewMultiV2Store/NewV2Store).
+// It reconstructs shardDiskOf by enumerating each shard store's committed
+// extents — the shard-stream analogue of the data-stream startup scan — so a
+// shard stripe survives a restart with reads routing to the shard store that
+// holds it. Returns an error if the count does not match the data disks.
+func (v *V2Store) AttachShardStores(shardStores []storage.Store) error {
+	if len(shardStores) != len(v.disks) {
+		return fmt.Errorf("attach shard stores: got %d stores for %d disks", len(shardStores), len(v.disks))
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for i, s := range shardStores {
+		b := &diskBackend{store: s, index: i}
+		if lister, ok := s.(extentLister); ok {
+			b.lister = lister
+			if extents, err := lister.ListExtents(); err == nil {
+				// Every extent in a shard store is a shard: it pins the chunk's
+				// stripe home disk. No marker bit is needed.
+				for _, e := range extents {
+					v.shardDiskOf[metadata.ChunkID(e.ExtentID)] = i
+					b.usedByts.Add(int64(e.Value.LogicalLen))
+					b.extCount.Add(1)
+				}
+			}
+		}
+		v.shards = append(v.shards, b)
+	}
+	return nil
+}
+
+// WriteShard durably writes one EC shard as an independent extent on the
+// chunk's shard stripe disk (least-used shard disk on first write) under the
+// generation that encodes the shard index. Per-shard checksum integrity is
+// maintained by the underlying CRC32C extent framing.
+func (v *V2Store) WriteShard(chunkID metadata.ChunkID, shardIndex int, data []byte) error {
+	v.mu.RLock()
+	disk, ok := v.shardDiskOf[chunkID]
+	v.mu.RUnlock()
+	if !ok {
+		disk = v.leastUsedShardDisk()
+	}
+	if disk < 0 || disk >= len(v.shards) {
+		return fmt.Errorf("write shard: no shard store attached (disk %d, have %d)", disk, len(v.shards))
+	}
+	b := v.shards[disk]
+	if _, err := b.store.Write(context.Background(), &storage.WriteRequest{
+		ExtentID:   storage.ExtentID(chunkID),
+		Generation: shardGen(shardIndex),
+		Data:       data,
+	}); err != nil {
+		return err
+	}
+	b.usedByts.Add(int64(len(data)))
+	b.extCount.Add(1)
+	if !ok {
+		v.mu.Lock()
+		v.shardDiskOf[chunkID] = disk
+		v.mu.Unlock()
+	}
+	return nil
+}
+
+// ReadShard reads one EC shard extent back from its stripe disk, byte-exact.
+func (v *V2Store) ReadShard(chunkID metadata.ChunkID, shardIndex int) ([]byte, uint32, error) {
+	v.mu.RLock()
+	disk, ok := v.shardDiskOf[chunkID]
+	v.mu.RUnlock()
+	if !ok || disk < 0 || disk >= len(v.shards) {
+		return nil, 0, storage.ErrExtentNotFound
+	}
+	res, err := v.shards[disk].store.Read(context.Background(), &storage.ReadRequest{
+		ExtentID: storage.ExtentID(chunkID), Generation: shardGen(shardIndex),
+		LogicalOffset: 0, Length: 0,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return res.Data, res.Checksum, nil
+}
+
+// DeleteShard removes one EC shard extent from its stripe disk.
+func (v *V2Store) DeleteShard(chunkID metadata.ChunkID, shardIndex int) error {
+	v.mu.RLock()
+	disk, ok := v.shardDiskOf[chunkID]
+	v.mu.RUnlock()
+	if !ok || disk < 0 || disk >= len(v.shards) {
+		return storage.ErrExtentNotFound
+	}
+	return v.shards[disk].store.Delete(context.Background(), &storage.DeleteRequest{
+		ExtentID: storage.ExtentID(chunkID), Generation: shardGen(shardIndex),
+	})
+}
+
+// leastUsedShardDisk returns the shard disk with the fewest bytes across its
+// shard store, or -1 when no shard stores are attached. Unlike nextLoc, it
+// does not consult locOf — shard placement is governed purely by shard-store
+// usage.
+func (v *V2Store) leastUsedShardDisk() int {
+	best, bestUsed := -1, int64(1<<63-1)
+	for i, d := range v.shards {
+		if used := d.usedByts.Load(); i == 0 || used < bestUsed {
+			bestUsed, best = used, i
+		}
+	}
+	return best
+}
+
 
 // nextLoc returns the owning disk and next generation for a write: the
 // existing location bumped to gen+1 for an overwrite, or (least-used
@@ -420,22 +570,6 @@ func (v *V2Store) leastUsedDisk(exclude int) int {
 			continue
 		}
 		if used := d.usedByts.Load(); used < bestUsed {
-			bestUsed, best = used, i
-		}
-	}
-	return best
-}
-
-// fullestDisk returns the index of the healthy disk holding the most used
-// bytes, skipping the excluded index and failed disks. Returns -1 when no
-// qualifying disk exists.
-func (v *V2Store) fullestDisk(exclude int) int {
-	best, bestUsed := -1, int64(-1)
-	for i, d := range v.disks {
-		if i == exclude || d.failCount.Load() >= 5 {
-			continue
-		}
-		if used := d.usedByts.Load(); used > bestUsed {
 			bestUsed, best = used, i
 		}
 	}
