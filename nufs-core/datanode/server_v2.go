@@ -88,9 +88,12 @@ type V2Store struct {
 	// updates both mutate them; reads take RLock.
 	mu    sync.RWMutex
 	locOf map[metadata.ChunkID]chunkLoc
-	// shardDiskOf records which disk hosts the shard stripe of a chunk, so
-	// ReadShard/DeleteShard route to the shard store that wrote it.
-	shardDiskOf map[metadata.ChunkID]int
+	// shardDiskOf records, per EC chunk and per shard index, which shard store
+	// disk hosts that shard extent, so ReadShard/DeleteShard route to the disk
+	// that wrote it. E3 spreads the 6+3 shards across distinct shard disks (disk
+	// fault isolation within a node), so the map is indexed by shard index
+	// rather than a single stripe-home disk per chunk.
+	shardDiskOf map[metadata.ChunkID]map[int]int
 
 	// stateVersion increments on every durable state change (write or
 	// delete), so the heartbeat's incremental delta diff can detect change.
@@ -100,7 +103,7 @@ type V2Store struct {
 // NewV2Store wraps a single backend (legacy/plain single-disk use). An
 // optional dir is the disk root reported to DiskInfos when non-empty.
 func NewV2Store(store storage.Store, dir ...string) *V2Store {
-	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc), shardDiskOf: make(map[metadata.ChunkID]int)}
+	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc), shardDiskOf: make(map[metadata.ChunkID]map[int]int)}
 	for _, s := range []storage.Store{store} {
 		d := ""
 		if len(dir) > 0 {
@@ -122,7 +125,7 @@ func NewV2Store(store storage.Store, dir ...string) *V2Store {
 // enumerating each store's committed extents, the equivalent of the legacy
 // ChunkStore's startup disk scan.
 func NewMultiV2Store(stores []storage.Store, dirs ...string) *V2Store {
-	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc), shardDiskOf: make(map[metadata.ChunkID]int)}
+	v := &V2Store{locOf: make(map[metadata.ChunkID]chunkLoc), shardDiskOf: make(map[metadata.ChunkID]map[int]int)}
 	for i, s := range stores {
 		d := ""
 		if i < len(dirs) {
@@ -256,7 +259,9 @@ func shardGen(shardIndex int) storage.Generation {
 // It reconstructs shardDiskOf by enumerating each shard store's committed
 // extents — the shard-stream analogue of the data-stream startup scan — so a
 // shard stripe survives a restart with reads routing to the shard store that
-// holds it. Returns an error if the count does not match the data disks.
+// holds each shard. Because a shard extent's generation encodes its shard
+// index (gen = index+1), the per-shard owning disk is recovered exactly.
+// Returns an error if the count does not match the data disks.
 func (v *V2Store) AttachShardStores(shardStores []storage.Store) error {
 	if len(shardStores) != len(v.disks) {
 		return fmt.Errorf("attach shard stores: got %d stores for %d disks", len(shardStores), len(v.disks))
@@ -268,10 +273,16 @@ func (v *V2Store) AttachShardStores(shardStores []storage.Store) error {
 		if lister, ok := s.(extentLister); ok {
 			b.lister = lister
 			if extents, err := lister.ListExtents(); err == nil {
-				// Every extent in a shard store is a shard: it pins the chunk's
-				// stripe home disk. No marker bit is needed.
+				// Every extent in a shard store is a shard: its generation brings
+				// its shard index, and store i is its owning disk. No marker bit
+				// is needed.
 				for _, e := range extents {
-					v.shardDiskOf[metadata.ChunkID(e.ExtentID)] = i
+					idx := int(e.Generation) - 1
+					cid := metadata.ChunkID(e.ExtentID)
+					if v.shardDiskOf[cid] == nil {
+						v.shardDiskOf[cid] = make(map[int]int)
+					}
+					v.shardDiskOf[cid][idx] = i
 					b.usedByts.Add(int64(e.Value.LogicalLen))
 					b.extCount.Add(1)
 				}
@@ -282,17 +293,68 @@ func (v *V2Store) AttachShardStores(shardStores []storage.Store) error {
 	return nil
 }
 
-// WriteShard durably writes one EC shard as an independent extent on the
-// chunk's shard stripe disk (least-used shard disk on first write) under the
-// generation that encodes the shard index. Per-shard checksum integrity is
-// maintained by the underlying CRC32C extent framing.
-func (v *V2Store) WriteShard(chunkID metadata.ChunkID, shardIndex int, data []byte) error {
+// shardDisk returns the disk hosting shard idx of chunkID, or -1 if unknown.
+//
+// The per-index map is authoritative during a session (every WriteShard/
+// WriteShardAtDisk records it). After a restart the map is only partially
+// recovered (ListExtents coalesces to one live generation per extent ID, and
+// all shards of a chunk share that ID, so it cannot enumerate every shard), so
+// an unknown (cid, idx) is resolved by probing each shard store for the exact
+// shard generation (gen = idx+1) — at most one store holds it — and caching
+// the result. This keeps restart routing correct without a new enumeration
+// primitive in the storage layer.
+func (v *V2Store) shardDisk(chunkID metadata.ChunkID, idx int) int {
 	v.mu.RLock()
-	disk, ok := v.shardDiskOf[chunkID]
-	v.mu.RUnlock()
-	if !ok {
-		disk = v.leastUsedShardDisk()
+	if m, ok := v.shardDiskOf[chunkID]; ok {
+		if d, ok := m[idx]; ok {
+			v.mu.RUnlock()
+			return d
+		}
 	}
+	v.mu.RUnlock()
+
+	gen := shardGen(idx)
+	for d := 0; d < len(v.shards); d++ {
+		if _, err := v.shards[d].store.Stat(context.Background(), &storage.StatRequest{
+			ExtentID: storage.ExtentID(chunkID), Generation: gen,
+		}); err == nil {
+			v.mu.Lock()
+			if v.shardDiskOf[chunkID] == nil {
+				v.shardDiskOf[chunkID] = make(map[int]int)
+			}
+			v.shardDiskOf[chunkID][idx] = d
+			v.mu.Unlock()
+			return d
+		}
+	}
+	return -1
+}
+
+// WriteShard durably writes one EC shard as an independent extent under the
+// generation that encodes the shard index. It routes to the chunk's recorded
+// shard disk for idx, or the least-used shard disk when this is the first
+// write of that shard. Per-shard checksum integrity is maintained by the
+// underlying CRC32C extent framing.
+func (v *V2Store) WriteShard(chunkID metadata.ChunkID, shardIndex int, data []byte) error {
+	if disk := v.shardDisk(chunkID, shardIndex); disk >= 0 {
+		return v.writeShardAt(chunkID, shardIndex, disk, data)
+	}
+	return v.writeShardAt(chunkID, shardIndex, v.leastUsedShardDisk(), data)
+}
+
+// WriteShardAtDisk durably writes one EC shard extent to a specific disk
+// (E3 write path: the 6+3 planner picks the owning disk, so a stripe spreads
+// across distinct shard disks for §14 disk-level fault isolation).
+func (v *V2Store) WriteShardAtDisk(chunkID metadata.ChunkID, shardIndex int, disk int, data []byte) error {
+	if disk < 0 || disk >= len(v.shards) {
+		return fmt.Errorf("write shard at disk: no shard store %d (have %d)", disk, len(v.shards))
+	}
+	return v.writeShardAt(chunkID, shardIndex, disk, data)
+}
+
+// writeShardAt is the shared impl: write a shard extent on a given disk,
+// record the per-shard owning disk, and update the disk's usage accounting.
+func (v *V2Store) writeShardAt(chunkID metadata.ChunkID, shardIndex, disk int, data []byte) error {
 	if disk < 0 || disk >= len(v.shards) {
 		return fmt.Errorf("write shard: no shard store attached (disk %d, have %d)", disk, len(v.shards))
 	}
@@ -306,20 +368,19 @@ func (v *V2Store) WriteShard(chunkID metadata.ChunkID, shardIndex int, data []by
 	}
 	b.usedByts.Add(int64(len(data)))
 	b.extCount.Add(1)
-	if !ok {
-		v.mu.Lock()
-		v.shardDiskOf[chunkID] = disk
-		v.mu.Unlock()
+	v.mu.Lock()
+	if v.shardDiskOf[chunkID] == nil {
+		v.shardDiskOf[chunkID] = make(map[int]int)
 	}
+	v.shardDiskOf[chunkID][shardIndex] = disk
+	v.mu.Unlock()
 	return nil
 }
 
-// ReadShard reads one EC shard extent back from its stripe disk, byte-exact.
+// ReadShard reads one EC shard extent back from its owning disk, byte-exact.
 func (v *V2Store) ReadShard(chunkID metadata.ChunkID, shardIndex int) ([]byte, uint32, error) {
-	v.mu.RLock()
-	disk, ok := v.shardDiskOf[chunkID]
-	v.mu.RUnlock()
-	if !ok || disk < 0 || disk >= len(v.shards) {
+	disk := v.shardDisk(chunkID, shardIndex)
+	if disk < 0 || disk >= len(v.shards) {
 		return nil, 0, storage.ErrExtentNotFound
 	}
 	res, err := v.shards[disk].store.Read(context.Background(), &storage.ReadRequest{
@@ -332,12 +393,10 @@ func (v *V2Store) ReadShard(chunkID metadata.ChunkID, shardIndex int) ([]byte, u
 	return res.Data, res.Checksum, nil
 }
 
-// DeleteShard removes one EC shard extent from its stripe disk.
+// DeleteShard removes one EC shard extent from its owning disk.
 func (v *V2Store) DeleteShard(chunkID metadata.ChunkID, shardIndex int) error {
-	v.mu.RLock()
-	disk, ok := v.shardDiskOf[chunkID]
-	v.mu.RUnlock()
-	if !ok || disk < 0 || disk >= len(v.shards) {
+	disk := v.shardDisk(chunkID, shardIndex)
+	if disk < 0 || disk >= len(v.shards) {
 		return storage.ErrExtentNotFound
 	}
 	return v.shards[disk].store.Delete(context.Background(), &storage.DeleteRequest{
@@ -357,6 +416,55 @@ func (v *V2Store) leastUsedShardDisk() int {
 		}
 	}
 	return best
+}
+
+// EC 6+3 aggregate write/read (V2.1 §14, Task #74 Phase E3). A written chunk
+// is encoded into six data shards and three parity shards and each shard is
+// stored as an independent extent spread across the node's distinct shard
+// disks (disk-level fault isolation); reads aggregate all nine shards and
+// decode the original. This is the single-node service path — multi-machine
+// diversity and cross-node placement ride on the same WriteShardAtDisk/
+// ReadShard primitive and are exercised by PlanShards + E5.
+
+// WriteChunkEC encodes data into 6+3 and durably writes each shard to the disk
+// chosen by placement[] (len 9, one disk per shard index, already validated for
+// §14 diversity by the caller, e.g. ECStore.PlanShards). It returns an error if
+// fewer than 9 shard stores are attached or if any shard write fails (partial
+// writes are reclaimable orphans, §14).
+func (v *V2Store) WriteChunkEC(chunkID metadata.ChunkID, data []byte, placement []int) error {
+	if len(placement) != ec63Shards {
+		return fmt.Errorf("write chunk ec: need %d shard placements, got %d", ec63Shards, len(placement))
+	}
+	all, err := encodeEC63(data)
+	if err != nil {
+		return fmt.Errorf("write chunk ec: encode: %w", err)
+	}
+	for idx, shard := range all {
+		if err := v.WriteShardAtDisk(chunkID, idx, placement[idx], shard); err != nil {
+			return fmt.Errorf("write chunk ec: shard %d: %w", idx, err)
+		}
+	}
+	return nil
+}
+
+// ReadChunkEC reads the nine shards, reconstructs and returns the original
+// (unpadded) payload of length originalLen. It is currently a full-shard read
+// (all nine present) — degraded reads that tolerate missing shards are the E5
+// repair/degrade surface built on EC 6+3 reconstruction.
+func (v *V2Store) ReadChunkEC(chunkID metadata.ChunkID, originalLen int) ([]byte, uint32, error) {
+	shards := make([][]byte, ec63Shards)
+	for idx := 0; idx < ec63Shards; idx++ {
+		data, _, err := v.ReadShard(chunkID, idx)
+		if err != nil {
+			return nil, 0, fmt.Errorf("read chunk ec: shard %d: %w", idx, err)
+		}
+		shards[idx] = data
+	}
+	data, err := decodeEC63(shards, originalLen)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read chunk ec: %w", err)
+	}
+	return data, storage.CRC32C(data), nil
 }
 
 
