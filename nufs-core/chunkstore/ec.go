@@ -119,7 +119,18 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 				ch <- shardData{r.ShardIndex, nil, fmt.Errorf("connect %s: %w", r.Addr, err)}
 				return
 			}
-			resp, err := client.ReadChunk(chunk.ID, 0, 0)
+			// V2.1 converted chunks store each EC shard as an independent extent in a
+			// dedicated shard store keyed (chunkID, gen=shardIndex+1), readable only via
+			// ReadECShard — generic ReadChunk(chunk.ID) looks in the data store and finds
+			// nothing. The ECStripeID discriminator (Program 5) marks a V2.1-converted
+			// 6+3 chunk. Legacy V1 gateway EC (ECStripeID == "") keeps the original
+			// ReadChunk path: there each Replica is a whole shard file keyed by chunk.ID.
+			var resp *datanode.Response
+			if chunk.ECStripeID != "" {
+				resp, err = client.ReadECShard(chunk.ID, r.ShardIndex)
+			} else {
+				resp, err = client.ReadChunk(chunk.ID, 0, 0)
+			}
 			s.pool.Put(r.Addr, client)
 
 			if err != nil {
