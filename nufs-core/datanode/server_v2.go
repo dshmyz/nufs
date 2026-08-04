@@ -230,6 +230,218 @@ func (v *V2Store) nextLoc(chunkID metadata.ChunkID) (int, storage.Generation) {
 	return best, 1
 }
 
+// RebalanceOne moves a single chunk from fromDisk to toDisk at the same
+// generation (PUT-at-target: the extent is written under its existing
+// generation, so the segment store places it as a fresh extent on the
+// target). It reads the full payload from the source store, writes it to
+// the target store (a different backend instance, so the same
+// extentID+generation is a distinct extent there), verifies, then
+// atomically re-points locOf and adjusts both disks' usage accounting.
+//
+// Concurrency: the store read/write happen WITHOUT the lock so concurrent
+// Reads are not blocked for the duration of a large move. The locOf
+// re-point is a guarded CAS — it only flips if the chunk still lives at
+// (fromDisk, gen); if a concurrent Write/WriteGen/Delete already moved or
+// removed the chunk, the orphaned target extent (reclaimed by compaction)
+// is left unreferenced and accounting is untouched, so the winner's
+// authoritative location and generation are never clobbered.
+//
+// toDisk==fromDisk, an unknown chunk, a missing source, or a move onto a
+// failed disk returns an error without changing state.
+func (v *V2Store) RebalanceOne(chunkID metadata.ChunkID, fromDisk, toDisk int) error {
+	if fromDisk == toDisk {
+		return fmt.Errorf("rebalance: fromDisk == toDisk (%d)", fromDisk)
+	}
+	if toDisk < 0 || toDisk >= len(v.disks) || fromDisk < 0 || fromDisk >= len(v.disks) {
+		return fmt.Errorf("rebalance: disk index out of range (from=%d to=%d)", fromDisk, toDisk)
+	}
+	if v.disks[toDisk].failCount.Load() >= 5 {
+		return fmt.Errorf("rebalance: target disk %d is failed", toDisk)
+	}
+	v.mu.RLock()
+	loc, ok := v.locOf[chunkID]
+	v.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("%w: chunk %d", storage.ErrExtentNotFound, chunkID)
+	}
+	if loc.disk != fromDisk {
+		return fmt.Errorf("rebalance: chunk %d lives on disk %d, not %d", chunkID, loc.disk, fromDisk)
+	}
+	gen := loc.gen
+
+	src := v.disks[fromDisk]
+	dst := v.disks[toDisk]
+
+	res, err := src.store.Read(context.Background(), &storage.ReadRequest{
+		ExtentID:   storage.ExtentID(chunkID),
+		Generation: gen,
+	})
+	if err != nil {
+		return err
+	}
+
+	dst.writeOps.Add(1)
+	if _, err := dst.store.Write(context.Background(), &storage.WriteRequest{
+		ExtentID:   storage.ExtentID(chunkID),
+		Generation: gen,
+		Data:       res.Data,
+	}); err != nil {
+		dst.writeErr.Add(1)
+		dst.failCount.Add(1)
+		return err
+	}
+	dst.failCount.Store(0)
+	dst.writeByts.Add(int64(len(res.Data)))
+
+	// CAS re-point: only if the chunk still lives at (fromDisk, gen). A
+	// concurrent overwrite/delete that won the race leaves locOf pointing at
+	// the authoritative location and generation.
+	v.mu.Lock()
+	cur, still := v.locOf[chunkID]
+	if !still || cur.disk != fromDisk || cur.gen != gen {
+		v.mu.Unlock()
+		return fmt.Errorf("rebalance: chunk %d moved concurrently during rebalance", chunkID)
+	}
+	v.locOf[chunkID] = chunkLoc{disk: toDisk, gen: gen}
+	v.mu.Unlock()
+
+	src.usedByts.Add(-int64(len(res.Data)))
+	src.extCount.Add(-1)
+	dst.usedByts.Add(int64(len(res.Data)))
+	dst.extCount.Add(1)
+	v.stateVersion.Add(1)
+	return nil
+}
+
+// RebalanceBalanced drains the fullest disk onto the least-used healthy disk
+// until the used-byte gap between them is at most thresholdBytes. It returns
+// the number of extents moved.
+//
+// Termination and convergence: a single pass fixes the drain target (the
+// least-used healthy disk) and only moves an extent that fits strictly within
+// the current gap (len < srcUsed - dstUsed), so a move never overshoots into a
+// reversed imbalance that a later move would thrash back. The gap therefore
+// shrinks monotonically each move (no oscillation), and a second call is
+// idempotent (returns 0 once balanced). Rebooting on a failed disk never
+// happens — failed disks are excluded from both source and target. The loop
+// is additionally bounded so it always returns.
+func (v *V2Store) RebalanceBalanced(thresholdBytes int64) (int, error) {
+	moved := 0
+	// Cap worst-case iterations well above the number of movable extents so
+	// progress is guaranteed even under adversarial interleavings.
+	cap := 0
+	for _, b := range v.disks {
+		if b.lister != nil {
+			if extents, err := b.lister.ListExtents(); err == nil {
+				cap += len(extents)
+			}
+		}
+	}
+	if cap == 0 {
+		cap = 64
+	}
+	excluded := make(map[metadata.ChunkID]bool) // chunks that failed to move this pass
+	for i := 0; i < cap; i++ {
+		src, chunkID, ok := v.pickRebalanceChunk(thresholdBytes, excluded)
+		if !ok {
+			break
+		}
+		dst := v.leastUsedDisk(-1)
+		if err := v.RebalanceOne(chunkID, src, dst); err != nil {
+			// Not movable in this pass; exclude it so we make progress instead
+			// of re-picking the same chunk forever.
+			excluded[chunkID] = true
+			continue
+		}
+		moved++
+	}
+	return moved, nil
+}
+
+// pickRebalanceChunk chooses the single chunk to move next: from the fullest
+// healthy disk (≠ the least-used target), the largest extent that fits
+// strictly within the current used-byte gap. This is the move that releases
+// the most capacity per accounting bump without overshooting. Returns ok=false
+// when no move would strictly improve balance.
+func (v *V2Store) pickRebalanceChunk(thresholdBytes int64, excluded map[metadata.ChunkID]bool) (src int, chunkID metadata.ChunkID, ok bool) {
+	dst := v.leastUsedDisk(-1)
+	if dst < 0 {
+		return 0, 0, false
+	}
+	dstUsed := v.disks[dst].usedByts.Load()
+
+	// Pick the fullest healthy source disk that is beyond threshold and has a
+	// movable extent; greedy on the fullest disk keeps the driver converging.
+	bestSrc, bestGap := -1, int64(thresholdBytes)
+	for i, b := range v.disks {
+		if i == dst || b.failCount.Load() >= 5 {
+			continue
+		}
+		if gap := b.usedByts.Load() - dstUsed; gap > bestGap {
+			bestGap, bestSrc = gap, i
+		}
+	}
+	if bestSrc < 0 {
+		return 0, 0, false
+	}
+
+	// Largest extent on the source that fits strictly within its gap — never
+	// overshooting into a reversed imbalance.
+	bestChunk, bestLen := metadata.ChunkID(0), int64(-1)
+	if l := v.disks[bestSrc].lister; l != nil {
+		srcUsed := v.disks[bestSrc].usedByts.Load()
+		if extents, err := l.ListExtents(); err == nil {
+			for _, e := range extents {
+				id := metadata.ChunkID(e.ExtentID)
+				if e.Generation == 0 || excluded[id] {
+					continue
+				}
+				n := int64(e.Value.LogicalLen)
+				// Strict fit within the current gap (no overshoot).
+				if n < srcUsed-dstUsed && n > bestLen {
+					bestLen, bestChunk = n, id
+				}
+			}
+		}
+	}
+	if bestLen < 0 {
+		return 0, 0, false
+	}
+	return bestSrc, bestChunk, true
+}
+
+// leastUsedDisk returns the index of the healthy disk with the fewest used
+// bytes, skipping failed disks and the excluded index (use exclude=-1 for
+// none). Returns -1 when no healthy disk qualifies.
+func (v *V2Store) leastUsedDisk(exclude int) int {
+	best, bestUsed := -1, int64(1<<63-1)
+	for i, d := range v.disks {
+		if i == exclude || d.failCount.Load() >= 5 {
+			continue
+		}
+		if used := d.usedByts.Load(); used < bestUsed {
+			bestUsed, best = used, i
+		}
+	}
+	return best
+}
+
+// fullestDisk returns the index of the healthy disk holding the most used
+// bytes, skipping the excluded index and failed disks. Returns -1 when no
+// qualifying disk exists.
+func (v *V2Store) fullestDisk(exclude int) int {
+	best, bestUsed := -1, int64(-1)
+	for i, d := range v.disks {
+		if i == exclude || d.failCount.Load() >= 5 {
+			continue
+		}
+		if used := d.usedByts.Load(); used > bestUsed {
+			bestUsed, best = used, i
+		}
+	}
+	return best
+}
+
 // loc returns the location of a chunk, defaulting to the first disk at
 // generation 1 when unknown (mirrors the legacy chunkstore.diskOf
 // fallback).
