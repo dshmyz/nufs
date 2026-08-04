@@ -163,6 +163,30 @@ func (s *ECService) CandidateDisks() []metadata.ECDisk {
 // ShardStoreCount returns the number of attached shard stores (0 if none).
 func (v *V2Store) ShardStoreCount() int { return len(v.shards) }
 
+// ECShardChunks returns the set of chunk IDs that hold at least one EC shard on
+// this node, discovered by enumerating each shard store's committed extents
+// (ListExtents coalesces to one live generation per extent ID — the chunk ID —
+// so each returned ID is a distinct chunk with shard(s) here). It is the
+// discovery input for the EC self-healer (Program 6 F2).
+func (v *V2Store) ECShardChunks() (map[metadata.ChunkID]bool, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	seen := make(map[metadata.ChunkID]bool)
+	for _, b := range v.shards {
+		if b.lister == nil {
+			continue
+		}
+		extents, err := b.lister.ListExtents()
+		if err != nil {
+			return nil, fmt.Errorf("ec shard chunks: list shard store: %w", err)
+		}
+		for _, e := range extents {
+			seen[metadata.ChunkID(e.ExtentID)] = true
+		}
+	}
+	return seen, nil
+}
+
 // ConvertToEC converts one replicated chunk (chunkID, currently a whole extent
 // readable through v.Read) into a completed 6+3 stripe. The authority owns the
 // §14 placement and lifecycle; the local service encodes and writes the shards

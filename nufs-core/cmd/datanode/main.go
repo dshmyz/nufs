@@ -681,6 +681,16 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	})
 	opsServer.SetECService(ecService)
 
+	// Program 6 / F2: EC self-heal scan. A background sweep discovers every
+	// degraded 6+3 stripe on this node (shards lost to disk/node ageing or
+	// degrade) and, when the loss is within §14 tolerance and the stripe's
+	// original length resolves from metadata, drives RepairChunkEC to rebuild
+	// the missing shards back onto healthy shard disks. metaStore resolves the
+	// original length via the chunk's authoritative Size (the padding makes it
+	// unrecoverable from shard lengths alone, §14).
+	healer := datanode.NewECSelfHealer(v2Store, metaStore, datanode.ECSelfHealConfig{})
+	healer.Start(ctx)
+
 	if err := opsServer.Start(); err != nil {
 		log.Error("failed to start ops HTTP server", "error", err)
 		closeStores()
@@ -714,6 +724,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	repairWorker.Stop()
 	replicator.Stop()
 	heartbeat.Stop()
+	healer.Stop()
 	// Drain in-flight writes before closing the stores (mirrors the V1
 	// shutdown Phase 3). The barrier quiesces writes without blocking reads.
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
