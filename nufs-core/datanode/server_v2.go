@@ -202,6 +202,14 @@ func (v *V2Store) writeTo(chunkID metadata.ChunkID, disk int, gen storage.Genera
 	if disk < 0 || disk >= len(v.disks) {
 		disk = 0
 	}
+	// Health admission: a FAILED disk (>=5 consecutive write failures, per
+	// the disk health state machine) must not accept writes — it is treated
+	// as read-only, mirroring V1's CanAdmitWrite rejection. Degraded disks
+	// (1..4 failures) remain eligible so a transient error doesn't permanently
+	// starve the disk of the success that would clear its streak.
+	if v.diskFailed(disk) {
+		return fmt.Errorf("datanode: disk %d is FAILED, refusing write", disk)
+	}
 	newChunk := gen == 1
 	b := v.disks[disk]
 	b.writeOps.Add(1)
@@ -627,11 +635,22 @@ func (v *V2Store) nextLoc(chunkID metadata.ChunkID) (int, storage.Generation) {
 		return loc.disk, loc.gen + 1
 	}
 
-	best, bestUsed := 0, int64(1<<63-1)
+	best, bestUsed := -1, int64(1<<63-1)
 	for i, d := range v.disks {
+		// Skip FAILED disks (>=5 consecutive write failures) so a wedged disk
+		// never receives new chunks — closing the placement gap where nextLoc's
+		// least-used loop (unlike leastUsedDisk) failed to skip bad disks.
+		if v.diskFailed(i) {
+			continue
+		}
 		if used := d.usedByts.Load(); used < bestUsed {
 			bestUsed, best = used, i
 		}
+	}
+	if best < 0 {
+		// Every disk is failed; fall back to disk 0 so the write surfaces the
+		// failure through writeTo's health admission rather than panicking.
+		best = 0
 	}
 	return best, 1
 }
@@ -827,7 +846,7 @@ func (v *V2Store) pickRebalanceChunk(thresholdBytes int64, excluded map[metadata
 func (v *V2Store) leastUsedDisk(exclude int) int {
 	best, bestUsed := -1, int64(1<<63-1)
 	for i, d := range v.disks {
-		if i == exclude || d.failCount.Load() >= 5 {
+		if i == exclude || v.diskFailed(i) {
 			continue
 		}
 		if used := d.usedByts.Load(); used < bestUsed {
@@ -1008,18 +1027,40 @@ func (v *V2Store) DiskStats() []DiskStatsItem {
 			UsedBytes:  b.usedByts.Load(),
 			ChunkCount: b.extCount.Load(),
 			Failed:     v.diskFailed(i),
+			State:      v.diskState(i),
 		}
 	}
 	return out
 }
 
-// diskFailed reports whether a backend has been erroring (crude health
-// signal: a streak of consecutive write failures, cleared by any success).
-// Uses failCount, not the rolling write window, so WriteErrorRate's per-
-// cycle reset does not erase the health signal. Kept minimal — no disk
-// lifecycle management in this scope.
+// diskState derives the 3-tier health of a backend from its consecutive
+// write-failure count, upgrading the crude diskFailed boolean into the V1
+// DiskState model (disk health state machine, Program 4 V1-c):
+//
+//	failCount == 0              -> DiskOnline  (healthy)
+//	failCount 1..4              -> DiskDegraded (I/O errors below threshold)
+//	failCount >= 5              -> DiskFailed   (read-only, excluded from placement)
+//
+// Uses failCount (a persistent consecutive-failure counter, cleared by any
+// success), not the rolling write-error window, so WriteErrorRate's per-cycle
+// reset does not erase the health signal.
+func (v *V2Store) diskState(i int) DiskState {
+	switch fc := v.disks[i].failCount.Load(); {
+	case fc >= 5:
+		return DiskFailed
+	case fc >= 1:
+		return DiskDegraded
+	default:
+		return DiskOnline
+	}
+}
+
+// diskFailed reports whether a backend is in the DiskFailed tier. It is the
+// boolean gate used by placement and write admission: only a FAILED disk is
+// excluded, so a merely-degraded disk (which can still clear its streak on a
+// success) stays eligible rather than being permanently starved of writes.
 func (v *V2Store) diskFailed(i int) bool {
-	return v.disks[i].failCount.Load() >= 5
+	return v.diskState(i) == DiskFailed
 }
 
 // WriteErrorRate returns the aggregate write error rate (0.0-1.0) across
@@ -1116,6 +1157,7 @@ func (v *V2Store) DiskInfos() []DiskInfo {
 			UsedBytes:  b.usedByts.Load(),
 			ChunkCount: b.extCount.Load(),
 			Failed:     v.diskFailed(i),
+			State:      v.diskState(i),
 		}
 	}
 	return out

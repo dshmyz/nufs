@@ -660,6 +660,7 @@ func (s *OpsServer) handleDisks(w http.ResponseWriter, r *http.Request) {
 		Index  int    `json:"index"`
 		Dir    string `json:"dir"`
 		Failed bool   `json:"failed"`
+		State  string `json:"state"`
 		Chunks int64  `json:"chunks"`
 		Bytes  int64  `json:"bytes"`
 	}
@@ -677,7 +678,7 @@ func (s *OpsServer) handleDisks(w http.ResponseWriter, r *http.Request) {
 		v := chunksPerDisk[di.Index]
 		disks = append(disks, diskJSON{
 			Index: di.Index, Dir: di.Dir, Failed: di.Failed,
-			Chunks: v.count, Bytes: v.bytes,
+			State: di.State.String(), Chunks: v.count, Bytes: v.bytes,
 		})
 	}
 

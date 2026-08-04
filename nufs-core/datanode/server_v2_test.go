@@ -2,6 +2,7 @@ package datanode
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -579,5 +580,194 @@ func TestV2StoreWriteGen_StaleGenerationFenced(t *testing.T) {
 	// generation has already been committed with a different checksum).
 	if err := v.WriteGen(metadata.ChunkID(601), 1, []byte("different-payload")); err == nil {
 		t.Fatalf("expected stale-generation write at gen 1 to be fenced, but it succeeded")
+	}
+}
+
+// ============ Program 4 V1-c: V2Store disk health state machine ============
+
+// toggleFailStore wraps a storage.Store and can be flipped to make every Write
+// fail, driving the V2Store's failCount/diskState health signal deterministically.
+// It embeds the interface so all non-Write methods forward unchanged; only Write
+// is overridden to delegate through the real store when not failing.
+type toggleFailStore struct {
+	storage.Store
+	real storage.Store
+	fail atomic.Bool
+}
+
+func (t *toggleFailStore) Write(ctx context.Context, r *storage.WriteRequest) (*storage.DurableReceipt, error) {
+	if t.fail.Load() {
+		return nil, storage.ErrStaleGeneration
+	}
+	return t.real.Write(ctx, r)
+}
+
+// TestV2StoreDiskStateTiers proves the 3-tier health model: failCount 0 ->
+// DiskOnline, 1..4 -> DiskDegraded, >=5 -> DiskFailed, and that DiskInfos /
+// DiskStats surface the derived State (and Failed boolean) to the ops/heartbeat
+// channels — closing the V1.DiskManager parity gap without a DiskManager slot.
+func TestV2StoreDiskStateTiers(t *testing.T) {
+	v, _ := newTestMultiStore(t, 2)
+
+	// Online at failCount 0.
+	if st := v.diskState(0); st != DiskOnline {
+		t.Fatalf("diskState(0) with no failures=%v, want online", st)
+	}
+	if v.diskFailed(0) {
+		t.Fatalf("diskFailed true at failCount 0")
+	}
+
+	// Degraded across the 1..4 band.
+	for _, n := range []int64{1, 2, 4} {
+		v.disks[0].failCount.Store(n)
+		if st := v.diskState(0); st != DiskDegraded {
+			t.Fatalf("diskState at failCount=%d=%v, want degraded", n, st)
+		}
+		if v.diskFailed(0) {
+			t.Fatalf("diskFailed true at degraded failCount=%d", n)
+		}
+	}
+
+	// Failed at >=5.
+	v.disks[0].failCount.Store(5)
+	if st := v.diskState(0); st != DiskFailed {
+		t.Fatalf("diskState at failCount=5=%v, want failed", st)
+	}
+	if !v.diskFailed(0) {
+		t.Fatalf("diskFailed false at failCount=5")
+	}
+
+	// DiskInfos / DiskStats surface State and Failed for the failed disk only.
+	infos := v.DiskInfos()
+	if len(infos) != 2 {
+		t.Fatalf("DiskInfos len=%d, want 2", len(infos))
+	}
+	if !infos[0].Failed || infos[0].State != DiskFailed {
+		t.Fatalf("DiskInfos[0] failed=%v state=%v, want failed/failed", infos[0].Failed, infos[0].State)
+	}
+	if infos[1].Failed || infos[1].State != DiskOnline {
+		t.Fatalf("DiskInfos[1] failed=%v state=%v, want healthy/online", infos[1].Failed, infos[1].State)
+	}
+
+	ds := v.DiskStats()
+	if !ds[0].Failed || ds[0].State != DiskFailed || ds[1].Failed || ds[1].State != DiskOnline {
+		t.Fatalf("DiskStats wrong: %+v", ds)
+	}
+}
+
+// TestV2StoreNextLocAndAdmissionSkipFailedDisk proves the placement-gap fix:
+// once a disk enters DiskFailed, nextLoc routes NEW chunks to a healthy disk
+// (matching leastUsedDisk), and writeTo ADMISSION rejects writing to the failed
+// disk (an overwrite of a chunk already living on it). A merely-degraded disk
+// stays eligible so it isn't starved of the success that clears its streak.
+func TestV2StoreNextLocAndAdmissionSkipFailedDisk(t *testing.T) {
+	v, _ := newTestMultiStore(t, 2)
+
+	// Write one chunk so disk 0 has bytes; disk 0 is the least-used healthy target.
+	if err := v.Write(metadata.ChunkID(701), []byte("seed")); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	// The seed chunk lives on disk 0 (least-used tie -> index 0).
+	v.mu.RLock()
+	d0 := v.locOf[metadata.ChunkID(701)].disk
+	v.mu.RUnlock()
+	if d0 != 0 {
+		t.Fatalf("seed chunk on disk %d, want 0", d0)
+	}
+
+	// Mark disk 0 failed (simulates the streak crossing the >=5 threshold).
+	v.disks[0].failCount.Store(5)
+
+	// NEW chunk: nextLoc must skip the failed disk and land on disk 1.
+	disk, _ := v.nextLoc(metadata.ChunkID(9999))
+	if disk != 1 {
+		t.Fatalf("nextLoc on failed disk0 -> disk %d, want 1", disk)
+	}
+	if err := v.Write(metadata.ChunkID(702), []byte("new-lives-on-healthy-disk")); err != nil {
+		t.Fatalf("write on healthy disk: %v", err)
+	}
+	v.mu.RLock()
+	loc := v.locOf[metadata.ChunkID(702)]
+	v.mu.RUnlock()
+	if loc.disk != 1 {
+		t.Fatalf("new chunk 702 on disk %d, want 1 (failed disk skipped)", loc.disk)
+	}
+
+	// OVERWRITE of the chunk living on the failed disk: admission must reject it.
+	// The store knows writeTo(disk=0) targets the FAILED disk -> error propagates.
+	if err := v.Write(metadata.ChunkID(701), []byte("rewrite-failed-disk-payload")); err == nil {
+		t.Fatalf("expected write to FAILED disk to be rejected, but it succeeded")
+	}
+
+	// A DEGRADED disk (failCount 1..4) remains an eligible placement target.
+	v.disks[0].failCount.Store(2)
+	disk, _ = v.nextLoc(metadata.ChunkID(9998))
+	if disk != 0 {
+		t.Fatalf("nextLoc on degraded disk0 -> disk %d, want 0 (degraded stays eligible)", disk)
+	}
+}
+
+// TestV2StoreFailStreakDrivesHealth proves the organic path: real failing writes
+// to a disk climb failCount and degrade it, a success clears the streak and
+// recovers a DEGRADED disk back to online, and a sustained streak crossing the
+// >=5 threshold flags the disk FAILED — after which writeTo admission refuses
+// further writes (the failed disk is read-only). Uses a toggle-failing backend
+// so the streak is driven by the actual write path rather than poking internals.
+func TestV2StoreFailStreakDrivesHealth(t *testing.T) {
+	// Build a 2-disk store where disk 0's backend can be flipped to fail writes.
+	dirs := []string{t.TempDir(), t.TempDir()}
+	backends := make([]storage.Store, 2)
+	cleanup := make([]*segment.Store, 2)
+	for i := range dirs {
+		s, err := segment.New(segment.Config{Dir: dirs[i], UseMemIndex: true, StreamID: 1})
+		if err != nil {
+			t.Fatalf("segment.New disk %d: %v", i, err)
+		}
+		cleanup[i] = s
+		backends[i] = s
+	}
+	defer func() {
+		for _, s := range cleanup {
+			s.Close()
+		}
+	}()
+	tog := &toggleFailStore{Store: backends[0], real: backends[0]}
+	backends[0] = tog
+	v := NewMultiV2Store(backends)
+
+	// Degrade disk 0 via the real write path (writeTo -> store.Write).
+	tog.fail.Store(true)
+	for i := 1; i <= 2; i++ {
+		if err := v.writeTo(metadata.ChunkID(800), 0, storage.Generation(i), []byte("failing-write")); err == nil {
+			t.Fatalf("write %d to failed-over backend succeeded, want error", i)
+		}
+		if st := v.diskState(0); st != DiskDegraded {
+			t.Fatalf("after %d failed writes diskState=%v, want degraded", i, st)
+		}
+	}
+
+	// A degraded disk is still eligible for writes; a success clears the streak,
+	// recovering the disk back to online (health recovers organically).
+	tog.fail.Store(false)
+	if err := v.writeTo(metadata.ChunkID(801), 0, storage.Generation(1), []byte("recovery")); err != nil {
+		t.Fatalf("recovery write failed: %v", err)
+	}
+	if st := v.diskState(0); st != DiskOnline {
+		t.Fatalf("diskState after recovery=%v, want online", st)
+	}
+
+	// A sustained streak crossing the >=5 threshold flags the disk FAILED; writeTo
+	// admission then refuses further writes (the failed disk is read-only).
+	tog.fail.Store(true)
+	for i := 1; i <= 5; i++ {
+		v.writeTo(metadata.ChunkID(802), 0, storage.Generation(i), []byte("failing-write"))
+	}
+	if !v.diskFailed(0) {
+		t.Fatalf("disk 0 not failed after 5-failure streak")
+	}
+	tog.fail.Store(false)
+	if err := v.writeTo(metadata.ChunkID(803), 0, storage.Generation(1), []byte("post-fail")); err == nil {
+		t.Fatalf("expected writeTo to reject write to FAILED disk, but it succeeded")
 	}
 }

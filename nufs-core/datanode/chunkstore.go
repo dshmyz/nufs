@@ -923,6 +923,10 @@ type DiskStatsItem struct {
 	UsedBytes  int64
 	ChunkCount int64
 	Failed     bool
+	// State is the derived 3-tier health (DiskOnline/DiskDegraded/DiskFailed).
+	// V2.1 V2Store fills it from failCount thresholds; V1 ChunkStore reports
+	// DiskOnline (its own DiskManager state is surfaced via the legacy channel).
+	State DiskState
 }
 
 // DiskStats returns per-disk usage breakdown.
@@ -935,6 +939,7 @@ func (cs *ChunkStore) DiskStats() []DiskStatsItem {
 			UsedBytes:  d.usedBytes.Load(),
 			ChunkCount: d.chunkCount.Load(),
 			Failed:     d.failed.Load(),
+			State:      DiskOnline,
 		}
 	}
 	return result
@@ -1062,6 +1067,10 @@ type DiskInfo struct {
 	UsedBytes  int64
 	ChunkCount int64
 	Failed     bool
+	// State is the derived 3-tier health (DiskOnline/DiskDegraded/DiskFailed).
+	// The legacy ChunkStore derives its own DiskManager state; V2.1 V2Store
+	// fills this from its failCount thresholds. Zero value = DiskOnline.
+	State DiskState
 }
 
 // DiskInfos returns a snapshot of all disk shards' metadata.
@@ -1074,6 +1083,7 @@ func (cs *ChunkStore) DiskInfos() []DiskInfo {
 			UsedBytes:  d.usedBytes.Load(),
 			ChunkCount: d.chunkCount.Load(),
 			Failed:     d.failed.Load(),
+			State:      DiskOnline,
 		}
 	}
 	return infos
