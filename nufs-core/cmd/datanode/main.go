@@ -534,9 +534,13 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		// stream; the V2Store attaches these so EC conversions (Program A)
 		// can place 6+3 shards across the node's shard stores (§14). The
 		// same encryption registry is reused so shard extents are encrypted
-		// at rest exactly like data extents.
+		// at rest exactly like data extents. It needs its own on-disk index
+		// directory: both streams would otherwise open Pebble in Dir/index,
+		// and Pebble's exclusive per-directory lock would make the second
+		// open fail ("lock held by current process").
 		shardCfg := segment.Config{
 			Dir:           dir,
+			IndexDir:      filepath.Join(dir, "index-ecshard"),
 			SegmentSize:   storage.DefaultDataSegmentSize,
 			UseMemIndex:   false,
 			StreamID:      2, // EC shard stream

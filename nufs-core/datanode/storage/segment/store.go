@@ -160,6 +160,13 @@ type Config struct {
 	Faults       storage.FaultHook
 	// StreamID is the commit-stream ID (0=small, 1=data).
 	StreamID uint8
+	// IndexDir overrides the on-disk index directory (default Dir/index).
+	// A disk hosts both a data store (StreamID 1) and an EC shard store
+	// (StreamID 2) that each hold a separate Pebble index; Pebble takes an
+	// exclusive lock per directory, so they cannot share Dir/index. The
+	// shard store passes a distinct index dir so both streams run in the
+	// same disk root without a file-lock collision.
+	IndexDir string
 	// Enc is the record encryption registry (nil = plaintext).
 	Enc *encryption.KeyRegistry
 	// FlushInterval bounds how long the index may lag the committed
@@ -232,8 +239,12 @@ func New(cfg Config) (*Store, error) {
 	if err := os.MkdirAll(segDir, 0755); err != nil {
 		return nil, err
 	}
+	ixDir := filepath.Join(cfg.Dir, "index")
+	if cfg.IndexDir != "" {
+		ixDir = cfg.IndexDir
+	}
 	ix, err := index.Open(index.Options{
-		Dir:          filepath.Join(cfg.Dir, "index"),
+		Dir:          ixDir,
 		MemTableSize: cfg.IndexMemSize,
 		UseInMemory:  cfg.UseMemIndex,
 	})
