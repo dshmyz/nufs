@@ -461,7 +461,18 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// deferred per-store close here would be a second owner and would not
 	// run at all on the os.Exit paths.
 	stores := make([]storage.Store, 0, len(dataDirs))
+	shardStores := make([]storage.Store, 0, len(dataDirs))
 	closeStores := func() {
+		// EC shard stores first (they piggyback on the same per-disk dir and
+		// share the change journal); closing order among independent stores
+		// does not matter, but keeping the same single owner is what matters.
+		for _, st := range shardStores {
+			if closer, ok := st.(interface{ Close() error }); ok {
+				if err := closer.Close(); err != nil {
+					log.Warn("V2.1 shard store close error", "error", err)
+				}
+			}
+		}
 		for _, st := range stores {
 			if closer, ok := st.(interface{ Close() error }); ok {
 				if err := closer.Close(); err != nil {
@@ -517,6 +528,30 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 			os.Exit(1)
 		}
 		stores = append(stores, s)
+
+		// EC shard store for this disk (StreamID 2, class dir "ecshard").
+		// One per disk, sharing the dir and change journal with the data
+		// stream; the V2Store attaches these so EC conversions (Program A)
+		// can place 6+3 shards across the node's shard stores (§14). The
+		// same encryption registry is reused so shard extents are encrypted
+		// at rest exactly like data extents.
+		shardCfg := segment.Config{
+			Dir:           dir,
+			SegmentSize:   storage.DefaultDataSegmentSize,
+			UseMemIndex:   false,
+			StreamID:      2, // EC shard stream
+			ChangeJournal: changeJournal,
+		}
+		if segCfg.Enc != nil {
+			shardCfg.Enc = segCfg.Enc
+		}
+		ss, err := segment.New(shardCfg)
+		if err != nil {
+			log.Error("failed to init V2.1 shard store", "disk", dir, "error", err)
+			closeStores()
+			os.Exit(1)
+		}
+		shardStores = append(shardStores, ss)
 	}
 	log.Info("V2.1 storage engine ready", "disks", len(dataDirs))
 
@@ -550,6 +585,18 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// and heartbeat data), so a multi-disk --data-dirs node actually
 	// serves from all of them rather than only the first.
 	v2Store := datanode.NewMultiV2Store(stores, dataDirs...)
+	// Attach the EC shard stores so Program A's EC conversions can place
+	// 6+3 shards across the node's shard stores. Requires ≥3 shard stores for
+	// §14 (≤3 shards per machine across ≥3 machines / fault domains); a
+	// datanode with fewer disks can still replicate, it just cannot host EC
+	// stripes (ConvertToEC will fail cleanly on an under-provisioned node).
+	if err := v2Store.AttachShardStores(shardStores); err != nil {
+		log.Error("failed to attach EC shard stores", "error", err)
+		closeStores()
+		os.Exit(1)
+	}
+	log.Info("V2.1 EC shard stores attached", "shard_stores", len(shardStores))
+
 	srvCfg := cfg
 	srvCfg.ListenAddr = cfg.ListenAddr
 	srv := datanode.NewServer(srvCfg, v2Store)
@@ -604,6 +651,27 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	}
 	defer stopMgmt()
 	opsServer := datanode.NewOpsServerWithRepair(cfg, v2Store, metaStore, nil, nil, nil, repairWorker)
+
+	// Program A / S1: EC conversion authority + serving-path driver. The V2.1
+	// dev/single-node serving path drives the EC conversion transaction
+	// against an in-process Pebble-backed ECStore (the §14 placement and
+	// lifecycle state machine live there), so the ops control plane can
+	// convert replicated chunks to 6+3 without a round-trip to a remote
+	// authority. A production topology injects an HTTP authority over the
+	// same ECAuthority seam (S2) instead; this local store is the single-node
+	// stand-in and is documented as such (ec_service.go).
+	ecPB, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
+		Dir: filepath.Join(dataDirs[0], "ec-authority"), UseInMemory: false, UseBucketStats: false,
+	})
+	if err != nil {
+		log.Error("failed to init local EC authority", "error", err)
+		closeStores()
+		os.Exit(1)
+	}
+	defer ecPB.Close()
+	ecService := datanode.NewECService(v2Store, metadata.NewECStore(ecPB))
+	opsServer.SetECService(ecService)
+
 	if err := opsServer.Start(); err != nil {
 		log.Error("failed to start ops HTTP server", "error", err)
 		closeStores()

@@ -21,8 +21,10 @@ import (
 // that chunkstore cannot reach (datanode↔chunkstore import cycle); the
 // metadata ECStore transaction is consumed through metadata's exported types.
 type ECConverter struct {
-	// ec is the metadata conversion transaction store (ECStore over Pebble).
-	ec *metadata.ECStore
+	// ec is the metadata conversion transaction authority (see ECAuthority).
+	// The serving path injects the local *metadata.ECStore (S1) or an HTTP
+	// implementation of the same seam (S2); tests inject the in-memory store.
+	ec ECAuthority
 	// v is the V2Store whose attached shard stores receive the encoded shards.
 	v *V2Store
 	// resolveDisk maps a planned ECShard's metadata placement (NodeID/DiskID)
@@ -34,8 +36,8 @@ type ECConverter struct {
 }
 
 // NewECConverter creates a conversion coordinator over the given metadata EC
-// transaction store and V2Store.
-func NewECConverter(ec *metadata.ECStore, v *V2Store, resolveDisk func(metadata.ECDisk) int) *ECConverter {
+// transaction authority and V2Store.
+func NewECConverter(ec ECAuthority, v *V2Store, resolveDisk func(metadata.ECDisk) int) *ECConverter {
 	if resolveDisk == nil {
 		resolveDisk = func(d metadata.ECDisk) int { return int(d.DiskID) }
 	}

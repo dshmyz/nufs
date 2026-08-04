@@ -48,6 +48,7 @@ type OpsServer struct {
 	repl       *ParallelReplicator
 	ae         *AntiEntropy
 	repair     *RepairWorker
+	ec         *ECService
 	listener   *http.Server
 	running    atomic.Bool
 	shutdownWg sync.WaitGroup
@@ -107,6 +108,9 @@ func NewOpsServerWithRepair(cfg Config, store OpsStore, meta OpsMetadata,
 	// Chunk operations
 	mux.HandleFunc("/api/v1/chunks/{id}/verify", s.handleVerifyChunk)
 
+	// EC (V2.1 6+3) operations
+	mux.HandleFunc("/api/v1/ec/convert", s.handleECConvert)
+
 	// Repair operations
 	mux.HandleFunc("/api/v1/repair/queue", s.handleRepairQueue)
 	mux.HandleFunc("/api/v1/gc/scan", s.handleGCScan)
@@ -155,6 +159,13 @@ func NewOpsServerWithRepair(cfg Config, store OpsStore, meta OpsMetadata,
 		}
 	}
 	return s
+}
+
+// SetECService attaches the V2.1 EC conversion driver to the ops server. It is
+// optional and nil-guarded (V1 leaves it unset; V2.1 wires the ECService built
+// by runDataNodeV21), enabling the /api/v1/ec/convert control-plane endpoint.
+func (s *OpsServer) SetECService(ec *ECService) {
+	s.ec = ec
 }
 
 // Start begins listening for operations requests.
@@ -796,6 +807,53 @@ func (s *OpsServer) handleHTTPMigrate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSONError(w, http.StatusNotFound, "dir not found")
+}
+
+// handleECConvert converts one replicated chunk to a completed 6+3 EC stripe
+// on the V2.1 serving path, driving the injected ECService's authority
+// transaction (§14). V1 (no ECService wired) answers "unsupported", the same
+// capability-gating the other V2.1 engine-specific endpoints use.
+//
+//	POST /api/v1/ec/convert?chunk_id=<id>[&generation=<gen>]
+//
+// On success returns the completed stripe (state, shard count, original
+// checksum). On failure the transaction is rolled back and the chunk remains a
+// readable replica.
+func (s *OpsServer) handleECConvert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.ec == nil {
+		writeJSONError(w, http.StatusNotImplemented, "EC conversion unsupported by this engine")
+		return
+	}
+	idStr := r.URL.Query().Get("chunk_id")
+	if idStr == "" {
+		writeJSONError(w, http.StatusBadRequest, "chunk_id required")
+		return
+	}
+	var chunkID metadata.ChunkID
+	if _, err := fmt.Sscanf(idStr, "%d", &chunkID); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid chunk_id")
+		return
+	}
+	var gen uint64
+	fmt.Sscanf(r.URL.Query().Get("generation"), "%d", &gen)
+
+	st, err := s.ec.ConvertToEC(r.Context(), chunkID, gen)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError,
+			fmt.Sprintf("ec convert: %v", err))
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"stripe_id":        st.StripeID,
+		"state":             st.State.String(),
+		"converted_at":     st.ConvertedAt,
+		"original_checksum": st.OriginalChecksum,
+		"shards":           len(st.Shards),
+	})
 }
 
 func writeJSON(w http.ResponseWriter, data interface{}) {
