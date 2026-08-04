@@ -80,6 +80,11 @@ type ECStripe struct {
 	State ECConversionState `json:"state"`
 	// ConvertedAt is when the stripe became durable.
 	ConvertedAt int64 `json:"converted_at"`
+	// RolledBackAt is when RollbackConversion marked the stripe rolled back.
+	// It gates stripe-orphan GC: a rolled-back stripe may still be mid-repair
+	// (its partial shards briefly referenced), so reclaim is deferred until the
+	// stripe has been rolled back for a configured age (§14 orphan reclamation).
+	RolledBackAt int64 `json:"rolled_back_at,omitempty"`
 }
 
 // ECShard is one shard's location.
@@ -293,9 +298,12 @@ func (s *ECStore) CompleteConversion(st *ECStripe, at time.Time) error {
 }
 
 // RollbackConversion marks a failed conversion (metadata still points at
-// the three replicas; partial EC shards are reclaimable orphans, §14).
+// the three replicas; partial EC shards are reclaimable orphans, §14). The
+// RolledBackAt timestamp gates orphan reclamation: GC defers reclaiming
+// partial shards until the stripe has been rolled back for a configured age.
 func (s *ECStore) RollbackConversion(st *ECStripe, reason string) error {
 	st.State = ECConversionRolledBack
+	st.RolledBackAt = time.Now().UnixNano()
 	return s.PutStripe(st)
 }
 

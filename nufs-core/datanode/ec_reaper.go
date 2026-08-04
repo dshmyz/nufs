@@ -29,6 +29,12 @@ type ECSelfHealConfig struct {
 
 const ecSelfHealDefaultInterval = 30 * time.Second
 
+// ecOrphanDefaultAge is how long a stripe must stay rolled back before its
+// partial shards are treated as reclaimable orphans (§14). It defers
+// reclamation past any in-progress retry or salvage, matching the product
+// expectation of "24h" in the F4 plan.
+const ecOrphanDefaultAge = 24 * time.Hour
+
 // ECChunkResolver resolves an EC chunk's metadata (notably its Size, which is
 // the only reliable source of the stripe's original pre-encoding length — the
 // padding makes it unrecoverable from shard lengths alone, §14). Both the
@@ -48,6 +54,18 @@ type ECLandingResolver interface {
 	ResolveStripeLanding(chunk *metadata.ChunkMeta) ([]metadata.ECShard, error)
 }
 
+// ECOrphanResolver answers whether a chunk's shards on this node are
+// reclaimable orphans (§14): partial shards of a failed/rolled-back conversion,
+// or leaked shards of a chunk whose metadata no longer references them. The
+// production *metadata.ECStore (IsChunkShardsOrphaned) and a test stub satisfy
+// it. When wired, the self-healer reclaims those shards via DeleteShard on a
+// periodic orphan pass; absent (e.g. the V1 transport's HTTPClient, which lacks
+// the local-only *metadata.ECStore method), orphan GC is disabled and the
+// healer only repairs — a documented deploy follow-on needs an HTTP RPC.
+type ECOrphanResolver interface {
+	IsChunkShardsOrphaned(ctx context.Context, chunkID metadata.ChunkID, olderThan time.Duration) (bool, error)
+}
+
 // ECSelfHealer is a background loop that repairs degraded 6+3 stripes on this
 // datanode. It runs a periodic sweep (Enumerate) so an operator can also drive
 // a single pass manually and assert on the result, or in tests.
@@ -55,6 +73,8 @@ type ECSelfHealer struct {
 	v        *V2Store
 	resolver ECChunkResolver
 	landing  ECLandingResolver
+	orphan   ECOrphanResolver
+	orphanAge time.Duration
 	interval time.Duration
 
 	mu      sync.Mutex
@@ -66,6 +86,7 @@ type ECSelfHealer struct {
 	repaired  atomic.Int64 // shards rebuilt
 	skipped   atomic.Int64 // stripes skipped (loss beyond tolerance or no size)
 	failed    atomic.Int64 // stripes whose repair errored
+	reclaimed atomic.Int64 // orphan shards reclaimed
 }
 
 // NewECSelfHealer creates the self-healing scanner. resolver supplies the
@@ -74,7 +95,12 @@ func NewECSelfHealer(v *V2Store, resolver ECChunkResolver, cfg ECSelfHealConfig)
 	if cfg.Interval <= 0 {
 		cfg.Interval = ecSelfHealDefaultInterval
 	}
-	return &ECSelfHealer{v: v, resolver: resolver, interval: cfg.Interval, stopCh: make(chan struct{})}
+	return &ECSelfHealer{
+		v: v, resolver: resolver,
+		interval:  cfg.Interval,
+		orphanAge: ecOrphanDefaultAge,
+		stopCh:    make(chan struct{}),
+	}
 }
 
 // SetLandingResolver wires an authoritative per-shard landing source (F3, §14):
@@ -83,6 +109,22 @@ func NewECSelfHealer(v *V2Store, resolver ECChunkResolver, cfg ECSelfHealConfig)
 func (h *ECSelfHealer) SetLandingResolver(src ECLandingResolver) {
 	if src != nil {
 		h.landing = src
+	}
+}
+
+// SetOrphanResolver wires an authoritative "are this chunk's shards orphans?"
+// source (F4, §14). When set, the periodic ReclaimOrphans pass deletes shards
+// the resolver judges reclaimable (rolled-back-and-aged or leaked) via
+// DeleteShard, permanently freeing the datanode shard-store space. Pass nil
+// (default) to disable orphan GC; olderThan <= 0 uses the default age.
+func (h *ECSelfHealer) SetOrphanResolver(src ECOrphanResolver, olderThan time.Duration) {
+	if src == nil {
+		h.orphan = nil
+		return
+	}
+	h.orphan = src
+	if olderThan > 0 {
+		h.orphanAge = olderThan
 	}
 }
 
@@ -109,6 +151,7 @@ func (h *ECSelfHealer) Start(ctx context.Context) {
 				return
 			case <-ticker.C:
 				h.Enumerate(ctx)
+				h.ReclaimOrphans(ctx)
 			}
 		}
 	}()
@@ -131,6 +174,9 @@ func (h *ECSelfHealer) Stats() (scanned, repaired, skipped, failed int64) {
 	return h.scanned.Load(), h.repaired.Load(), h.skipped.Load(), h.failed.Load()
 }
 
+// Reclaimed returns the count of orphan shards reclaimed this process lifetime.
+func (h *ECSelfHealer) Reclaimed() int64 { return h.reclaimed.Load() }
+
 // Enumerate runs one full self-healing sweep: it discovers every chunk with
 // shard(s) on this node and repairs any that are under-replicated within §14
 // tolerance. It is safe to call concurrently with the background loop; callers
@@ -150,7 +196,93 @@ func (h *ECSelfHealer) Enumerate(ctx context.Context) {
 			return
 		default:
 		}
+		// A chunk whose shards are reclaimable orphans (F4, §14) must not be
+		// repaired or re-referenced — skip it on this sweep; ReclaimOrphans
+		// owns its lifecycle.
+		if h.isOrphan(ctx, cid) {
+			continue
+		}
 		h.repairChunk(ctx, cid)
+	}
+}
+
+// isOrphan reports whether the chunk's shards are reclaimable orphans. With no
+// orphan resolver wired it is always false (orphan GC disabled).
+func (h *ECSelfHealer) isOrphan(ctx context.Context, cid metadata.ChunkID) bool {
+	if h.orphan == nil {
+		return false
+	}
+	orph, err := h.orphan.IsChunkShardsOrphaned(ctx, cid, h.orphanAge)
+	if err != nil {
+		slog.Warn("ec self-heal: orphan check failed, assuming live",
+			"chunk", cid, "error", err)
+		return false
+	}
+	return orph
+}
+
+// ReclaimOrphans runs one orphan-reclamation pass: it discovers every chunk
+// with shard(s) on this node, and for any chunk the orphan resolver judges
+// reclaimable (§14 rolled-back-and-aged or leaked), deletes every present
+// shard via DeleteShard — permanently releasing the freed shard-store space.
+// Idempotent: an already-reclaimed chunk has no present shards to delete. Safe
+// to call concurrently with Enumerate; it is a no-op with no resolver wired.
+func (h *ECSelfHealer) ReclaimOrphans(ctx context.Context) {
+	if h.v == nil || h.orphan == nil {
+		return
+	}
+	chunks, err := h.v.ECShardChunks()
+	if err != nil {
+		slog.Warn("ec self-heal: orphan discovery failed", "error", err)
+		return
+	}
+	for cid := range chunks {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if !h.isOrphan(ctx, cid) {
+			continue
+		}
+		h.reclaimChunkShards(ctx, cid)
+	}
+}
+
+// reclaimChunkShards deletes every present shard of an orphaned chunk.
+func (h *ECSelfHealer) reclaimChunkShards(ctx context.Context, cid metadata.ChunkID) {
+	_, missing, err := h.v.readChunkECShards(cid)
+	if err != nil {
+		slog.Warn("ec self-heal: orphan shard occupancy read failed",
+			"chunk", cid, "error", err)
+		return
+	}
+	// readChunkECShards lists *missing* indices; the present ones are the
+	// complement (0..8 minus missing). Reclaim those.
+	present := make([]int, 0, ec63Shards-len(missing))
+	presentMap := make(map[int]bool, ec63Shards)
+	for _, m := range missing {
+		presentMap[m] = true
+	}
+	for idx := 0; idx < ec63Shards; idx++ {
+		if presentMap[idx] {
+			continue
+		}
+		present = append(present, idx)
+	}
+	reclaimed := 0
+	for _, idx := range present {
+		if err := h.v.DeleteShard(cid, idx); err != nil {
+			slog.Warn("ec self-heal: orphan shard delete failed",
+				"chunk", cid, "shard", idx, "error", err)
+			continue
+		}
+		reclaimed++
+	}
+	if reclaimed > 0 {
+		h.reclaimed.Add(int64(reclaimed))
+		slog.Info("ec self-heal: reclaimed orphan shards",
+			"chunk", cid, "reclaimed", reclaimed)
 	}
 }
 

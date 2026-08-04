@@ -689,6 +689,13 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// original length via the chunk's authoritative Size (the padding makes it
 	// unrecoverable from shard lengths alone, §14).
 	healer := datanode.NewECSelfHealer(v2Store, metaStore, datanode.ECSelfHealConfig{})
+	// Orphan GC (F4, §14) is enabled by default only when an orphan resolver is
+	// wired. The production metaStore (*metadata.HTTPClient) resolves the
+	// original length but lacks the local-only *metadata.ECStore orphan check
+	// (IsChunkShardsOrphaned), so SetOrphanResolver is not wired here — orphan
+	// reclamation is disabled on the production path until a counterpart HTTP
+	// RPC exists (documented deploy follow-on, same seam as F3's landing
+	// resolver). Tests wire a local ECStore-backed resolver directly.
 	healer.Start(ctx)
 
 	if err := opsServer.Start(); err != nil {
