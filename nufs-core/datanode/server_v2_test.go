@@ -168,6 +168,110 @@ func TestV2StoreWriteErrorRateAndInterface(t *testing.T) {
 	var _ HeartbeatStore = v
 }
 
+// TestV2StoreDrainWrites verifies the DrainOps write barrier: DrainWrites
+// blocks until an in-flight write completes, then blocks new writes until
+// the returned release func is called, after which writes resume. Reads are
+// never blocked by a drain (they do not take drainMu).
+func TestV2StoreDrainWrites(t *testing.T) {
+	v, _ := newTestMultiStore(t, 2)
+
+	// Simulate an in-flight write: hold drainMu.RLock exactly as writeTo /
+	// writeShardAt / RebalanceOne hold it for their duration.
+	v.drainMu.RLock()
+
+	drainDone := make(chan func(), 1)
+	go func() {
+		release, err := v.DrainWrites(context.Background())
+		if err != nil {
+			t.Errorf("DrainWrites: %v", err)
+			close(drainDone)
+			return
+		}
+		drainDone <- release
+	}()
+
+	// While the write is in flight, the drain must not have returned.
+	select {
+	case _, ok := <-drainDone:
+		if ok {
+			t.Fatal("DrainWrites returned while a write was still in flight")
+		}
+		t.Fatal("DrainWrites errored")
+	case <-time.After(50 * time.Millisecond):
+		// Good: drain is blocked on the in-flight write.
+	}
+
+	// The in-flight write completes; the drain now acquires the barrier.
+	v.drainMu.RUnlock()
+	var release func()
+	select {
+	case release = <-drainDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("DrainWrites did not acquire the barrier after the write drained")
+	}
+
+	// While drained, a concurrent write must block.
+	writeStarted := make(chan struct{})
+	writeDone := make(chan error, 1)
+	go func() {
+		close(writeStarted)
+		writeDone <- v.Write(metadata.ChunkID(3033), []byte("blocked-while-drained"))
+	}()
+	<-writeStarted
+	select {
+	case <-time.After(50 * time.Millisecond):
+		// Good: the write stayed blocked behind the held barrier.
+	case <-writeDone:
+		t.Fatal("write proceeded while the store was drained")
+	}
+
+	// Release: the blocked write now lands and is readable. Reads were never
+	// gated, so a read issued during the drain already returns the old state.
+	release()
+	if err := <-writeDone; err != nil {
+		t.Fatalf("post-drain write: %v", err)
+	}
+	got, _, err := v.Read(metadata.ChunkID(3033), 0, 0)
+	if err != nil || string(got) != "blocked-while-drained" {
+		t.Fatalf("post-drain write not readable: got=%q err=%v", got, err)
+	}
+}
+
+// TestV2StoreDrainWritesTimeoutSelfHeals verifies the timeout path of the
+// drain barrier: when DrainWrites cannot acquire the barrier before its
+// deadline, it returns the deadline error and the store self-heals (the
+// barrier is not leaked), so writes resume once the in-flight write clears.
+func TestV2StoreDrainWritesTimeoutSelfHeals(t *testing.T) {
+	v, _ := newTestMultiStore(t, 1)
+
+	// Hold a write in flight so the barrier cannot be acquired, forcing the
+	// deadline to fire deterministically.
+	v.drainMu.RLock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	release, err := v.DrainWrites(ctx)
+	if err == nil {
+		if release != nil {
+			release()
+		}
+		t.Fatal("DrainWrites with held write returned nil error, want timeout")
+	}
+	// The in-flight write clears; the DrainWrites goroutine acquires then
+	// releases the barrier (self-heal), so the store accepts writes again.
+	v.drainMu.RUnlock()
+
+	var werr error
+	for i := 0; i < 50; i++ {
+		if werr = v.Write(metadata.ChunkID(4044), []byte("after-timeout")); werr == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if werr != nil {
+		t.Fatalf("write after drained timeout: %v", werr)
+	}
+}
+
 func TestV2StoreOverwriteAccounting(t *testing.T) {
 	v, _ := newTestMultiStore(t, 1)
 

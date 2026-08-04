@@ -52,3 +52,6 @@ var _ OpsStore = (*V2Store)(nil)
 // capabilities (V2.1 gates them out until Metadata V2 serving lands).
 var _ DiskLifecycleOps = (*ChunkStore)(nil)
 var _ DrainOps = (*ChunkStore)(nil)
+// The V2.1 V2Store implements the drain capability too (its drainMu write
+// barrier quiesces writes without blocking reads), lighting up POST /drain.
+var _ DrainOps = (*V2Store)(nil)

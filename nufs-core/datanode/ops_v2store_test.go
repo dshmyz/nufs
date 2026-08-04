@@ -141,6 +141,27 @@ func mustV2Store(t *testing.T) *V2Store {
 // TestOpsServer_V2StoreDiskLifecycleUnsupported proves the disk-lifecycle
 // endpoints answer "unsupported" (503) because V2.1 has no disk lifecycle,
 // rather than dereferencing a nil capability or panicking.
+// TestOpsServer_V2StoreDrain proves the V2.1 engine's drain capability lights
+// up the ops surface: V2Store implements the DrainOps structural interface,
+// so POST /api/v1/disks/drain returns 200 "drained" (it previously returned
+// 501 "unsupported by this engine" before V2.1 parity landed).
+func TestOpsServer_V2StoreDrain(t *testing.T) {
+	_, dispatch := newV2OpsServer(t)
+	rec := dispatch(http.MethodPost, "/api/v1/disks/drain")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/v1/disks/drain code=%d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "drained") {
+		t.Fatalf("/api/v1/disks/drain body=%q, want 'drained'", rec.Body.String())
+	}
+
+	// The unsupported method forms still 405.
+	rec = dispatch(http.MethodGet, "/api/v1/disks/drain")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /api/v1/disks/drain code=%d, want 405", rec.Code)
+	}
+}
+
 func TestOpsServer_V2StoreDiskLifecycleUnsupported(t *testing.T) {
 	_, dispatch := newV2OpsServer(t)
 
@@ -149,7 +170,6 @@ func TestOpsServer_V2StoreDiskLifecycleUnsupported(t *testing.T) {
 		{http.MethodPost, "/api/v1/disks/retire?dir=/tmp/x"},
 		{http.MethodPost, "/api/v1/disks/decommission?dir=/tmp/x"},
 		{http.MethodPost, "/api/v1/disks/migrate?dir=/tmp/x"},
-		{http.MethodPost, "/api/v1/disks/drain"},
 	} {
 		rec := dispatch(tc.method, tc.path)
 		if rec.Code != http.StatusNotImplemented {

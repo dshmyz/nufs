@@ -714,6 +714,19 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	repairWorker.Stop()
 	replicator.Stop()
 	heartbeat.Stop()
+	// Drain in-flight writes before closing the stores (mirrors the V1
+	// shutdown Phase 3). The barrier quiesces writes without blocking reads.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	releaseDrain, err := v2Store.DrainWrites(drainCtx)
+	if err != nil {
+		log.Warn("drain timeout, some writes may be in-flight", "error", err)
+	} else {
+		log.Info("all in-flight writes drained")
+	}
+	if releaseDrain != nil {
+		releaseDrain()
+	}
+	drainCancel()
 	closeStores()
 	if err := changeJournal.Close(); err != nil {
 		log.Warn("V2.1 change journal close error", "error", err)

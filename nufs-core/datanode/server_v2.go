@@ -89,6 +89,16 @@ type V2Store struct {
 	// updates both mutate them; reads take RLock.
 	mu    sync.RWMutex
 	locOf map[metadata.ChunkID]chunkLoc
+	// drainMu is the write-drain barrier (V1-b, DrainOps parity). Every write
+	// primitive takes drainMu.RLock for its duration; DrainWrites takes
+	// drainMu.Lock() to quiesce in-flight writes and block new ones, then
+	// returns a release func that Unlock()s to resume. It is a separate
+	// mutex from mu so writes are drained WITHOUT blocking concurrent reads
+	// (reads take only mu.RLock, never drainMu). A drained store can keep
+	// serving reads; after release it accepts writes again (non-destructive,
+	// unlike close which sets closing permanently).
+	drainMu sync.RWMutex
+	// shardDiskOf records, per EC chunk and per shard index, which shard store
 	// shardDiskOf records, per EC chunk and per shard index, which shard store
 	// disk hosts that shard extent, so ReadShard/DeleteShard route to the disk
 	// that wrote it. E3 spreads the 6+3 shards across distinct shard disks (disk
@@ -184,6 +194,11 @@ func (v *V2Store) WriteGen(chunkID metadata.ChunkID, generation uint64, data []b
 // generation, updating location and accounting. newChunk (gen==1) is inferred
 // from the generation.
 func (v *V2Store) writeTo(chunkID metadata.ChunkID, disk int, gen storage.Generation, data []byte) error {
+	// Write barrier: hold drainMu.RLock for the whole write so DrainWrites
+	// (which takes drainMu.Lock) cannot race an in-flight write. Reads do not
+	// take drainMu, so draining never blocks them.
+	v.drainMu.RLock()
+	defer v.drainMu.RUnlock()
 	if disk < 0 || disk >= len(v.disks) {
 		disk = 0
 	}
@@ -356,6 +371,10 @@ func (v *V2Store) WriteShardAtDisk(chunkID metadata.ChunkID, shardIndex int, dis
 // writeShardAt is the shared impl: write a shard extent on a given disk,
 // record the per-shard owning disk, and update the disk's usage accounting.
 func (v *V2Store) writeShardAt(chunkID metadata.ChunkID, shardIndex, disk int, data []byte) error {
+	// Write barrier (shared by WriteShard/WriteShardAtDisk/WriteChunkEC) so
+	// DrainWrites quiesces EC-shard writes too.
+	v.drainMu.RLock()
+	defer v.drainMu.RUnlock()
 	if disk < 0 || disk >= len(v.shards) {
 		return fmt.Errorf("write shard: no shard store attached (disk %d, have %d)", disk, len(v.shards))
 	}
@@ -636,6 +655,11 @@ func (v *V2Store) nextLoc(chunkID metadata.ChunkID) (int, storage.Generation) {
 // toDisk==fromDisk, an unknown chunk, a missing source, or a move onto a
 // failed disk returns an error without changing state.
 func (v *V2Store) RebalanceOne(chunkID metadata.ChunkID, fromDisk, toDisk int) error {
+	// Rebalance issues a write to the target disk, so hold the write barrier
+	// for the whole move: a DrainWrites running concurrently must not observe
+	// a half-moved extent. Reads (which take only mu.RLock) are unaffected.
+	v.drainMu.RLock()
+	defer v.drainMu.RUnlock()
 	if fromDisk == toDisk {
 		return fmt.Errorf("rebalance: fromDisk == toDisk (%d)", fromDisk)
 	}
@@ -1014,6 +1038,50 @@ func (v *V2Store) WriteErrorRate() float64 {
 		return 0
 	}
 	return float64(errs) / float64(ops)
+}
+
+// DrainWrites quiesces in-flight writes and blocks new ones until the
+// returned release func is called, satisfying the DrainOps structural
+// interface (this is what lights up POST /drain in the ops channel). It
+// takes drainMu.Lock(), which blocks until every in-flight write
+// (writeTo/writeShardAt/RebalanceOne — all hold drainMu.RLock for their
+// duration) has completed, then blocks all new writes. The returned release
+// func resumes writes; reads are never blocked (they do not take drainMu),
+// so a drained store continues serving reads. A ctx timeout returns
+// ctx.Err with no release func and no barrier held.
+func (v *V2Store) DrainWrites(ctx context.Context) (func(), error) {
+	acquired := make(chan struct{})
+	// release is idempotent so the success path and the timeout self-heal can
+	// both call it without risk of a double-unlock.
+	var once sync.Once
+	release := func() { once.Do(func() { v.drainMu.Unlock() }) }
+
+	// Acquire the barrier in a goroutine: drainMu.Lock blocks until every
+	// in-flight write (which holds drainMu.RLock) completes, then blocks new
+	// writes until release is called.
+	go func() {
+		v.drainMu.Lock()
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+		// Barrier held exclusively by this goroutine until the caller
+		// invokes release.
+		return release, nil
+	case <-ctx.Done():
+		// Deadline elapsed before we could hand the barrier back. Do NOT
+		// block the caller on acquired — the caller may itself hold a write
+		// (read lock) that the acquire goroutine is waiting on, so waiting
+		// here would deadlock. Instead spawn a self-heal goroutine that
+		// releases the barrier the moment it is eventually acquired, so the
+		// store never stays permanently drained. The caller gets the error.
+		go func() {
+			<-acquired
+			release()
+		}()
+		return nil, ctx.Err()
+	}
 }
 
 // DiskManager returns nil — the V2.1 engine manages per-disk layout
