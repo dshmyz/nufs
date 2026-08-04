@@ -155,6 +155,36 @@ func (h *opsHandlers) handleECConvertComplete(w http.ResponseWriter, r *http.Req
 	writeJSON(w, st)
 }
 
+// publishECConvert: POST /api/v1/ec/convert/publish
+// {stripe_id} → atomic §14 chunk layout switch + updated ECStripe.
+func (h *opsHandlers) handleECConvertPublish(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		StripeID string `json:"stripe_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.StripeID == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	st, err := h.ecStore().GetStripe(req.StripeID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if st == nil {
+		writeJSONError(w, http.StatusNotFound, "stripe not found")
+		return
+	}
+	if _, err := h.ecStore().SwitchChunkToEC(r.Context(), req.StripeID); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, st)
+}
+
 // rollbackECConvert: POST /api/v1/ec/convert/rollback
 // {stripe_id, reason} → ECStripe (RolledBack).
 func (h *opsHandlers) handleECConvertRollback(w http.ResponseWriter, r *http.Request) {

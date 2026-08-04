@@ -663,6 +663,18 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// takes it as the authority. This is the S2 replacement for the S1
 	// in-process local Pebble ECStore stand-in.
 	ecService := datanode.NewECService(v2Store, metaStore)
+	// Wire the publish hook: after a completed conversion, lift the stripe's EC
+	// layout into the chunk's authoritative metadata (atomic §14 layout switch)
+	// on the metad authority over HTTP. This closes the serving loop — a
+	// converted chunk is then served from its 6+3 shards, not the old replicas.
+	//
+	// Note: this stores the full nine-shard layout per chunk (O(N×9)) — the
+	// PG-level-convergence transition form. Long term the EC layout should
+	// converge to a placement-group / EC-profile level so a chunk references
+	// the profile instead of embedding all nine shards.
+	ecService.SetPublish(func(_ context.Context, st *metadata.ECStripe) error {
+		return metaStore.PublishConversion(st)
+	})
 	opsServer.SetECService(ecService)
 
 	if err := opsServer.Start(); err != nil {

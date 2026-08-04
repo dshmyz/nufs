@@ -116,6 +116,7 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/ec/convert/plan", mut(s.handleECConvertPlan))
 	mux.HandleFunc("/api/v1/ec/convert/mark-syncing", mut(s.handleECConvertMarkSyncing))
 	mux.HandleFunc("/api/v1/ec/convert/complete", mut(s.handleECConvertComplete))
+	mux.HandleFunc("/api/v1/ec/convert/publish", mut(s.handleECConvertPublish))
 	mux.HandleFunc("/api/v1/ec/convert/rollback", mut(s.handleECConvertRollback))
 
 	// Watch — long-poll SSE stream of metadata change events

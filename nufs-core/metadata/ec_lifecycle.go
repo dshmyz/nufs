@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"time"
@@ -308,6 +309,80 @@ func (s *ECStore) RollbackConversion(st *ECStripe, reason string) error {
 // small idle files (≤ 16 MiB, one extent), which is exactly the EC demographic.
 // Multi-extent (paged) files report ErrExtentNotInline — the service path (E4)
 // resolves those through the placement group.
+// SwitchChunkToEC is the atomic §14 layout switch that lifts a durable,
+// completed conversion stripe into the chunk's authoritative metadata: it
+// replaces the chunk's 3-replica layout (ChunkMeta.Replicas) with the stripe's
+// nine shard placements, sets ECGroup, and records the original checksum, so
+// the chunk is thereafter served from the 6+3 shards rather than the old
+// replicas. It is the server-side twin of datanode.BuildECGroup, driven here
+// off the durable stripe so the switch is made from authoritative state.
+//
+// The write runs through the same tombstone-safe, exact-value conditional
+// update (updateLiveChunkMetadata + readChunkTombstoneRaw) every other chunk
+// mutation uses, so a concurrent heartbeat replica-state report or tombstone
+// is never silently clobbered; non-layout fields (Size, Tier, CreateTime,
+// Generation, PGID/Epoch, replica states) are preserved as-is.
+//
+// Transition-form note: this stores the full nine-shard layout per chunk
+// (O(N×9) metadata). It is the PG-level-convergence *transition* form — long
+// term the EC layout should converge to a placement-group / EC-profile level
+// so a chunk references the profile rather than embedding all nine shards.
+func (s *ECStore) SwitchChunkToEC(ctx context.Context, stripeID string) (*ChunkMeta, error) {
+	if s.store.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	st, err := s.GetStripe(stripeID)
+	if err != nil {
+		return nil, err
+	}
+	if st == nil {
+		return nil, fmt.Errorf("ec: publish: stripe %q not found", stripeID)
+	}
+	if st.State != ECConversionComplete {
+		return nil, fmt.Errorf("ec: publish: stripe %q state %s, want complete", stripeID, st.State)
+	}
+	chunkID := ChunkID(st.ExtentID)
+	key := fmt.Sprintf("%s%d", prefixChunk, chunkID)
+
+	raw, exists, err := s.store.readChunkTombstoneRaw(key)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrChunkNotFound
+	}
+	var chunk ChunkMeta
+	if err := unmarshalValue(raw, &chunk); err != nil {
+		return nil, fmt.Errorf("ec: publish: decode chunk %d: %w", chunkID, err)
+	}
+
+	// Build the EC layout from the durable stripe, preserving every field the
+	// datanode does not own (Size, Tier, CreateTime, Generation, PG/Epoch).
+	layout := &ChunkMeta{
+		ID:         chunk.ID,
+		Size:       chunk.Size,
+		State:      ChunkReady,
+		ECGroup:    &ECGroupInfo{GroupID: st.StripeID, DataShards: ECDataShards, ParityShards: ECParityShards},
+		Tier:       chunk.Tier,
+		CreateTime: chunk.CreateTime,
+		Checksum:   st.OriginalChecksum,
+		PGID:       chunk.PGID,
+		Epoch:      chunk.Epoch,
+		Generation: chunk.Generation,
+	}
+	for _, sh := range st.Shards {
+		layout.Replicas = append(layout.Replicas, ReplicaInfo{
+			NodeID:     NodeID(sh.NodeID),
+			ShardIndex: sh.Index,
+		})
+	}
+	if err := s.store.updateLiveChunkMetadata(ctx, raw, layout); err != nil {
+		return nil, fmt.Errorf("ec: publish: switch chunk %d to EC: %w", chunkID, err)
+	}
+	s.store.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("chunk:%d", chunkID)})
+	return layout, nil
+}
+
 func (s *ECStore) MarkExtentColdEC(id InodeID, extentID ExtentIDV2, stripeID string) error {
 	inodes := NewInodeStoreV2(s.store)
 	in, err := inodes.Get(id)

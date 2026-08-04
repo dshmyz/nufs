@@ -1352,6 +1352,24 @@ func (c *HTTPClient) CompleteConversion(st *ECStripe, at time.Time) error {
 	return nil
 }
 
+// PublishConversion performs the atomic §14 layout switch on the remote
+// authority: it tells metad to lift a completed conversion stripe's EC layout
+// into the chunk's authoritative metadata (Replicas → nine shard placements,
+// ECGroup set). It is the remote half of the datanode ECService publish hook.
+func (c *HTTPClient) PublishConversion(st *ECStripe) error {
+	req := map[string]interface{}{"stripe_id": st.StripeID}
+	resp, err := c.doRequestWithRetry(context.Background(), http.MethodPost, "/api/v1/ec/convert/publish", req)
+	if err != nil {
+		return err
+	}
+	var updated ECStripe
+	if err := c.readResponse(resp, &updated); err != nil {
+		return err
+	}
+	*st = updated
+	return nil
+}
+
 // RollbackConversion aborts a non-durable transaction on the remote authority.
 func (c *HTTPClient) RollbackConversion(st *ECStripe, reason string) error {
 	req := map[string]interface{}{"stripe_id": st.StripeID, "reason": reason}

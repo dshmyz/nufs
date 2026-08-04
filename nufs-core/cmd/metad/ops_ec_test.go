@@ -298,3 +298,136 @@ func TestECConvertS2UnderProvisionedFailsCleanly(t *testing.T) {
 		t.Fatalf("replica unreadable after failed convert: data=%q err=%v", got, err)
 	}
 }
+
+// TestECConvertS2PublishSwitchesChunkLayout wires the publish hook end to end:
+// after a completed HTTP-driven conversion, PublishConversion lifts the stripe's
+// 6+3 layout into the chunk's authoritative metadata (Replicas → nine shard
+// placements, ECGroup set, checksum recorded), preserving non-layout fields —
+// the atomic §14 serving-loop switch (Task #78).
+func TestECConvertS2PublishSwitchesChunkLayout(t *testing.T) {
+	store, bundle := newOpsTestStore(t)
+	srv := httptest.NewServer(buildOpsTestMux(t, store, bundle))
+	defer srv.Close()
+
+	v, _ := opsECDatanode(t, 3)
+
+	// Seed authoritative chunk metadata the way the real serving loop does:
+	// register a placement node, create a bucket + file, allocate the chunk.
+	// ConvertToEC then converts the allocated chunk (its metadata row is what
+	// the publish layout switch must update).
+	ctx := context.Background()
+	if err := store.RegisterNode(ctx, &metadata.NodeInfo{ID: 1, Addr: "datanode-1:9100", CapacityGB: 10, Tier: metadata.TierHot}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	if err := store.CreateBucket(ctx, "publish-bucket", metadata.PlacementPolicy{ReplicationFactor: 1}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "publish-bucket")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	inode, err := store.CreateFile(ctx, bucket.RootInode, "f", 0644)
+	if err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+	alloc, err := store.AllocateChunk(ctx, inode.ID, 0, metadata.PlacementPolicy{ReplicationFactor: 1})
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+	cid := alloc.ID
+	if cid == 0 {
+		t.Fatal("allocated chunk has zero ID")
+	}
+
+	payload := []byte("s2-publish-layout-switch")
+	for i := 0; i < 64; i++ {
+		payload = append(payload, 0x7B)
+	}
+	if err := v.Write(cid, payload); err != nil {
+		t.Fatalf("write replicated chunk: %v", err)
+	}
+
+	auth := metadata.NewHTTPClient(srv.URL, 10*time.Second)
+	svc := datanode.NewECService(v, auth)
+	st, err := svc.ConvertToEC(context.Background(), cid, 1)
+	if err != nil {
+		t.Fatalf("ConvertToEC: %v", err)
+	}
+	if st.State != metadata.ECConversionComplete {
+		t.Fatalf("state = %s, want complete", st.State)
+	}
+
+	// Before publish the chunk is still a replica layout (no EC group).
+	pre, err := store.GetChunk(ctx, cid)
+	if err != nil {
+		t.Fatalf("GetChunk(pre): %v", err)
+	}
+	if pre.ECGroup != nil {
+		t.Fatalf("chunk already has ECGroup before publish: %+v", pre.ECGroup)
+	}
+
+	// Publish: the server-side atomic §14 layout switch writes the EC layout
+	// into the chunk's authoritative metadata.
+	if err := auth.PublishConversion(st); err != nil {
+		t.Fatalf("PublishConversion: %v", err)
+	}
+
+	chunk, err := store.GetChunk(context.Background(), cid)
+	if err != nil {
+		t.Fatalf("GetChunk: %v", err)
+	}
+	if chunk.ECGroup == nil {
+		t.Fatal("ECGroup not set after publish")
+	}
+	if chunk.ECGroup.GroupID != st.StripeID || chunk.ECGroup.DataShards != 6 || chunk.ECGroup.ParityShards != 3 {
+		t.Fatalf("ECGroup = %+v, want stripe %s 6+3", chunk.ECGroup, st.StripeID)
+	}
+	if len(chunk.Replicas) != 9 {
+		t.Fatalf("replicas after publish = %d, want 9 shard placements", len(chunk.Replicas))
+	}
+	// Each shard placement carries the planned NodeID and its shard index.
+	for i, sh := range st.Shards {
+		r := chunk.Replicas[i]
+		if uint64(r.NodeID) != sh.NodeID {
+			t.Fatalf("replica %d node = %d, want planned %d", i, uint64(r.NodeID), sh.NodeID)
+		}
+		if r.ShardIndex != sh.Index {
+			t.Fatalf("replica %d shard index = %d, want %d", i, r.ShardIndex, sh.Index)
+		}
+	}
+	if chunk.Checksum != st.OriginalChecksum {
+		t.Fatalf("chunk checksum = %#x, want %#x", chunk.Checksum, st.OriginalChecksum)
+	}
+	if chunk.State != metadata.ChunkReady {
+		t.Fatalf("chunk state = %v, want ready", chunk.State)
+	}
+	if chunk.Size != pre.Size {
+		t.Fatalf("chunk size not preserved: got %d, want %d", chunk.Size, pre.Size)
+	}
+
+	// The converted chunk still serves byte-exact through the storage layer.
+	data, sum, err := v.ReadChunkEC(cid, len(payload))
+	if err != nil {
+		t.Fatalf("ReadChunkEC after publish: %v", err)
+	}
+	if string(data) != string(payload) || sum == 0 {
+		t.Fatalf("serving read after publish: len=%d sum=%#x", len(data), sum)
+	}
+}
+
+// TestECConvertS2PublishNotCompleteFails proves the layout switch refuses a
+// stripe that has not durably completed (no partial publish).
+func TestECConvertS2PublishNotCompleteFails(t *testing.T) {
+	store, bundle := newOpsTestStore(t)
+	srv := httptest.NewServer(buildOpsTestMux(t, store, bundle))
+	defer srv.Close()
+
+	auth := metadata.NewHTTPClient(srv.URL, 10*time.Second)
+	st, err := auth.BeginConversion("stripe-s2-pub-nc", 43004, 1, 0x1234)
+	if err != nil {
+		t.Fatalf("BeginConversion: %v", err)
+	}
+	if err := auth.PublishConversion(st); err == nil {
+		t.Fatal("PublishConversion on a non-complete stripe succeeded, want error")
+	}
+}
