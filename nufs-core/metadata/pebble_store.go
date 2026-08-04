@@ -2057,7 +2057,13 @@ func (s *PebbleStore) buildAllocatedChunks(ctx context.Context, offsets []int64,
 		}
 		chunk := &ChunkMeta{ID: id, Size: MaxChunkSize, State: ChunkCreated, Replicas: replicas, Tier: policy.StorageTier, CreateTime: time.Now().UnixNano(), PGID: pgID, Epoch: pgEpoch, Generation: 1}
 		if groupID != "" {
-			chunk.ECGroup = &ECGroupInfo{GroupID: groupID, DataShards: policy.ECConfig.DataShards, ParityShards: policy.ECConfig.ParityShards}
+			// Reference the shared ECProfile (config lives in the profile row,
+			// not repeated per chunk) while retaining the embedded
+			// DataShards/ParityShards for read-compatible consumers. No
+			// ECStripeID yet: the durable stripe is only created at
+			// conversion time (ECStore.BeginConversion), after which the
+			// landing pointer is set by the publish step.
+			chunk.ECGroup = ECGroupFromProfile(nil, groupID)
 		}
 		chunks[i] = chunk
 	}

@@ -219,6 +219,17 @@ type ChunkMeta struct {
 	// for the legacy per-chunk path (V1), where datanodes keep their own
 	// local generation.
 	Generation uint64 `json:"generation,omitempty"`
+
+	// ECStripeID points at the durable, write-once ECStripe registry entry
+	// (ec-stripe/<id>) that holds the authoritative per-stripe *actual
+	// landing* — each shard's (Index, NodeID, DiskID, SegmentID, Offset,
+	// Checksum). It is the referenced form of the EC landing: ChunkMeta
+	// never embeds the nine shards directly into a shared/static record, so
+	// "which disks this stripe actually landed on" stays recoverable even as
+	// the embedded ChunkMeta.Replicas materialization is kept for
+	// V1 gateway / repair / ha / tombstone / migrate consumers. Empty for
+	// non-EC chunks (replicated or V1).
+	ECStripeID string `json:"ec_stripe_id,omitempty"`
 }
 
 // ChunkState represents the lifecycle state of a chunk.
@@ -253,10 +264,22 @@ const (
 
 // ECGroupInfo describes erasure coding group membership.
 type ECGroupInfo struct {
-	GroupID      string `json:"group_id"`
-	DataShards   int    `json:"data_shards"`
-	ParityShards int    `json:"parity_shards"`
-	ShardIndex   int    `json:"shard_index"` // This chunk's shard index
+	// GroupID identifies the group/stripe (for converted chunks this is the
+	// ECStripeID).
+	GroupID string `json:"group_id"`
+	// ProfileID points at the shared ECProfile record (ec-profile/<id>) that
+	// holds the common 6+3 configuration (DataShards/ParityShards/fault-domain
+	// bounds). It is the shared-profile pointer: the config is stored once in
+	// the profile row rather than repeated on every EC chunk. Empty for old
+	// rows written before the profile existed, or when the chunk embeds the
+	// config directly (DataShards/ParityShards below).
+	ProfileID string `json:"profile_id,omitempty"`
+	// DataShards/ParityShards are the EC group's config, embedded per chunk
+	// for read compatibility with consumers that do not resolve the profile.
+	// New rows may leave them zero and carry only ProfileID.
+	DataShards   int `json:"data_shards"`
+	ParityShards int `json:"parity_shards"`
+	ShardIndex   int `json:"shard_index"` // This chunk's shard index
 }
 
 // ========== Node & Cluster ==========

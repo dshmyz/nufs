@@ -382,6 +382,14 @@ func TestECConvertS2PublishSwitchesChunkLayout(t *testing.T) {
 	if chunk.ECGroup.GroupID != st.StripeID || chunk.ECGroup.DataShards != 6 || chunk.ECGroup.ParityShards != 3 {
 		t.Fatalf("ECGroup = %+v, want stripe %s 6+3", chunk.ECGroup, st.StripeID)
 	}
+	// Consolidated form (Program 5): the chunk references the shared profile
+	// and the durable stripe that holds the authoritative shard landing.
+	if chunk.ECGroup.ProfileID != metadata.DefaultECProfileID {
+		t.Fatalf("ECGroup profile id = %q, want %q", chunk.ECGroup.ProfileID, metadata.DefaultECProfileID)
+	}
+	if chunk.ECStripeID != st.StripeID {
+		t.Fatalf("ECStripeID = %q, want %q", chunk.ECStripeID, st.StripeID)
+	}
 	if len(chunk.Replicas) != 9 {
 		t.Fatalf("replicas after publish = %d, want 9 shard placements", len(chunk.Replicas))
 	}

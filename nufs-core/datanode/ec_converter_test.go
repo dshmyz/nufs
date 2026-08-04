@@ -119,6 +119,14 @@ func TestECConverter_ConvertReplicaRoundTrip(t *testing.T) {
 	if cm.ECGroup == nil || cm.ECGroup.DataShards != 6 || cm.ECGroup.ParityShards != 3 {
 		t.Fatalf("ECGroup = %+v, want 6+3", cm.ECGroup)
 	}
+	// The consolidated form references the shared profile + durable stripe
+	// rather than embedding only the config (Program 5).
+	if cm.ECGroup.ProfileID != metadata.DefaultECProfileID {
+		t.Fatalf("ECGroup profile id = %q, want %q", cm.ECGroup.ProfileID, metadata.DefaultECProfileID)
+	}
+	if cm.ECStripeID != st.StripeID {
+		t.Fatalf("ECStripeID = %q, want %q", cm.ECStripeID, st.StripeID)
+	}
 	if len(cm.Replicas) != 9 {
 		t.Fatalf("EC layout has %d replicas, want 9 shards", len(cm.Replicas))
 	}

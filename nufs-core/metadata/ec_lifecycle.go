@@ -99,12 +99,12 @@ type ECShard struct {
 
 // ECConversionCheck reports whether conversion eligibility holds (§14).
 type ECConversionCheck struct {
-	Immutable      bool
-	Idle           bool
-	NoConflict     bool
+	Immutable       bool
+	Idle            bool
+	NoConflict      bool
 	HealthyReplicas bool
-	Scrubbed       bool
-	Diverse        bool
+	Scrubbed        bool
+	Diverse         bool
 }
 
 // All returns true if every precondition passes.
@@ -238,9 +238,9 @@ func (s *ECStore) PlanShards(st *ECStripe, disks []ECDisk) error {
 	sort.Slice(nodeOrder, func(i, j int) bool { return nodeOrder[i] < nodeOrder[j] })
 
 	type nodeQueue struct {
-		nodeID  uint64
-		disks   []ECDisk
-		used    int
+		nodeID   uint64
+		disks    []ECDisk
+		used     int
 		nextDisk int
 	}
 	queues := make([]*nodeQueue, 0, len(nodeOrder))
@@ -358,23 +358,44 @@ func (s *ECStore) SwitchChunkToEC(ctx context.Context, stripeID string) (*ChunkM
 
 	// Build the EC layout from the durable stripe, preserving every field the
 	// datanode does not own (Size, Tier, CreateTime, Generation, PG/Epoch).
+	// The layout references the shared ECProfile (shared config lives in the
+	// profile row, not on every chunk) and the chunk points at the durable
+	// stripe (ECStripeID) that holds the authoritative per-shard actual
+	// landing (§14 / Program 5). ChunkMeta.Replicas is still materialized
+	// below for V1 gateway / repair / ha / tombstone / migrate consumers —
+	// and this publish step cross-checks it against the authoritative stripe
+	// so the materialized copy can never silently diverge from the landing.
 	layout := &ChunkMeta{
 		ID:         chunk.ID,
 		Size:       chunk.Size,
 		State:      ChunkReady,
-		ECGroup:    &ECGroupInfo{GroupID: st.StripeID, DataShards: ECDataShards, ParityShards: ECParityShards},
+		ECGroup:    ECGroupFromProfile(nil, st.StripeID),
 		Tier:       chunk.Tier,
 		CreateTime: chunk.CreateTime,
 		Checksum:   st.OriginalChecksum,
 		PGID:       chunk.PGID,
 		Epoch:      chunk.Epoch,
 		Generation: chunk.Generation,
+		ECStripeID: st.StripeID,
 	}
 	for _, sh := range st.Shards {
 		layout.Replicas = append(layout.Replicas, ReplicaInfo{
 			NodeID:     NodeID(sh.NodeID),
 			ShardIndex: sh.Index,
 		})
+	}
+	// Cross-check the materialized landing copy against the authoritative
+	// stripe: same shard count and same node per shard index. A mismatch
+	// means the denormalized Replicas would disagree with where the shards
+	// actually landed — refuse to publish rather than persist a stale view.
+	if len(layout.Replicas) != len(st.Shards) {
+		return nil, fmt.Errorf("ec: publish: stripe %q has %d shards, built %d replicas", stripeID, len(st.Shards), len(layout.Replicas))
+	}
+	for i, sh := range st.Shards {
+		if layout.Replicas[i].NodeID != NodeID(sh.NodeID) || layout.Replicas[i].ShardIndex != sh.Index {
+			return nil, fmt.Errorf("ec: publish: stripe %q shard %d landing mismatch (stripe node %d idx %d vs replica node %d idx %d)",
+				stripeID, i, sh.NodeID, sh.Index, layout.Replicas[i].NodeID, layout.Replicas[i].ShardIndex)
+		}
 	}
 	if err := s.store.updateLiveChunkMetadata(ctx, raw, layout); err != nil {
 		return nil, fmt.Errorf("ec: publish: switch chunk %d to EC: %w", chunkID, err)

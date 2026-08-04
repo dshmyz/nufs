@@ -152,11 +152,12 @@ func (c *ECConverter) ConvertReplica(stripeID string, extentID uint64, gen uint6
 // replicas (§14 atomic switch).
 func BuildECGroup(st *metadata.ECStripe, size int32, tier metadata.StorageTier) *metadata.ChunkMeta {
 	cm := &metadata.ChunkMeta{
-		Size:     size,
-		State:    metadata.ChunkReady,
-		ECGroup:  &metadata.ECGroupInfo{GroupID: st.StripeID, DataShards: ec63Data, ParityShards: ec63Parity},
-		Checksum: st.OriginalChecksum,
-		Tier:     tier,
+		Size:       size,
+		State:      metadata.ChunkReady,
+		ECGroup:    metadata.ECGroupFromProfile(nil, st.StripeID),
+		Checksum:   st.OriginalChecksum,
+		Tier:       tier,
+		ECStripeID: st.StripeID,
 	}
 	for _, s := range st.Shards {
 		cm.Replicas = append(cm.Replicas, metadata.ReplicaInfo{
