@@ -57,6 +57,7 @@ var (
 	ErrNameTooLong       = errors.New("metadata: name exceeds maximum length")
 	ErrCrossBucketRename = errors.New("metadata: rename across buckets is not allowed")
 	ErrXAttrNotFound     = errors.New("metadata: extended attribute not found")
+	ErrExtentNotInline   = errors.New("metadata: extent is not inline")
 	ErrDirTooLarge       = errors.New("metadata: directory exceeds maximum entries limit")
 	ErrAccessDenied      = errors.New("metadata: access denied")
 	ErrQuotaExceeded     = errors.New("metadata: bucket quota exceeded")

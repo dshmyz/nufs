@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -186,16 +187,92 @@ func (s *ECStore) BeginConversion(stripeID string, extentID uint64, gen uint64, 
 	return st, nil
 }
 
-// PlanShards assigns the 9 shards across fault domains. For a 9-disk,
-// 3-machine layout each machine gets 3 shards; the validator enforces
-// the §14 bounds.
-func (s *ECStore) PlanShards(st *ECStripe, nodeForDisk func(diskID uint64) uint64) error {
-	// Placeholder: the caller assigns shards from the data path; here we
-	// validate that a proposed placement meets diversity. The store
-	// persists the plan once validated.
-	if st.State == ECConversionPreparing {
-		st.State = ECConversionEncoding
+// ECDisk is a candidate shard storage target: one physical disk on a node.
+// The 6+3 planner distributes the nine shard extents across a set of these
+// so that loss of a whole node (and its disks) is tolerated (§14).
+type ECDisk struct {
+	// DiskID identifies the physical disk (the datanode's shard store disk).
+	DiskID uint64
+	// NodeID is the machine hosting the disk (the fault domain).
+	NodeID uint64
+}
+
+// PlanShards assigns the nine shards (six data, three parity) of one stripe
+// across candidate disks with fault-domain diversity: at least MinMachines
+// distinct nodes take part and no node holds more than MaxShardsPerMachine
+// shards (per §14, 6+3 tolerates losing at most three shards / one machine).
+//
+// It fills st.Shards (Index, NodeID, DiskID — location/checksum are filled
+// when the shard is durably written), validates the diversity, advances the
+// transaction Preparing → Encoding, and persists. It returns an error when
+// the candidate set cannot meet §14 bounds (too few distinct nodes or too few
+// disks to place all nine shards).
+func (s *ECStore) PlanShards(st *ECStripe, disks []ECDisk) error {
+	if st.State != ECConversionPreparing {
+		return fmt.Errorf("ec: plan shards requires state preparing, have %s", st.State)
 	}
+	total := ECDataShards + ECParityShards
+
+	// Group available disks by node, and require enough distinct machines.
+	byNode := make(map[uint64][]ECDisk)
+	for _, d := range disks {
+		byNode[d.NodeID] = append(byNode[d.NodeID], d)
+	}
+	if len(byNode) < ECMinMachines {
+		return fmt.Errorf("ec: plan shards needs >=%d distinct nodes, got %d (%d shards to place)",
+			ECMinMachines, len(byNode), total)
+	}
+	if len(disks) < total {
+		return fmt.Errorf("ec: plan shards needs >=%d disks, got %d", total, len(disks))
+	}
+
+	// Deterministic round-robin across nodes ordered by NodeID: one shard gets
+	// one disk from each node per pass, skipping a node once it hits its disk
+	// count or the per-machine shard cap. This spreads the stripe evenly and
+	// never exceeds MaxShardsPerMachine on any node.
+	nodeOrder := make([]uint64, 0, len(byNode))
+	for n := range byNode {
+		nodeOrder = append(nodeOrder, n)
+	}
+	sort.Slice(nodeOrder, func(i, j int) bool { return nodeOrder[i] < nodeOrder[j] })
+
+	type nodeQueue struct {
+		nodeID  uint64
+		disks   []ECDisk
+		used    int
+		nextDisk int
+	}
+	queues := make([]*nodeQueue, 0, len(nodeOrder))
+	for _, n := range nodeOrder {
+		ds := byNode[n]
+		sort.Slice(ds, func(i, j int) bool { return ds[i].DiskID < ds[j].DiskID })
+		queues = append(queues, &nodeQueue{nodeID: n, disks: ds})
+	}
+
+	plan := make([]ECShard, 0, total)
+	i := 0
+	for placed := 0; placed < total; placed++ {
+		q := queues[i%len(queues)]
+		if q.used >= ECMaxShardsPerMachine || q.nextDisk >= len(q.disks) {
+			i++
+			placed-- // retry with next node; bounded by total passes below
+			continue
+		}
+		d := q.disks[q.nextDisk]
+		q.nextDisk++
+		q.used++
+		plan = append(plan, ECShard{Index: placed, NodeID: d.NodeID, DiskID: d.DiskID})
+		i++
+	}
+	if len(plan) != total {
+		return fmt.Errorf("ec: plan shards could not place %d shards (disk/cap exhaustion)", total)
+	}
+
+	st.Shards = plan
+	if _, err := (&ECPlacementValidator{MinMachines: ECMinMachines, MaxPerMachine: ECMaxShardsPerMachine}).Validate(plan); err != nil {
+		return fmt.Errorf("ec: plan shards: %w", err)
+	}
+	st.State = ECConversionEncoding
 	return s.PutStripe(st)
 }
 
@@ -219,4 +296,35 @@ func (s *ECStore) CompleteConversion(st *ECStripe, at time.Time) error {
 func (s *ECStore) RollbackConversion(st *ECStripe, reason string) error {
 	st.State = ECConversionRolledBack
 	return s.PutStripe(st)
+}
+
+// MarkExtentColdEC writes the dormant V2.1 extent EC fields (§11.2): it marks
+// the inode's inline extent as ColdEC and points it at an EC stripe. This is
+// the persistence path that turns ExtentMetaV2.StorageClass/ECStripeID/
+// Lifecycle from recorded-but-unwritten to durable metadata when a single
+// extent converts 3-replica → 6+3.
+//
+// Only the inline (single-extent) layout is supported here: conversion targets
+// small idle files (≤ 16 MiB, one extent), which is exactly the EC demographic.
+// Multi-extent (paged) files report ErrExtentNotInline — the service path (E4)
+// resolves those through the placement group.
+func (s *ECStore) MarkExtentColdEC(id InodeID, extentID ExtentIDV2, stripeID string) error {
+	inodes := NewInodeStoreV2(s.store)
+	in, err := inodes.Get(id)
+	if err != nil {
+		return err
+	}
+	if in == nil {
+		return ErrInodeNotFound
+	}
+	if in.InlineExtent == nil {
+		return ErrExtentNotInline
+	}
+	if in.InlineExtent.ID != extentID {
+		return fmt.Errorf("ec: inode %d has inline extent %d, not %d", id, in.InlineExtent.ID, extentID)
+	}
+	in.InlineExtent.Lifecycle = LifecycleECConverting
+	in.InlineExtent.StorageClass = StorageClassColdEC
+	in.InlineExtent.ECStripeID = stripeID
+	return inodes.Put(in)
 }
