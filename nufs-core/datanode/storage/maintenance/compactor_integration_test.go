@@ -51,4 +51,20 @@ func TestCompactor_WithRealStore(t *testing.T) {
 	if copied != 3 {
 		t.Fatalf("expected 3 live records copied, got %d", copied)
 	}
+
+	// The P0 relocation-checksum regression: after compaction moves a live
+	// extent, reading it back through the real store must yield the
+	// byte-exact payload AND its real logical checksum (not the 0 that the
+	// old Relocate shadowed in). This is the property read/repair/verify
+	// rely on for integrity validation.
+	relocated, err := s.Read(ctx, &storage.ReadRequest{ExtentID: 2, Generation: 1})
+	if err != nil {
+		t.Fatalf("read relocated live extent: %v", err)
+	}
+	if string(relocated.Data) != "live-data" {
+		t.Fatalf("relocated data = %q, want %q", relocated.Data, "live-data")
+	}
+	if want := storage.CRC32C([]byte("live-data")); relocated.Checksum != want {
+		t.Fatalf("relocated checksum = %d, want %d (was shadowed to 0 before the fix)", relocated.Checksum, want)
+	}
 }

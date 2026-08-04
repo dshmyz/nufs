@@ -2,6 +2,7 @@ package segment
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -53,7 +54,16 @@ func TestRecoverStreaming_ReplaysCommittedBatchAndTruncatesTail(t *testing.T) {
 	}
 }
 
-func TestStoreRecovery_RelocateFailsClosed(t *testing.T) {
+// TestStoreRecovery_RelocateNoopDoesNotClobber verifies recovery treats a
+// RELOCATE record as a no-op: it must not fail closed (a supported record
+// op) and must not bind the extent to the RELOCATE record's own empty
+// location. A RELOCATE record cannot encode a target offset (see
+// Store.Relocate), so its durable role is validation-only; the relocation's
+// real durability comes from the fresh PUT at the target that precedes it.
+// When the fixture's only record is a RELOCATE (no prior PUT), the extent
+// must therefore resolve as NOT FOUND rather than being bound to the empty
+// RELOCATE location.
+func TestStoreRecovery_RelocateNoopDoesNotClobber(t *testing.T) {
 	path, desc, committedEnd := writeRecoveryFixture(t, 0, 1, nil)
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -103,12 +113,16 @@ func TestStoreRecovery_RelocateFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, err := New(Config{Dir: dir, UseMemIndex: true})
-	if s != nil {
-		crashStoreForTest(t, s)
-		t.Fatal("recovery returned a store for an unsupported relocate record")
+	if err != nil {
+		t.Fatalf("recovery rejected a supported relocate record: %v", err)
 	}
-	if !errors.Is(err, storage.ErrUnsupportedRecordOperation) {
-		t.Fatalf("recovery error = %v, want ErrUnsupportedRecordOperation", err)
+	defer s.Close()
+
+	// The RELOCATE record's own (empty) location must NOT be applied: the
+	// extent has no prior PUT in this fixture, so it resolves as not found
+	// rather than being bound to 0-byte payload at the relocate record.
+	if _, err := s.Stat(context.Background(), &storage.StatRequest{ExtentID: desc.ExtentID, Generation: desc.Generation}); !errors.Is(err, storage.ErrExtentNotFound) {
+		t.Fatalf("recovery applied the empty relocate location instead of skipping it: Stat = %v, want ErrExtentNotFound", err)
 	}
 }
 

@@ -374,14 +374,24 @@ func (s *Store) recoverActiveSegment(path string) error {
 		// unflushed records are served from the overlay until the async
 		// apply loop or a later flush persists them to Pebble.
 		state := storage.ExtentDurable
+		skip := false
 		switch d.Op {
 		case RecordPut:
 		case RecordDelete:
 			state = storage.ExtentTombstoned
 		case RecordRelocate:
-			return fmt.Errorf("%w: relocate", storage.ErrUnsupportedRecordOperation)
+			// no-op: a durable RELOCATE record cannot encode a target offset
+			// (see Relocate), and every relocation ships a fresh PUT at the
+			// target first, so the prior binding already points at the target.
+			// Skipping avoids clobbering that correct binding with the empty
+			// RELOCATE record's own location. The record is still validated by
+			// descriptor CRC, so a torn/corrupt RELOCATE still fails closed.
+			skip = true
 		default:
 			return fmt.Errorf("%w: %d", storage.ErrUnsupportedRecordOperation, d.Op)
+		}
+		if skip {
+			return nil
 		}
 		s.overlay.Put(index.Key(d.ExtentID, d.Generation), index.Value{
 			SegmentID:  d.SegmentID,
@@ -976,12 +986,28 @@ func (s *Store) AppendRecord(extentID storage.ExtentID, gen storage.Generation, 
 	}})
 	s.alloc.RecordCommit(streamSeq + 1)
 
-	return &storage.Reloc{ExtentID: extentID, Generation: gen, SegmentID: segID, Offset: off, StoredLen: storedLen, LogicalLen: uint32(len(data))}, nil
+	return &storage.Reloc{ExtentID: extentID, Generation: gen, SegmentID: segID, Offset: off, StoredLen: storedLen, LogicalLen: uint32(len(data)), Checksum: checksumOf(data)}, nil
 }
 
-// Relocate updates the derived index and overlay for records moved by
-// compaction (§10.3 step 6), applying only if the old location still
-// matches.
+// Relocate repoints a record to the location already made durable by
+// AppendRecord (§10.3 step 6). The compactor writes a fresh PUT record at
+// the new location before calling Relocate, so the relocation is ALREADY
+// durable: on crash + segment-log replay that PUT binds (extent,gen) to the
+// target location and checksum. This step therefore only updates the live
+// read authorities (overlay, location cache) and the change journal.
+//
+// We deliberately do NOT append a standalone durable RELOCATE record: the
+// on-disk record format cannot encode a destination offset (recovery
+// derives Offset from the record's physical position and SegmentID from the
+// current segment path), so a standalone RELOCATE record would replay to its
+// own empty location and clobber the correct PUT-at-target binding. The
+// durable relocation is the AppendRecord PUT itself.
+//
+// It honors the documented "apply only if the old location still matches"
+// precondition as a tombstone-preservation guard: if a concurrent delete
+// tombstones (extent,gen) between the source-scan live check and this call,
+// the tombstone is preserved and the relocation is skipped rather than
+// resurrecting a deleted extent.
 func (s *Store) Relocate(relocs []storage.Reloc) error {
 	if err := s.enter(); err != nil {
 		return err
@@ -989,14 +1015,28 @@ func (s *Store) Relocate(relocs []storage.Reloc) error {
 	defer s.leave()
 
 	for _, r := range relocs {
-		s.overlay.Put(index.Key(r.ExtentID, r.Generation), index.Value{
+		key := index.Key(r.ExtentID, r.Generation)
+		if v, ok := s.overlay.Get(key); ok && v.State == storage.ExtentTombstoned {
+			// A delete committed after this record was scanned live. Keep
+			// the tombstone: compacting over it would resurrect a deleted
+			// extent. The dead bytes are reclaimed by a later pass.
+			continue
+		}
+		s.overlay.Put(key, index.Value{
 			SegmentID:  r.SegmentID,
 			Offset:     r.Offset,
 			StoredLen:  r.StoredLen,
 			LogicalLen: r.LogicalLen,
 			State:      storage.ExtentDurable,
-			Checksum:   0,
+			// Preserve the extent's real logical checksum (the old code
+			// shadowed it to 0, silently disabling read/repair integrity
+			// validation after compaction).
+			Checksum: r.Checksum,
 		})
+		// A prior read may have cached the old location; invalidate so the
+		// next read re-resolves through the overlay/index.
+		s.locCache.Delete(key)
+		s.emitChangeEvent(journal.EventRelocated, r.ExtentID, r.Generation, r.SegmentID, "relocated")
 	}
 	return nil
 }

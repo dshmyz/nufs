@@ -216,9 +216,12 @@ var (
 
 // ========== Crash-point injection ==========
 
-// Reloc is one record's new location after compaction (§10.3). It lives
+// Reloc is one record's new location after relocation (§10.3). It lives
 // in the storage root so both the segment store and the maintenance
-// compactor can reference it without an import cycle.
+// compactor can reference it without an import cycle. Checksum is the
+// logical payload checksum of the relocated record; carrying it through
+// relocation preserves read/repair integrity instead of shadowing the
+// derived location's checksum with 0.
 type Reloc struct {
 	ExtentID   ExtentID
 	Generation Generation
@@ -226,6 +229,7 @@ type Reloc struct {
 	Offset     int64
 	StoredLen  uint32
 	LogicalLen uint32
+	Checksum   uint32
 }
 
 // CrashPoint identifies a durable operation stage where a crash can be
