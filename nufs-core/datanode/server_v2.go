@@ -547,7 +547,24 @@ func (v *V2Store) ReadChunkECDegraded(chunkID metadata.ChunkID, originalLen int)
 // i.e. a healthy replacement location. It returns the number of shards rebuilt.
 // With fewer than six shards present, or if any rebuild write fails, it returns
 // an error and leaves the stripe degraded (no partial commit past survivors).
+// It is the least-used-fallback form of RepairChunkECWithLanding.
 func (v *V2Store) RepairChunkEC(chunkID metadata.ChunkID, originalLen int) (int, error) {
+	return v.RepairChunkECWithLanding(chunkID, originalLen, nil)
+}
+
+// RepairChunkECWithLanding rebuilds lost shards of a 6+3 stripe like
+// RepairChunkEC, but prefers to land each restored shard back onto its
+// authoritative landing disk from the durable ECStripe (Program 5/F3, §14):
+// landing[i].DiskID records which disk shard i originally landed on, so a
+// repair that rebuilds i onto that same disk keeps the placement intact rather
+// than relocating it to a least-used disk. The authoritative disk is only
+// preferred when it can still accept a fresh write at the shard's generation —
+// if it holds a tombstone or live record there (e.g. the shard was lost by
+// deleting it off that disk), the rebuild falls back to the least-used healthy
+// target, exactly as RepairChunkEC would. landing nil preserves the plain
+// least-used behavior (V1 / no authority). DiskID encodes the node-local shard
+// store index as DiskID % 1000, matching the ECSingleton resolveDisk mapping.
+func (v *V2Store) RepairChunkECWithLanding(chunkID metadata.ChunkID, originalLen int, landing []metadata.ECShard) (int, error) {
 	shards, missing, err := v.readChunkECShards(chunkID)
 	if err != nil {
 		return 0, fmt.Errorf("repair chunk ec: %w", err)
@@ -560,7 +577,14 @@ func (v *V2Store) RepairChunkEC(chunkID metadata.ChunkID, originalLen int) (int,
 		return 0, fmt.Errorf("repair chunk ec: %w", err)
 	}
 	for _, idx := range missing {
-		disk := v.cleanShardDisk(chunkID, idx)
+		prefer := -1
+		if idx < len(landing) {
+			// Prefer the authoritative landing disk for this shard index
+			// (Program 5 durable ECStripe), translating the cluster DiskID to
+			// this node's local shard-store index (DiskID % 1000).
+			prefer = int(landing[idx].DiskID % 1000)
+		}
+		disk := v.cleanShardDiskPref(chunkID, idx, prefer)
 		if disk < 0 {
 			return 0, fmt.Errorf("repair chunk ec: no healthy shard disk for shard %d", idx)
 		}
@@ -579,19 +603,41 @@ func (v *V2Store) RepairChunkEC(chunkID metadata.ChunkID, originalLen int) (int,
 // Returns -1 when no shard disk is a healthy target (e.g. every disk already
 // holds the shard, so there is nothing to repair onto).
 func (v *V2Store) cleanShardDisk(chunkID metadata.ChunkID, idx int) int {
+	return v.cleanShardDiskPref(chunkID, idx, -1)
+}
+
+// cleanShardDiskPref is cleanShardDisk with an authoritative-disk preference
+// (F3, §14): when prefer is a valid local shard-store index that can accept a
+// fresh write at the shard's generation, it is chosen outright — rebuilding
+// the lost shard back onto its originally-landed disk keeps the placement
+// intact. When prefer is out of range, already holds the generation (its shard
+// was deleted off it, so it tombstoned the generation), or no landing was
+// supplied (-1), it falls back to the least-used healthy target.
+func (v *V2Store) cleanShardDiskPref(chunkID metadata.ChunkID, idx, prefer int) int {
 	gen := shardGen(idx)
+	if prefer >= 0 && prefer < len(v.shards) && v.shardAccepting(prefer, chunkID, gen) {
+		return prefer
+	}
 	best, bestUsed := -1, int64(1<<63-1)
 	for d := 0; d < len(v.shards); d++ {
-		_, err := v.shards[d].store.Stat(context.Background(), &storage.StatRequest{
-			ExtentID: storage.ExtentID(chunkID), Generation: gen,
-		})
-		if err == storage.ErrExtentNotFound {
-			if used := v.shards[d].usedByts.Load(); used < bestUsed {
-				bestUsed, best = used, d
-			}
+		if !v.shardAccepting(d, chunkID, gen) {
+			continue
+		}
+		if used := v.shards[d].usedByts.Load(); used < bestUsed {
+			bestUsed, best = used, d
 		}
 	}
 	return best
+}
+
+// shardAccepting reports whether shard disk d accepts a fresh write at gen:
+// its store holds no record (neither live nor tombstoned) for that
+// (extent, generation), so the write would not trip the generation fence.
+func (v *V2Store) shardAccepting(d int, chunkID metadata.ChunkID, gen storage.Generation) bool {
+	_, err := v.shards[d].store.Stat(context.Background(), &storage.StatRequest{
+		ExtentID: storage.ExtentID(chunkID), Generation: gen,
+	})
+	return err == storage.ErrExtentNotFound
 }
 
 // ReheatChunkEC reconstructs a full 6+3 stripe onto a clean shard disk (a

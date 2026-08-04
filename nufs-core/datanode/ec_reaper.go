@@ -37,12 +37,24 @@ type ECChunkResolver interface {
 	GetChunk(ctx context.Context, chunkID metadata.ChunkID) (*metadata.ChunkMeta, error)
 }
 
+// ECLandingResolver resolves a chunk's authoritative per-shard landing (§14):
+// the durable ECStripe.Shards recording which disk each shard originally landed
+// on. The production *metadata.ECStore (ResolveStripeLanding) and a test stub
+// satisfy it. When wired, the self-healer rebuilds a lost shard back onto its
+// authoritative landing disk (RepairChunkECWithLanding) instead of a
+// least-used disk, keeping the placement intact; absent, it falls back to
+// least-used (RepairChunkEC's existing behavior).
+type ECLandingResolver interface {
+	ResolveStripeLanding(chunk *metadata.ChunkMeta) ([]metadata.ECShard, error)
+}
+
 // ECSelfHealer is a background loop that repairs degraded 6+3 stripes on this
 // datanode. It runs a periodic sweep (Enumerate) so an operator can also drive
 // a single pass manually and assert on the result, or in tests.
 type ECSelfHealer struct {
 	v        *V2Store
 	resolver ECChunkResolver
+	landing  ECLandingResolver
 	interval time.Duration
 
 	mu      sync.Mutex
@@ -63,6 +75,15 @@ func NewECSelfHealer(v *V2Store, resolver ECChunkResolver, cfg ECSelfHealConfig)
 		cfg.Interval = ecSelfHealDefaultInterval
 	}
 	return &ECSelfHealer{v: v, resolver: resolver, interval: cfg.Interval, stopCh: make(chan struct{})}
+}
+
+// SetLandingResolver wires an authoritative per-shard landing source (F3, §14):
+// when set, a repaired shard is rebuilt back onto its originally-landed disk
+// rather than a least-used one. Pass nil (default) to keep least-used fallback.
+func (h *ECSelfHealer) SetLandingResolver(src ECLandingResolver) {
+	if src != nil {
+		h.landing = src
+	}
 }
 
 // Start begins the periodic sweep loop.
@@ -159,7 +180,7 @@ func (h *ECSelfHealer) repairChunk(ctx context.Context, cid metadata.ChunkID) {
 			"chunk", cid, "missing", loss)
 		return
 	}
-	originalLen, ok := h.originalLen(ctx, cid)
+	chunk, ok := h.chunkMeta(ctx, cid)
 	if !ok {
 		// No authoritative original length (chunk metadata unreachable or gone):
 		// we cannot safely decode/reconstruct, so skip rather than write garbage.
@@ -168,7 +189,10 @@ func (h *ECSelfHealer) repairChunk(ctx context.Context, cid metadata.ChunkID) {
 			"chunk", cid, "missing", loss)
 		return
 	}
-	rebuilt, err := h.v.RepairChunkEC(cid, originalLen)
+	// Prefer rebuilding each lost shard back onto its authoritative landing
+	// disk (F3, §14) when the durable stripe is resolvable; else least-used.
+	landing := h.landingFor(chunk)
+	rebuilt, err := h.v.RepairChunkECWithLanding(cid, int(chunk.Size), landing)
 	if err != nil {
 		h.failed.Add(1)
 		slog.Warn("ec self-heal: repair failed", "chunk", cid, "missing", loss, "error", err)
@@ -181,19 +205,36 @@ func (h *ECSelfHealer) repairChunk(ctx context.Context, cid metadata.ChunkID) {
 	}
 }
 
-// originalLen resolves the stripe's authoritative pre-encoding length from the
-// chunk's metadata Size. Returns ok=false when the chunk metadata is
-// unavailable (no resolver, or the chunk row no longer resolves).
-func (h *ECSelfHealer) originalLen(ctx context.Context, cid metadata.ChunkID) (int, bool) {
+// chunkMeta fetches the chunk's authoritative metadata (its Size is the
+// stripe's original pre-encoding length, §14). Returns ok=false when the chunk
+// metadata is unavailable (no resolver, or the chunk row no longer resolves).
+func (h *ECSelfHealer) chunkMeta(ctx context.Context, cid metadata.ChunkID) (*metadata.ChunkMeta, bool) {
 	if h.resolver == nil {
-		return 0, false
+		return nil, false
 	}
 	chunk, err := h.resolver.GetChunk(ctx, cid)
 	if err != nil || chunk == nil {
-		return 0, false
+		return nil, false
 	}
 	if chunk.Size <= 0 {
-		return 0, false
+		return nil, false
 	}
-	return int(chunk.Size), true
+	return chunk, true
+}
+
+// landingFor resolves the chunk's authoritative per-shard landing (the durable
+// ECStripe.Shards, F3/§14) for the repair to prefer. Returns nil when no
+// landing resolver is wired, or resolution fails — the repair then falls back
+// to least-used disk placement.
+func (h *ECSelfHealer) landingFor(chunk *metadata.ChunkMeta) []metadata.ECShard {
+	if h.landing == nil {
+		return nil
+	}
+	landing, err := h.landing.ResolveStripeLanding(chunk)
+	if err != nil {
+		slog.Warn("ec self-heal: landing resolution failed, using least-used",
+			"chunk", chunk.ID, "error", err)
+		return nil
+	}
+	return landing
 }

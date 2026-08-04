@@ -9,20 +9,37 @@ import (
 	"github.com/example/dfs/metadata"
 )
 
-// This file is Program 6 Phase F2: the EC self-heal scan. When shards of a 6+3
-// stripe are lost (disk/node degrades), ECSelfHealer discovers the degraded
+// This file is Program 6 Phase F2/F3: the EC self-heal scan. When shards of a
+// 6+3 stripe are lost (disk/node degrades), ECSelfHealer discovers the degraded
 // chunk on its periodic sweep, and — when the loss is within §14 tolerance and
 // the stripe's original length resolves from metadata — drives RepairChunkEC to
-// rebuild the missing shards from the survivors, restoring the full nine.
+// rebuild the missing shards from the survivors, restoring the full nine. F3
+// adds the authoritative-landing preference: with an ECLandingResolver wired,
+// a lost shard is rebuilt back onto the disk it originally landed on (§14).
 
 // stubChunkResolver serves chunk.Size (the authoritative original pre-encoding
-// length, §14) for the self-healer without a live metadata HTTP server.
+// length, §14) and, via stripeID, the reference that lets a landing resolver
+// find the durable ECStripe — without a live metadata HTTP server.
 type stubChunkResolver struct {
-	size int
+	size   int
+	stripe string
 }
 
 func (s stubChunkResolver) GetChunk(ctx context.Context, cid metadata.ChunkID) (*metadata.ChunkMeta, error) {
-	return &metadata.ChunkMeta{ID: cid, Size: int32(s.size)}, nil
+	return &metadata.ChunkMeta{ID: cid, Size: int32(s.size), ECStripeID: s.stripe}, nil
+}
+
+// ecLandingStub wraps a real *metadata.ECStore as the healer's authoritative
+// landing resolver (F3, §14) and records how often it is consulted, so the
+// test can assert the repair path prefers the authoritative landing.
+type ecLandingStub struct {
+	ec    *metadata.ECStore
+	calls int
+}
+
+func (s *ecLandingStub) ResolveStripeLanding(chunk *metadata.ChunkMeta) ([]metadata.ECShard, error) {
+	s.calls++
+	return s.ec.ResolveStripeLanding(chunk)
 }
 
 // TestECSelfHeal_ResolvesDegradedStripe restores a stripe after three shards
@@ -134,3 +151,139 @@ func TestECSelfHeal_SkipsWithoutOriginalLen(t *testing.T) {
 		t.Fatal("shard 5 should remain missing (repair skipped)")
 	}
 }
+
+// buildF3Authority persists a durable ECStripe whose per-shard landing matches
+// placement: DiskID = 1000 + placement[i] (so DiskID%1000 resolves to the local
+// shard-store index the healer's V2Store expects), node 1 hosting all nine.
+func buildF3Authority(t *testing.T, placement []int) (*metadata.ECStore, *ecLandingStub) {
+	t.Helper()
+	pb, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
+		Dir: t.TempDir(), UseInMemory: true, UseBucketStats: false,
+	})
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	t.Cleanup(func() { _ = pb.Close() })
+	auth := metadata.NewECStore(pb)
+	var shards []metadata.ECShard
+	for i, d := range placement {
+		shards = append(shards, metadata.ECShard{Index: i, NodeID: 1, DiskID: 1000 + uint64(d)})
+	}
+	if err := auth.PutStripe(&metadata.ECStripe{StripeID: "stripe-f3", Shards: shards}); err != nil {
+		t.Fatalf("PutStripe: %v", err)
+	}
+	return auth, &ecLandingStub{ec: auth}
+}
+
+// TestECSelfHeal_RepairsOntoAuthoritativeLanding (F3, §14) wires the durable
+// landing into the repair: after three shards are lost, self-heal rebuilds each
+// one back onto the disk the stripe originally landed on (not a least-used
+// replacement), consulting the landing resolver on the way, and leaves a full
+// byte-exact stripe.
+func TestECSelfHeal_RepairsOntoAuthoritativeLanding(t *testing.T) {
+	v, _ := newTestShardMultiStore(t, 4)
+	cid := metadata.ChunkID(30001)
+	payload := bytes.Repeat([]byte("landing-6+3-"), 600)
+	placement := []int{0, 1, 2, 3, 0, 1, 2, 3, 0}
+
+	// Materialize only the six-shard quorum, leaving shards {1,4,7} absent on
+	// this node while their authoritative landing disks remain accepting. This
+	// mirrors a shard lost without the landing disk being tombstoned (e.g. it
+	// was never written onto the current generation of an otherwise-healthy
+	// disk), so the landing preference — not a fallback — is what restores them.
+	shards, err := encodeEC63(payload)
+	if err != nil {
+		t.Fatalf("encodeEC63: %v", err)
+	}
+	lost := []int{1, 4, 7}
+	for idx, d := range placement {
+		if slicesContains(lost, idx) {
+			continue
+		}
+		if err := v.WriteShardAtDisk(cid, idx, d, shards[idx]); err != nil {
+			t.Fatalf("WriteShardAtDisk(%d -> %d): %v", idx, d, err)
+		}
+	}
+
+	_, landing := buildF3Authority(t, placement)
+	h := NewECSelfHealer(v, stubChunkResolver{size: len(payload), stripe: "stripe-f3"}, ECSelfHealConfig{})
+	h.SetLandingResolver(landing)
+	h.Enumerate(context.Background())
+
+	// Each restored shard routes back onto its authoritative landing disk.
+	for _, idx := range lost {
+		if got := v.shardDisk(cid, idx); got != placement[idx] {
+			t.Fatalf("shard %d routed to disk %d, want authoritative disk %d", idx, got, placement[idx])
+		}
+	}
+	// The landing resolver was consulted on the repair path (the F3 seam).
+	if landing.calls == 0 {
+		t.Fatal("ResolveStripeLanding was not consulted on the repair path")
+	}
+	// Full stripe reads byte-exact with the original checksum.
+	data, sum, err := v.ReadChunkEC(cid, len(payload))
+	if err != nil {
+		t.Fatalf("ReadChunkEC after authoritative landing repair: %v", err)
+	}
+	if !bytes.Equal(data, payload) {
+		t.Fatal("post-heal mismatch")
+	}
+	if want := storage.CRC32C(payload); sum != want {
+		t.Fatalf("post-heal checksum = %#x, want %#x", sum, want)
+	}
+}
+
+// slicesContains reports whether xs contains x.
+func slicesContains(xs []int, x int) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+// TestECSelfHeal_FallsBackWhenAuthoritativeDiskTombstoned (F3, §14) covers the
+// precise fallback: when the authoritative landing disk can no longer accept a
+// fresh write (the lost shard was deleted off it, tombstoning its generation),
+// self-heal must NOT write back there — it falls back to a healthy least-used
+// disk, still leaving a byte-exact stripe.
+func TestECSelfHeal_FallsBackWhenAuthoritativeDiskTombstoned(t *testing.T) {
+	v, _ := newTestShardMultiStore(t, 4)
+	cid := metadata.ChunkID(30002)
+	payload := bytes.Repeat([]byte("landing-fallback-6+3-"), 500)
+	placement := []int{0, 1, 2, 3, 0, 1, 2, 3, 0}
+	if err := v.WriteChunkEC(cid, payload, placement); err != nil {
+		t.Fatalf("WriteChunkEC: %v", err)
+	}
+	_, landing := buildF3Authority(t, placement)
+
+	h := NewECSelfHealer(v, stubChunkResolver{size: len(payload), stripe: "stripe-f3"}, ECSelfHealConfig{})
+	h.SetLandingResolver(landing)
+
+	// Lost shard 2 was deleted off its authoritative disk (placement[2] == 2),
+	// tombstoning gen 3 there — so that disk can no longer accept a fresh write.
+	lost := 2
+	if err := v.DeleteShard(cid, lost); err != nil {
+		t.Fatalf("DeleteShard(%d): %v", lost, err)
+	}
+	h.Enumerate(context.Background())
+
+	// The rebuild falls back to a different healthy disk, not the tombstoned one.
+	got := v.shardDisk(cid, lost)
+	if got < 0 || got >= 4 {
+		t.Fatalf("hard-fallback disk %d out of range", got)
+	}
+	if got == placement[lost] {
+		t.Fatalf("repair landed back on the tombstoned authoritative disk %d", got)
+	}
+	// Stripe is restored and reads byte-exact.
+	data, _, err := v.ReadChunkEC(cid, len(payload))
+	if err != nil {
+		t.Fatalf("ReadChunkEC after fallback repair: %v", err)
+	}
+	if !bytes.Equal(data, payload) {
+		t.Fatal("post-fallback mismatch")
+	}
+}
+
