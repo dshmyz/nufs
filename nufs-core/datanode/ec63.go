@@ -114,3 +114,58 @@ func decodeEC63(shards [][]byte, originalLen int) ([]byte, error) {
 	}
 	return result[:originalLen], nil
 }
+
+// reconstructEC63 rebuilds a degraded stripe and returns the full nine-shard
+// set (missing shards repopulated) plus the original payload. At least six
+// shards must be present (those empty are considered lost). This is the E5
+// repair material: the returned shards let the caller write back the lost
+// ones to their owning stores (repair/reheat), and the payload is what a
+// degraded read returns.
+func reconstructEC63(shards [][]byte, originalLen int) ([][]byte, []byte, error) {
+	enc, err := ec63RS()
+	if err != nil {
+		return nil, nil, fmt.Errorf("ec63: new encoder: %w", err)
+	}
+	if len(shards) != ec63Shards {
+		return nil, nil, fmt.Errorf("ec63: shard count %d, want %d", len(shards), ec63Shards)
+	}
+	available := 0
+	for _, s := range shards {
+		if len(s) > 0 {
+			available++
+		}
+	}
+	if available < ec63Data {
+		return nil, nil, fmt.Errorf("ec63: insufficient shards (have %d, need %d)", available, ec63Data)
+	}
+	rsShards := make([][]byte, ec63Shards)
+	for i, s := range shards {
+		if len(s) > 0 {
+			rsShards[i] = s
+		}
+	}
+	if err := enc.Reconstruct(rsShards); err != nil {
+		return nil, nil, fmt.Errorf("ec63: reconstruct: %w", err)
+	}
+	ok, err := enc.Verify(rsShards)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ec63: verify: %w", err)
+	}
+	if !ok {
+		return nil, nil, fmt.Errorf("ec63: verification failed — data may be corrupted")
+	}
+	result := make([]byte, 0, originalLen)
+	for i := 0; i < ec63Data; i++ {
+		result = append(result, rsShards[i]...)
+	}
+	if len(result) < originalLen {
+		return nil, nil, fmt.Errorf("ec63: reconstructed data too short (%d < %d)", len(result), originalLen)
+	}
+	// Return copies of the rebuilt set so callers can persist lost shards
+	// without aliasing the read buffers.
+	rebuilt := make([][]byte, ec63Shards)
+	for i := range rsShards {
+		rebuilt[i] = append([]byte(nil), rsShards[i]...)
+	}
+	return rebuilt, result[:originalLen], nil
+}

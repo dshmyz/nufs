@@ -2,6 +2,7 @@ package datanode
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -448,17 +449,17 @@ func (v *V2Store) WriteChunkEC(chunkID metadata.ChunkID, data []byte, placement 
 }
 
 // ReadChunkEC reads the nine shards, reconstructs and returns the original
-// (unpadded) payload of length originalLen. It is currently a full-shard read
-// (all nine present) — degraded reads that tolerate missing shards are the E5
-// repair/degrade surface built on EC 6+3 reconstruction.
+// (unpadded) payload of length originalLen. It is a strict full-shard read —
+// every one of the nine shards must be present; a missing shard is an error,
+// not a tolerated loss. Degraded reads that reconstruct from ≥6 surviving
+// shards are ReadChunkECDegraded (E5).
 func (v *V2Store) ReadChunkEC(chunkID metadata.ChunkID, originalLen int) ([]byte, uint32, error) {
-	shards := make([][]byte, ec63Shards)
-	for idx := 0; idx < ec63Shards; idx++ {
-		data, _, err := v.ReadShard(chunkID, idx)
-		if err != nil {
-			return nil, 0, fmt.Errorf("read chunk ec: shard %d: %w", idx, err)
-		}
-		shards[idx] = data
+	shards, missing, err := v.readChunkECShards(chunkID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read chunk ec: %w", err)
+	}
+	if len(missing) != 0 {
+		return nil, 0, fmt.Errorf("read chunk ec: missing %d shard(s): %v", len(missing), missing)
 	}
 	data, err := decodeEC63(shards, originalLen)
 	if err != nil {
@@ -467,6 +468,134 @@ func (v *V2Store) ReadChunkEC(chunkID metadata.ChunkID, originalLen int) ([]byte
 	return data, storage.CRC32C(data), nil
 }
 
+// readChunkECShards reads all nine shards, returning each shard's bytes (nil
+// for a shard that is absent) and the list of missing shard indices. An absent
+// shard is not an error here — callers decide whether the loss is tolerable.
+func (v *V2Store) readChunkECShards(chunkID metadata.ChunkID) ([][]byte, []int, error) {
+	shards := make([][]byte, ec63Shards)
+	var missing []int
+	for idx := 0; idx < ec63Shards; idx++ {
+		data, _, err := v.ReadShard(chunkID, idx)
+		if err != nil {
+			if errors.Is(err, storage.ErrExtentNotFound) {
+				missing = append(missing, idx)
+				continue
+			}
+			return nil, nil, fmt.Errorf("shard %d: %w", idx, err)
+		}
+		shards[idx] = data
+	}
+	return shards, missing, nil
+}
+
+// ReadChunkECDegraded reads a 6+3 stripe tolerating up to three lost shards:
+// it reconstructs the original payload from any ≥6 surviving shards and
+// returns it byte-exact with the recomputed checksum, plus the indices of the
+// missing shards. This is §14's degraded read — a read must still succeed
+// (verifying the original extent checksum) while the stripe is under repair.
+// With fewer than six shards present it returns the reconstruct error.
+func (v *V2Store) ReadChunkECDegraded(chunkID metadata.ChunkID, originalLen int) ([]byte, uint32, []int, error) {
+	shards, missing, err := v.readChunkECShards(chunkID)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("read chunk ec degraded: %w", err)
+	}
+	available := ec63Shards - len(missing)
+	if available < ec63Data {
+		return nil, 0, missing, fmt.Errorf("read chunk ec degraded: only %d/%d shards present, need %d", available, ec63Shards, ec63Data)
+	}
+	data, err := decodeEC63(shards, originalLen)
+	if err != nil {
+		return nil, 0, missing, fmt.Errorf("read chunk ec degraded: %w", err)
+	}
+	return data, storage.CRC32C(data), missing, nil
+}
+
+// RepairChunkEC rebuilds any lost shards of a 6+3 stripe from the surviving
+// ones and writes them onto healthy shard disks, restoring the full nine
+// shards (§14 repair). A lost shard cannot be re-written back onto the store
+// that lost it: deleting a shard tombstoned it at its generation (gen = idx+1
+// is fixed by the E1 shard-extent design), and the generation fence rejects
+// re-writing a tombstoned (extent, gen) in place — so the rebuild lands on the
+// least-used shard disk that does not already hold the shard's generation,
+// i.e. a healthy replacement location. It returns the number of shards rebuilt.
+// With fewer than six shards present, or if any rebuild write fails, it returns
+// an error and leaves the stripe degraded (no partial commit past survivors).
+func (v *V2Store) RepairChunkEC(chunkID metadata.ChunkID, originalLen int) (int, error) {
+	shards, missing, err := v.readChunkECShards(chunkID)
+	if err != nil {
+		return 0, fmt.Errorf("repair chunk ec: %w", err)
+	}
+	if len(missing) == 0 {
+		return 0, nil // nothing to repair
+	}
+	rebuilt, _, err := reconstructEC63(shards, originalLen)
+	if err != nil {
+		return 0, fmt.Errorf("repair chunk ec: %w", err)
+	}
+	for _, idx := range missing {
+		disk := v.cleanShardDisk(chunkID, idx)
+		if disk < 0 {
+			return 0, fmt.Errorf("repair chunk ec: no healthy shard disk for shard %d", idx)
+		}
+		if err := v.WriteShardAtDisk(chunkID, idx, disk, rebuilt[idx]); err != nil {
+			return 0, fmt.Errorf("repair chunk ec: restore shard %d: %w", idx, err)
+		}
+	}
+	return len(missing), nil
+}
+
+// cleanShardDisk returns the least-used shard disk whose store can accept a
+// fresh write of shard idx of chunkID — one that holds no record (neither live
+// nor tombstoned) at the shard's generation (gen = idx+1). A store already
+// holding that generation would reject the write via the generation fence
+// (ErrStaleGeneration for a live value, or a tombstone that hides the extent).
+// Returns -1 when no shard disk is a healthy target (e.g. every disk already
+// holds the shard, so there is nothing to repair onto).
+func (v *V2Store) cleanShardDisk(chunkID metadata.ChunkID, idx int) int {
+	gen := shardGen(idx)
+	best, bestUsed := -1, int64(1<<63-1)
+	for d := 0; d < len(v.shards); d++ {
+		_, err := v.shards[d].store.Stat(context.Background(), &storage.StatRequest{
+			ExtentID: storage.ExtentID(chunkID), Generation: gen,
+		})
+		if err == storage.ErrExtentNotFound {
+			if used := v.shards[d].usedByts.Load(); used < bestUsed {
+				bestUsed, best = used, d
+			}
+		}
+	}
+	return best
+}
+
+// ReheatChunkEC reconstructs a full 6+3 stripe onto a clean shard disk (a
+// replacement node/disk joining the stripe, §14 reheat): it rebuilds the
+// complete nine-shard set from whatever ≥6 survive and writes every shard to
+// the replacement disk. The target must be a shard disk that holds no record
+// of these shards — a disk that lost the stripe has its shards tombstoned at
+// their generations, and the generation fence would reject re-writing them in
+// place (§14 gen fencing) — so the caller points reheat at a fresh store.
+// Returns the number of shards written to the replacement disk.
+func (v *V2Store) ReheatChunkEC(chunkID metadata.ChunkID, originalLen int, newDisk int) (int, error) {
+	if newDisk < 0 || newDisk >= len(v.shards) {
+		return 0, fmt.Errorf("reheat chunk ec: no shard store %d (have %d)", newDisk, len(v.shards))
+	}
+	shards, _, err := v.readChunkECShards(chunkID)
+	if err != nil {
+		return 0, fmt.Errorf("reheat chunk ec: %w", err)
+	}
+	rebuilt, _, err := reconstructEC63(shards, originalLen)
+	if err != nil {
+		return 0, fmt.Errorf("reheat chunk ec: %w", err)
+	}
+	written := 0
+	for idx, shard := range rebuilt {
+		if err := v.WriteShardAtDisk(chunkID, idx, newDisk, shard); err != nil {
+			return 0, fmt.Errorf("reheat chunk ec: write shard %d: %w", idx, err)
+		}
+		written++
+	}
+	return written, nil
+}
 
 // nextLoc returns the owning disk and next generation for a write: the
 // existing location bumped to gen+1 for an overwrite, or (least-used
