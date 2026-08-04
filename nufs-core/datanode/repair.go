@@ -282,6 +282,10 @@ func (rw *RepairWorker) repairByAddingReplica(ctx context.Context, chunk *metada
 			ChunkID:    chunk.ID,
 			SourceAddr: sourceReplica.Addr,
 			TargetAddr: targetNode.Addr,
+			// Land the restored copy on the metadata-issued generation so it
+			// matches the surviving replicas (Metadata V2 fencing); a stale
+			// duplicate or a wrong local gen+1 would diverge from the rest.
+			Generation: chunk.Generation,
 			CreatedAt:  time.Now(),
 		}
 		if err := rw.replicator.SubmitWait(task, repairReplicationTimeout); err != nil {
@@ -317,7 +321,7 @@ func (rw *RepairWorker) repairByAddingReplica(ctx context.Context, chunk *metada
 		}
 		defer tgtClient.Close()
 
-		replResp, err := tgtClient.ReplicateChunk(chunk.ID, resp.Data)
+		replResp, err := tgtClient.ReplicateChunkGen(chunk.ID, chunk.Generation, resp.Data)
 		if err != nil {
 			return fmt.Errorf("repair: write to target %s: %w", targetNode.Addr, err)
 		}
@@ -379,11 +383,13 @@ func (rw *RepairWorker) repairByRefetchLocal(ctx context.Context, chunk *metadat
 		return fmt.Errorf("repair: local refetch requires a replicator")
 	}
 
-	// Overwrite local chunk via replicator
+	// Overwrite local chunk via replicator at the metadata-issued generation
+	// so the restored local copy stays consistent with the surviving replicas.
 	err := rw.replicator.Repair(ChunkRepairTask{
 		ChunkID:       chunk.ID,
 		SurvivingAddr: sourceReplica.Addr,
 		NewTargetAddr: rw.localAddr,
+		Generation:    chunk.Generation,
 	})
 	if err != nil {
 		return fmt.Errorf("repair: local chunk rewrite: %w", err)

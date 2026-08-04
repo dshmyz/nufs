@@ -548,11 +548,34 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	heartbeat := datanode.NewHeartbeatReporter(cfg, metaStore, v2Store)
 	heartbeat.Start()
 
+	// Cross-node repair on the V2.1 serving path. The Replicator and
+	// RepairWorker are engine-agnostic: they act over the datanode TCP wire
+	// (read a surviving replica, rewrite a failed/new target) plus the
+	// metadata RepRepairMeta surface, so they drive V2Store exactly as they
+	// drive the legacy ChunkStore. Repair carries the metadata-issued chunk
+	// generation so a restored replica lands on the same authoritative
+	// generation as its surviving peers (Metadata V2 fencing), rather than a
+	// local gen+1 bump on the V2 store.
+	replicator := datanode.NewReplicator(cfg.ListenAddr, 4)
+	replicator.SetTLS(cfg.TLS)
+	replicator.Start()
+
+	repairWorker := datanode.NewRepairWorker(datanode.RepairConfig{
+		Meta:       metaStore,
+		NodeID:     cfg.NodeID,
+		Interval:   30 * time.Second,
+		Replicator: replicator,
+		LocalAddr:  cfg.ListenAddr,
+	})
+	repairWorker.Start(context.Background())
+
 	// Operational channels: the unix-socket management server and the HTTP
 	// ops server. Both are engine-agnostic (they hold the OpsStore subset, so
-	// V2Store drives the same surface V1 exposes). V2.1 has no disk
-	// lifecycle/replicator/anti-entropy/repair, so those capability handlers
-	// answer "unsupported" and the V1-only subsystems are nil.
+	// V2Store drives the same surface V1 exposes). V2.1 has no legacy
+	// DiskManager lifecycle and no V1 full-scan AntiEntropy (it reconciles
+	// via the change journal), so those capability handlers answer
+	// "unsupported"/not-rewired and diskManager/chainRepl/antiEntropy stay nil;
+	// the repair worker is wired above.
 	stopMgmt, err := startManagementServer(v2Store, nil, dataDirs)
 	if err != nil {
 		log.Error("failed to start management socket", "error", err)
@@ -560,7 +583,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		os.Exit(1)
 	}
 	defer stopMgmt()
-	opsServer := datanode.NewOpsServerWithRepair(cfg, v2Store, metaStore, nil, nil, nil, nil)
+	opsServer := datanode.NewOpsServerWithRepair(cfg, v2Store, metaStore, nil, nil, nil, repairWorker)
 	if err := opsServer.Start(); err != nil {
 		log.Error("failed to start ops HTTP server", "error", err)
 		closeStores()
@@ -575,9 +598,12 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	log.Info("shutting down", "signal", sig)
 
 	// Graceful shutdown, in dependency order: stop accepting requests and
-	// drain in-flight ones, stop the heartbeat (it reads store state, so
-	// it must not outlive the stores), then close the stores exactly once.
+	// draining in-flight ones, stop background write-generators (repair,
+	// replicator) and the heartbeat (it reads store state, so it must not
+	// outlive the stores), then close the stores exactly once.
 	srv.Stop()
+	repairWorker.Stop()
+	replicator.Stop()
 	heartbeat.Stop()
 	closeStores()
 

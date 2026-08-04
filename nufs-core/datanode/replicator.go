@@ -21,6 +21,13 @@ type ReplicationTask struct {
 	Retries    int
 	CreatedAt  time.Time
 
+	// Generation is the metadata-issued generation to write the copy under
+	// (Metadata V2 fencing). 0 means "unspecified" — the target datanode keeps
+	// its own local generation (legacy V1 behavior). Repair sets it to the
+	// chunk's authoritative metadata.Generation so the restored replica lands
+	// at the same generation as the surviving one instead of a local gen+1.
+	Generation uint64
+
 	// done is an optional 1-buffered channel signalled by the worker
 	// once replicate(task) returns. nil means fire-and-forget.
 	done chan error
@@ -327,8 +334,16 @@ func (r *Replicator) replicate(task ReplicationTask) error {
 		return fmt.Errorf("connect target: %w", err)
 	}
 
-	// Write chunk to target
-	resp, err = tgtClient.ReplicateChunk(task.ChunkID, data)
+	// Write chunk to target, honoring the metadata-issued generation when the
+	// task carries one so the restored copy lands on the same authoritative
+	// generation as its source (Metadata V2 fencing). A generation of 0 falls
+	// back to the target datanode's local generation (legacy behavior).
+	var replResp *Response
+	if task.Generation != 0 {
+		replResp, err = tgtClient.ReplicateChunkGen(task.ChunkID, task.Generation, data)
+	} else {
+		replResp, err = tgtClient.ReplicateChunk(task.ChunkID, data)
+	}
 	if err != nil {
 		tgtClient.Close()
 		r.poolOpenConns.Add(-1)
@@ -337,13 +352,13 @@ func (r *Replicator) replicate(task ReplicationTask) error {
 	// Return target connection to pool for reuse
 	r.pool.put(task.TargetAddr, tgtClient)
 
-	if resp.Status != StatusOK {
-		return fmt.Errorf("target write failed: %s", resp.Error)
+	if replResp.Status != StatusOK {
+		return fmt.Errorf("target write failed: %s", replResp.Error)
 	}
 
 	// Verify checksum
-	if resp.Checksum != 0 && resp.Checksum != checksum {
-		return fmt.Errorf("checksum mismatch: expected %d, got %d", checksum, resp.Checksum)
+	if replResp.Checksum != 0 && replResp.Checksum != checksum {
+		return fmt.Errorf("checksum mismatch: expected %d, got %d", checksum, replResp.Checksum)
 	}
 
 	return nil
@@ -354,6 +369,10 @@ type ChunkRepairTask struct {
 	ChunkID       metadata.ChunkID
 	SurvivingAddr string // address of node with valid copy
 	NewTargetAddr string // address of new replica node
+
+	// Generation is the metadata-issued generation to write the copy under
+	// (Metadata V2 fencing). 0 = unspecified (legacy local-generation).
+	Generation uint64
 }
 
 // Repair initiates a chunk repair from a surviving replica.
@@ -362,6 +381,7 @@ func (r *Replicator) Repair(task ChunkRepairTask) error {
 		ChunkID:    task.ChunkID,
 		SourceAddr: task.SurvivingAddr,
 		TargetAddr: task.NewTargetAddr,
+		Generation: task.Generation,
 		CreatedAt:  time.Now(),
 	})
 }
