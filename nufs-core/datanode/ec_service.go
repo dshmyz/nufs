@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/metadata"
 )
 
@@ -62,6 +63,13 @@ type ECService struct {
 	// (atomic §14 switch). nil → no-op (local-serving default until /S2 wires
 	// the remote layout switch).
 	publish func(context.Context, *metadata.ECStripe) error
+
+	// Cross-node conversion (S3) fields. When set, ConvertToEC runs on this
+	// datanode as the coordinator, pushing shards this node does not own to
+	// peers over the TCP wire instead of writing them to local shard stores.
+	ownNodeID  uint64
+	peerClient func(uint64) (*Client, bool)
+	crossNode  bool
 }
 
 // NewECService wires the serving-path EC driver over a V2Store whose shard
@@ -97,6 +105,29 @@ func (s *ECService) SetCandidateDisks(fn func() []metadata.ECDisk) {
 func (s *ECService) SetPublish(fn func(context.Context, *metadata.ECStripe) error) {
 	if fn != nil {
 		s.publish = fn
+	}
+}
+
+// SetCrossNode configures the service as a cross-node EC conversion coordinator
+// (S3 / multi-datanode). ownNodeID is this datanode's NodeID (metadata
+// namespace); peerClient resolves a peer NodeID to a ready datanode *Client so
+// the coordinator can push shards this node does not own over the TCP wire.
+//
+// The candidate topology must then be supplied via SetCandidateDisks (the
+// cluster's real nodes and per-node disk indices) rather than the default
+// single-node synthetic topology. DiskID within each NodeID encodes that node's
+// shard-store index (DiskID % 1000 == node-local disk); the coordinator writes a
+// shard locally (WriteShardAtDisk) when it owns the node, else pushes it to the
+// owning peer (ReplicateECShard) with the planned disk index.
+func (s *ECService) SetCrossNode(ownNodeID uint64, peerClient func(uint64) (*Client, bool)) {
+	s.ownNodeID = ownNodeID
+	s.peerClient = peerClient
+	s.crossNode = true
+	s.resolveDisk = func(d metadata.ECDisk) int {
+		if d.DiskID >= 1000 {
+			return int(d.DiskID % 1000)
+		}
+		return int(d.DiskID)
 	}
 }
 
@@ -149,6 +180,66 @@ func (s *ECService) ConvertToEC(ctx context.Context, chunkID metadata.ChunkID, g
 		return nil, fmt.Errorf("ec convert: need >=%d candidate shard disks, datanode has %d attached shard stores", ec63Shards, len(disks))
 	}
 	cv := NewECConverter(s.ec, s.v, s.resolveDisk)
+	if s.crossNode {
+		// Coordinator mode: each shard goes to the node that owns it — written
+		// locally if we own it, else pushed to the peer over the wire.
+		cid := chunkID
+		cv.shardWriter = func(i int, shard []byte, loc metadata.ECDisk) error {
+			if loc.NodeID == s.ownNodeID {
+				return s.v.WriteShardAtDisk(cid, i, int(loc.DiskID%1000), shard)
+			}
+			peer, ok := s.peerClient(loc.NodeID)
+			if !ok {
+				return fmt.Errorf("ec convert: no client for peer node %d (shard %d)", loc.NodeID, i)
+			}
+			resp, err := peer.ReplicateECShard(cid, i, int(loc.DiskID%1000), shard)
+			if err != nil {
+				return fmt.Errorf("ec convert: push shard %d to node %d: %w", i, loc.NodeID, err)
+			}
+			if resp.Status != StatusOK {
+				return fmt.Errorf("ec convert: push shard %d to node %d: %s", i, loc.NodeID, resp.Error)
+			}
+			return nil
+		}
+		// Cross-node aggregate verify: assemble every shard from the node that
+		// owns it and decode — the coordinator cannot read peers' shards from
+		// its own local shard stores.
+		cv.verifyAggregate = func(cid metadata.ChunkID, shards []metadata.ECShard, originalLen int) ([]byte, uint32, error) {
+			all := make([][]byte, len(shards))
+			for i, sh := range shards {
+				var data []byte
+				if sh.NodeID == s.ownNodeID {
+					d, _, err := s.v.ReadShard(cid, sh.Index)
+					if err != nil {
+						return nil, 0, fmt.Errorf("verify: read local shard %d: %w", sh.Index, err)
+					}
+					data = d
+				} else {
+					peer, ok := s.peerClient(sh.NodeID)
+					if !ok {
+						return nil, 0, fmt.Errorf("verify: no client for node %d (shard %d)", sh.NodeID, sh.Index)
+					}
+					resp, err := peer.ReadECShard(cid, sh.Index)
+					if err != nil {
+						return nil, 0, fmt.Errorf("verify: read peer shard %d node %d: %w", sh.Index, sh.NodeID, err)
+					}
+					if resp.Status != StatusOK {
+						return nil, 0, fmt.Errorf("verify: read peer shard %d node %d: %s", sh.Index, sh.NodeID, resp.Error)
+					}
+					data = resp.Data
+				}
+				all[i] = data
+			}
+			dec, err := decodeEC63(all, originalLen)
+			if err != nil {
+				return nil, 0, fmt.Errorf("verify: decode aggregate: %w", err)
+			}
+			// The segment store persists its extent checksum as CRC32C
+			// (Castagnoli), matching V2Store.Read/ReadChunkEC; the original
+			// checksum recorded at BeginConversion comes from that same store.
+			return dec, storage.CRC32C(dec), nil
+		}
+	}
 	stripeID := fmt.Sprintf("stripe-%d", uint64(chunkID))
 	st, err := cv.ConvertReplica(stripeID, uint64(chunkID), generation, disks)
 	if err != nil {

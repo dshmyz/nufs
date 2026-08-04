@@ -10,11 +10,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
 	"time"
 
+	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/internal/tlsutil"
 	"github.com/example/dfs/metadata"
 )
@@ -248,6 +250,10 @@ func (s *Server) dispatch(header *Header, body []byte) *Response {
 		return s.handleDelete(header)
 	case ReqReplicateChunk:
 		return s.handleReplicate(header, body)
+	case ReqReplicateECShard:
+		return s.handleReplicateECShard(header, body)
+	case ReqReadECShard:
+		return s.handleReadECShard(header)
 	case ReqChunkInfo:
 		return s.handleChunkInfo(header)
 	case ReqListChunks:
@@ -359,6 +365,97 @@ func (s *Server) handleReplicate(header *Header, data []byte) *Response {
 		RequestID: header.RequestID,
 		Status:    StatusOK,
 		Length:    int32(len(data)),
+	}
+}
+
+// handleReplicateECShard writes a single EC shard onto this datanode's shard
+// store. It is the server side of the coordinator push in a cross-node EC
+// conversion (S3): a coordinating datanode that does NOT own a shard pushes the
+// shard bytes here. The store must expose WriteShard (V2Store with attached
+// shard stores); otherwise the request fails cleanly.
+func (s *Server) handleReplicateECShard(header *Header, data []byte) *Response {
+	if header.Checksum != 0 {
+		actual := crc32.ChecksumIEEE(data)
+		if actual != header.Checksum {
+			return &Response{
+				RequestID: header.RequestID,
+				Status:    StatusError,
+				Error:     "checksum mismatch",
+			}
+		}
+	}
+	ws, ok := s.store.(interface {
+		WriteShard(metadata.ChunkID, int, []byte) error
+	})
+	if !ok {
+		return &Response{
+			RequestID: header.RequestID,
+			Status:    StatusError,
+			Error:     "store does not support EC shard writes",
+		}
+	}
+	// The coordinator may name the exact target disk (planned §14 placement). An
+	// absent/zero disk falls back to the store's own shard routing (WriteShard).
+	if d, err := strconv.Atoi(header.Extra["disk"]); err == nil && d > 0 {
+		if wsd, ok2 := s.store.(interface {
+			WriteShardAtDisk(metadata.ChunkID, int, int, []byte) error
+		}); ok2 {
+			if err := wsd.WriteShardAtDisk(header.ChunkID, header.ShardIndex, d, data); err != nil {
+				return &Response{
+					RequestID: header.RequestID,
+					Status:    StatusError,
+					Error:     err.Error(),
+				}
+			}
+			return &Response{RequestID: header.RequestID, Status: StatusOK, Length: int32(len(data))}
+		}
+	}
+	if err := ws.WriteShard(header.ChunkID, header.ShardIndex, data); err != nil {
+		return &Response{
+			RequestID: header.RequestID,
+			Status:    StatusError,
+			Error:     err.Error(),
+		}
+	}
+	return &Response{
+		RequestID: header.RequestID,
+		Status:    StatusOK,
+		Length:    int32(len(data)),
+	}
+}
+
+// handleReadECShard reads one EC shard extent and returns its bytes. It is
+// the server side of the coordinator's cross-node verify (S3): the coordinator
+// fetches every shard from the node that owns it and decodes the aggregate.
+func (s *Server) handleReadECShard(header *Header) *Response {
+	rs, ok := s.store.(interface {
+		ReadShard(metadata.ChunkID, int) ([]byte, uint32, error)
+	})
+	if !ok {
+		return &Response{
+			RequestID: header.RequestID,
+			Status:    StatusError,
+			Error:     "store does not support EC shard reads",
+		}
+	}
+	data, sum, err := rs.ReadShard(header.ChunkID, header.ShardIndex)
+	if err != nil {
+		status := StatusError
+		if err == storage.ErrExtentNotFound {
+			status = StatusNotFound
+		}
+		return &Response{
+			RequestID: header.RequestID,
+			Status:    status,
+			Error:     err.Error(),
+		}
+	}
+	return &Response{
+		RequestID: header.RequestID,
+		Status:    StatusOK,
+		Data:      data,
+		Length:    int32(len(data)),
+		Checksum:  sum,
 	}
 }
 

@@ -154,6 +154,8 @@ const (
 	ReqChunkInfo                         // Get chunk metadata
 	ReqListChunks                        // List local chunks
 	ReqHealth                            // Health check
+	ReqReplicateECShard                  // Replicate a single EC shard to a peer datanode
+	ReqReadECShard                       // Read a single EC shard from a peer datanode
 )
 
 // Header is the wire protocol header for all data node messages.
@@ -170,6 +172,9 @@ type Header struct {
 	// generation (legacy V1 behavior). Obsolete (idempotent) writes are fenced
 	// on receipt.
 	Generation uint64            `json:"generation,omitempty"`
+	// ShardIndex is the EC shard index within a stripe, used for EC shard
+	// replication (ReqReplicateECShard). 0 = unspecified (whole-chunk op).
+	ShardIndex int               `json:"shard_index,omitempty"`
 	Extra     map[string]string `json:"extra,omitempty"`
 }
 

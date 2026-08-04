@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -119,7 +120,19 @@ func (c *Client) WriteChunkGen(chunkID metadata.ChunkID, generation uint64, data
 	return c.sendRequest(header, data)
 }
 
-// ReadChunk sends a chunk read request.
+// ReadECShard fetches one EC shard extent from a peer datanode (the read side
+// of the S3 cross-node coordination — the coordinator assembles shards from the
+// nodes that own them to verify an aggregate). Returns the shard bytes and the
+// peer's recorded checksum.
+func (c *Client) ReadECShard(chunkID metadata.ChunkID, shardIndex int) (*Response, error) {
+	header := &Header{
+		Type:       ReqReadECShard,
+		ChunkID:    chunkID,
+		ShardIndex: shardIndex,
+		RequestID:  c.seq.Add(1),
+	}
+	return c.sendRequest(header, nil)
+}
 func (c *Client) ReadChunk(chunkID metadata.ChunkID, offset int64, length int32) (*Response, error) {
 	header := &Header{
 		Type:      ReqReadChunk,
@@ -148,6 +161,30 @@ func (c *Client) ReplicateChunkGen(chunkID metadata.ChunkID, generation uint64, 
 		Length:     int32(len(data)),
 		Checksum:   crc32.ChecksumIEEE(data),
 		RequestID:  c.seq.Add(1),
+	}
+	return c.sendRequest(header, data)
+}
+
+// ReplicateECShard sends a single EC shard to a peer datanode for placement
+// on its shard store. It is the coordinator->peer push in a cross-node EC
+// conversion (S3): the coordinating datanode encodes the shard and pushes the
+// bytes to the peer that owns that shard index. disk (when >=0) names the exact
+// target shard-store index on the peer per the planned §14 placement; -1 lets
+// the peer route via its own shard selection. The peer's Server routes it to
+// its shard store (ReqReplicateECShard).
+func (c *Client) ReplicateECShard(chunkID metadata.ChunkID, shardIndex, disk int, data []byte) (*Response, error) {
+	extra := map[string]string{}
+	if disk >= 0 {
+		extra["disk"] = strconv.Itoa(disk)
+	}
+	header := &Header{
+		Type:       ReqReplicateECShard,
+		ChunkID:    chunkID,
+		ShardIndex: shardIndex,
+		Length:     int32(len(data)),
+		Checksum:   crc32.ChecksumIEEE(data),
+		RequestID:  c.seq.Add(1),
+		Extra:      extra,
 	}
 	return c.sendRequest(header, data)
 }

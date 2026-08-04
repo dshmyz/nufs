@@ -33,6 +33,18 @@ type ECConverter struct {
 	// multi-node topology onto a node's shard stores. Defaults to DiskID when
 	// nil (single-node where DiskID is the store index).
 	resolveDisk func(metadata.ECDisk) int
+	// shardWriter, when non-nil, is used instead of the default write loop. It
+	// lets the coordinator decide per-shard whether to write locally or push a
+	// shard to a peer datanode over the wire (S3 cross-node conversion). The
+	// default writes to the resolved local store index.
+	shardWriter func(i int, shard []byte, loc metadata.ECDisk) error
+	// verifyAggregate, when non-nil, is used instead of the default local
+	// aggregate read to validate the written shards before completing. The S3
+	// cross-node coordinator sets it to assemble every shard from whichever
+	// node owns it (the default ReadChunkEC only sees local shard stores);
+	// shards is the planned placement (from st.Shards) so ownership can be
+	// resolved per shard.
+	verifyAggregate func(cid metadata.ChunkID, shards []metadata.ECShard, originalLen int) ([]byte, uint32, error)
 }
 
 // NewECConverter creates a conversion coordinator over the given metadata EC
@@ -88,8 +100,17 @@ func (c *ECConverter) ConvertReplica(stripeID string, extentID uint64, gen uint6
 		return fail("encode", err)
 	}
 	// Write each shard to the physical store owning its planned (node,disk).
+	// With a cross-node coordinator (S3) the injected shardWriter routes each
+	// shard to the node that owns it: write locally, or push over the wire.
 	for i, shard := range all {
-		local := c.resolveDisk(metadata.ECDisk{NodeID: st.Shards[i].NodeID, DiskID: st.Shards[i].DiskID})
+		loc := metadata.ECDisk{NodeID: st.Shards[i].NodeID, DiskID: st.Shards[i].DiskID}
+		if c.shardWriter != nil {
+			if err := c.shardWriter(i, shard, loc); err != nil {
+				return fail(fmt.Sprintf("write shard %d", i), err)
+			}
+			continue
+		}
+		local := c.resolveDisk(loc)
 		if err := c.v.WriteShardAtDisk(cid, i, local, shard); err != nil {
 			return fail(fmt.Sprintf("write shard %d", i), err)
 		}
@@ -101,7 +122,13 @@ func (c *ECConverter) ConvertReplica(stripeID string, extentID uint64, gen uint6
 
 	// Verify the aggregate decodes byte- and checksum-exact before committing
 	// the layout switch (a degraded read must recover the original, §14).
-	got, gotSum, err := c.v.ReadChunkEC(cid, len(replica))
+	var got []byte
+	var gotSum uint32
+	if c.verifyAggregate != nil {
+		got, gotSum, err = c.verifyAggregate(cid, st.Shards, len(replica))
+	} else {
+		got, gotSum, err = c.v.ReadChunkEC(cid, len(replica))
+	}
 	if err != nil {
 		return fail("verify", err)
 	}
