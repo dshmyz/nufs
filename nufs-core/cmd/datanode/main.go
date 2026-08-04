@@ -688,6 +688,18 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	}
 	defer opsServer.Stop()
 
+	// SIGHUP handler for config hot-reload (log level changes), mirroring the
+	// V1 runDataNode handler. A SIGHUP re-applies the configured log level in
+	// place, so operators can rotate verbosity without restarting the daemon.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go func() {
+		for range hupCh {
+			log.Info("received SIGHUP, reloading log level")
+			logging.SetLevel(cfg.LogLevel)
+		}
+	}()
+
 	// Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
