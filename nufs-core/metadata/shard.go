@@ -858,6 +858,33 @@ func (ss *ShardedStore) ReportChunkState(ctx context.Context, nodeID NodeID, sta
 	return nil
 }
 
+// ReconcileChangeEvents consumes a node's change-journal events on the shard
+// that owns the node's chunk routing. The node-scoped sweep (storage loss) is
+// idempotent, so routing to one owning shard is sufficient.
+func (ss *ShardedStore) ReconcileChangeEvents(ctx context.Context, nodeID NodeID, events []ChangeEventRecord) error {
+	if len(events) == 0 {
+		return nil
+	}
+	sid := ss.ring.Route(shardKeyForNode(nodeID))
+	store, err := ss.routeToShardID(sid)
+	if err != nil {
+		return err
+	}
+	_, err = store.ReconcileChangeEvents(ctx, nodeID, events)
+	return err
+}
+
+// AckChangeEvents reports the node's persisted reconciled watermark by
+// routing to the single owning shard (same routing as reconcile).
+func (ss *ShardedStore) AckChangeEvents(ctx context.Context, nodeID NodeID, seq uint64) (uint64, error) {
+	sid := ss.ring.Route(shardKeyForNode(nodeID))
+	store, err := ss.routeToShardID(sid)
+	if err != nil {
+		return 0, err
+	}
+	return store.AckChangeEvents(ctx, nodeID, seq)
+}
+
 // routeToShardID returns the store registered for a shard ID.
 func (ss *ShardedStore) routeToShardID(sid ShardID) (*PebbleStore, error) {
 	ss.mu.RLock()
@@ -897,7 +924,14 @@ func (ss *ShardedStore) Heartbeat(ctx context.Context, nodeID NodeID, report *No
 		return livenessErr
 	}
 	if report != nil && len(report.ChunkStates) > 0 {
-		return ss.ReportChunkState(ctx, nodeID, report.ChunkStates)
+		if err := ss.ReportChunkState(ctx, nodeID, report.ChunkStates); err != nil {
+			return err
+		}
+	}
+	// Change-journal events are node-scoped and reconciled on a single owning
+	// shard (the same routing as chunk state), not broadcast.
+	if report != nil && len(report.ChangeEvents) > 0 {
+		return ss.ReconcileChangeEvents(ctx, nodeID, report.ChangeEvents)
 	}
 	return nil
 }

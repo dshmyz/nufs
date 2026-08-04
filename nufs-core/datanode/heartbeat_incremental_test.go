@@ -11,10 +11,10 @@ import (
 
 // mockHeartbeatMeta captures heartbeat reports for inspection.
 type mockHeartbeatMeta struct {
-	mu       sync.Mutex
-	reports  []*metadata.NodeReport
-	count    int
-	nodeIDs  []metadata.NodeID
+	mu      sync.Mutex
+	reports []*metadata.NodeReport
+	count   int
+	nodeIDs []metadata.NodeID
 }
 
 func (m *mockHeartbeatMeta) Heartbeat(_ context.Context, nodeID metadata.NodeID, report *metadata.NodeReport) error {
@@ -24,6 +24,10 @@ func (m *mockHeartbeatMeta) Heartbeat(_ context.Context, nodeID metadata.NodeID,
 	m.count++
 	m.nodeIDs = append(m.nodeIDs, nodeID)
 	return nil
+}
+
+func (m *mockHeartbeatMeta) AckChangeEvents(_ context.Context, _ metadata.NodeID, _ uint64) (uint64, error) {
+	return 0, nil
 }
 
 func (m *mockHeartbeatMeta) getReports() []*metadata.NodeReport {
@@ -50,7 +54,7 @@ func TestHeartbeat_IncrementalChunkStates(t *testing.T) {
 
 	mock := &mockHeartbeatMeta{}
 	cfg := Config{
-		NodeID:           1,
+		NodeID:            1,
 		HeartbeatInterval: 50 * time.Millisecond,
 	}
 	reporter := NewHeartbeatReporter(cfg, mock, cs)
@@ -129,7 +133,7 @@ func TestHeartbeat_ForceFullSync(t *testing.T) {
 
 	mock := &mockHeartbeatMeta{}
 	cfg := Config{
-		NodeID:           1,
+		NodeID:            1,
 		HeartbeatInterval: 50 * time.Millisecond,
 	}
 	reporter := NewHeartbeatReporter(cfg, mock, cs)

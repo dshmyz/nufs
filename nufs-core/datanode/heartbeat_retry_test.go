@@ -30,6 +30,10 @@ func (m *mockHeartbeatMetaFail) Heartbeat(_ context.Context, _ metadata.NodeID, 
 	return nil
 }
 
+func (m *mockHeartbeatMetaFail) AckChangeEvents(_ context.Context, _ metadata.NodeID, _ uint64) (uint64, error) {
+	return 0, nil
+}
+
 func (m *mockHeartbeatMetaFail) getReports() []*metadata.NodeReport {
 	m.mu.Lock()
 	defer m.mu.Unlock()

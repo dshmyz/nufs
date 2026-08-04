@@ -760,6 +760,27 @@ func (c *HTTPClient) Heartbeat(ctx context.Context, nodeID NodeID, report *NodeR
 	return c.readResponse(resp, nil)
 }
 
+// AckChangeEvents reports the change-journal sequence this node believes it
+// has delivered and returns the metadata authority's persisted reconciled
+// watermark — the highest sequence metadata has in fact consumed (§12). The
+// caller advances its local journal Ack only once this returns a watermark
+// that covers its pending events, so no un-reconciled event is dropped.
+func (c *HTTPClient) AckChangeEvents(ctx context.Context, nodeID NodeID, seq uint64) (uint64, error) {
+	path := fmt.Sprintf("/api/v1/nodes/%d/change-ack", nodeID)
+	req := map[string]uint64{"seq": seq}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, path, req)
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		ChangeAck uint64 `json:"change_ack"`
+	}
+	if err := c.readResponse(resp, &out); err != nil {
+		return 0, err
+	}
+	return out.ChangeAck, nil
+}
+
 func (c *HTTPClient) DecommissionNode(ctx context.Context, nodeID NodeID) error {
 	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, fmt.Sprintf("/api/v1/nodes/%d/decommission", nodeID), nil)
 	if err != nil {

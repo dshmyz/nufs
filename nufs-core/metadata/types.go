@@ -34,8 +34,8 @@ type NodeID uint64
 type InodeMeta struct {
 	ID         InodeID  `json:"id"`
 	Type       FileType `json:"type"`
-	Size       int64    `json:"size"`  // Total file size in bytes
-	NLink      uint32   `json:"nlink"` // Hard link count
+	Size       int64    `json:"size"`                  // Total file size in bytes
+	NLink      uint32   `json:"nlink"`                 // Hard link count
 	BucketRoot InodeID  `json:"bucket_root,omitempty"` // Root inode of containing bucket
 	UID        uint32   `json:"uid"`
 	GID        uint32   `json:"gid"`
@@ -92,7 +92,7 @@ type InodeMetaV2 struct {
 	// ExtentRootVersion distinguishes COW roots (old roots enter GC).
 	ExtentRootVersion uint64 `json:"extent_root_version,omitempty"`
 
-	Symlink string `json:"symlink,omitempty"`
+	Symlink string            `json:"symlink,omitempty"`
 	XAttrs  map[string][]byte `json:"xattrs,omitempty"`
 }
 
@@ -100,7 +100,7 @@ type InodeMetaV2 struct {
 // repeat complete DataNode addresses; placement is resolved through the
 // placement group.
 type ExtentMetaV2 struct {
-	ID        ExtentIDV2 `json:"id"`
+	ID         ExtentIDV2 `json:"id"`
 	Generation uint64     `json:"generation"`
 	LogicalLen int64      `json:"logical_len"`
 	Checksum   uint32     `json:"checksum"`
@@ -149,9 +149,9 @@ const (
 // ExtentPage holds up to MaxExtentsPerPage extent references (V2.1
 // §11.1). Stored at /extent-page/{inode_id}/{extent_root}/{page_no}.
 type ExtentPage struct {
-	InodeID   InodeID        `json:"inode_id"`
-	PageNo    uint32         `json:"page_no"`
-	Extents   []ExtentRef    `json:"extents"`
+	InodeID InodeID     `json:"inode_id"`
+	PageNo  uint32      `json:"page_no"`
+	Extents []ExtentRef `json:"extents"`
 }
 
 // MaxExtentsPerPage is the page capacity (§11.1): 256 references →
@@ -199,7 +199,7 @@ type ChunkMeta struct {
 	State      ChunkState    `json:"state"`
 	Replicas   []ReplicaInfo `json:"replicas"` // Ordered: [primary, secondary, ...]
 	ECGroup    *ECGroupInfo  `json:"ec_group,omitempty"`
-	Tier       StorageTier   `json:"tier"`       // Target storage tier for this chunk
+	Tier       StorageTier   `json:"tier"` // Target storage tier for this chunk
 	CreateTime int64         `json:"create_time"`
 	Checksum   uint32        `json:"checksum"` // CRC32C of chunk data
 
@@ -225,16 +225,16 @@ type ChunkMeta struct {
 type ChunkState uint8
 
 const (
-	ChunkCreated ChunkState = iota // Allocated, not yet committed
-	ChunkSealed                    // Commit received, replicating
-	ChunkReady                     // All replicas confirmed
+	ChunkCreated  ChunkState = iota // Allocated, not yet committed
+	ChunkSealed                     // Commit received, replicating
+	ChunkReady                      // All replicas confirmed
 	ChunkDegraded                   // Replica lost, repairing
 	ChunkOrphan                     // No inode references (GC candidate)
 )
 
 // ReplicaInfo describes a replica location.
 type ReplicaInfo struct {
-	NodeID   NodeID       `json:"node_id"`
+	NodeID     NodeID       `json:"node_id"`
 	Addr       string       `json:"addr"` // Data node address (host:port)
 	State      ReplicaState `json:"state"`
 	DiskPath   string       `json:"disk_path"`   // Local storage path on data node
@@ -277,15 +277,21 @@ type NodeInfo struct {
 	ChunkCount int64       `json:"chunk_count"`
 	State      NodeState   `json:"state"`
 	LastSeen   int64       `json:"last_seen"`
+
+	// ChangeAck is the highest change-journal sequence the metadata authority
+	// has reconciled for this node (persisted, monotonic). The node polls it
+	// via the change-ack RPC and advances its local journal Ack once metadata
+	// catches up, guaranteeing no un-reconciled event is dropped (§12).
+	ChangeAck uint64 `json:"change_ack,omitempty"`
 }
 
 // NodeState represents the operational state of a node.
 type NodeState uint8
 
 const (
-	NodeOnline    NodeState = iota
-	NodeDraining             // Being decommissioned
-	NodeMaint                // Under maintenance (rolling upgrade)
+	NodeOnline   NodeState = iota
+	NodeDraining           // Being decommissioned
+	NodeMaint              // Under maintenance (rolling upgrade)
 	NodeOffline
 	NodeFailed
 )
@@ -311,19 +317,83 @@ func (s NodeState) String() string {
 type NodeReport struct {
 	UsedGB         int64                    `json:"used_gb"`
 	ChunkCount     int64                    `json:"chunk_count"`
-	DiskIO         float64                  `json:"disk_io"`        // 0.0 - 1.0 utilization
+	DiskIO         float64                  `json:"disk_io"`          // 0.0 - 1.0 utilization
 	WriteErrorRate float64                  `json:"write_error_rate"` // 0.0 - 1.0, rolling write failure ratio
 	ChunkStates    map[ChunkID]ReplicaState `json:"chunk_states"`
 	DiskStats      []DiskReport             `json:"disk_stats,omitempty"` // per-disk breakdown (JBOD)
+
+	// ChangeEvents carries the node's locally-detected async changes
+	// (corruption, disk/segment loss — thing the delta ChunkStates does not
+	// convey because a corrupt-but-present extent still looks "present").
+	// Rides on the heartbeat so the metadata authority can reconcile the
+	// affected replicas (mark failed / trigger repair). V1 nodes send none.
+	// §12.
+	ChangeEvents []ChangeEventRecord `json:"change_events,omitempty"`
+}
+
+// ChangeEventKind enumerates the async datanode change-journal event types
+// surfaced to the metadata authority (§12). It mirrors the datanode-side
+// journal's representation; the datanode reconciler converts its local
+// journal events into these records before shipping them on the heartbeat.
+type ChangeEventKind uint8
+
+const (
+	ChangeCorrupt ChangeEventKind = iota
+	ChangeDiskLost
+	ChangeSegmentLost
+	ChangeRelocated
+	ChangeThirdReplicaComplete
+	ChangeRepairCreated
+	ChangeScrubFinding
+	ChangeDeleteComplete
+)
+
+func (k ChangeEventKind) String() string {
+	switch k {
+	case ChangeCorrupt:
+		return "corrupt"
+	case ChangeDiskLost:
+		return "disk_lost"
+	case ChangeSegmentLost:
+		return "segment_lost"
+	case ChangeRelocated:
+		return "relocated"
+	case ChangeThirdReplicaComplete:
+		return "third_replica_complete"
+	case ChangeRepairCreated:
+		return "repair_created"
+	case ChangeScrubFinding:
+		return "scrub_finding"
+	case ChangeDeleteComplete:
+		return "delete_complete"
+	default:
+		return fmt.Sprintf("unknown(%d)", k)
+	}
+}
+
+// ChangeEventRecord is the metadata-side representation of one datanode
+// change-journal event. ExtentID/Generation identify the affected extent
+// (0 for disk/segment-level events); SegmentID is set for those. It is
+// shipped inside NodeReport.ChangeEvents and reconciled by the metadata
+// service, which then acknowledges the watermark back so the datanode can
+// advance its journal Ack.
+type ChangeEventRecord struct {
+	Seq        uint64          `json:"seq"`
+	Kind       ChangeEventKind `json:"kind"`
+	ExtentID   uint64          `json:"extent_id,omitempty"`
+	Generation uint64          `json:"generation,omitempty"`
+	SegmentID  uint64          `json:"segment_id,omitempty"`
+	Reason     string          `json:"reason,omitempty"`
+	AtUnix     int64           `json:"at_unix,omitempty"`
 }
 
 // DiskReport holds per-disk statistics for the heartbeat, allowing the
 // metadata service to track per-disk usage and health for placement.
 type DiskReport struct {
-	Index      int    `json:"index"`
-	UsedBytes  int64  `json:"used_bytes"`
-	ChunkCount int64  `json:"chunk_count"`
-	Failed     bool   `json:"failed"`
+	Index      int   `json:"index"`
+	UsedBytes  int64 `json:"used_bytes"`
+	ChunkCount int64 `json:"chunk_count"`
+	Failed     bool  `json:"failed"`
 }
 
 // RepairTask represents a pending repair operation.
@@ -362,10 +432,10 @@ type PlacementPolicy struct {
 
 // CrossZoneConfig defines cross-zone (cross-DC) replication settings.
 type CrossZoneConfig struct {
-	RemoteZone    string `json:"remote_zone"`     // Target zone name
-	ReplicaFactor int    `json:"replica_factor"`  // Number of remote replicas (default: 1)
-	AsyncMode     bool   `json:"async_mode"`      // true=async, false=sync
-	BandwidthMBps int    `json:"bandwidth_mbps"`  // Bandwidth limit in MB/s (0=unlimited)
+	RemoteZone    string `json:"remote_zone"`    // Target zone name
+	ReplicaFactor int    `json:"replica_factor"` // Number of remote replicas (default: 1)
+	AsyncMode     bool   `json:"async_mode"`     // true=async, false=sync
+	BandwidthMBps int    `json:"bandwidth_mbps"` // Bandwidth limit in MB/s (0=unlimited)
 }
 
 // ECConfig defines erasure coding parameters.

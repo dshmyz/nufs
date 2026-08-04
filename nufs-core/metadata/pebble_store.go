@@ -216,12 +216,12 @@ type PebbleStore struct {
 	// pgStore is the placement-group authority for the Metadata V2 serving
 	// path (Task #56 Phase A). It shares this store's DB and is raft-backed
 	// like the other component stores. Built lazily in NewPebbleStore.
-	pgStore *PlacementGroupStore
-	chunkGen  *ChunkIDGenerator
-	inodeSeq  atomic.Uint64
-	closed    atomic.Bool
-	mu        sync.RWMutex
-	cfg       PebbleStoreConfig
+	pgStore  *PlacementGroupStore
+	chunkGen *ChunkIDGenerator
+	inodeSeq atomic.Uint64
+	closed   atomic.Bool
+	mu       sync.RWMutex
+	cfg      PebbleStoreConfig
 
 	// Dynamic config — swapped atomically via atomic.Pointer so reads are lock-free.
 	// Use GetDynamicConfig() / SetDynamicConfig() to access.
@@ -351,13 +351,13 @@ type DynamicConfig struct {
 	RaftPreVoteEnabled bool `json:"raft_prevote_enabled"`
 
 	// Placement
-	PlacementSpreadEnabled       bool    `json:"placement_spread_enabled"`
-	PlacementWeightedChoice      bool    `json:"placement_weighted_choice"`
-	PlacementErrorRateFilter     float64 `json:"placement_error_rate_filter"`     // Filter nodes above this error rate (0.0-1.0)
-	PlacementWeightCapacity      float64 `json:"placement_weight_capacity"`       // Scoring weight for free capacity
-	PlacementWeightLoad          float64 `json:"placement_weight_load"`           // Scoring weight for low load
-	PlacementWeightTier          float64 `json:"placement_weight_tier"`           // Scoring weight for tier match
-	PlacementWeightHealth        float64 `json:"placement_weight_health"`         // Scoring weight for low error rate
+	PlacementSpreadEnabled   bool    `json:"placement_spread_enabled"`
+	PlacementWeightedChoice  bool    `json:"placement_weighted_choice"`
+	PlacementErrorRateFilter float64 `json:"placement_error_rate_filter"` // Filter nodes above this error rate (0.0-1.0)
+	PlacementWeightCapacity  float64 `json:"placement_weight_capacity"`   // Scoring weight for free capacity
+	PlacementWeightLoad      float64 `json:"placement_weight_load"`       // Scoring weight for low load
+	PlacementWeightTier      float64 `json:"placement_weight_tier"`       // Scoring weight for tier match
+	PlacementWeightHealth    float64 `json:"placement_weight_health"`     // Scoring weight for low error rate
 
 	// Readiness
 	ReadinessRepairQueueThreshold int64 `json:"readiness_repair_queue_threshold"` // Repair backlog above this → degraded
@@ -366,27 +366,27 @@ type DynamicConfig struct {
 // DefaultDynamicConfig returns safe production defaults for all dynamic configs.
 func DefaultDynamicConfig() DynamicConfig {
 	return DynamicConfig{
-		GCEnabled:               true,
-		GCInterval:              15 * time.Minute,
-		GCChunkBatchSize:        1000,
-		GCThresholdPercent:      0.0, // GC if any orphaned chunk
-		GCDryRun:                false,
-		HeartbeatTTLSeconds:     30,
-		HeartbeatCheckInterval:  5,
-		AutoRepairEnabled:       true,
-		WriteBatchingEnabled:    true,
-		WriteBatchMaxSize:       256,
-		WriteBatchMaxWait:       50 * time.Millisecond,
-		CacheEnabled:            true,
-		CacheMaxSize:            65536,
-		RaftPreVoteEnabled:      true,
-		PlacementSpreadEnabled:       true,
-		PlacementWeightedChoice:      false,
-		PlacementErrorRateFilter:     0.8,
-		PlacementWeightCapacity:      0.4,
-		PlacementWeightLoad:          0.25,
-		PlacementWeightTier:          0.2,
-		PlacementWeightHealth:        0.15,
+		GCEnabled:                     true,
+		GCInterval:                    15 * time.Minute,
+		GCChunkBatchSize:              1000,
+		GCThresholdPercent:            0.0, // GC if any orphaned chunk
+		GCDryRun:                      false,
+		HeartbeatTTLSeconds:           30,
+		HeartbeatCheckInterval:        5,
+		AutoRepairEnabled:             true,
+		WriteBatchingEnabled:          true,
+		WriteBatchMaxSize:             256,
+		WriteBatchMaxWait:             50 * time.Millisecond,
+		CacheEnabled:                  true,
+		CacheMaxSize:                  65536,
+		RaftPreVoteEnabled:            true,
+		PlacementSpreadEnabled:        true,
+		PlacementWeightedChoice:       false,
+		PlacementErrorRateFilter:      0.8,
+		PlacementWeightCapacity:       0.4,
+		PlacementWeightLoad:           0.25,
+		PlacementWeightTier:           0.2,
+		PlacementWeightHealth:         0.15,
 		ReadinessRepairQueueThreshold: 1000,
 	}
 }
@@ -2246,8 +2246,8 @@ func (s *PebbleStore) CreateObjectWithChunks(ctx context.Context, parent InodeID
 	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
 
 	ops := []batchOp{
-		{Key: nsKey, Value: entry},          // namespace entry
-		{Key: inodeKey, Value: inode},        // inode with ChunkMap
+		{Key: nsKey, Value: entry},    // namespace entry
+		{Key: inodeKey, Value: inode}, // inode with ChunkMap
 	}
 	s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
 
@@ -2547,8 +2547,161 @@ func (s *PebbleStore) Heartbeat(ctx context.Context, nodeID NodeID, report *Node
 		return err
 	}
 	if report != nil && len(report.ChunkStates) > 0 {
-		return s.ReportChunkState(ctx, nodeID, report.ChunkStates)
+		if err := s.ReportChunkState(ctx, nodeID, report.ChunkStates); err != nil {
+			return err
+		}
 	}
+	if report != nil && len(report.ChangeEvents) > 0 {
+		if _, err := s.ReconcileChangeEvents(ctx, nodeID, report.ChangeEvents); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReconcileChangeEvents consumes the change-journal events a node shipped on
+// its heartbeat (§12) and returns the highest sequence the metadata authority
+// has fully processed — the watermark the node may Ack. It is called by the
+// HTTP heartbeat handler after liveness/chunk-state processing so a batch
+// that fails to reconcile is not acked (the node will reship it next round).
+//
+// Event → action mapping:
+//   - corrupt  : the extent on this node failed a checksum/decrypt read. Mark
+//     this node's replica of the chunk ReplicaFailed and trigger a repair so a
+//     fresh copy replaces it.
+//   - disk_lost / segment_lost : the node lost storage. Conservatively mark
+//     every chunk this node reports as ReplicaFailed and trigger repairs. (The
+//     event carries only the lost disk/segment, not its chunk list, so the
+//     node-level sweep is the safe reconciliation.)
+//   - informational kinds (relocated, third_replica_complete, repair_created,
+//     scrub_finding, delete_complete) : logged; replica reconciliation for
+//     these is driven by the repair/relocation/delete paths themselves.
+//
+// The returned watermark is the highest event sequence processed without
+// error; on any reconciliation error the method returns (0, err) so the node
+// does not advance past un-processed events.
+func (s *PebbleStore) ReconcileChangeEvents(ctx context.Context, nodeID NodeID, events []ChangeEventRecord) (uint64, error) {
+	if len(events) == 0 {
+		return 0, nil
+	}
+	var maxSeq uint64
+	for _, ev := range events {
+		if err := s.reconcileOneChangeEvent(ctx, nodeID, ev); err != nil {
+			return 0, fmt.Errorf("reconcile %s: %w", ev.Kind, err)
+		}
+		if ev.Seq > maxSeq {
+			maxSeq = ev.Seq
+		}
+	}
+	// Persist the reconciled watermark so the node can safely advance its
+	// local journal Ack once metadata has caught up (§12).
+	if err := s.advanceChangeAck(ctx, nodeID, maxSeq); err != nil {
+		return 0, err
+	}
+	return maxSeq, nil
+}
+
+// advanceChangeAck bumps the node's persisted change-journal watermark to seq
+// (monotonic: never lowers it).
+func (s *PebbleStore) advanceChangeAck(ctx context.Context, nodeID NodeID, seq uint64) error {
+	key := prefixNode + fmt.Sprintf("%d", nodeID)
+	var info NodeInfo
+	exists, err := s.getJSON(key, &info)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNodeNotFound
+	}
+	if seq <= info.ChangeAck {
+		return nil // already advanced past this
+	}
+	info.ChangeAck = seq
+	return s.putMsgpack(key, &info)
+}
+
+// GetChangeAck returns the highest change-journal sequence metadata has
+// reconciled for this node — the watermark the node may safely Ack. 0 if the
+// node is unknown or no events were ever reconciled.
+func (s *PebbleStore) GetChangeAck(ctx context.Context, nodeID NodeID) (uint64, error) {
+	key := prefixNode + fmt.Sprintf("%d", nodeID)
+	var info NodeInfo
+	exists, err := s.getJSON(key, &info)
+	if err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, ErrNodeNotFound
+	}
+	return info.ChangeAck, nil
+}
+
+// AckChangeEvents is the dedicated change-ack RPC (Option B transport). It
+// returns the node's persisted reconciled watermark — the sequence the node
+// may have the metadata authority confirm before advancing its local journal
+// Ack. Metadata does not trust the node's assertion; it reports what it has in
+// fact reconciled, so the node advances only past actually-processed events.
+func (s *PebbleStore) AckChangeEvents(ctx context.Context, nodeID NodeID, _ uint64) (uint64, error) {
+	if s.closed.Load() {
+		return 0, ErrServiceClosed
+	}
+	return s.GetChangeAck(ctx, nodeID)
+}
+
+func (s *PebbleStore) reconcileOneChangeEvent(ctx context.Context, nodeID NodeID, ev ChangeEventRecord) error {
+	switch ev.Kind {
+	case ChangeCorrupt:
+		if ev.ExtentID == 0 {
+			return nil // no extent to reconcile against
+		}
+		return s.markReplicaFailedAndRepair(ctx, nodeID, ChunkID(ev.ExtentID))
+	case ChangeDiskLost, ChangeSegmentLost:
+		return s.markNodeReplicasFailedAndRepair(ctx, nodeID)
+	case ChangeRelocated, ChangeThirdReplicaComplete, ChangeRepairCreated,
+		ChangeScrubFinding, ChangeDeleteComplete:
+		slog.Debug("metadata: info change event ignored", "kind", ev.Kind.String(), "node", nodeID)
+		return nil
+	default:
+		return nil
+	}
+}
+
+// markReplicaFailedAndRepair marks nodeID's replica of chunkID ReplicaFailed
+// and triggers a repair for it (so a fresh copy is re-replicated elsewhere).
+func (s *PebbleStore) markReplicaFailedAndRepair(ctx context.Context, nodeID NodeID, chunkID ChunkID) error {
+	if err := s.ReportChunkState(ctx, nodeID, map[ChunkID]ReplicaState{chunkID: ReplicaFailed}); err != nil {
+		return err
+	}
+	slog.Info("metadata: replica marked failed from change event",
+		"node", nodeID, "chunk", chunkID)
+	return s.TriggerRepair(ctx, chunkID)
+}
+
+// markNodeReplicasFailedAndRepair marks every chunk this node reports as
+// ReplicaFailed (storage loss) and triggers repairs for them.
+func (s *PebbleStore) markNodeReplicasFailedAndRepair(ctx context.Context, nodeID NodeID) error {
+	chunks, err := s.ChunksByNode(context.Background(), nodeID)
+	if err != nil {
+		return err
+	}
+	states := make(map[ChunkID]ReplicaState, len(chunks))
+	for _, c := range chunks {
+		if c.ID != 0 {
+			states[c.ID] = ReplicaFailed
+		}
+	}
+	if len(states) == 0 {
+		return nil
+	}
+	if err := s.ReportChunkState(ctx, nodeID, states); err != nil {
+		return err
+	}
+	for id := range states {
+		if err := s.TriggerRepair(ctx, id); err != nil {
+			slog.Warn("metadata: trigger repair after storage loss", "chunk", id, "error", err)
+		}
+	}
+	slog.Info("metadata: marked replicas failed after storage loss", "node", nodeID, "chunks", len(states))
 	return nil
 }
 

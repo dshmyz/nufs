@@ -306,6 +306,12 @@ func WithLocalWriter(writer func(chunkID metadata.ChunkID, data []byte) error) f
 // HeartbeatMeta is the minimal metadata interface for HeartbeatReporter.
 type HeartbeatMeta interface {
 	Heartbeat(ctx context.Context, nodeID metadata.NodeID, report *metadata.NodeReport) error
+	// AckChangeEvents reports the delivered change-journal sequence and
+	// returns the metadata authority's persisted reconciled watermark, so the
+	// reporter can advance its local journal Ack past events metadata has in
+	// fact consumed (§12). Optional — a store without a change journal sends
+	// the Reporter nil and this is never called.
+	AckChangeEvents(ctx context.Context, nodeID metadata.NodeID, seq uint64) (uint64, error)
 }
 
 // AntiEntropyMeta is the minimal metadata interface for AntiEntropy.

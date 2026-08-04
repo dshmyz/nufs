@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/example/dfs/datanode/storage/journal"
 	"github.com/example/dfs/metadata"
 )
 
@@ -68,9 +69,9 @@ type HeartbeatReporter struct {
 	// reported), with the store version it was built from. On ticks
 	// where the store is unchanged it is reused to re-derive an
 	// unacknowledged delta without an O(N) rescan. Guarded by stateMu.
-	lastSnapshot      map[metadata.ChunkID]metadata.ReplicaState
-	lastSnapshotVer   uint64
-	lastFullSyncVer   uint64 // store version at the last successful full sync
+	lastSnapshot    map[metadata.ChunkID]metadata.ReplicaState
+	lastSnapshotVer uint64
+	lastFullSyncVer uint64 // store version at the last successful full sync
 
 	// fullSyncCounter counts heartbeats since the last full sync.
 	// Every fullSyncInterval heartbeats, we do a full sync to
@@ -78,6 +79,13 @@ type HeartbeatReporter struct {
 	// was lost).
 	fullSyncCounter  int
 	fullSyncInterval int
+
+	// changeJournal, when non-nil, is the node's async change journal
+	// (§12) whose Pending() events ride on the heartbeat so metadata can
+	// reconcile corruption/disk-loss that the ChunkStates delta misses.
+	// After a successful heartbeat the reporter polls AckChangeEvents and
+	// advances the journal past sequences metadata has actually consumed.
+	changeJournal *journal.ChangeJournal
 }
 
 const defaultFullSyncInterval = 6 // every 6th heartbeat (~1 min at 10s interval)
@@ -95,6 +103,13 @@ func NewHeartbeatReporter(cfg Config, metaStore HeartbeatMeta, chunkStore Heartb
 		lastKnownState:   make(map[metadata.ChunkID]metadata.ReplicaState),
 		fullSyncInterval: defaultFullSyncInterval,
 	}
+}
+
+// SetChangeJournal attaches the node's async change journal (§12) so its
+// Pending() events ride on heartbeats for metadata reconciliation. Nil
+// disables change-event shipping.
+func (h *HeartbeatReporter) SetChangeJournal(j *journal.ChangeJournal) {
+	h.changeJournal = j
 }
 
 // Start begins the periodic heartbeat loop.
@@ -198,6 +213,20 @@ func (h *HeartbeatReporter) send() {
 		ChunkStates:    chunkStates,
 	}
 
+	// Pull the node's pending change-journal events (bounded by the journal's
+	// own heartbeat caps) onto the heartbeat so metadata can reconcile async
+	// corruption/storage-loss (§12). The events are not acked here — Acking
+	// happens only after metadata confirms consumption (below).
+	var pendingAck uint64
+	hadEvents := false
+	if j := h.changeJournal; j != nil {
+		if evs, nextAck := j.Pending(j.MaxPerHeartbeat, j.MaxHeartbeatBytes); len(evs) > 0 {
+			report.ChangeEvents = changeEventsToReport(evs, make([]metadata.ChangeEventRecord, 0, len(evs)))
+			pendingAck = nextAck
+			hadEvents = true
+		}
+	}
+
 	// Per-disk stats for JBOD multi-disk deployments.
 	if ds := h.chunkSt.DiskStats(); len(ds) > 1 {
 		diskReports := make([]metadata.DiskReport, len(ds))
@@ -218,6 +247,19 @@ func (h *HeartbeatReporter) send() {
 		// from the cached snapshot (O(1) in steady state).
 		slog.Error("datanode: heartbeat failed", "error", err)
 		return
+	}
+
+	// Heartbeat succeeded. If we shipped change events, ask the metadata
+	// authority for its persisted reconciled watermark and advance the local
+	// journal Ack only past sequences metadata has in fact consumed. On any
+	// error the un-acked events are simply reshipped next tick — idempotent
+	// reconcile makes this safe (§12).
+	if hadEvents && h.changeJournal != nil {
+		if acked, err := h.meta.AckChangeEvents(h.ctx, h.cfg.NodeID, pendingAck); err != nil {
+			slog.Warn("datanode: change-ack query failed", "error", err)
+		} else if acked > 0 {
+			h.changeJournal.Ack(acked)
+		}
 	}
 
 	// Send succeeded: snapshot is now acknowledged. For a full sync the
@@ -292,4 +334,46 @@ func (h *HeartbeatReporter) ForceFullSync() {
 // Called by external monitoring or the server itself.
 func (h *HeartbeatReporter) SetDiskIO(utilization float64) {
 	h.lastDiskIO = utilization
+}
+
+// changeEventKindToReport maps a datanode journal event kind to its
+// metadata-side representation (§12).
+func changeEventKindToReport(k journal.ChangeEventKind) metadata.ChangeEventKind {
+	switch k {
+	case journal.EventCorrupt:
+		return metadata.ChangeCorrupt
+	case journal.EventDiskLost:
+		return metadata.ChangeDiskLost
+	case journal.EventSegmentLost:
+		return metadata.ChangeSegmentLost
+	case journal.EventRelocated:
+		return metadata.ChangeRelocated
+	case journal.EventThirdReplicaComplete:
+		return metadata.ChangeThirdReplicaComplete
+	case journal.EventRepairCreated:
+		return metadata.ChangeRepairCreated
+	case journal.EventScrubFinding:
+		return metadata.ChangeScrubFinding
+	case journal.EventDeleteComplete:
+		return metadata.ChangeDeleteComplete
+	default:
+		return metadata.ChangeCorrupt // safe fallback; unknown kinds are rare
+	}
+}
+
+// changeEventsToReport converts datanode journal events to metadata
+// ChangeEventRecords for shipping on the heartbeat.
+func changeEventsToReport(evs []journal.ChangeEvent, out []metadata.ChangeEventRecord) []metadata.ChangeEventRecord {
+	for _, ev := range evs {
+		out = append(out, metadata.ChangeEventRecord{
+			Seq:        ev.Seq,
+			Kind:       changeEventKindToReport(ev.Kind),
+			ExtentID:   uint64(ev.ExtentID),
+			Generation: uint64(ev.Generation),
+			SegmentID:  uint64(ev.SegmentID),
+			Reason:     ev.Reason,
+			AtUnix:     ev.AtUnix,
+		})
+	}
+	return out
 }

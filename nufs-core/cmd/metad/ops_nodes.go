@@ -99,6 +99,24 @@ func (h *opsHandlers) handleNodesByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]string{"status": "ok"})
+	case rest == "change-ack":
+		if r.Method != http.MethodPost {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var req struct {
+			Seq uint64 `json:"seq"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		ack, err := h.store.AckChangeEvents(r.Context(), nodeID, req.Seq)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]uint64{"change_ack": ack})
 	case rest == "decommission":
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -124,4 +142,3 @@ func (h *opsHandlers) handleNodesByID(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "unknown node sub-path")
 	}
 }
-

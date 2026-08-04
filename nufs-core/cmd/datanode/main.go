@@ -17,6 +17,7 @@ import (
 	"github.com/example/dfs/datanode"
 	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/datanode/storage/encryption"
+	"github.com/example/dfs/datanode/storage/journal"
 	"github.com/example/dfs/datanode/storage/segment"
 	"github.com/example/dfs/internal/config"
 	"github.com/example/dfs/internal/crypto"
@@ -469,12 +470,30 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 			}
 		}
 	}
+	// Open the node's async change journal (§12). A single journal shared
+	// across all disks keeps one heartbeat watermark; events already carry
+	// the affected disk/segment. The segment stores append corruption/
+	// disk-loss events to it, and the heartbeat ships Pending() to the
+	// metadata authority for reconciliation.
+	changeJournal, err := journal.OpenChangeJournal(journal.JournalOptions{
+		Dir:               filepath.Join(dataDirs[0], "change-journal"),
+		MaxBytes:          8 << 30,
+		RetainMinDuration: 24 * time.Hour,
+		MaxPerHeartbeat:   10000,
+		MaxHeartbeatBytes: 4 << 20,
+	})
+	if err != nil {
+		log.Error("failed to open change journal", "error", err)
+		closeStores()
+		os.Exit(1)
+	}
 	for _, dir := range dataDirs {
 		segCfg := segment.Config{
-			Dir:         dir,
-			SegmentSize: storage.DefaultDataSegmentSize,
-			UseMemIndex: false,
-			StreamID:    1, // data stream (0 = small)
+			Dir:           dir,
+			SegmentSize:   storage.DefaultDataSegmentSize,
+			UseMemIndex:   false,
+			StreamID:      1, // data stream (0 = small)
+			ChangeJournal: changeJournal,
 		}
 		// Configure at-rest encryption if enabled.
 		if cfg.EncryptAtRest {
@@ -516,9 +535,9 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// heartbeat still start. The address is refreshed via heartbeat.
 	ctx := context.Background()
 	if err := metaStore.RegisterNode(ctx, &metadata.NodeInfo{
-		ID:      cfg.NodeID,
-		Addr:    registerAddr(cfg),
-		State:   metadata.NodeOnline,
+		ID:    cfg.NodeID,
+		Addr:  registerAddr(cfg),
+		State: metadata.NodeOnline,
 	}); err != nil && err != metadata.ErrNodeAlreadyExists {
 		log.Error("failed to register with metadata service", "error", err)
 		closeStores()
@@ -546,6 +565,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// (§6.3). Without it the node would be marked offline and never
 	// receive writes.
 	heartbeat := datanode.NewHeartbeatReporter(cfg, metaStore, v2Store)
+	heartbeat.SetChangeJournal(changeJournal)
 	heartbeat.Start()
 
 	// Cross-node repair on the V2.1 serving path. The Replicator and
@@ -606,6 +626,9 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	replicator.Stop()
 	heartbeat.Stop()
 	closeStores()
+	if err := changeJournal.Close(); err != nil {
+		log.Warn("V2.1 change journal close error", "error", err)
+	}
 
 	deregCtx, deregCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := metaStore.RegisterNode(deregCtx, &metadata.NodeInfo{
