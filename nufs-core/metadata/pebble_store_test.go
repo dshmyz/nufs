@@ -634,6 +634,94 @@ func TestPebbleStore_ConcurrentSameNameCreateFile(t *testing.T) {
 	}
 }
 
+// TestPebbleStore_CreateNode exercises the special-node primitive: FIFO, char
+// device (with Rdev), block device and socket each create a namespace entry
+// with the right FileType + Type round-tripped through DirEntry, bucket-root
+// inheritance, and a same-name create failing with ErrEntryExists.
+func TestPebbleStore_CreateNode(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+	if err := store.CreateBucket(ctx, "fs", PlacementPolicy{}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	parent := bucket.RootInode
+
+	cases := []struct {
+		name     string
+		ftype    FileType
+		mode     uint32
+		rdev     uint32
+		wantType FileType
+	}{
+		{"pipe", FileFIFO, 0644, 0, FileFIFO},
+		{"chardev", FileCharDevice, 0666, 0x0102, FileCharDevice},
+		{"blockdev", FileBlockDevice, 0660, 0x0a01, FileBlockDevice},
+		{"sock", FileSocket, 0755, 0, FileSocket},
+	}
+
+	for _, tc := range cases {
+		meta, err := store.CreateNode(ctx, parent, tc.name, tc.ftype, tc.mode, tc.rdev)
+		if err != nil {
+			t.Fatalf("CreateNode(%s): %v", tc.name, err)
+		}
+		if meta.Type != tc.wantType {
+			t.Fatalf("%s: inode type = %v, want %v", tc.name, meta.Type, tc.wantType)
+		}
+		if meta.Mode != tc.mode {
+			t.Fatalf("%s: mode = %o, want %o", tc.name, meta.Mode, tc.mode)
+		}
+		if meta.Rdev != tc.rdev {
+			t.Fatalf("%s: rdev = %d, want %d", tc.name, meta.Rdev, tc.rdev)
+		}
+		if meta.BucketRoot != parent {
+			t.Fatalf("%s: bucket root not inherited: %d, want %d", tc.name, meta.BucketRoot, parent)
+		}
+
+		// Lookup reflects the same type + rdev.
+		got, err := store.Lookup(ctx, parent, tc.name)
+		if err != nil {
+			t.Fatalf("Lookup(%s): %v", tc.name, err)
+		}
+		if got.Type != tc.wantType || got.Rdev != tc.rdev {
+			t.Fatalf("%s: lookup type=%v rdev=%d, want type=%v rdev=%d", tc.name, got.Type, got.Rdev, tc.wantType, tc.rdev)
+		}
+	}
+
+	// ReadDir reflects each entry's type.
+	entries, err := store.ReadDir(ctx, parent, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != len(cases) {
+		t.Fatalf("ReadDir entries = %d, want %d", len(entries), len(cases))
+	}
+	byName := map[string]DirEntry{}
+	for _, e := range entries {
+		byName[e.Name] = e
+	}
+	for _, tc := range cases {
+		if e, ok := byName[tc.name]; !ok || e.Type != tc.wantType {
+			t.Fatalf("entry %q type = %v, want %v", tc.name, byName[tc.name].Type, tc.wantType)
+		}
+	}
+
+	// Same-name create fails atomically with ErrEntryExists.
+	if _, err := store.CreateNode(ctx, parent, "pipe", FileFIFO, 0644, 0); err != ErrEntryExists {
+		t.Fatalf("duplicate CreateNode = %v, want ErrEntryExists", err)
+	}
+
+	// Other types (regular/dir/symlink) cannot be created through CreateNode.
+	for _, bad := range []FileType{FileRegular, FileDirectory, FileSymlink} {
+		if _, err := store.CreateNode(ctx, parent, "bad-"+string(rune(bad)), bad, 0644, 0); err == nil {
+			t.Fatalf("CreateNode with type %v succeeded, want non-special type rejected", bad)
+		}
+	}
+}
+
 // runConcurrentSameNameDelete fans out `n` goroutines all deleting the same
 // name under the same parent, then asserts the atomic namespace-delete
 // invariant: exactly one goroutine succeeds and every other gets

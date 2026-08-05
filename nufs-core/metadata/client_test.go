@@ -426,3 +426,49 @@ func TestHTTPClientDoesNotReplayAllocationAfterServerOrTransportAmbiguity(t *tes
 		})
 	}
 }
+
+// TestHTTPClientCreateNodeRoundTrip verifies HTTPClient.CreateNode POSTs the
+// ftype/mode/rdev to /api/v1/namespace/create-node and decodes the returned
+// InodeMeta (type + rdev preserved), mirroring the createfile client contract.
+func TestHTTPClientCreateNodeRoundTrip(t *testing.T) {
+	var gotPath string
+	var gotBody struct {
+		Parent InodeID `json:"parent"`
+		Name   string  `json:"name"`
+		Type   FileType `json:"type"`
+		Mode   uint32  `json:"mode"`
+		Rdev   uint32  `json:"rdev"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/namespace/create-node" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode create-node request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(InodeMeta{
+			ID: 99, Type: FileCharDevice, Mode: 0666, Rdev: 0x0102, NLink: 1,
+		})
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, time.Second)
+	ctx := context.Background()
+	meta, err := c.CreateNode(ctx, 7, "dev", FileCharDevice, 0666, 0x0102)
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+
+	if gotPath != "/api/v1/namespace/create-node" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotBody.Parent != 7 || gotBody.Name != "dev" || gotBody.Type != FileCharDevice || gotBody.Mode != 0666 || gotBody.Rdev != 0x0102 {
+		t.Fatalf("request body = %+v", gotBody)
+	}
+	if meta.Type != FileCharDevice || meta.Rdev != 0x0102 {
+		t.Fatalf("decoded meta = %+v", meta)
+	}
+}

@@ -695,6 +695,14 @@ func (ss *ShardedStore) CreateFile(ctx context.Context, parent InodeID, name str
 	return store.CreateFile(ctx, parent, name, mode)
 }
 
+func (ss *ShardedStore) CreateNode(ctx context.Context, parent InodeID, name string, ftype FileType, mode uint32, rdev uint32) (*InodeMeta, error) {
+	store, err := ss.routeToShard(shardKeyForInode(parent))
+	if err != nil {
+		return nil, err
+	}
+	return store.CreateNode(ctx, parent, name, ftype, mode, rdev)
+}
+
 func (ss *ShardedStore) Unlink(ctx context.Context, parent InodeID, name string) error {
 	store, err := ss.routeToShard(shardKeyForInode(parent))
 	if err != nil {

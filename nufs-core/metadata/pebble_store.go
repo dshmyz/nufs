@@ -1615,6 +1615,54 @@ func (s *PebbleStore) CreateFile(ctx context.Context, parent InodeID, name strin
 	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", inodeID)})
 	return meta, nil
 }
+
+// CreateNode creates a special (non-regular) namespace entry — FIFO, char or
+// block device, or unix socket. It mirrors CreateFile's atomic namespace CAS
+// (nextInodeID + bucket-root inheritance + buildNamespaceConditional +
+// applyNamespaceConditional), differing only in the FileType and Rdev carried
+// on the inode and its DirEntry. Special nodes never back real data, so their
+// size stays 0 and they add one object to the bucket's object count.
+func (s *PebbleStore) CreateNode(ctx context.Context, parent InodeID, name string, ftype FileType, mode uint32, rdev uint32) (*InodeMeta, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	if len(name) > MaxNameLength {
+		return nil, ErrNameTooLong
+	}
+	// CreateNode is only for special nodes; regular files/dirs/symlinks have
+	// their own dedicated primitives.
+	switch ftype {
+	case FileFIFO, FileCharDevice, FileBlockDevice, FileSocket:
+	default:
+		return nil, fmt.Errorf("metadata: CreateNode called with non-special type %v", ftype)
+	}
+
+	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
+
+	inodeID := s.nextInodeID()
+	now := time.Now().UnixNano()
+	bucketRoot := s.getBucketRoot(parent)
+	meta := &InodeMeta{
+		ID: inodeID, Type: ftype, Mode: mode, Rdev: rdev, NLink: 1,
+		BucketRoot: bucketRoot,
+		CTime:      now, MTime: now, ATime: now,
+	}
+	entry := &DirEntry{InodeID: inodeID, Type: ftype, Name: name}
+	ops := []batchOp{
+		{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
+		{Key: nsKey, Value: entry},
+	}
+	s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
+	conditional, err := buildNamespaceConditional(nsKey, ops)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
+		return nil, err
+	}
+	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", inodeID)})
+	return meta, nil
+}
 func (s *PebbleStore) Unlink(ctx context.Context, parent InodeID, name string) error {
 	if s.closed.Load() {
 		return ErrServiceClosed

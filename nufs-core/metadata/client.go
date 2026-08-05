@@ -529,6 +529,21 @@ func (c *HTTPClient) CreateFile(ctx context.Context, parent InodeID, name string
 	return &meta, nil
 }
 
+// CreateNode creates a special (non-regular) namespace entry (FIFO, char or
+// block device, socket). rdev is the device number used by the device types.
+func (c *HTTPClient) CreateNode(ctx context.Context, parent InodeID, name string, ftype FileType, mode uint32, rdev uint32) (*InodeMeta, error) {
+	req := map[string]interface{}{"parent": parent, "name": name, "type": ftype, "mode": mode, "rdev": rdev}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/namespace/create-node", req)
+	if err != nil {
+		return nil, err
+	}
+	var meta InodeMeta
+	if err := c.readResponse(resp, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
 func (c *HTTPClient) Unlink(ctx context.Context, parent InodeID, name string) error {
 	req := map[string]interface{}{"parent": parent, "name": name}
 	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/namespace/unlink", req)

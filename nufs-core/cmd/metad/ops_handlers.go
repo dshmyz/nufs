@@ -141,6 +141,7 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/namespace/rmdir", mut(s.handleRmDir))
 	mux.HandleFunc("/api/v1/namespace/readdir", s.handleReadDir)
 	mux.HandleFunc("/api/v1/namespace/createfile", mut(s.handleCreateFile))
+	mux.HandleFunc("/api/v1/namespace/create-node", mut(s.handleCreateNode))
 	mux.HandleFunc("/api/v1/namespace/unlink", mut(s.handleUnlink))
 	mux.HandleFunc("/api/v1/namespace/lookup", s.handleLookup)
 	mux.HandleFunc("/api/v1/namespace/rename", mut(s.handleRename))

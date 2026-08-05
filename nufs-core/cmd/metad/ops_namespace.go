@@ -104,6 +104,35 @@ func (h *opsHandlers) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, meta)
 }
 
+// handleCreateNode creates a special (non-regular) namespace entry —
+// FIFO (type 3), char device (4), block device (5) or socket (6). rdev is
+// the device number for the char/block device types. Same JSON contract as
+// createfile plus the ftype/rdev fields; HTTPClient.CreateNode decodes it.
+func (h *opsHandlers) handleCreateNode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		Parent metadata.InodeID `json:"parent"`
+		Name   string           `json:"name"`
+		Type   metadata.FileType `json:"type"`
+		Mode   uint32           `json:"mode"`
+		Rdev   uint32           `json:"rdev"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	meta, err := h.store.CreateNode(r.Context(), req.Parent, req.Name, req.Type, req.Mode, req.Rdev)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, meta)
+}
+
 func (h *opsHandlers) handleUnlink(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")

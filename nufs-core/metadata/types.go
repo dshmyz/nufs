@@ -15,6 +15,15 @@ const (
 	FileRegular   FileType = iota // Regular file
 	FileDirectory                 // Directory
 	FileSymlink                   // Symbolic link
+	// FileFIFO / device / socket nodes. These carry no payload in the
+	// object-store model (FIFO I/O is owned by the kernel pipe; device and
+	// socket nodes are identity-only stubs), so only their type bit and Rdev
+	// are material. Appended after FileSymlink so byte values stay backward
+	// compatible with existing on-disk InodeMeta rows.
+	FileFIFO       // Named pipe (FIFO)
+	FileCharDevice // Character device
+	FileBlockDevice // Block device
+	FileSocket     // Unix-domain socket
 )
 
 // InodeID is a unique identifier for an inode in the namespace tree.
@@ -43,6 +52,10 @@ type InodeMeta struct {
 	CTime      int64    `json:"ctime"` // Change time (unix nanoseconds)
 	MTime      int64    `json:"mtime"` // Modification time
 	ATime      int64    `json:"atime"` // Access time
+
+	// Rdev is the device number for FIFO/device nodes (mode&S_IFMT handled
+	// via Type). Zero for regular files, directories, symlinks and sockets.
+	Rdev uint32 `json:"rdev,omitempty"`
 
 	// File-specific fields
 	ChunkMap []ChunkRef `json:"chunks,omitempty"`  // Ordered chunk list

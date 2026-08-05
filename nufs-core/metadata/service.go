@@ -35,6 +35,10 @@ type NamespaceService interface {
 	ReadDir(ctx context.Context, parent InodeID, offset int, limit int) ([]DirEntry, error)
 	ReadDirFrom(ctx context.Context, parent InodeID, afterName string, limit int) ([]DirEntry, error)
 	CreateFile(ctx context.Context, parent InodeID, name string, mode uint32) (*InodeMeta, error)
+	// CreateNode creates a special (non-regular) namespace entry: FIFO, char
+	// device, block device or socket. rdev is the device number, used only by
+	// the char/block device types.
+	CreateNode(ctx context.Context, parent InodeID, name string, ftype FileType, mode uint32, rdev uint32) (*InodeMeta, error)
 	Unlink(ctx context.Context, parent InodeID, name string) error
 	Lookup(ctx context.Context, parent InodeID, name string) (*InodeMeta, error)
 	Rename(ctx context.Context, oldParent InodeID, oldName string, newParent InodeID, newName string) error
