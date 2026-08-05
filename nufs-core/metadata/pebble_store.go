@@ -2456,11 +2456,20 @@ func (s *PebbleStore) RegisterNode(ctx context.Context, info *NodeInfo) error {
 	}
 	if exists {
 		// The same node is re-registering (process restart, container
-		// recreation). Refresh its address and liveness so peers can
-		// route to the current reachable endpoint — the address may have
-		// changed (e.g. new container hostname/port).
+		// recreation). Refresh its address, liveness, and EC shard-disk
+		// count so peers can route to the current reachable endpoint and an
+		// EC coordinator sees the node's true candidate-disk topology. The
+		// address may have changed (e.g. new container hostname/port).
+		changed := false
 		if info.Addr != "" && info.Addr != existing.Addr {
 			existing.Addr = info.Addr
+			changed = true
+		}
+		if info.ShardDiskCount > 0 && info.ShardDiskCount != existing.ShardDiskCount {
+			existing.ShardDiskCount = info.ShardDiskCount
+			changed = true
+		}
+		if changed {
 			if err := s.putMsgpack(key, &existing); err != nil {
 				return err
 			}

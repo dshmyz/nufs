@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -574,9 +575,10 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// heartbeat still start. The address is refreshed via heartbeat.
 	ctx := context.Background()
 	if err := metaStore.RegisterNode(ctx, &metadata.NodeInfo{
-		ID:    cfg.NodeID,
-		Addr:  registerAddr(cfg),
-		State: metadata.NodeOnline,
+		ID:             cfg.NodeID,
+		Addr:           registerAddr(cfg),
+		State:          metadata.NodeOnline,
+		ShardDiskCount: len(shardStores),
 	}); err != nil && err != metadata.ErrNodeAlreadyExists {
 		log.Error("failed to register with metadata service", "error", err)
 		closeStores()
@@ -678,6 +680,82 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// the profile instead of embedding all nine shards.
 	ecService.SetPublish(func(_ context.Context, st *metadata.ECStripe) error {
 		return metaStore.PublishConversion(st)
+	})
+
+	// Program 9: cross-node EC production topology. Without this, §14 planning
+	// runs against the default *synthetic single-node* candidate topology
+	// (CandidateDisks() fakes NodeID 1/2/3 "slots" that all resolve back to this
+	// one physical node) — so "≥3 distinct NodeID fault domains" is fake. Here we
+	// instead resolve the real cluster topology live from the metadata authority
+	// at convert-time:
+	//   - peerClient (SetCrossNode) lets the coordinator push each not-on-this-node
+	//     shard over TCP (ReplicateECShard) to the peer that owns it, writing each
+	//     node's own shard only → true §14 fault domains.
+	//   - SetCandidateDisks feeds PlanShards the real candidate-disk set built from
+	//     every NodeOnline peer's ShardDiskCount (DiskID = NodeID*1000 + local_disk;
+	//     resolveDisk uses %1000 to recover the node-local index).
+	//
+	// Both are resolved lazily on first convert and cached (sync.Once), so a
+	// multi-shard conversion issues one ListNodes round-trip instead of one per
+	// shard. The candidate set includes every online node's shard disks — this
+	// node's own disks participate too, since the coordinator writes the shards
+	// it owns locally (WriteShardAtDisk) and pushes the rest to their peers; so
+	// a full 6+3 stripe needs ≥3 online nodes (including this one) with ≥3 shard
+	// disks each for §14. An under-provisioned cluster simply fails the convert
+	// cleanly (S3 semantics) rather than fabricating a fake fault domain.
+	//
+	// Single-node clusters and V2.1 nodes that never convert are unaffected: the
+	// synthetic topology remains the fallback for the (dev-only) local-peer path,
+	// and replication (non-EC) needs none of this.
+	var (
+		peerAddrs     map[uint64]string
+		loadPeersOnce sync.Once
+	)
+	loadPeers := func() {
+		nodes, err := metaStore.ListNodes(ctx)
+		if err != nil {
+			return // leave empty; convert will fail cleanly
+		}
+		peerAddrs = make(map[uint64]string, len(nodes))
+		for _, n := range nodes {
+			if n.State == metadata.NodeOnline && n.Addr != "" {
+				peerAddrs[uint64(n.ID)] = n.Addr
+			}
+		}
+	}
+	ecService.SetCrossNode(uint64(cfg.NodeID), func(nodeID uint64) (*datanode.Client, bool) {
+		loadPeersOnce.Do(loadPeers)
+		addr, ok := peerAddrs[nodeID]
+		if !ok {
+			return nil, false
+		}
+		return datanode.NewClient(addr), true
+	})
+	ecService.SetCandidateDisks(func() []metadata.ECDisk {
+		loadPeersOnce.Do(loadPeers)
+		nodes, err := metaStore.ListNodes(ctx)
+		if err != nil {
+			return nil
+		}
+		var disks []metadata.ECDisk
+		for _, n := range nodes {
+			// Include every online node with shard disks — this node too. In
+			// cross-node mode the coordinator writes the shards it owns locally
+			// (WriteShardAtDisk) and pushes the rest to their owning peers, so
+			// the coordinator's own disks participate in §14 placement rather
+			// than being a dead letter. Only offline or disk-less nodes are
+			// excluded (no reachable candidate disks).
+			if n.State != metadata.NodeOnline || n.ShardDiskCount <= 0 {
+				continue
+			}
+			for d := 0; d < n.ShardDiskCount; d++ {
+				disks = append(disks, metadata.ECDisk{
+					NodeID: uint64(n.ID),
+					DiskID: uint64(n.ID)*1000 + uint64(d),
+				})
+			}
+		}
+		return disks
 	})
 	opsServer.SetECService(ecService)
 

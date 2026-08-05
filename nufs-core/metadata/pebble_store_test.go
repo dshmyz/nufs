@@ -381,6 +381,69 @@ func TestPebbleStore_NodeManagement(t *testing.T) {
 	}
 }
 
+// TestPebbleStore_ShardDiskCountRoundTrip proves the EC candidate-topology
+// contract (Program 9): ShardDiskCount reported at registration persists and
+// round-trips through ListNodes/GetNode, and re-registration (ErrNodeAlreadyExists
+// + address refresh) also refreshes a *changed* ShardDiskCount — so an EC
+// coordinator converting at a later time sees the node's current disk count.
+func TestPebbleStore_ShardDiskCountRoundTrip(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	// Initial registration with 3 shard disks.
+	if err := store.RegisterNode(ctx, &NodeInfo{ID: 10, Addr: "n10:9100", ShardDiskCount: 3}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	n, err := store.GetNode(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if n.ShardDiskCount != 3 {
+		t.Fatalf("ShardDiskCount after register=%d, want 3", n.ShardDiskCount)
+	}
+
+	// Re-register with the SAME count + same addr -> still ErrNodeAlreadyExists,
+	// no spurious refresh, count unchanged.
+	if err := store.RegisterNode(ctx, &NodeInfo{ID: 10, Addr: "n10:9100", ShardDiskCount: 3}); err != ErrNodeAlreadyExists {
+		t.Fatalf("re-register same: got %v, want ErrNodeAlreadyExists", err)
+	}
+	n, _ = store.GetNode(ctx, 10)
+	if n.ShardDiskCount != 3 {
+		t.Fatalf("ShardDiskCount after no-op re-register=%d, want 3", n.ShardDiskCount)
+	}
+
+	// Re-register with a NEW count (node gained a shard disk) -> refreshed.
+	if err := store.RegisterNode(ctx, &NodeInfo{ID: 10, Addr: "n10:9100", ShardDiskCount: 6}); err != ErrNodeAlreadyExists {
+		t.Fatalf("re-register changed: got %v, want ErrNodeAlreadyExists", err)
+	}
+	n, _ = store.GetNode(ctx, 10)
+	if n.ShardDiskCount != 6 {
+		t.Fatalf("ShardDiskCount after changed re-register=%d, want 6 (refreshed)", n.ShardDiskCount)
+	}
+	if n.Addr != "n10:9100" {
+		t.Fatalf("Addr was clobbered=%q, want n10:9100", n.Addr)
+	}
+
+	// ListNodes carries the refreshed count too.
+	nodes, err := store.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].ShardDiskCount != 6 {
+		t.Fatalf("ListNodes ShardDiskCount=%v (len=%d), want 6", nodes[0].ShardDiskCount, len(nodes))
+	}
+
+	// Legacy semantics preserved: a re-register with ShardDiskCount 0 (a V1 node
+	// that never reports it) does not clobber a previously reported value.
+	if err := store.RegisterNode(ctx, &NodeInfo{ID: 10, Addr: "n10:9100", ShardDiskCount: 0}); err != ErrNodeAlreadyExists {
+		t.Fatalf("re-register legacy: got %v, want ErrNodeAlreadyExists", err)
+	}
+	n, _ = store.GetNode(ctx, 10)
+	if n.ShardDiskCount != 6 {
+		t.Fatalf("ShardDiskCount after legacy 0 re-register=%d, want 6 (0 must not clobber)", n.ShardDiskCount)
+	}
+}
+
 func TestPebbleStore_ScanAllChunks(t *testing.T) {
 	store := newTestPebbleStore(t)
 	ctx := context.Background()

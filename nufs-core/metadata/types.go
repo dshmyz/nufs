@@ -306,6 +306,13 @@ type NodeInfo struct {
 	// via the change-ack RPC and advances its local journal Ack once metadata
 	// catches up, guaranteeing no un-reconciled event is dropped (§12).
 	ChangeAck uint64 `json:"change_ack,omitempty"`
+
+	// ShardDiskCount is the number of EC shard stores (StreamID 2) this node
+	// serves. Reported at registration and consumed by an EC coordinator at
+	// convert-time to build the real cross-node candidate-disk topology
+	// (DiskID = NodeID*1000 + local_disk, §14). Omitempty -> legacy nodes
+	// registered without it read as 0 and are excluded from EC candidates.
+	ShardDiskCount int `json:"shard_disk_count,omitempty"`
 }
 
 // NodeState represents the operational state of a node.
