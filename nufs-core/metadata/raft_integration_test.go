@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -29,6 +30,77 @@ func TestRaftClusterLeaderFailoverPreservesCommittedBucket(t *testing.T) {
 	bucket := waitForBucket(t, failoverCtx, newLeader.Store, "prod-check")
 	if bucket.Name != "prod-check" {
 		t.Fatalf("bucket name = %q", bucket.Name)
+	}
+}
+
+// TestRaftClusterConcurrentSameNameMkDir verifies the distributed (Raft)
+// path of atomic namespace creation: concurrent same-name MkDir through the
+// leader must yield exactly one winner and ErrEntryExists for every loser,
+// with no orphan inode or parent-NLink drift. This is the multi-node
+// counterpart of TestPebbleStore_ConcurrentSameNameMkDir and is the real
+// hazard behind "concurrent directory creation in a distributed scenario".
+func TestRaftClusterConcurrentSameNameMkDir(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real raft integration test")
+	}
+
+	cluster := startRealRaftTestCluster(t, 3)
+	defer cluster.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	_ = cluster.CreateBucketOnLeader(t, ctx, "fs", PlacementPolicy{ReplicationFactor: 2})
+	leader := cluster.WaitForLeader(t, ctx)
+	bucket, err := leader.Store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	parent := bucket.RootInode
+
+	const n = 32
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx] = leader.Store.MkDir(ctx, parent, "race-dir", 0755)
+		}(i)
+	}
+	wg.Wait()
+
+	var succeeded, conflicts int
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case err == ErrEntryExists:
+			conflicts++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("expected exactly 1 successful MkDir, got %d (conflicts=%d)", succeeded, conflicts)
+	}
+	if conflicts != n-1 {
+		t.Fatalf("expected %d ErrEntryExists, got %d", n-1, conflicts)
+	}
+
+	entries, err := leader.Store.ReadDir(ctx, parent, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	parentMeta, err := leader.Store.GetInode(ctx, parent)
+	if err != nil {
+		t.Fatalf("GetInode(parent): %v", err)
+	}
+	if parentMeta.NLink != 3 {
+		t.Fatalf("parent NLink = %d, want 3 (no lost/double update)", parentMeta.NLink)
 	}
 }
 

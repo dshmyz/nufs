@@ -515,6 +515,125 @@ func TestPebbleStore_ConcurrentWrites(t *testing.T) {
 	}
 }
 
+// runConcurrentSameNameCreate fans out `n` goroutines all creating the same
+// name under the same parent, then asserts the atomic namespace-creation
+// invariant: exactly one goroutine succeeds, every other gets
+// ErrEntryExists, exactly one entry exists, and the parent NLink is not
+// over-incremented (lost/false updates are forbidden). The create closure is
+// parameterized so the same invariant is checked for both MkDir and
+// CreateFile.
+func runConcurrentSameNameCreate(t *testing.T, create func() error) {
+	t.Helper()
+	const n = 32
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = create()
+		}(i)
+	}
+	wg.Wait()
+
+	var succeeded, conflicts int
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case err == ErrEntryExists:
+			conflicts++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("expected exactly 1 successful create, got %d (conflicts=%d)", succeeded, conflicts)
+	}
+	if conflicts != n-1 {
+		t.Fatalf("expected %d ErrEntryExists conflicts, got %d", n-1, conflicts)
+	}
+}
+
+// TestPebbleStore_ConcurrentSameNameMkDir verifies that concurrent same-name
+// MkDir is atomic (the pre-CAS code could persist orphan inodes and lose a
+// parent NLink update when two creates both passed the existence check).
+func TestPebbleStore_ConcurrentSameNameMkDir(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+	if err := store.CreateBucket(ctx, "fs", PlacementPolicy{}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	parent := bucket.RootInode
+
+	runConcurrentSameNameCreate(t, func() error {
+		_, err := store.MkDir(ctx, parent, "race-dir", 0755)
+		return err
+	})
+
+	// Exactly one directory entry, and it points at a live inode.
+	entries, err := store.ReadDir(ctx, parent, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if _, err := store.GetInode(ctx, entries[0].InodeID); err != nil {
+		t.Fatalf("winner inode is not live: %v", err)
+	}
+
+	// Parent NLink must be incremented exactly once (a dir holds NLink=2 for
+	// itself+parent; after one child, +1 for the child link).
+	parentMeta, err := store.GetInode(ctx, parent)
+	if err != nil {
+		t.Fatalf("GetInode(parent): %v", err)
+	}
+	if parentMeta.NLink != 3 {
+		t.Fatalf("parent NLink = %d, want 3 (one child link, no lost/double update)", parentMeta.NLink)
+	}
+}
+
+// TestPebbleStore_ConcurrentSameNameCreateFile mirrors the MkDir race for
+// CreateFile, also asserting bucket-stats object count stays exactly 1.
+func TestPebbleStore_ConcurrentSameNameCreateFile(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+	if err := store.CreateBucket(ctx, "fs", PlacementPolicy{}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	parent := bucket.RootInode
+
+	runConcurrentSameNameCreate(t, func() error {
+		_, err := store.CreateFile(ctx, parent, "race-file.txt", 0644)
+		return err
+	})
+
+	entries, err := store.ReadDir(ctx, parent, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	usage, err := store.ComputeAllBucketUsage(ctx)
+	if err != nil {
+		t.Fatalf("ComputeAllBucketUsage: %v", err)
+	}
+	if len(usage) != 1 || usage[0].Objects != 1 {
+		t.Fatalf("bucket usage = %+v, want exactly 1 object", usage)
+	}
+}
+
+
 func TestPebbleStore_PerfWrite10K(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping perf test in short mode")
