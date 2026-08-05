@@ -31,10 +31,9 @@ var readBufPool = sync.Pool{
 // ========== DFSFile: regular file inode ==========
 
 // MaxChunkPayload is the largest single-chunk payload we hand to
-// ChunkStore.WriteChunk. A file larger than this is rejected with
-// EFBIG in commit 1.1 (single-chunk path); commit 1.2 / the cache
-// commit will introduce a multi-chunk Flush that allocates one
-// chunk per MaxChunkPayload window.
+// ChunkStore.WriteChunk. Flush is multi-chunk (Program 11): a file
+// larger than this is split into one chunk per MaxChunkPayload window
+// and the inode's ChunkMap holds one ref per window.
 const MaxChunkPayload = 64 * 1024 * 1024 // 64 MiB
 
 // fuseDefaultPolicy is the fallback placement policy used when Flush
@@ -285,17 +284,18 @@ func (f *DFSFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off 
 
 // Flush pushes the in-memory buffer to the chunk store and updates
 // the inode's ChunkMap + size. It is idempotent: a second Flush on
-// the same dirty buffer is a no-op for the chunk store (the chunks
-// are already sealed), and a third+ on the same buffer is a no-op
-// for the metadata (size is monotone). (B2 + B3 fix.)
+// the same dirty buffer is a no-op (a clean Flush never re-writes).
 //
-// Single-chunk only in commit 1.1: AllocateChunk at offset 0, then
-// WriteChunk + CommitChunk + SealChunk the entire buffer as one
-// payload, then update the ChunkMap length and inode size. A file
-// larger than MaxChunkPayload is rejected with EFBIG — the right
-// answer for a single-chunk path; the multi-chunk Flush arrives
-// in commit 1.2 / the cache commit alongside an mmap-style write
-// buffer.
+// Multi-chunk (Program 11), aligned with the production S3 PUT
+// overwrite path (metadataObjectCommitter.Put): the buffer is the
+// whole new file content, so Flush cuts it into MaxChunkPayload
+// windows, AllocateChunksBatch'es fresh chunk IDs at offsets
+// [0, MaxChunkPayload, 2*MaxChunkPayload, ...), writes/commits/seals
+// each, then wholesale-replaces the inode's ChunkMap with the new
+// refs and DeleteChunk's the superseded old chunks. Fresh allocation
+// + supersede + delete sidesteps the ErrChunkAlreadySealed invariant
+// (a sealed chunk can never be re-committed) with zero metadata
+// changes — exactly how S3 already reuses across PUTs.
 func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	rec := recorderFor(f.recorder)
 	rec.IncOp("flush")
@@ -307,20 +307,14 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 		return 0
 	}
 
-	// Reject files that would not fit in a single chunk. (commit
-	// 1.1 only knows the single-chunk code path.)
-	if int64(len(f.buffer)) > MaxChunkPayload {
-		logf("flush: file %d size %d exceeds single-chunk limit %d (multi-chunk write is commit 1.2)", f.inodeID, len(f.buffer), MaxChunkPayload)
-		rec.IncOpError("flush")
-		return syscall.EFBIG
-	}
-
 	// 路径锁：串行化同一 inode 的并发 Flush，防止不同 DFSFile
 	// 实例（go-fuse inode cache eviction 后重建）交叉写入。
 	// nil receiver 时为 no-op（passthrough 模式）。
 	unlock := f.reliability.LockInode(uint64(f.inodeID))
 	defer unlock()
 
+	// Read the current inode once. Its ChunkMap holds the OLD chunk
+	// refs we will supersede at the end of this flush.
 	var metaInode *metadata.InodeMeta
 	if err := f.reliability.DoMeta("flush", func() error {
 		var gerr error
@@ -330,16 +324,8 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 		rec.IncOpError("flush")
 		return syscall.EIO
 	}
-
-	// Find the existing chunk for offset 0 if the file has been
-	// flushed before; otherwise allocate a fresh one.
-	var existingChunkID metadata.ChunkID
-	for _, cref := range metaInode.ChunkMap {
-		if cref.Offset == 0 {
-			existingChunkID = cref.ID
-			break
-		}
-	}
+	oldRefs := make([]metadata.ChunkRef, len(metaInode.ChunkMap))
+	copy(oldRefs, metaInode.ChunkMap)
 
 	// Resolve the placement policy from the file's containing bucket
 	// instead of using a hardcoded fuseChunkPolicy. This ensures a
@@ -347,65 +333,87 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	// replicas for FUSE writes (fixes D3).
 	policy := f.resolveChunkPolicy(ctx, metaInode)
 
-	var chunk *metadata.ChunkMeta
-	if err := f.reliability.DoMeta("flush", func() error {
-		var gerr error
-		chunk, gerr = f.meta.AllocateChunk(ctx, f.inodeID, 0, policy)
-		return gerr
-	}); err != nil {
-		logf("flush: allocate chunk: %v", err)
-		rec.IncOpError("flush")
-		return syscall.EIO
+	size := len(f.buffer)
+	nChunks := (size + MaxChunkPayload - 1) / int(MaxChunkPayload)
+	if nChunks == 0 {
+		nChunks = 1 // an empty buffer still allocates one chunk at offset 0
 	}
-	_ = existingChunkID // currently unused; future work lets us
-	// re-use the same chunk ID across flushes (the allocator always
-	// returns a fresh ID today; that's a metadata-layer bug — see
-	// TODO in the design doc).
-
-	if err := f.reliability.DoChunk("flush", func() error {
-		return f.chunkStore.WriteChunk(ctx, chunk, f.buffer)
-	}); err != nil {
-		logf("flush: write chunk %d: %v", chunk.ID, err)
-		rec.IncOpError("flush")
-		return syscall.EIO
-	}
-	checksum := crc32.ChecksumIEEE(f.buffer)
-	if err := f.reliability.DoMeta("flush", func() error {
-		return f.meta.CommitChunk(ctx, chunk.ID, checksum)
-	}); err != nil {
-		logf("flush: commit chunk %d: %v", chunk.ID, err)
-		rec.IncOpError("flush")
-		return syscall.EIO
-	}
-	if err := f.reliability.DoMeta("flush", func() error {
-		return f.meta.SealChunk(ctx, chunk.ID)
-	}); err != nil {
-		logf("flush: seal chunk %d: %v", chunk.ID, err)
-		// Not fatal: a sealed chunk can already be read.
-	}
-
-	// Re-read the inode to find the ChunkRef that AllocateChunk
-	// just appended, then stamp the actual data length on it so
-	// Read can trim the payload to the data window.
-	if err := f.reliability.DoMeta("flush", func() error {
-		var gerr error
-		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
-		return gerr
-	}); err != nil {
-		rec.IncOpError("flush")
-		return syscall.EIO
-	}
-	for i := range metaInode.ChunkMap {
-		if metaInode.ChunkMap[i].ID == chunk.ID {
-			metaInode.ChunkMap[i].Length = int32(len(f.buffer))
-			break
+	offsets := make([]int64, nChunks)
+	segEnd := make([]int, nChunks)
+	for i := 0; i < nChunks; i++ {
+		offsets[i] = int64(i) * MaxChunkPayload
+		end := (i + 1) * MaxChunkPayload
+		if end > size {
+			end = size
 		}
+		segEnd[i] = end
 	}
 
-	// Update the inode size + mtime + the patched ChunkMap, then
-	// drop the buffer so the next Flush is a no-op even if the
-	// kernel calls us twice.
-	metaInode.Size = int64(len(f.buffer))
+	// AllocateChunksBatch is capped at metadata.MaxChunkAllocationBatch
+	// (1024) chunks per request. A single flush beyond that (>64 GiB) is
+	// unrealistic, but loop defensively so the batch allocation never
+	// trips the per-request cap. Each batch offsets are already sorted
+	// ascending, so the concatenated result preserves file order.
+	chunks := make([]*metadata.ChunkMeta, 0, nChunks)
+	for start := 0; start < nChunks; {
+		end := start + metadata.MaxChunkAllocationBatch
+		if end > nChunks {
+			end = nChunks
+		}
+		var batch []*metadata.ChunkMeta
+		if err := f.reliability.DoMeta("flush", func() error {
+			var gerr error
+			batch, gerr = f.meta.AllocateChunksBatch(ctx, f.inodeID, offsets[start:end], policy)
+			return gerr
+		}); err != nil {
+			logf("flush: allocate chunk batch [%d:%d): %v", start, end, err)
+			rec.IncOpError("flush")
+			return syscall.EIO
+		}
+		chunks = append(chunks, batch...)
+		start = end
+	}
+
+	// Write, commit, and seal each chunk, then assemble the new
+	// ChunkMap refs. Mirrors S3 metadataObjectCommitter.Put: one
+	// ChunkRef{ID, Offset, Length, Version} per chunk at its
+	// MaxChunkPayload-aligned offset.
+	newRefs := make([]metadata.ChunkRef, 0, nChunks)
+	for i, chunk := range chunks {
+		data := f.buffer[i*MaxChunkPayload:segEnd[i]]
+		if err := f.reliability.DoChunk("flush", func() error {
+			return f.chunkStore.WriteChunk(ctx, chunk, data)
+		}); err != nil {
+			logf("flush: write chunk %d: %v", chunk.ID, err)
+			rec.IncOpError("flush")
+			return syscall.EIO
+		}
+		checksum := crc32.ChecksumIEEE(data)
+		if err := f.reliability.DoMeta("flush", func() error {
+			return f.meta.CommitChunk(ctx, chunk.ID, checksum)
+		}); err != nil {
+			logf("flush: commit chunk %d: %v", chunk.ID, err)
+			rec.IncOpError("flush")
+			return syscall.EIO
+		}
+		if err := f.reliability.DoMeta("flush", func() error {
+			return f.meta.SealChunk(ctx, chunk.ID)
+		}); err != nil {
+			logf("flush: seal chunk %d: %v", chunk.ID, err)
+			// Not fatal: a sealed chunk can already be read.
+		}
+		newRefs = append(newRefs, metadata.ChunkRef{
+			ID:      chunk.ID,
+			Offset:  offsets[i],
+			Length:  int32(len(data)),
+			Version: 1,
+		})
+	}
+
+	// Wholesale-replace the ChunkMap + size + mtime (S3 overwrite
+	// semantics), so Read walks the fresh refs across every chunk.
+	metaInode.ChunkMap = newRefs
+	metaInode.Size = int64(size)
 	metaInode.MTime = time.Now().UnixNano()
 
 	if err := f.reliability.DoMeta("flush", func() error {
@@ -413,6 +421,16 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	}); err != nil {
 		rec.IncOpError("flush")
 		return syscall.EIO
+	}
+
+	// Reclaim the superseded chunks. Fresh-allocation guarantees none
+	// of the new IDs overlap the old refs, so deleting by ID is safe.
+	for _, cref := range oldRefs {
+		if err := f.reliability.DoMeta("flush", func() error {
+			return f.meta.DeleteChunk(ctx, cref.ID)
+		}); err != nil {
+			logf("flush: delete old chunk %d: %v", cref.ID, err)
+		}
 	}
 
 	f.buffer = nil

@@ -24,6 +24,7 @@ import (
 func newTestMetaStore(t *testing.T) (*metadata.PebbleStore, metadata.InodeID) {
 	t.Helper()
 	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
+		Dir:         t.TempDir(), // required even in UseInMemory mode; storage is mem-VFS
 		UseInMemory: true,
 	})
 	if err != nil {
@@ -32,6 +33,18 @@ func newTestMetaStore(t *testing.T) (*metadata.PebbleStore, metadata.InodeID) {
 	t.Cleanup(func() { _ = store.Close() })
 
 	ctx := context.Background()
+
+	// Register one healthy node so the PlacementEngine can satisfy RF=1
+	// chunk allocations. Without any node the store rejects placement
+	// with "insufficient healthy nodes" (these fixtures run under linux).
+	if err := store.RegisterNode(ctx, &metadata.NodeInfo{
+		ID:         1,
+		Addr:       "127.0.0.1:9001",
+		CapacityGB: 100,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
 	if err := store.CreateBucket(ctx, "test", metadata.PlacementPolicy{
 		ID:                "test",
 		ReplicationFactor: 1,
@@ -234,8 +247,8 @@ func TestDFSFile_Flush_CommitsAndSeals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetChunk: %v", err)
 	}
-	if chunk.State != metadata.ChunkSealed {
-		t.Fatalf("chunk state=%v, want ChunkSealed", chunk.State)
+	if chunk.State != metadata.ChunkReady {
+		t.Fatalf("chunk state=%v, want ChunkReady (post-seal)", chunk.State)
 	}
 	if chunk.Checksum != crc32.ChecksumIEEE(want) {
 		t.Fatalf("chunk checksum=%#x, want %#x", chunk.Checksum, crc32.ChecksumIEEE(want))
@@ -321,37 +334,213 @@ func TestDFSFile_Flush_CleanIsNoop(t *testing.T) {
 	}
 }
 
-// TestDFSFile_Flush_TooLarge_ReturnsEFBIG is the guard for the
-// single-chunk path. Anything larger than MaxChunkPayload must be
-// rejected so the kernel can split it across multiple writes that
-// each fit in one chunk.
-func TestDFSFile_Flush_TooLarge_ReturnsEFBIG(t *testing.T) {
+// TestDFSFile_Flush_Oversized_AllocatesMultiChunk replaces the old
+// EFBIG rejection (commit 1.1 single-chunk path). Now a buffer larger
+// than MaxChunkPayload is split into multiple chunks and the inode's
+// ChunkMap holds one ref per MaxChunkPayload window (Program 11).
+func TestDFSFile_Flush_Oversized_AllocatesMultiChunk(t *testing.T) {
 	meta, id := newTestMetaStore(t)
 	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
-	// Write a payload one byte over the limit. We don't actually
-	// allocate 64MiB+1 in the test buffer (too slow) — instead we
-	// just bump the in-memory buffer length past the limit by
-	// exercising the check path directly. To do that we set
-	// f.buffer and f.dirty by hand.
+	// Directly seed the in-memory buffer past the chunk limit, as the
+	// old EFBIG test did, so we don't copy ~128MiB through Write.
+	size := 2*MaxChunkPayload + 123
+	buf := make([]byte, size)
+	for i := range buf {
+		buf[i] = byte(i % 251)
+	}
 	f.mu.Lock()
-	f.buffer = make([]byte, MaxChunkPayload+1)
+	f.buffer = buf
 	f.dirty = true
 	f.mu.Unlock()
 
 	errno := f.Flush(context.Background(), nil)
-	if errno != syscall.EFBIG {
-		t.Fatalf("Flush oversized: errno=%v, want EFBIG", errno)
+	if errno != 0 {
+		t.Fatalf("Flush oversized: errno=%v, want 0 (multi-chunk)", errno)
 	}
 
-	// And no chunk should have been allocated.
+	// The inode must now reference ceil(size/chunk) = 3 chunks.
 	inode, err := meta.GetInode(context.Background(), id)
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
 	}
-	if len(inode.ChunkMap) != 0 {
-		t.Fatalf("after EFBIG flush: ChunkMap len=%d, want 0", len(inode.ChunkMap))
+	if len(inode.ChunkMap) != 3 {
+		t.Fatalf("after oversized flush: ChunkMap len=%d, want 3", len(inode.ChunkMap))
+	}
+	if inode.Size != int64(size) {
+		t.Fatalf("after oversized flush: Size=%d, want %d", inode.Size, size)
+	}
+	// Each ref is sealed, holds the right offset/length window, and
+	// read-back is byte-exact across the whole file.
+	for i, cref := range inode.ChunkMap {
+		wantOff := int64(i) * MaxChunkPayload
+		if cref.Offset != wantOff {
+			t.Fatalf("ChunkMap[%d].Offset=%d, want %d", i, cref.Offset, wantOff)
+		}
+		wantLen := MaxChunkPayload
+		if i == 2 {
+			wantLen = size - 2*MaxChunkPayload
+		}
+		if int(cref.Length) != wantLen {
+			t.Fatalf("ChunkMap[%d].Length=%d, want %d", i, cref.Length, wantLen)
+		}
+		chunk, gerr := meta.GetChunk(context.Background(), cref.ID)
+		if gerr != nil {
+			t.Fatalf("GetChunk(%d): %v", cref.ID, gerr)
+		}
+		if chunk.State != metadata.ChunkReady {
+			t.Fatalf("chunk %d state=%v, want ready (post-seal)", cref.ID, chunk.State)
+		}
+		if chunk.Checksum != crc32.ChecksumIEEE(buf[cref.Offset:cref.Offset+int64(cref.Length)]) {
+			t.Fatalf("chunk %d checksum mismatch", cref.ID)
+		}
+	}
+
+	dest := make([]byte, size)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read oversized: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, buf) {
+		t.Fatalf("oversized read-back mismatch: got %d bytes (prefix %v...), want %d", len(got), got[:8], len(buf))
+	}
+}
+
+// TestDFSFile_Flush_MultiChunk_ReadBack is the Program 11 capstone for
+// the plain multi-chunk path: a payload spanning 2*MaxChunkPayload+123
+// bytes (3 chunk windows) flushes into 3 sealed chunks at aligned
+// offsets, and Read reconstructs the whole file byte-exact across them.
+func TestDFSFile_Flush_MultiChunk_ReadBack(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	size := 2*MaxChunkPayload + 123
+	want := make([]byte, size)
+	for i := range want {
+		want[i] = byte((i*7 + 3) % 256)
+	}
+	if _, errno := f.Write(context.Background(), nil, want, 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if len(inode.ChunkMap) != 3 {
+		t.Fatalf("ChunkMap len=%d, want 3", len(inode.ChunkMap))
+	}
+	if inode.Size != int64(size) {
+		t.Fatalf("Size=%d, want %d", inode.Size, size)
+	}
+
+	dest := make([]byte, size)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("multi-chunk read-back mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
+// TestDFSFile_Flush_MultiChunk_CrossFlushReuse is the Program 11
+// chunk-reuse test: a first flush writes a multi-chunk file, then a
+// second flush (after overwriting part of the buffer) rebuilds the
+// ChunkMap with fresh chunk IDs and DeleteChunk's the superseded old
+// chunks (S3 PUT-overwrite alignment). Read-back after the second flush
+// is byte-exact against the new buffer.
+func TestDFSFile_Flush_MultiChunk_CrossFlushReuse(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	// First flush: a 2-window file.
+	size1 := MaxChunkPayload + 50
+	first := make([]byte, size1)
+	for i := range first {
+		first[i] = byte(i % 200)
+	}
+	if _, errno := f.Write(context.Background(), nil, first, 0); errno != 0 {
+		t.Fatalf("Write #1: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush #1: errno=%v", errno)
+	}
+
+	before, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode (before overwrite): %v", err)
+	}
+	if len(before.ChunkMap) != 2 {
+		t.Fatalf("before overwrite: ChunkMap len=%d, want 2", len(before.ChunkMap))
+	}
+	oldIDs := make(map[metadata.ChunkID]bool, len(before.ChunkMap))
+	for _, cref := range before.ChunkMap {
+		oldIDs[cref.ID] = true
+	}
+
+	// Second flush: overwrite a chunk-worth of data and extend the file.
+	size2 := MaxChunkPayload + 300
+	second := make([]byte, size2)
+	for i := range second {
+		second[i] = byte((i*11 + 1) % 256)
+	}
+	if _, errno := f.Write(context.Background(), nil, second, 0); errno != 0 {
+		t.Fatalf("Write #2: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush #2: errno=%v", errno)
+	}
+
+	// The inode's ChunkMap is rebuilt with fresh (non-overlapping) IDs.
+	after, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode (after overwrite): %v", err)
+	}
+	if len(after.ChunkMap) != 2 {
+		t.Fatalf("after overwrite: ChunkMap len=%d, want 2", len(after.ChunkMap))
+	}
+	for _, cref := range after.ChunkMap {
+		if oldIDs[cref.ID] {
+			t.Fatalf("chunk %d reused across flush — overwrite must not reuse chunk IDs (S3-aligned)", cref.ID)
+		}
+	}
+
+	// Every old chunk must have been reclaimed: DeleteChunk writes a
+	// durable tombstone (metadata retained, inode dereferenced), which
+	// is the same reclaim contract S3 metadataObjectCommitter.Put relies
+	// on. Verify each old ID landed in the tombstone set.
+	ts, err := meta.ListChunkTombstones(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("ListChunkTombstones: %v", err)
+	}
+	tombstoned := make(map[metadata.ChunkID]bool, len(ts))
+	for _, tb := range ts {
+		tombstoned[tb.ChunkID] = true
+	}
+	for cid := range oldIDs {
+		if !tombstoned[cid] {
+			t.Fatalf("old chunk %d not tombstoned after overwrite — DeleteChunk was not issued (Program 11 reclaim regression)", cid)
+		}
+	}
+
+	// Read-back is byte-exact against the new buffer.
+	dest := make([]byte, size2)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read (after overwrite): errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, second) {
+		t.Fatalf("cross-flush read-back mismatch: got %d bytes, want %d", len(got), len(second))
 	}
 }
 
@@ -756,6 +945,7 @@ func TestDFSFile_Open_AcquiresSharedLock(t *testing.T) {
 func newTestMetaStoreWithPolicy(t *testing.T, policy metadata.PlacementPolicy) (*metadata.PebbleStore, metadata.InodeID) {
 	t.Helper()
 	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
+		Dir:         t.TempDir(), // required even in UseInMemory mode; storage is mem-VFS
 		UseInMemory: true,
 	})
 	if err != nil {
@@ -848,6 +1038,7 @@ func TestDFSFile_Flush_UsesBucketPolicy(t *testing.T) {
 // safe default policy rather than panicking.
 func TestDFSFile_Flush_FallsBackToDefaultOnNoBucket(t *testing.T) {
 	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
+		Dir:         t.TempDir(), // required even in UseInMemory mode; storage is mem-VFS
 		UseInMemory: true,
 	})
 	if err != nil {

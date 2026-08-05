@@ -5,10 +5,10 @@ package fuse
 import (
 	"context"
 	"sync/atomic"
-	"syscall"
 	"testing"
 
 	"github.com/example/dfs/chunkstore"
+	"github.com/example/dfs/metadata"
 )
 
 // ========== 集成测试：验证 FUSE 操作正确递增 MetricsRecorder 计数器 ==========
@@ -155,19 +155,46 @@ func TestDFSFile_Read_HitCache_IncrementsCacheHits(t *testing.T) {
 }
 
 // TestDFSFile_Flush_ErrorIncrementsOpsErrors 验证 Flush 失败时递增 OpsErrors。
-// 通过注入超过 MaxChunkPayload 的数据触发 EFBIG。
+// Program 11 移除了 >MaxChunkPayload 的 EFBIG 分支（多 chunk Flush），故这里改用一个
+// 未注册任何节点的 store 触发放置失败（"insufficient healthy nodes"）→ Flush 返回
+// EIO，断言 OpsErrors 递增。
 func TestDFSFile_Flush_ErrorIncrementsOpsErrors(t *testing.T) {
-	meta, id := newTestMetaStore(t)
+	// Bare in-memory store with NO registered node: AllocateChunksBatch
+	// fails placement, so Flush returns EIO.
+	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
+		Dir:         t.TempDir(), // required even in UseInMemory mode
+		UseInMemory: true,
+	})
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx := context.Background()
+	if err := store.CreateBucket(ctx, "err-test", metadata.PlacementPolicy{
+		ID:                "err-test",
+		ReplicationFactor: 1,
+		TopologySpread:    metadata.SpreadNode,
+	}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "err-test")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	file, err := store.CreateFile(ctx, bucket.RootInode, "obj", 0o644)
+	if err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+
 	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
-	f := newTestFileWithRecorder(meta, cs, id, rec)
+	f := newTestFileWithRecorder(store, cs, file.ID, rec)
 
-	// 写入超过 MaxChunkPayload 的数据触发 EFBIG
-	bigData := make([]byte, MaxChunkPayload+1)
-	_, _ = f.Write(context.Background(), nil, bigData, 0)
+	_, _ = f.Write(context.Background(), nil, []byte("some data"), 0)
 	errno := f.Flush(context.Background(), nil)
-	if errno != syscall.EFBIG {
-		t.Fatalf("Flush: errno=%v, want EFBIG", errno)
+	if errno == 0 {
+		t.Fatalf("Flush: errno=0, want non-zero (placement failure)")
 	}
 	if got := atomic.LoadUint64(&rec.OpsErrors); got != 1 {
 		t.Errorf("OpsErrors = %d, want 1", got)
