@@ -140,6 +140,17 @@ func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fus
 	rec := recorderFor(f.recorder)
 	rec.IncOp("open")
 
+	// Linux delivers open(2)'s O_TRUNC via the Open flags (the kernel does not
+	// issue a separate SETATTR for it), so the filesystem must perform the
+	// truncation itself. Do it before anything else so the truncation is
+	// visible immediately to every other open fd of this inode.
+	if flags&syscall.O_TRUNC != 0 {
+		if e := f.truncateOnOpen(ctx, rec); e != 0 {
+			rec.IncOpError("open")
+			return nil, 0, e
+		}
+	}
+
 	h := &DFSFileHandle{file: f, append: flags&syscall.O_APPEND != 0}
 
 	// Acquire an advisory file lock.  O_WRONLY|O_RDWR → exclusive;
@@ -164,6 +175,46 @@ func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fus
 	}
 
 	return h, 0, 0
+}
+
+// truncateOnOpen implements O_TRUNC semantics for Open: the file becomes
+// empty immediately, visible to every other open fd of the inode. A
+// subsequent write in this same open produces only the new bytes (a fresh
+// empty file), never a stale committed tail.
+//
+// It clears the buffer AND marks it loaded=true. loaded=true means the
+// (empty) buffer is the faithful image of the now-empty file, which is what
+// stops ensureHydratedLocked from restoring committed bytes on a later
+// partial write — truncation wins over hydration. The inode's committed Size
+// is set to 0 right away; its old ChunkMap refs are left untouched and get
+// reclaimed by the supersede+delete in Flush.
+func (f *DFSFile) truncateOnOpen(ctx context.Context, rec MetricsRecorder) syscall.Errno {
+	var metaInode *metadata.InodeMeta
+	if err := f.reliability.DoMeta("truncate", func() error {
+		var gerr error
+		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
+		return gerr
+	}); err != nil {
+		logf("open otrunc: get inode %d: %v", f.inodeID, err)
+		return syscall.EIO
+	}
+
+	f.mu.Lock()
+	f.buffer = nil
+	f.dirty = true
+	f.loaded = true
+	metaInode.Size = 0
+	metaInode.MTime = time.Now().UnixNano()
+	metaInode.CTime = time.Now().UnixNano()
+	f.mu.Unlock()
+
+	if err := f.reliability.DoMeta("truncate", func() error {
+		return f.meta.UpdateInode(ctx, metaInode)
+	}); err != nil {
+		logf("open otrunc: update inode %d: %v", f.inodeID, err)
+		return syscall.EIO
+	}
+	return 0
 }
 
 // Read reads data from the file. The returned window is the merged view of

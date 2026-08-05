@@ -37,34 +37,54 @@ var _ = (fs.NodeGetattrer)((*DFSDir)(nil))
 var _ = (fs.NodeSetattrer)((*DFSDir)(nil))
 var _ = (fs.NodeAccesser)((*DFSDir)(nil))
 
+// readdirPageSize is the number of entries fetched per ReadDirFrom page.
+// The metadata layer caps a single read at maxReadDirEntries (10k); paging in
+// smaller chunks via the O(limit) cursor API keeps per-call latency bounded and
+// lets directories of arbitrary size enumerate fully (no silent truncation).
+const readdirPageSize = 4096
+
 // Readdir lists directory entries.
+//
+// Directories can exceed the 10k-entry cap a single ReadDir call imposes, so we
+// page through the O(limit) cursor-based ReadDirFrom until a page comes back
+// short (i.e. we hit the end). This guarantees every entry is listed.
 func (d *DFSDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	rec := recorderFor(d.recorder)
 	rec.IncOp("readdir")
 
-	entries, err := d.meta.ReadDir(ctx, d.inodeID, 0, 10000)
-	if err != nil {
-		logf("readdir error: %v", err)
-		rec.IncOpError("readdir")
-		return nil, syscall.EIO
-	}
-
 	var fuseEntries []fuse.DirEntry
-	for _, e := range entries {
-		var mode uint32
-		switch e.Type {
-		case metadata.FileDirectory:
-			mode = fuse.S_IFDIR
-		case metadata.FileRegular:
-			mode = fuse.S_IFREG
-		case metadata.FileSymlink:
-			mode = fuse.S_IFLNK
+	cursor := ""
+	for {
+		entries, err := d.meta.ReadDirFrom(ctx, d.inodeID, cursor, readdirPageSize)
+		if err != nil {
+			logf("readdir error: %v", err)
+			rec.IncOpError("readdir")
+			return nil, syscall.EIO
 		}
-		fuseEntries = append(fuseEntries, fuse.DirEntry{
-			Name: e.Name,
-			Ino:  uint64(e.InodeID),
-			Mode: mode,
-		})
+		for _, e := range entries {
+			var mode uint32
+			switch e.Type {
+			case metadata.FileDirectory:
+				mode = fuse.S_IFDIR
+			case metadata.FileRegular:
+				mode = fuse.S_IFREG
+			case metadata.FileSymlink:
+				mode = fuse.S_IFLNK
+			}
+			fuseEntries = append(fuseEntries, fuse.DirEntry{
+				Name: e.Name,
+				Ino:  uint64(e.InodeID),
+				Mode: mode,
+			})
+		}
+		// A short page means we've reached the end of the directory.
+		if len(entries) < readdirPageSize {
+			break
+		}
+		// Advance the cursor past the last entry of this page. ReadDirFrom
+		// returns entries strictly after the cursor name, so using the final
+		// entry's name makes the next page start exactly at the next entry.
+		cursor = entries[len(entries)-1].Name
 	}
 
 	return fs.NewListDirStream(fuseEntries), 0

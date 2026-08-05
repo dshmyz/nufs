@@ -1622,3 +1622,145 @@ func TestDFSFile_Flush_FallsBackToDefaultOnNoBucket(t *testing.T) {
 		t.Fatalf("expected 1 replica (default policy), got %d", len(chunk.Replicas))
 	}
 }
+
+// ========== O_TRUNC: open(2) with O_TRUNC truncates the file ==========
+//
+// Linux delivers open(2)'s O_TRUNC through the Open flags (the kernel does
+// not issue a separate SETATTR), so DFSFile.Open is responsible for the
+// truncation. These tests exercise the three contracts:
+//   1. `: > file` (open O_TRUNC, no write, close) empties a committed file.
+//   2. open O_TRUNC then a partial write yields only the new bytes — no
+//      stale committed tail is preserved (echo x > file semantics).
+//   3. the truncation is visible immediately (inode Size == 0) as soon as
+//      Open returns, before any write or flush.
+
+// commitFile writes data + Flush so the inode has a committed (on-disk)
+// size and ChunkMap, then returns the DFSFile used. Mirrors the fixture
+// pattern of the other Flush round-trip tests.
+func commitFile(t *testing.T, meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID, want []byte) *DFSFile {
+	t.Helper()
+	f := newTestFile(meta, cs, id)
+	if _, errno := f.Write(context.Background(), nil, want, 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+	return f
+}
+
+// TestDFSFile_Open_OTrunc_NoWrite_EmptiesFile covers `: > file`: open with
+// O_TRUNC and nothing else, then close. The committed file must become empty
+// (Size 0, no readable bytes).
+func TestDFSFile_Open_OTrunc_NoWrite_EmptiesFile(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+
+	original := []byte("this is a committed file worth one hundred bytes exactly!!!")
+	if len(original) < 40 {
+		t.Fatal("test fixture too short")
+	}
+	commitFile(t, meta, cs, id, original)
+
+	// Reopen with O_TRUNC (as `: > file` does), then flush/close with no
+	// intervening write.
+	f := newTestFile(meta, cs, id)
+	if _, _, errno := f.Open(context.Background(), syscall.O_WRONLY|syscall.O_TRUNC); errno != 0 {
+		t.Fatalf("Open(O_TRUNC): errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != 0 {
+		t.Fatalf("after O_TRUNC flush: Size=%d, want 0", inode.Size)
+	}
+
+	// A read anywhere in the file must return no bytes.
+	dest := make([]byte, 16)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if len(got) != 0 {
+		t.Fatalf("Read after O_TRUNC: got %d bytes, want 0", len(got))
+	}
+}
+
+// TestDFSFile_Open_OTrunc_ThenPartialWrite_NoStaleTail covers `echo x > file`:
+// open O_TRUNC then write a short string. The result must be exactly the new
+// string — a partial off-0 write over a truncated file must not preserve the
+// old committed tail.
+func TestDFSFile_Open_OTrunc_ThenPartialWrite_NoStaleTail(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+
+	original := []byte("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP") // 50 bytes
+	commitFile(t, meta, cs, id, original)
+
+	f := newTestFile(meta, cs, id)
+	if _, _, errno := f.Open(context.Background(), syscall.O_WRONLY|syscall.O_TRUNC); errno != 0 {
+		t.Fatalf("Open(O_TRUNC): errno=%v", errno)
+	}
+
+	// A partial write shorter than the old committed file.
+	payload := []byte("hi")
+	if _, errno := f.Write(context.Background(), nil, payload, 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != int64(len(payload)) {
+		t.Fatalf("after O_TRUNC + partial write: Size=%d, want %d (stale committed tail preserved)",
+			inode.Size, len(payload))
+	}
+
+	// Read back: must be exactly "hi" with no stale tail.
+	dest := make([]byte, len(original))
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("after O_TRUNC + partial write: got %q (%d bytes), want %q (stale committed tail preserved)",
+			got, len(got), payload)
+	}
+}
+
+// TestDFSFile_Open_OTrunc_VisibleImmediately asserts the POSIX contract that
+// once open(O_TRUNC) returns, the file size is 0 to every observer — before
+// any write or flush. This is what makes concurrent fds/readers see the
+// truncation at the right moment rather than at close.
+func TestDFSFile_Open_OTrunc_VisibleImmediately(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+
+	original := []byte("a committed body long enough to matter")
+	commitFile(t, meta, cs, id, original)
+
+	f := newTestFile(meta, cs, id)
+	if _, _, errno := f.Open(context.Background(), syscall.O_RDWR|syscall.O_TRUNC); errno != 0 {
+		t.Fatalf("Open(O_TRUNC): errno=%v", errno)
+	}
+
+	// The committed size must already be 0, without any write or flush.
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != 0 {
+		t.Fatalf("immediately after Open(O_TRUNC): Size=%d, want 0", inode.Size)
+	}
+}
