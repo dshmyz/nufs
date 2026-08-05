@@ -52,6 +52,26 @@
   - metadata: 59 测试
   - gateway/s3: 20 测试
 
+### V2.1 加固（`codex/v21-p0-hardening` 分支，66 commit）
+
+> 详细逐项清单（含 commit、capstone 测试、设计决策）见
+> [`docs/v21-hardening-delivery.md`](docs/v21-hardening-delivery.md)。
+
+- [x] **V2.1 跨节点 EC 生产拓扑（Program 9）**：`NodeInfo.ShardDiskCount` 上报 + `runDataNodeV21` 接 `SetCrossNode`/`SetCandidateDisks`，convert 经 `ListNodes` 解析在线 peer 候选盘，非本节点分片 TCP push
+- [x] **V2.1 写路径直写 EC（Program 10）**：网关直写分片，`ECWriteAuthority`（PlanECWrite/RecordDirectEC）经元数据 HTTP RPC，单节点/多节点均支持
+- [x] **V2.1 EC 6+3 服务路径收官（Program 6/7）**：gateway serving 读、自愈、权威落盘（`ResolveStripeLanding`）、孤儿分片 GC，全部经元数据 HTTP RPC 点亮
+- [x] **V2.1 EC 服务路径接线（Program 2/3）**：E1–E5 分片存储直写/转换/降级读，S1 serving、S2 元数据 RPC 权威、S3 跨节点 push、publish 原子布局切换，Program 5 共享 ECProfile
+- [x] **V2.1 磁盘健康（Program 4/8）**：3-tier 状态机 + 主动 I/O health monitor
+- [x] **V2.1 V1 子系统 parity**：SIGHUP 热重载、`DrainWrites` 写屏障、management/ops 通道泛化 OpsStore
+- [x] **V2.1 元数据权威 + 真复制（Task #56）**：PG/epoch 放置权威、generation fencing、跨节点复制、change-journal 对账 + repair
+- [x] **Task #49 relocation 加固 + 跨盘 rebalance**：P1 safe conditional relocation + 真实 checksum，P2 MultiV2Store 跨盘 rebalance
+- [x] **FUSE 补完 + 多 chunk Flush（Program 11）**：解除 64MiB EFBIG、整文件 ChunkMap 重建、读写状态一致性（同 class bug）修复
+- [x] **命名空间一致性加固**：create/delete 双路径 `ConditionalBatch` CAS，消除并发同名 RMW 竞态
+- [x] **V2.1 存储引擎可靠性（P0 gate）**：group commit 无死锁、恢复 checkpoint 硬化、崩溃验收等
+
+**门禁**：全包 `-race -count=1` 绿；`tests/run-v21-multidisk.sh` e2e PASSED；
+`git diff HEAD -- gateway/s3/auth.go` 恒为 0。
+
 ---
 
 ## 📋 待实现 (P2-P3)
