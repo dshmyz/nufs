@@ -164,7 +164,11 @@ func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fus
 	return h, 0, 0
 }
 
-// Read reads data from the file.
+// Read reads data from the file. The returned window is the merged view of
+// the committed chunk store and any un-flushed buffered writes: a buffered
+// (dirty) region is authoritative over the committed bytes it overlaps, so a
+// read immediately after a write (before Flush) sees the new data rather than
+// stale committed content. (Same-class fix as the buffer hydration work.)
 func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	rec := recorderFor(f.recorder)
 	rec.IncOp("read")
@@ -178,11 +182,56 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 		rec.IncOpError("read")
 		return nil, syscall.EIO
 	}
-	// Clamp read to file size
-	if off >= metaInode.Size {
+
+	// f.mu guards the dirty buffer. A read races a concurrent Write/Flush
+	// on f.buffer otherwise, so the whole window resolution runs under it.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Effective file size accounts for an un-flushed buffered tail that
+	// extends past the committed size (e.g. after an O_APPEND write). A read
+	// must be able to see bytes a process wrote but hasn't fsync/flushed.
+	size := metaInode.Size
+	if int64(len(f.buffer)) > size {
+		size = int64(len(f.buffer))
+	}
+	if off >= size {
 		return fuse.ReadResultData(nil), 0
 	}
 	end := off + int64(len(dest))
+	if end > size {
+		end = size
+	}
+
+	// Dirty buffer present: it is a faithful image of the committed prefix
+	// [0, committed) (writeLocked / ensureHydratedLocked keep loaded=true
+	// whenever buffer is non-nil) plus any dirty tail, so it is authoritative
+	// for the whole window up to its end. Anything past the buffer is a hole.
+	// ensureHydratedLocked is a defensive re-check of the invariant: it is a
+	// no-op when the buffer already covers committed content.
+	if len(f.buffer) > 0 {
+		if err := f.ensureHydratedLocked(ctx, rec); err != nil {
+			rec.IncOpError("read")
+			return nil, syscall.EIO
+		}
+		out := make([]byte, end-off)
+		bufStart := int(off)
+		if bufStart < 0 {
+			bufStart = 0
+		}
+		if bufStart < len(f.buffer) {
+			n := len(f.buffer) - bufStart
+			if n > len(out) {
+				n = len(out)
+			}
+			copy(out, f.buffer[bufStart:bufStart+n])
+		}
+		return fuse.ReadResultData(out), 0
+	}
+	if off >= metaInode.Size {
+		return fuse.ReadResultData(nil), 0
+	}
+	end = off + int64(len(dest))
 	if end > metaInode.Size {
 		end = metaInode.Size
 	}
@@ -643,6 +692,16 @@ func (f *DFSFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrO
 		return syscall.EIO
 	}
 	out.Attr = inodeMetaToAttr(metaInode)
+
+	// Report the effective file size including any un-flushed buffered tail
+	// (e.g. after an O_APPEND write), so stat() agrees with where the next
+	// write/append will land rather than lagging behind on committed size.
+	// Same-class fix: the buffered image must be reflected in the view.
+	f.mu.Lock()
+	if int64(len(f.buffer)) > int64(out.Attr.Size) {
+		out.Attr.Size = uint64(len(f.buffer))
+	}
+	f.mu.Unlock()
 	return 0
 }
 

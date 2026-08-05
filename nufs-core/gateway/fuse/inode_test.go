@@ -739,6 +739,171 @@ func TestDFSFile_Append_Concurrent_NoCollision(t *testing.T) {
 	}
 }
 
+// ========== State-consistency: Read/Getattr must reflect un-flushed buffer ==========
+
+// TestDFSFile_Read_AfterWrite_NoFlush_ReturnsBuffered covers the same-class
+// bug where Read served only committed bytes and returned empty/stale data
+// for a write that hadn't been flushed yet. POSIX requires a write followed
+// by a read on the same open file (no fsync) to observe the write.
+func TestDFSFile_Read_AfterWrite_NoFlush_ReturnsBuffered(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("hello"), 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	// NO Flush. The committed ChunkMap is still empty; Read must serve the
+	// buffered "hello" rather than treating the file as empty.
+	dest := make([]byte, 8)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, []byte("hello")) {
+		t.Fatalf("Read after un-flushed write = %q, want %q", got, "hello")
+	}
+}
+
+// TestDFSFile_Read_AfterInPlaceOverwrite_NoFlush_ReturnsBuffered covers the
+// random-overwrite case: flush "hello world", then overwrite [6,11) with
+// "brave" WITHOUT flushing, then read. The read must see the new byte range
+// (buffered) merged with the committed prefix.
+func TestDFSFile_Read_AfterInPlaceOverwrite_NoFlush_ReturnsBuffered(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("hello world"), 0); errno != 0 {
+		t.Fatalf("Write base: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush base: errno=%v", errno)
+	}
+	// Overwrite mid-file, no flush.
+	if _, errno := f.Write(context.Background(), nil, []byte("brave"), 6); errno != 0 {
+		t.Fatalf("Write overwrite: errno=%v", errno)
+	}
+
+	dest := make([]byte, 16)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, []byte("hello brave")) {
+		t.Fatalf("Read after un-flushed overwrite = %q, want %q", got, "hello brave")
+	}
+}
+
+// TestDFSFile_Read_AfterAppend_NoFlush_ReturnsBuffered covers the append
+// case: an O_APPEND write that grows the file past the committed size must be
+// visible to an immediate read (the buffered tail extends the file).
+func TestDFSFile_Read_AfterAppend_NoFlush_ReturnsBuffered(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("hello"), 0); errno != 0 {
+		t.Fatalf("Write base: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush base: errno=%v", errno)
+	}
+	h := &DFSFileHandle{file: f, append: true}
+	if _, errno := h.Write(context.Background(), []byte(" world"), 0); errno != 0 {
+		t.Fatalf("Append: errno=%v", errno)
+	}
+
+	dest := make([]byte, 16)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, []byte("hello world")) {
+		t.Fatalf("Read after un-flushed append = %q, want %q", got, "hello world")
+	}
+}
+
+// TestDFSFile_Read_UnflushedHole_ReturnsZeros covers a buffered write at a
+// nonzero offset that leaves a hole: {"llo" at offset 2, buffer "..llo"} must
+// serve two NULs then "llo", even before any flush.
+func TestDFSFile_Read_UnflushedHole_ReturnsZeros(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("llo"), 2); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	dest := make([]byte, 5)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	want := []byte{0x00, 0x00, 'l', 'l', 'o'}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("Read buffered hole = %v, want %v", got, want)
+	}
+}
+
+// TestDFSFile_Read_AfterFlush_FallsBackToCommitted verifies the committed
+// (no-buffer) read path is still correct after a flush clears the buffer —
+// the buffer overlay must not corrupt the post-flush read.
+func TestDFSFile_Read_AfterFlush_FallsBackToCommitted(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("committed-data"), 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+	if f.buffer != nil {
+		t.Fatalf("after Flush buffer should be nil, got %q", f.buffer)
+	}
+	dest := make([]byte, 32)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, []byte("committed-data")) {
+		t.Fatalf("Read after flush = %q, want %q", got, "committed-data")
+	}
+}
+
+// TestDFSFile_Getattr_SizeIncludesBufferedTail verifies stat() reports the
+// effective file size including an un-flushed O_APPEND tail, so the reported
+// size agrees with the next append position.
+func TestDFSFile_Getattr_SizeIncludesBufferedTail(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("hello world"), 0); errno != 0 {
+		t.Fatalf("Write base: errno=%v", errno)
+	}
+	h := &DFSFileHandle{file: f, append: true}
+	if _, errno := h.Write(context.Background(), []byte("!"), 0); errno != 0 {
+		t.Fatalf("Append: errno=%v", errno)
+	}
+	// No flush: Getattr must reflect the 12-byte buffered file, not the
+	// committed size (0), which would be 0 before the first flush.
+	var out fuse.AttrOut
+	if errno := f.Getattr(context.Background(), nil, &out); errno != 0 {
+		t.Fatalf("Getattr: errno=%v", errno)
+	}
+	if got := int64(out.Attr.Size); got != int64(len("hello world!")) {
+		t.Fatalf("Getattr.Size=%d, want %d (buffered tail not reflected)", got, len("hello world!"))
+	}
+}
+
 // TestDFSFile_Write_OffZero_ExtendsBuffer covers the "pwrite at a
 // non-zero offset" path, which previously allocated a giant buffer
 // up to `off+len(data)`. That's still how the single-chunk Flush
