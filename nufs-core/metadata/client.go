@@ -1427,3 +1427,46 @@ func (c *HTTPClient) RollbackConversion(st *ECStripe, reason string) error {
 	*st = updated
 	return nil
 }
+
+// PlanECWrite queries the remote authority for where each shard of a write-path
+// direct EC write should land (§14, Program 10). The gateway encodes K+M shards
+// up front and pushes each shard straight to the owning node's shard store; the
+// authority (not the gateway) decides the per-shard (NodeID, DiskID) placement
+// for fault-domain diversity. It structurally satisfies the chunkstore
+// ECWriteAuthority seam so *HTTPClient can be injected as the direct-write
+// authority. shards' NodeID is aligned with the allocated Replicas' node per
+// shard index (the server resolves it from the chunk), so the caller can push
+// shard i to Replicas[i].Addr with a disk of shards[i].DiskID % 1000.
+func (c *HTTPClient) PlanECWrite(ctx context.Context, chunkID ChunkID, dataShards, parityShards int) ([]ECShard, error) {
+	req := map[string]interface{}{"chunk_id": uint64(chunkID), "data_shards": dataShards, "parity_shards": parityShards}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/ec/plan-write", req)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Shards []ECShard `json:"shards"`
+	}
+	if err := c.readResponse(resp, &out); err != nil {
+		return nil, err
+	}
+	return out.Shards, nil
+}
+
+// RecordDirectEC records a directly-written EC chunk on the remote authority
+// (§14, Program 10): after the gateway has pushed every shard to its owning
+// node's shard store it reports the plan + original checksum, and the authority
+// durably lifts the chunk into EC (Complete stripe + ChunkMeta.ECStripeID) — the
+// same served state a converted chunk reaches through publish. It structurally
+// satisfies the chunkstore ECWriteAuthority seam.
+func (c *HTTPClient) RecordDirectEC(ctx context.Context, chunkID ChunkID, dataShards, parityShards int, shards []ECShard, checksum uint32) error {
+	req := map[string]interface{}{
+		"chunk_id": uint64(chunkID), "shards": shards,
+		"data_shards": dataShards, "parity_shards": parityShards,
+		"original_checksum": checksum,
+	}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/ec/record-direct", req)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}

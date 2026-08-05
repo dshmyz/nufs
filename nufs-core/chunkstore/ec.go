@@ -3,11 +3,133 @@ package chunkstore
 import (
 	"context"
 	"fmt"
+	"hash/crc32"
 	"log/slog"
 
 	"github.com/example/dfs/datanode"
 	"github.com/example/dfs/metadata"
 )
+
+// ECWriteAuthority is the write-path direct-EC authority seam (Program 10,
+// §14): it answers "where does each shard of a direct EC write land" and later
+// records the landed write as a durable EC stripe. On the production path it is
+// satisfied structurally by *metadata.HTTPClient (PlanECWrite / RecordDirectEC
+// RPCs to the metadata service); a test stub satisfies it in unit tests. It is
+// the mirror of the ECAuthority (Program 3) and ECLandingResolver /
+// ECOrphanResolver (Program 7) structural-interface seams. When it is nil the
+// write path falls back to V1 semantics (writeECChunk), so unwired stores keep
+// today's behavior.
+type ECWriteAuthority interface {
+	PlanECWrite(ctx context.Context, chunkID metadata.ChunkID, dataShards, parityShards int) ([]metadata.ECShard, error)
+	RecordDirectEC(ctx context.Context, chunkID metadata.ChunkID, dataShards, parityShards int, shards []metadata.ECShard, checksum uint32) error
+}
+
+// writeECShardDirect is the V2.1 write-path direct-EC write (Program 10, §14,
+// aligning with V1 writeECChunk): it encodes data into K+M shards and pushes
+// each shard *directly* to its owning node's shard store via ReplicateECShard —
+// no intermediate replica, exactly like V1 but landing in the shard store. The
+// §14 per-shard (NodeID, DiskID) placement is decided by the metadata authority
+// (PlanECWrite), not the gateway. Once ≥K shards (the write quorum) land, the
+// landed write is recorded as a durable Complete stripe + ChunkMeta.ECStripeID
+// (RecordDirectEC) so the serving read (ReadECShard), self-heal (landing
+// resolve) and orphan-GC paths recognize it exactly as they do a converted
+// chunk.
+//
+// If the authority is unavailable or the plan cannot meet §14 (e.g. a V1-only
+// cluster with no V2.1 shard disks), it falls back to V1 writeECChunk *before
+// writing anything* so the write still lands via legacy whole-shard replication.
+func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *metadata.ChunkMeta, data []byte) error {
+	ec := chunk.ECGroup
+	encoder := GetECEncoder(ec.DataShards, ec.ParityShards)
+
+	result, err := encoder.Encode(data)
+	if err != nil {
+		return fmt.Errorf("chunkstore: ec encode chunk %d: %w", chunk.ID, err)
+	}
+	totalShards := ec.DataShards + ec.ParityShards
+	allShards := make([][]byte, totalShards)
+	copy(allShards[:ec.DataShards], result.DataShards)
+	copy(allShards[ec.DataShards:], result.ParityShards)
+
+	// The metadata authority (not the gateway) decides the §14 placement. If it
+	// is unreachable or cannot place all shards across a V2.1 topology, fall
+	// back to V1 whole-shard replication before touching any shard store.
+	plan, err := s.ecWrite.PlanECWrite(ctx, chunk.ID, ec.DataShards, ec.ParityShards)
+	if err != nil || len(plan) != totalShards {
+		slog.Warn("chunkstore: ec direct plan unavailable, falling back to V1 writeECChunk",
+			"chunkID", chunk.ID, "planned", len(plan), "want", totalShards, "error", err)
+		return s.writeECChunk(ctx, chunk, data)
+	}
+
+	type shardResult struct {
+		nodeID metadata.NodeID
+		err    error
+	}
+	ch := make(chan shardResult, len(chunk.Replicas))
+	for i, rep := range chunk.Replicas {
+		// plan[i].NodeID is aligned with chunk.Replicas[i].NodeID (the authority
+		// resolved it from the chunk), so we push shard i to the owning node's
+		// address — replicas[i].Addr — with the planned disk on that node
+		// (DiskID%1000 = node-local shard-store index, §14).
+		disk := int(plan[i].DiskID % 1000)
+		go func(r metadata.ReplicaInfo, idx, disk int) {
+			if r.Addr == "" {
+				ch <- shardResult{r.NodeID, fmt.Errorf("empty addr for node %d", r.NodeID)}
+				return
+			}
+			client, err := s.pool.Get(r.Addr)
+			if err != nil {
+				ch <- shardResult{r.NodeID, fmt.Errorf("connect %s: %w", r.Addr, err)}
+				return
+			}
+			resp, err := client.ReplicateECShard(chunk.ID, idx, disk, allShards[idx])
+			s.pool.Put(r.Addr, client)
+			if err != nil {
+				ch <- shardResult{r.NodeID, fmt.Errorf("write shard %d to %s: %w", idx, r.Addr, err)}
+				return
+			}
+			if resp.Status != datanode.StatusOK {
+				ch <- shardResult{r.NodeID, fmt.Errorf("node %d status=%d: %s", r.NodeID, resp.Status, resp.Error)}
+				return
+			}
+			ch <- shardResult{r.NodeID, nil}
+		}(rep, i, disk)
+	}
+
+	quorum := ec.DataShards // K shards must land
+	successes := 0
+	var lastErr error
+	for i := 0; i < len(chunk.Replicas); i++ {
+		select {
+		case r := <-ch:
+			if r.err != nil {
+				lastErr = r.err
+				slog.Warn("chunkstore: ec direct shard write failed",
+					"chunkID", chunk.ID, "nodeID", r.nodeID, "error", r.err)
+			} else {
+				successes++
+			}
+		case <-ctx.Done():
+			return fmt.Errorf("chunkstore: ec write context cancelled: %w", ctx.Err())
+		}
+	}
+	if successes < quorum {
+		if lastErr != nil {
+			return fmt.Errorf("chunkstore: ec direct write only %d/%d shards for chunk %d: %w",
+				successes, quorum, chunk.ID, lastErr)
+		}
+		return fmt.Errorf("chunkstore: ec direct write only %d/%d shards for chunk %d",
+			successes, quorum, chunk.ID)
+	}
+
+	// Quorum landed. Lift the chunk into durable EC state (Complete stripe +
+	// ECStripeID) so serving read / self-heal / orphan-GC recognize it.
+	checksum := crc32.ChecksumIEEE(data)
+	if err := s.ecWrite.RecordDirectEC(ctx, chunk.ID, ec.DataShards, ec.ParityShards, plan, checksum); err != nil {
+		return fmt.Errorf("chunkstore: ec record-direct chunk %d: %w", chunk.ID, err)
+	}
+	return nil
+}
 
 // writeECChunk encodes data into K+M shards and writes each shard
 // to its assigned datanode concurrently. Returns success once K

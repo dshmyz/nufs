@@ -126,6 +126,12 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/ec/convert/resolve-landing", mut(s.handleECResolveLanding))
 	mux.HandleFunc("/api/v1/ec/convert/is-orphan", mut(s.handleECIsOrphan))
 
+	// EC write-path direct authority (Program 10): the gateway queries where
+	// each shard of a direct EC write lands (plan-write) and later reports the
+	// original checksum + plan so the authority durably lifts the chunk into EC.
+	mux.HandleFunc("/api/v1/ec/plan-write", mut(s.handleECPlanWrite))
+	mux.HandleFunc("/api/v1/ec/record-direct", mut(s.handleECRecordDirect))
+
 	// Watch — long-poll SSE stream of metadata change events
 	// (doesn't need leader check; followers already consume from their local EventBus)
 	mux.HandleFunc("/api/v1/watch", s.handleWatch)

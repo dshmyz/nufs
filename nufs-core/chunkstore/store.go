@@ -40,6 +40,20 @@ type DatanodeChunkStore struct {
 	// MinReplicasPerWrite is the floor on the number of replicas that
 	// must acknowledge a write. <= 0 means "all replicas must succeed".
 	MinReplicasPerWrite int
+	// ecWrite is the write-path direct-EC authority (Program 10, §14). When
+	// set, an ECConfig chunk's write routes to writeECShardDirect (encode K+M
+	// and push each shard to its owning node's shard store); when nil, it falls
+	// back to V1 writeECChunk. Wired from the S3 layer (gateway) as the
+	// *metadata.HTTPClient authority.
+	ecWrite ECWriteAuthority
+}
+
+// SetECWriteAuthority injects the write-path direct-EC authority (Program 10).
+// A nil value keeps V1 writeECChunk semantics; a real authority (the metadata
+// HTTPClient) enables V2.1 direct EC writes for ECConfig buckets. The production
+// gateway wires this at construction; unit-test / in-memory stores omit it.
+func (s *DatanodeChunkStore) SetECWriteAuthority(a ECWriteAuthority) {
+	s.ecWrite = a
 }
 
 // NewDatanodeChunkStore returns a ChunkStore that dials datanode daemons
@@ -80,6 +94,13 @@ func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.Chu
 	}
 
 	if chunk.ECGroup != nil {
+		// V2.1 write-path direct EC (Program 10, §14): with a wired authority,
+		// encode K+M shards and push each directly to its owning node's shard
+		// store (no intermediate replica). Without one (unwired store, or the
+		// authority not present in this engine) fall back to V1 writeECChunk.
+		if s.ecWrite != nil {
+			return s.writeECShardDirect(ctx, chunk, data)
+		}
 		return s.writeECChunk(ctx, chunk, data)
 	}
 

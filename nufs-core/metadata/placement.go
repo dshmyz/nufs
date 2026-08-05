@@ -322,17 +322,28 @@ func (p *PlacementEngine) spreadSelect(
 		}
 	}
 
-	// Pass 3: Multi-shard per node (EC with fewer nodes than K+M)
+	// Pass 3: Multi-shard per node (EC with fewer nodes than K+M). Keep filling
+	// until count is met or every candidate node has reached maxPerNode —
+	// a single sweep would top each node at just one extra shard and cap the
+	// total at 2*candidates, which breaks EC placement on 1..few nodes (e.g. a
+	// single-node V2.1 testbed hosting a full 6+3 stripe on its disks, Program 10).
 	if len(result) < count && maxPerNode > 1 {
-		for _, s := range scored {
-			if len(result) >= count {
+		for len(result) < count {
+			progressed := false
+			for _, s := range scored {
+				if len(result) >= count {
+					break
+				}
+				if nodeCount[s.node.ID] >= maxPerNode {
+					continue
+				}
+				result = append(result, s.node.ID)
+				nodeCount[s.node.ID]++
+				progressed = true
+			}
+			if !progressed {
 				break
 			}
-			if nodeCount[s.node.ID] >= maxPerNode {
-				continue
-			}
-			result = append(result, s.node.ID)
-			nodeCount[s.node.ID]++
 		}
 	}
 

@@ -412,6 +412,110 @@ func (s *ECStore) SwitchChunkToEC(ctx context.Context, stripeID string) (*ChunkM
 	return layout, nil
 }
 
+// RecordDirect records a directly-written EC chunk (Program 10, §14 write-path
+// direct EC): the gateway encodes K+M shards and pushes each to the owning
+// node's shard store, then calls this to lift the chunk into the authoritative
+// EC metadata — a durably Complete ECStripe plus ChunkMeta.ECStripeID — so the
+// serving read / self-heal / orphan-GC paths (which all key off the stripe
+// pointer, Program 5/6) recognize it exactly as they do a converted chunk.
+//
+// Unlike the five-step conversion transaction, direct write has no
+// Prepare/Encoding/Syncing window: the shards are already landed when this is
+// called, so the stripe is recorded atomically as Complete (the same durable
+// state conversion's publish step produces — byte-compatible). The stripe ID is
+// the chunk's allocation group ID ("ec-<chunkID>"), stable and unique per
+// chunk, so write-once semantics hold without a datanode-supplied ID.
+//
+// The chunk's materialized Replicas are preserved as allocated (each carries
+// the owning node's live Addr + ShardIndex), only ECStripeID/State and Checksum
+// are joined — so the gateway serving read (which dials Replicas[i].Addr) keeps
+// working after the switch. A cross-check verifies the supplied plan's
+// per-shard node matches the allocated Replicas node, so the materialized copy
+// can never silently diverge from the authoritative stripe. The atomic write
+// runs through the same tombstone-safe conditional update every chunk mutation
+// uses (updateLiveChunkMetadata).
+func (s *ECStore) RecordDirect(ctx context.Context, chunkID ChunkID, shards []ECShard, checksum uint32) (*ChunkMeta, *ECStripe, error) {
+	if s.store.closed.Load() {
+		return nil, nil, ErrServiceClosed
+	}
+	key := fmt.Sprintf("%s%d", prefixChunk, chunkID)
+	raw, exists, err := s.store.readChunkTombstoneRaw(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !exists {
+		return nil, nil, ErrChunkNotFound
+	}
+	var chunk ChunkMeta
+	if err := unmarshalValue(raw, &chunk); err != nil {
+		return nil, nil, fmt.Errorf("ec: record-direct: decode chunk %d: %w", chunkID, err)
+	}
+	if chunk.ECGroup == nil || chunk.ECGroup.GroupID == "" {
+		return nil, nil, fmt.Errorf("ec: record-direct: chunk %d has no EC group (not allocated for EC)", chunkID)
+	}
+	stripeID := chunk.ECGroup.GroupID
+
+	// The plan must agree with the allocation on which node owns each shard
+	// index (the gateway pushes shard i to Replicas[i].Addr; the durable stripe
+	// records the same node). A mismatch would make the resolved landing diverge
+	// from the actually-written placement — refuse to record.
+	for i, sh := range shards {
+		if i >= len(chunk.Replicas) {
+			return nil, nil, fmt.Errorf("ec: record-direct: chunk %d plan has %d shards, allocated %d replicas", chunkID, len(shards), len(chunk.Replicas))
+		}
+		if sh.NodeID != uint64(chunk.Replicas[i].NodeID) {
+			return nil, nil, fmt.Errorf("ec: record-direct: chunk %d shard %d planned node %d but replica %d node %d",
+				chunkID, i, sh.NodeID, chunk.Replicas[i].NodeID, i)
+		}
+	}
+
+	// Write-once: a stripe with this ID already recorded must already be
+	// Complete (idempotent re-record) — a partial/in-flight stripe means the
+	// direct write raced a conversion, which is not supported.
+	if existing, err := s.GetStripe(stripeID); err != nil {
+		return nil, nil, err
+	} else if existing != nil && existing.State != ECConversionComplete {
+		return nil, nil, fmt.Errorf("ec: record-direct: chunk %d stripe %q already in state %s", chunkID, stripeID, existing.State)
+	}
+
+	st := &ECStripe{
+		StripeID:         stripeID,
+		ExtentID:         uint64(chunkID),
+		Generation:       chunk.Generation,
+		OriginalChecksum: checksum,
+		Shards:           shards,
+		State:            ECConversionComplete,
+		ConvertedAt:      time.Now().UnixNano(),
+	}
+	if err := s.PutStripe(st); err != nil {
+		return nil, nil, err
+	}
+
+	// Lighter than SwitchChunkToEC: preserve the allocated Replicas (they carry
+	// the owning nodes' live Addr, which the gateway serving read dials) and the
+	// fields the gateway set; only join ECStripeID + State, and record the
+	// original checksum for degraded-read verification.
+	layout := &ChunkMeta{
+		ID:         chunk.ID,
+		Size:       chunk.Size,
+		State:      ChunkReady,
+		Replicas:   chunk.Replicas,
+		ECGroup:    chunk.ECGroup,
+		Tier:       chunk.Tier,
+		CreateTime: chunk.CreateTime,
+		Checksum:   checksum,
+		PGID:       chunk.PGID,
+		Epoch:      chunk.Epoch,
+		Generation: chunk.Generation,
+		ECStripeID: stripeID,
+	}
+	if err := s.store.updateLiveChunkMetadata(ctx, raw, layout); err != nil {
+		return nil, nil, fmt.Errorf("ec: record-direct: switch chunk %d to EC: %w", chunkID, err)
+	}
+	s.store.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("chunk:%d", chunkID)})
+	return layout, st, nil
+}
+
 func (s *ECStore) MarkExtentColdEC(id InodeID, extentID ExtentIDV2, stripeID string) error {
 	inodes := NewInodeStoreV2(s.store)
 	in, err := inodes.Get(id)

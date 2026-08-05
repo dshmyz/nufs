@@ -100,6 +100,17 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 	if gw.chunkStore == nil {
 		gw.chunkStore = chunkstore.NewDatanodeChunkStore()
 	}
+	// Wire the write-path direct-EC authority (Program 10, §14): a configured
+	// DatanodeChunkStore over a metadata HTTPClient can direct-write EC shards
+	// (encode K+M and push each to its owning node's shard store) for ECConfig
+	// buckets. The authority is the metadata service (structural ECWriteAuthority);
+	// in-memory/test stores or non-datanode backends skip this and keep V1
+	// semantics.
+	if cs, ok := gw.chunkStore.(*chunkstore.DatanodeChunkStore); ok {
+		if auth, ok := gw.meta.(chunkstore.ECWriteAuthority); ok {
+			cs.SetECWriteAuthority(auth)
+		}
+	}
 	gw.committer = newMetadataObjectCommitter(gw.meta, gw.chunkStore, cfg.RejectEmptyReplicas)
 	if cfg.MaxObjectSize <= 0 {
 		gw.maxObjectSize = DefaultMaxObjectSize

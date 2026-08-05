@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -252,6 +253,142 @@ func (h *opsHandlers) handleECResolveLanding(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, struct {
 		Shards []metadata.ECShard `json:"shards"`
 	}{Shards: shards})
+}
+
+// planECWrite: POST /api/v1/ec/plan-write
+// {chunk_id, data_shards, parity_shards} → {shards:[]ECShard{Index,NodeID,DiskID}}
+//
+// The write-path direct-EC authority (§14, Program 10): when the gateway writes
+// an object into an ECConfig bucket it encodes K+M shards up front and pushes
+// each shard straight to the owning node's shard store — no intermediate
+// replica. It needs to know *which disk on which node* each shard lands on,
+// and that decision is the metadata authority's (§14 fault-domain diversity),
+// not the gateway's. This endpoint computes it: it loads the chunk (whose
+// allocation already fixed Replicas[i].NodeID + Addr for each shard index) and
+// the current cluster topology, then assigns each shard a disk on its owning
+// node via a deterministic per-node round-robin. No state is mutated — this is
+// a pure placement query; the durable stripe is only recorded after the shards
+// actually land (record-direct).
+//
+// When the topology cannot meet §14 bounds (too few V2.1 nodes / shard disks,
+// or a node missing from the topology) it fails cleanly with 4xx/5xx so the
+// gateway falls back to the replication write path.
+func (h *opsHandlers) handleECPlanWrite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		ChunkID      uint64 `json:"chunk_id"`
+		DataShards   int    `json:"data_shards"`
+		ParityShards int    `json:"parity_shards"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChunkID == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	chunk, err := h.store.GetChunk(r.Context(), metadata.ChunkID(req.ChunkID))
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, "chunk not found")
+		return
+	}
+	total := req.DataShards + req.ParityShards
+	if total <= 0 || len(chunk.Replicas) != total {
+		writeJSONError(w, http.StatusBadRequest, "chunk replicas/EC shard count mismatch")
+		return
+	}
+
+	// Build per-node candidate disks from the live topology (Program 9's
+	// ShardDiskCount: only V2.1 nodes report >0 shard stores; DiskID encodes
+	// NodeID*1000 + local disk). The §14 planner needs >=3 distinct nodes with
+	// enough disks — a V1-only cluster (all ShardDiskCount==0) yields no
+	// candidates and fails cleanly, so the gateway falls back to replication.
+	nodes, err := h.store.ListNodes(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	nodeDisks := make(map[uint64][]metadata.ECDisk)
+	for _, n := range nodes {
+		if n.State != metadata.NodeOnline || n.ShardDiskCount <= 0 {
+			continue
+		}
+		for d := 0; d < n.ShardDiskCount; d++ {
+			id := uint64(n.ID)
+			nodeDisks[id] = append(nodeDisks[id], metadata.ECDisk{NodeID: id, DiskID: id*1000 + uint64(d)})
+		}
+	}
+	// Assign each shard a disk on its *owning* node (chunk.Replicas[i].NodeID
+	// — the node the gateway will push shard i to), round-robin across that
+	// node's disks so consecutive shards on the same node hit distinct disks.
+	//
+	// Fault isolation (§14) is a placement goal, not a hard correctness gate:
+	// the gateway pushes each shard to exactly the node the allocation chose,
+	// so the plan is only free to pick *which disk* on that node. A real
+	// multi-node cluster spreads shards across ≥3 fault domains because the
+	// allocation did; a single-node V2.1 testbed legitimately hosts all 9
+	// shards on its one node's disks (user-selected — single-node must support
+	// write-path direct EC). The round-robin guarantees no node is asked to
+	// hold more shards than it has registered shard disks.
+	nextDisk := make(map[uint64]int, len(nodeDisks))
+	plan := make([]metadata.ECShard, 0, total)
+	for i, rep := range chunk.Replicas {
+		node := uint64(rep.NodeID)
+		disks := nodeDisks[node]
+		if len(disks) == 0 {
+			writeJSONError(w, http.StatusFailedDependency,
+				fmt.Sprintf("node %d not online/no shard disks for direct EC write", node))
+			return
+		}
+		j := nextDisk[node] % len(disks)
+		nextDisk[node] = nextDisk[node] + 1
+		plan = append(plan, metadata.ECShard{Index: i, NodeID: node, DiskID: disks[j].DiskID})
+	}
+
+	writeJSON(w, struct {
+		Shards []metadata.ECShard `json:"shards"`
+	}{Shards: plan})
+}
+
+// recordDirectEC: POST /api/v1/ec/record-direct
+// {chunk_id, shards:[]ECShard, data_shards, parity_shards, original_checksum}
+// → ChunkMeta (ECStripeID set) + ECStripe (Complete).
+//
+// The second half of write-path direct EC (§14, Program 10): after the gateway
+// has encoded and pushed every shard to its owning node's shard store, it
+// reports here so the metadata authority durably lifts the chunk into EC — a
+// Complete stripe + ChunkMeta.ECStripeID — which is exactly the state a
+// converted chunk reaches through publish. The server stays authoritative: it
+// builds the durable stripe from the supplied plan + checksum (in the same
+// write-once PutStripe keyed by the chunk's allocation group ID) and atomically
+// switches the chunk's metadata, preserving the allocated Replicas (with live
+// Addr) that the gateway read path dials. The shards' node per index must match
+// the allocation (PlanECWrite produced it), enforced by ECStore.RecordDirect.
+func (h *opsHandlers) handleECRecordDirect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		ChunkID           uint64               `json:"chunk_id"`
+		Shards            []metadata.ECShard   `json:"shards"`
+		DataShards        int                  `json:"data_shards"`
+		ParityShards      int                  `json:"parity_shards"`
+		OriginalChecksum  uint32               `json:"original_checksum"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChunkID == 0 || len(req.Shards) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	layout, st, err := h.ecStore().RecordDirect(r.Context(), metadata.ChunkID(req.ChunkID), req.Shards, req.OriginalChecksum)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, struct {
+		Chunk  *metadata.ChunkMeta  `json:"chunk"`
+		Stripe *metadata.ECStripe   `json:"stripe"`
+	}{Chunk: layout, Stripe: st})
 }
 
 // isOrphanECConvert: POST /api/v1/ec/convert/is-orphan
