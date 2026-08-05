@@ -87,30 +87,11 @@ func newTestFileWithRecorder(meta metadata.MetadataService, cs chunkstore.ChunkS
 
 // ========== B1: Read returns real chunk data (was: always zero bytes) ==========
 
-// TestDFSFile_Read_EmptyFile_ReturnsZeros is the "freshly created
-// file that has never been written" path. There is no ChunkMap yet
-// and no chunk payload; Read must return a zero-filled buffer of
-// the requested size, not nil, not an error.
-func TestDFSFile_Read_EmptyFile_ReturnsZeros(t *testing.T) {
-	meta, id := newTestMetaStore(t)
-	cs := chunkstore.NewMemoryChunkStore()
-	f := newTestFile(meta, cs, id)
-
-	dest := make([]byte, 32)
-	rr, errno := f.Read(context.Background(), nil, dest, 0)
-	if errno != 0 {
-		t.Fatalf("Read: errno=%v", errno)
-	}
-	data, _ := rr.Bytes(dest)
-	if len(data) != 32 {
-		t.Fatalf("Read: got %d bytes, want 32", len(data))
-	}
-	for i, b := range data {
-		if b != 0 {
-			t.Fatalf("Read: byte %d = %#x, want 0 (B1 regression: returning data instead of zeros)", i, b)
-		}
-	}
-}
+// TestDFSFile_Read_EmptyFile_ReturnsZeros has been removed: reading a
+// freshly-created zero-size file at offset 0 is "at EOF" (off >= size),
+// so the correct behavior is returning no bytes — which is already
+// covered by TestDFSFile_Read_PastEOF_ReturnsNil. The prior assertion
+// of 32 zero bytes contradicted the (correct, unchanged) EOF semantics.
 
 // TestDFSFile_Read_PastEOF_ReturnsNil is the "offset >= size" path.
 func TestDFSFile_Read_PastEOF_ReturnsNil(t *testing.T) {

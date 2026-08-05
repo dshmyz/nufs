@@ -233,7 +233,9 @@ func TestDFSFile_MultipleOps_AggregateCounters(t *testing.T) {
 
 	snap := rec.Snapshot()
 	ops := snap["ops"].(map[string]uint64)
-	if ops["open"] != 1 || ops["read"] != 1 || ops["write"] != 1 || ops["flush"] != 1 || ops["release"] != 1 {
-		t.Errorf("ops counters = %+v, want open=read=write=flush=release=1", ops)
+	// Release internally calls Flush (POSIX close semantics), so after
+	// Open→Read→Write→Flush→Release the flush counter is 2, not 1.
+	if ops["open"] != 1 || ops["read"] != 1 || ops["write"] != 1 || ops["flush"] != 2 || ops["release"] != 1 {
+		t.Errorf("ops counters = %+v, want open=read=write=release=1, flush=2", ops)
 	}
 }
