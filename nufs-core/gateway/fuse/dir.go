@@ -29,6 +29,7 @@ var _ = (fs.NodeLookuper)((*DFSDir)(nil))
 var _ = (fs.NodeMkdirer)((*DFSDir)(nil))
 var _ = (fs.NodeRmdirer)((*DFSDir)(nil))
 var _ = (fs.NodeCreater)((*DFSDir)(nil))
+var _ = (fs.NodeMknoder)((*DFSDir)(nil))
 var _ = (fs.NodeUnlinker)((*DFSDir)(nil))
 var _ = (fs.NodeRenamer)((*DFSDir)(nil))
 var _ = (fs.NodeSymlinker)((*DFSDir)(nil))
@@ -62,19 +63,10 @@ func (d *DFSDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 			return nil, syscall.EIO
 		}
 		for _, e := range entries {
-			var mode uint32
-			switch e.Type {
-			case metadata.FileDirectory:
-				mode = fuse.S_IFDIR
-			case metadata.FileRegular:
-				mode = fuse.S_IFREG
-			case metadata.FileSymlink:
-				mode = fuse.S_IFLNK
-			}
 			fuseEntries = append(fuseEntries, fuse.DirEntry{
 				Name: e.Name,
 				Ino:  uint64(e.InodeID),
-				Mode: mode,
+				Mode: typeFromReaddir(e.Type),
 			})
 		}
 		// A short page means we've reached the end of the directory.
@@ -88,6 +80,30 @@ func (d *DFSDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	}
 
 	return fs.NewListDirStream(fuseEntries), 0
+}
+
+// typeFromReaddir maps a metadata FileType to the FUSE S_IF* mode bit used in
+// directory listings. Unknown types map to 0 (treated as a regular file by the
+// caller's caller); see inodeMetaToAttr for the full getattr mapping.
+func typeFromReaddir(t metadata.FileType) uint32 {
+	switch t {
+	case metadata.FileDirectory:
+		return fuse.S_IFDIR
+	case metadata.FileRegular:
+		return fuse.S_IFREG
+	case metadata.FileSymlink:
+		return fuse.S_IFLNK
+	case metadata.FileFIFO:
+		return fuse.S_IFIFO
+	case metadata.FileCharDevice:
+		return syscall.S_IFCHR
+	case metadata.FileBlockDevice:
+		return syscall.S_IFBLK
+	case metadata.FileSocket:
+		return syscall.S_IFSOCK
+	default:
+		return 0
+	}
 }
 
 // Lookup looks up a child entry by name.
@@ -212,6 +228,49 @@ func (d *DFSDir) Create(ctx context.Context, name string, flags uint32, mode uin
 
 	out.Attr = attr
 	return inode, file, 0, 0
+}
+
+// Mknod creates a special (non-regular) node: FIFO, char/block device or
+// unix socket. The kernel fully owns FIFO pipe semantics (this fs only
+// provides node identity + attrs via the DFSFifo thin node); devices and
+// sockets exist as identity-only stubs and open() is refused (EOPNOTSUPP).
+func (d *DFSDir) Mknod(ctx context.Context, name string, mode uint32, dev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	rec := recorderFor(d.recorder)
+	rec.IncOp("mknod")
+
+	var ftype metadata.FileType
+	var rdev uint32
+	switch mode & syscall.S_IFMT {
+	case syscall.S_IFIFO:
+		ftype = metadata.FileFIFO
+	case syscall.S_IFCHR:
+		ftype = metadata.FileCharDevice
+		rdev = dev
+	case syscall.S_IFBLK:
+		ftype = metadata.FileBlockDevice
+		rdev = dev
+	case syscall.S_IFSOCK:
+		ftype = metadata.FileSocket
+	default:
+		return nil, syscall.EINVAL
+	}
+
+	metaInode, err := d.meta.CreateNode(ctx, d.inodeID, name, ftype, mode&07777, rdev)
+	if errno := errnoForCreateNode(err); errno != 0 {
+		if errno == syscall.EIO {
+			logf("mknod error: %v", err)
+			rec.IncOpError("mknod")
+		}
+		return nil, errno
+	}
+
+	attr := inodeMetaToAttr(metaInode)
+	inode := d.NewInode(ctx, &DFSFifo{meta: d.meta, inodeID: metaInode.ID, recorder: rec}, fs.StableAttr{
+		Mode: attr.Mode & syscall.S_IFMT,
+		Ino:  uint64(metaInode.ID),
+	})
+	out.Attr = attr
+	return inode, 0
 }
 
 // Unlink removes a file entry.

@@ -285,6 +285,8 @@ func newChildInode(dfs *DFSFileSystem, metaInode *metadata.InodeMeta) fs.InodeEm
 		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: dfs.recorder, reliability: dfs.reliability}
 	case metadata.FileSymlink:
 		return &DFSSymlink{meta: dfs.meta, inodeID: metaInode.ID, recorder: dfs.recorder}
+	case metadata.FileFIFO, metadata.FileCharDevice, metadata.FileBlockDevice, metadata.FileSocket:
+		return &DFSFifo{meta: dfs.meta, inodeID: metaInode.ID, recorder: dfs.recorder}
 	default:
 		return &DFSFile{meta: dfs.meta, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: dfs.recorder, reliability: dfs.reliability}
 	}
@@ -309,7 +311,19 @@ func inodeMetaToAttr(m *metadata.InodeMeta) fuse.Attr {
 		attr.Mode |= fuse.S_IFREG
 	case metadata.FileSymlink:
 		attr.Mode |= fuse.S_IFLNK
+	case metadata.FileFIFO:
+		attr.Mode |= fuse.S_IFIFO
+	case metadata.FileCharDevice:
+		attr.Mode |= syscall.S_IFCHR
+	case metadata.FileBlockDevice:
+		attr.Mode |= syscall.S_IFBLK
+	case metadata.FileSocket:
+		attr.Mode |= syscall.S_IFSOCK
 	}
+
+	// Rdev carries the device number on char/block devices (fuse.Attr exposes
+	// it as a uint32); zero for every other type.
+	attr.Rdev = m.Rdev
 
 	// Convert nanosecond timestamps
 	if m.MTime > 0 {

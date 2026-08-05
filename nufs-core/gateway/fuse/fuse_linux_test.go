@@ -71,6 +71,12 @@ func TestInodeMetaToAttr_Symlink(t *testing.T) {
 }
 
 func TestNewChildInode(t *testing.T) {
+	// A minimal, real DFSFileSystem so newChildInode can read its meta/chunkStore
+	// fields without a nil deref. The children's fields are irrelevant here (we
+	// only assert the returned node type). (The previously-passed nil pointer
+	// dereferenced dfs.meta/chunkStore and panicked for every file type.)
+	dfs := &DFSFileSystem{}
+
 	tests := []struct {
 		fileType metadata.FileType
 		name     string
@@ -78,24 +84,36 @@ func TestNewChildInode(t *testing.T) {
 		{metadata.FileRegular, "file"},
 		{metadata.FileDirectory, "dir"},
 		{metadata.FileSymlink, "symlink"},
+		{metadata.FileFIFO, "fifo"},
+		{metadata.FileCharDevice, "chardev"},
+		{metadata.FileBlockDevice, "blockdev"},
+		{metadata.FileSocket, "socket"},
 	}
 
 	for _, tt := range tests {
 		m := &metadata.InodeMeta{ID: 1, Type: tt.fileType}
-		child := newChildInode(nil, m)
-		switch tt.name {
-		case "file":
-			if _, ok := child.(*DFSFile); !ok {
-				t.Errorf("expected *DFSFile for %s", tt.name)
+		child := newChildInode(dfs, m)
+		var want string
+		switch tt.fileType {
+		case metadata.FileRegular:
+			if _, ok := child.(*DFSFile); ok {
+				want = "file"
 			}
-		case "dir":
-			if _, ok := child.(*DFSDir); !ok {
-				t.Errorf("expected *DFSDir for %s", tt.name)
+		case metadata.FileDirectory:
+			if _, ok := child.(*DFSDir); ok {
+				want = "dir"
 			}
-		case "symlink":
-			if _, ok := child.(*DFSSymlink); !ok {
-				t.Errorf("expected *DFSSymlink for %s", tt.name)
+		case metadata.FileSymlink:
+			if _, ok := child.(*DFSSymlink); ok {
+				want = "symlink"
 			}
+		case metadata.FileFIFO, metadata.FileCharDevice, metadata.FileBlockDevice, metadata.FileSocket:
+			if _, ok := child.(*DFSFifo); ok {
+				want = "special"
+			}
+		}
+		if want == "" {
+			t.Errorf("newChildInode(%v) returned unexpected node type %T", tt.fileType, child)
 		}
 	}
 }
