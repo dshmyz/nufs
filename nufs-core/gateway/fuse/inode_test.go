@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"hash/crc32"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -588,6 +589,153 @@ func TestDFSFile_Flush_MultiChunk_CrossFlushReuse(t *testing.T) {
 	got, _ := rr.Bytes(dest)
 	if !bytes.Equal(got, second) {
 		t.Fatalf("cross-flush read-back mismatch: got %d bytes, want %d", len(got), len(second))
+	}
+}
+
+// TestDFSFile_Append_AfterFlush_HydratesCommittedContent covers O_APPEND
+// semantics after a Flush: opening with O_APPEND routes writes to
+// AppendWrite at the file's current end. The tricky part is that a Flush
+// clears the in-memory buffer, so an append must first hydrate the
+// committed content back into the buffer — otherwise the next Flush would
+// rebuild the whole file from an empty buffer and silently zero the
+// originally-written prefix.
+func TestDFSFile_Append_AfterFlush_HydratesCommittedContent(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	// Write the base content and flush it.
+	base := []byte("hello")
+	if _, errno := f.Write(context.Background(), nil, base, 0); errno != 0 {
+		t.Fatalf("Write base: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush base: errno=%v", errno)
+	}
+
+	// Open an O_APPEND handle and append. This is the exact regression:
+	// pre-fix the buffer (empty after Flush) would not know the committed
+	// "hello", so appending " WORL" then flushing would produce
+	// "\x00...WORL" with "hello" destroyed.
+	h := &DFSFileHandle{file: f, append: true}
+	if _, errno := h.Write(context.Background(), []byte(" world"), 0); errno != 0 {
+		t.Fatalf("Append: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush appended: errno=%v", errno)
+	}
+
+	want := "hello world"
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != int64(len(want)) {
+		t.Fatalf("after append: Size=%d, want %d", inode.Size, len(want))
+	}
+
+	dest := make([]byte, len(want)+8)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, []byte(want)) {
+		t.Fatalf("append read-back = %q, want %q (committed prefix was zeroed)", got, want)
+	}
+}
+
+// TestDFSFile_Write_NonZeroOffset_AfterFlush_PreservesPrefix covers a
+// random in-place overwrite after a Flush (the same hydration
+// prerequisite that enables append): flushing "hello world", then
+// overwriting [6,11) with "brave", then flushing again must yield
+// "hello brave" — the committed prefix must survive the whole-file
+// rebuild rather than being zeroed by the fresh buffer.
+func TestDFSFile_Write_NonZeroOffset_AfterFlush_PreservesPrefix(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("hello world"), 0); errno != 0 {
+		t.Fatalf("Write base: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush base: errno=%v", errno)
+	}
+
+	// In-place overwrite at a nonzero offset after the flush.
+	if _, errno := f.Write(context.Background(), nil, []byte("brave"), 6); errno != 0 {
+		t.Fatalf("Write overwrite: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush overwrite: errno=%v", errno)
+	}
+
+	want := []byte("hello brave")
+	dest := make([]byte, len(want)+8)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("overwrite read-back = %q, want %q (committed prefix was zeroed)", got, want)
+	}
+}
+
+// TestDFSFile_Append_Concurrent_NoCollision verifies that two append
+// writes to the same inode land back-to-back rather than at the same
+// offset (the serialization point is the per-inode f.mu in AppendWrite).
+func TestDFSFile_Append_Concurrent_NoCollision(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	h := &DFSFileHandle{file: f, append: true}
+	var wg sync.WaitGroup
+	writes := []string{"AAA", "BBB", "CCC", "DDD"}
+	for _, w := range writes {
+		wg.Add(1)
+		go func(s string) {
+			defer wg.Done()
+			if _, errno := h.Write(context.Background(), []byte(s), 0); errno != 0 {
+				t.Errorf("concurrent append %q: errno=%v", s, errno)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	want := "AAABBBCCCDDD"
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != int64(len(want)) {
+		t.Fatalf("after concurrent appends: Size=%d, want %d", inode.Size, len(want))
+	}
+
+	// Content is a permutation of the four writes, back-to-back — i.e.
+	// each write occupies a unique non-overlapping window.
+	got := make([]byte, len(want))
+	rr, errno := f.Read(context.Background(), nil, got, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	rb, _ := rr.Bytes(got)
+	// Sort the read-back into 3-char windows and confirm they're exactly
+	// the four pieces (no overlap, no loss).
+	seen := map[string]bool{}
+	for i := 0; i+3 <= len(rb); i += 3 {
+		seen[string(rb[i:i+3])] = true
+	}
+	for _, w := range writes {
+		if !seen[w] {
+			t.Fatalf("concurrent append lost/interleaved piece %q (got %q)", w, rb)
+		}
 	}
 }
 

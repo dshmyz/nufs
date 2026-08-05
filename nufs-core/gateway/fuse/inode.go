@@ -100,6 +100,14 @@ type DFSFile struct {
 	mu     sync.Mutex
 	dirty  bool
 	buffer []byte
+
+	// loaded reports whether buffer, when non-nil, holds a faithful image
+	// of the file's *committed* prefix [0, committedSize). It is false right
+	// after a Flush (buffer reset) and true once the buffer has either been
+	// hydrated from the chunk store or fully overwritten from offset 0.
+	// Guards against a write/append at a nonzero offset rebuilding the whole
+	// file from an empty buffer and zeroing the committed prefix.
+	loaded bool
 }
 
 var _ = (fs.NodeOpener)((*DFSFile)(nil))
@@ -115,6 +123,10 @@ var _ = (fs.NodeAccesser)((*DFSFile)(nil))
 // DFSFileHandle wraps DFSFile for per-open-file state.
 type DFSFileHandle struct {
 	file *DFSFile
+	// append is true when the file was opened with O_APPEND. Every write
+	// through this handle is then placed at the file's current end
+	// (O_APPEND semantics) rather than at the fd's file position.
+	append bool
 	// lockAcquired is true when Open acquired an advisory lock on
 	// this file descriptor. Release must call AdvisoryUnlock exactly
 	// once per acquisition (POSIX-flock semantics).
@@ -126,7 +138,7 @@ func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fus
 	rec := recorderFor(f.recorder)
 	rec.IncOp("open")
 
-	h := &DFSFileHandle{file: f}
+	h := &DFSFileHandle{file: f, append: flags&syscall.O_APPEND != 0}
 
 	// Acquire an advisory file lock.  O_WRONLY|O_RDWR → exclusive;
 	// O_RDONLY → shared.  An empty lockOwner (unit tests that supply
@@ -266,9 +278,13 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 	return fuse.ReadResultData(out), 0
 }
 
-// Write writes data to the file. The actual datanode round-trip
-// happens in Flush, not here, so the kernel can coalesce many small
-// pwrite(2) calls into one chunk allocation.
+// Write buffers data at the given offset until Flush; the actual datanode
+// round-trip happens in Flush, not here, so the kernel can coalesce many small
+// pwrite(2) calls into one chunk allocation. It supports random writes: a write
+// at a nonzero offset grows the buffer, zero-filling any hole. When the write
+// lands after a Flush (buffer reset) but at a nonzero offset, the buffer is
+// first hydrated from the committed file content so the next Flush's whole-file
+// rebuild doesn't zero the committed prefix.
 func (f *DFSFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
 	rec := recorderFor(f.recorder)
 	rec.IncOp("write")
@@ -276,6 +292,46 @@ func (f *DFSFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// A write at a nonzero offset that reaches beyond the current buffer
+	// needs the committed prefix loaded, or the next Flush would rebuild
+	// the file from zeros and destroy the committed [0, off) region. A
+	// write at offset 0 is a full-file overwrite — the empty buffer is the
+	// intended whole replacement, so no hydration.
+	if int(off) > 0 && !f.loaded {
+		if err := f.ensureHydratedLocked(ctx, rec); err != nil {
+			rec.IncOpError("write")
+			return 0, syscall.EIO
+		}
+	}
+	return f.writeLocked(ctx, data, off, rec)
+}
+
+// AppendWrite implements O_APPEND semantics: the write is placed at the
+// file's current end (max of committed size and any already-buffered tail)
+// regardless of the offset the kernel would otherwise pass from the fd's
+// file position. This is the correct serialization point — the tail is
+// computed under f.mu so concurrent appends to the same inode don't collide.
+func (f *DFSFile) AppendWrite(ctx context.Context, fh fs.FileHandle, data []byte) (uint32, syscall.Errno) {
+	rec := recorderFor(f.recorder)
+	rec.IncOp("write")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Resolve the true end of file: hydrate so the buffered tail reflects
+	// committed content, then append after whatever is already buffered.
+	if err := f.ensureHydratedLocked(ctx, rec); err != nil {
+		rec.IncOpError("write")
+		return 0, syscall.EIO
+	}
+	tail := int64(len(f.buffer))
+	return f.writeLocked(ctx, data, tail, rec)
+}
+
+// writeLocked applies a buffered write at the given offset. Must be called
+// with f.mu held and the buffer hydrated (unless it's a full overwrite from
+// offset 0, where hydration is intentionally skipped).
+func (f *DFSFile) writeLocked(ctx context.Context, data []byte, off int64, rec MetricsRecorder) (uint32, syscall.Errno) {
 	// Buffer write data locally until flush
 	needed := int(off) + len(data)
 	if needed > len(f.buffer) {
@@ -285,8 +341,112 @@ func (f *DFSFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off 
 	}
 	copy(f.buffer[off:], data)
 	f.dirty = true
+	f.loaded = true
 
 	return uint32(len(data)), 0
+}
+
+// ensureHydratedLocked guarantees that f.buffer is a faithful image of the
+// file's committed prefix [0, committedSize), zero-filling holes. This is
+// required because Flush rebuilds the whole file from f.buffer: if the
+// buffer started empty and a write landed at a nonzero offset, the
+// committed [0, off) prefix must be loaded from the chunk store or the next
+// Flush would write zeros over it (data loss for append /
+// random-overwrite-after-Flush). Any already-buffered (un-flushed) bytes
+// that extend past the committed size are preserved on top. Must be called
+// with f.mu held.
+func (f *DFSFile) ensureHydratedLocked(ctx context.Context, rec MetricsRecorder) error {
+	if f.loaded {
+		return nil
+	}
+	var metaInode *metadata.InodeMeta
+	if err := f.reliability.DoMeta("read", func() error {
+		var gerr error
+		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
+		return gerr
+	}); err != nil {
+		return err
+	}
+	committed := int(metaInode.Size)
+	if committed <= 0 {
+		f.loaded = true
+		return nil
+	}
+
+	// Preserve any already-buffered tail that extends past the committed
+	// size (un-flushed bytes written while the buffer wasn't loaded).
+	var tail []byte
+	if len(f.buffer) > committed {
+		tail = f.buffer[committed:]
+	}
+	buf := make([]byte, committed+len(tail))
+	f.buffer = buf
+	if err := f.loadChunkRangeLocked(ctx, rec, metaInode); err != nil {
+		return err
+	}
+	if tail != nil {
+		copy(f.buffer[committed:], tail)
+	}
+	f.loaded = true
+	return nil
+}
+
+// loadChunkRangeLocked fills f.buffer's [0, committed) region from the
+// inode's committed ChunkMap. Must be called with f.mu held and f.buffer
+// already sized to at least the committed file size.
+func (f *DFSFile) loadChunkRangeLocked(ctx context.Context, rec MetricsRecorder, metaInode *metadata.InodeMeta) error {
+	for _, cref := range metaInode.ChunkMap {
+		chunkStart := int(cref.Offset)
+		if chunkStart < 0 {
+			continue
+		}
+		chunkEnd := chunkStart + int(cref.Length)
+		if chunkStart >= len(f.buffer) {
+			break
+		}
+		if chunkEnd > len(f.buffer) {
+			chunkEnd = len(f.buffer)
+		}
+		var payload []byte
+		if f.cache != nil {
+			if p, ok := f.cache.Get(uint64(cref.ID)); ok {
+				payload = p
+			}
+		}
+		if payload == nil {
+			var chunk *metadata.ChunkMeta
+			if err := f.reliability.DoMeta("read", func() error {
+				var gerr error
+				chunk, gerr = f.meta.GetChunk(ctx, cref.ID)
+				return gerr
+			}); err != nil {
+				return err
+			}
+			if err := f.reliability.DoChunk("read", func() error {
+				var gerr error
+				payload, gerr = f.chunkStore.ReadChunk(ctx, chunk)
+				return gerr
+			}); err != nil {
+				return err
+			}
+			if f.cache != nil {
+				f.cache.Add(uint64(cref.ID), payload)
+			}
+		}
+		rel := chunkStart - int(cref.Offset) // == 0 normally
+		n := chunkEnd - chunkStart
+		if rel < 0 {
+			rel = 0
+		}
+		if rel >= len(payload) {
+			continue
+		}
+		if rel+n > len(payload) {
+			n = len(payload) - rel
+		}
+		copy(f.buffer[chunkStart:chunkStart+n], payload[rel:rel+n])
+	}
+	return nil
 }
 
 // Flush pushes the in-memory buffer to the chunk store and updates
@@ -442,6 +602,7 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 
 	f.buffer = nil
 	f.dirty = false
+	f.loaded = false
 	return 0
 }
 
@@ -496,15 +657,34 @@ func (f *DFSFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 
 	if size, ok := in.GetSize(); ok {
 		f.mu.Lock()
+		if int(size) >= len(f.buffer) && !f.loaded {
+			// Truncating up (or to the same size) over a buffer that
+			// doesn't yet hold the committed prefix: hydrate it first so
+			// the extension zero-fills only the new range and preserves
+			// the committed content (truncate-extend), and so a later
+			// Flush's whole-file rebuild doesn't zero committed bytes.
+			if err := f.ensureHydratedLocked(ctx, rec); err != nil {
+				rec.IncOpError("setattr")
+				f.mu.Unlock()
+				return syscall.EIO
+			}
+		}
 		if int(size) < len(f.buffer) {
 			f.buffer = f.buffer[:size]
+			// Truncating down: the file is genuinely smaller now, so the
+			// buffer is a faithful image of the new file. Committed bytes
+			// beyond `size` are intentionally dropped on the next Flush.
+			f.dirty = true
 		} else if int(size) > len(f.buffer) {
 			newBuf := make([]byte, size)
 			copy(newBuf, f.buffer)
 			f.buffer = newBuf
+			f.dirty = true
+		} else {
+			// size == len(f.buffer): no buffer change, but the attr still
+			// applies below (mtime/ctime).
 		}
 		metaInode.Size = int64(size)
-		f.dirty = true
 		f.mu.Unlock()
 	}
 
@@ -549,6 +729,10 @@ func (h *DFSFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.
 }
 
 func (h *DFSFileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	// O_APPEND: ignore the fd's file position and write at the current end.
+	if h.append {
+		return h.file.AppendWrite(ctx, h, data)
+	}
 	return h.file.Write(ctx, h, data, off)
 }
 
