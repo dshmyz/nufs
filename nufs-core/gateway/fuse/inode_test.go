@@ -156,6 +156,72 @@ func TestDFSFile_Read_AfterFlush_ReadsFromChunkStore(t *testing.T) {
 	}
 }
 
+// TestDFSFile_Read_TruncateExtend_ServesZeros covers the hole-read path:
+// a file truncated (extended) to a nonzero size via Setattr, so its inode
+// has Size > 0 but an empty ChunkMap (no data has ever been flushed). The
+// new size range is a hole; reading within it must return zero-filled
+// bytes. This is the dead-path fix: pre-fix the fast path required
+// Size==0, and the EOF clamp (off >= Size) fires before it for Size==0, so
+// an empty-ChunkMap file with Size>0 fell through to an empty ChunkMap
+// walk and returned zero bytes instead of the hole's zeros.
+func TestDFSFile_Read_TruncateExtend_ServesZeros(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	// Extend the file to 1024 bytes with no data written (truncate-up:
+	// POSIX ftruncate to a larger size zero-fills the new range). The
+	// freshly-created file's ChunkMap is empty, so this yields the
+	// Size>0 / empty-ChunkMap hole state.
+	const holeSize = 1024
+	if errno := f.Setattr(context.Background(), nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{
+			Valid: fuse.FATTR_SIZE,
+			Size:  holeSize,
+		},
+	}, &fuse.AttrOut{}); errno != 0 {
+		t.Fatalf("Setattr truncate-extend: errno=%v", errno)
+	}
+
+	// Sanity: the inode now has the size but no chunks.
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != holeSize {
+		t.Fatalf("after truncate: Size=%d, want %d", inode.Size, holeSize)
+	}
+	if len(inode.ChunkMap) != 0 {
+		t.Fatalf("after truncate: ChunkMap len=%d, want 0", len(inode.ChunkMap))
+	}
+
+	// Read the whole hole — every byte must come back as 0x00.
+	dest := make([]byte, holeSize)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read hole: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if len(got) != holeSize {
+		t.Fatalf("Read hole: got %d bytes, want %d", len(got), holeSize)
+	}
+	for i, b := range got {
+		if b != 0 {
+			t.Fatalf("Read hole: byte[%d]=0x%02x, want 0x00", i, b)
+		}
+	}
+
+	// Reading past EOF still returns no bytes (unchanged EOF semantics).
+	rr, errno = f.Read(context.Background(), nil, make([]byte, 16), holeSize)
+	if errno != 0 {
+		t.Fatalf("Read at EOF: errno=%v", errno)
+	}
+	eof, _ := rr.Bytes(dest)
+	if len(eof) != 0 {
+		t.Fatalf("Read at EOF: got %d bytes, want 0", len(eof))
+	}
+}
+
 // ========== B2: Flush actually writes the buffer (was: only updated inode size) ==========
 
 // TestDFSFile_Flush_AllocatesChunk is the "first flush" path. After

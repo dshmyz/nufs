@@ -175,10 +175,17 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 		end = metaInode.Size
 	}
 
-	// Fast path: empty ChunkMap on a zero-size file is the freshly-
-	// created / never-flushed state. Serve zeros rather than
-	// round-tripping through every chunk. (B1 fix.)
-	if len(metaInode.ChunkMap) == 0 && metaInode.Size == 0 {
+	// Fast path: empty ChunkMap means the file has no on-disk chunks at
+	// all — every byte is a hole. This covers the freshly-created /
+	// never-flushed state and, more importantly, a truncate-extended file
+	// (Size > 0 with no data written into the new range). Serve zeros for
+	// the requested window rather than round-tripping through an empty
+	// ChunkMap and returning zero bytes. (B1 fix.)
+	//
+	// Note the Size==0 case needs no special handling: the EOF clamp above
+	// (off >= Size, i.e. off >= 0) already returns nil for it, so a
+	// zero-size file never reaches here.
+	if len(metaInode.ChunkMap) == 0 {
 		size := end - off
 		return fuse.ReadResultData(make([]byte, size)), 0
 	}
