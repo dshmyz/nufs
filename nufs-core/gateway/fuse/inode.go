@@ -367,12 +367,16 @@ func (f *DFSFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// A write at a nonzero offset that reaches beyond the current buffer
-	// needs the committed prefix loaded, or the next Flush would rebuild
-	// the file from zeros and destroy the committed [0, off) region. A
-	// write at offset 0 is a full-file overwrite — the empty buffer is the
-	// intended whole replacement, so no hydration.
-	if int(off) > 0 && !f.loaded {
+	// Hydrate the committed prefix whenever the buffer isn't loaded. This
+	// must happen for ANY write offset, including 0: a write at offset 0 is
+	// only a full-file overwrite if it covers the whole committed file. A
+	// partial off-0 overwrite (e.g. pwrite(fd, buf, 20, 0) over a 100-byte
+	// committed file on a freshly re-opened handle) replaces the head and
+	// must preserve the committed [off+len, committed) tail — otherwise the
+	// next Flush rebuilds the file from an under-faithful buffer and silently
+	// truncates/drops it. (Same-class fix; ensureHydratedLocked is a cheap
+	// no-op for a fresh/empty file, writing at 0 into one stays untouched.)
+	if !f.loaded {
 		if err := f.ensureHydratedLocked(ctx, rec); err != nil {
 			rec.IncOpError("write")
 			return 0, syscall.EIO

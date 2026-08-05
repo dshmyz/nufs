@@ -312,6 +312,74 @@ func TestDFSFile_Read_SparseCommittedChunkMap_ZeroFillsHoles(t *testing.T) {
 	}
 }
 
+// TestDFSFile_Write_PartialOverwriteZero_OnReopen_PreservesCommittedTail
+// guards a same-class data-loss hazard: a FRESH DFSFile (buffer nil,
+// loaded=false) doing a partial overwrite at offset 0 over an existing
+// committed file must NOT treat the empty buffer as a full-file overwrite.
+// Off-0 is a full overwrite only when the write covers the whole committed
+// file; a partial 0-off write replaces the head and must leave the committed
+// tail intact. Without hydration the buffer would claim loaded=true while
+// holding only [0,head), so a subsequent Read/Flush would truncate the
+// committed tail to zeros / drop it entirely.
+func TestDFSFile_Write_PartialOverwriteZero_OnReopen_PreservesCommittedTail(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+
+	// Handle 1: write a 100-byte committed file and flush it.
+	f1 := newTestFile(meta, cs, id)
+	original := bytes.Repeat([]byte("x"), 100)
+	if _, errno := f1.Write(context.Background(), nil, original, 0); errno != 0 {
+		t.Fatalf("Write (original): errno=%v", errno)
+	}
+	if errno := f1.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush (original): errno=%v", errno)
+	}
+
+	// Handle 2: a fresh DFSFile models a reopened fd — buffer nil, loaded=false.
+	f2 := newTestFile(meta, cs, id)
+	head := []byte("abcdefghij") // 10 bytes overwriting file [0,10)
+	if _, errno := f2.Write(context.Background(), nil, head, 0); errno != 0 {
+		t.Fatalf("Write (partial off=0): errno=%v", errno)
+	}
+
+	// Read through handle 2 before any flush: [0,10) is the new head, and
+	// the committed [10,100) must still be present (not zeros from a bogus
+	// loaded=true claim over an un-hydrated buffer).
+	dest := make([]byte, 100)
+	rr, errno := f2.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	want := append(append([]byte(nil), head...), original[10:]...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("partial overwrite read mismatch:\n got %q\nwant %q", got, want)
+	}
+
+	// Flush handle 2 and re-read: the file must still be 100 bytes with the
+	// new head + preserved committed tail — NOT truncated to 10 bytes.
+	if errno := f2.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush (partial): errno=%v", errno)
+	}
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != 100 {
+		t.Fatalf("after flush: Size=%d, want 100 (committed tail must be preserved)", inode.Size)
+	}
+	f3 := newTestFile(meta, cs, id)
+	dest2 := make([]byte, 100)
+	rr, errno = f3.Read(context.Background(), nil, dest2, 0)
+	if errno != 0 {
+		t.Fatalf("Read (post-flush): errno=%v", errno)
+	}
+	got2, _ := rr.Bytes(dest2)
+	if !bytes.Equal(got2, want) {
+		t.Fatalf("post-flush read mismatch:\n got %q\nwant %q", got2, want)
+	}
+}
+
 // ========== B2: Flush actually writes the buffer (was: only updated inode size) ==========
 
 // TestDFSFile_Flush_AllocatesChunk is the "first flush" path. After
