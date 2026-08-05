@@ -96,6 +96,48 @@ alive() { # pidfile
 }
 
 # ---------------------------------------------------------------------------
+# 测试结果汇总（每次运行打一个带时间戳的归档目录 + latest 软链）
+# ---------------------------------------------------------------------------
+# 结果目录（可覆盖默认 /var/log/nufs-tests；测试机可持续位置，非 /tmp）
+RESULTS_ROOT="${NUFS_RESULTS_ROOT:-/var/log/nufs-tests}"
+
+# 时间戳标签 + 建结果目录。用法:
+#   res_file=...; RES_DIR=$(result_dir "fatigue")   # -> $RESULTS_ROOT/fatigue-<ts>/
+#   result_dir 同时把 latest -> 本次目录。
+#   若 RESULTS_ROOT 不可写（如非 root 且 /var/log 受限），自动回退到
+#   $DATA_ROOT/results（数据根下，通常 /tmp 可写），保证永远有地方落证据。
+result_dir() { # tag
+  local tag="$1" ts res root="$RESULTS_ROOT"
+  if ! mkdir -p "$root" 2>/dev/null; then
+    root="$DATA_ROOT/results"
+    mkdir -p "$root" || die "无法创建结果根: $root（设 NUFS_RESULTS_ROOT 覆盖）"
+    echo "WARN: $RESULTS_ROOT 不可写，回退结果目录到 $root" >&2
+  fi
+  ts="$(date +%Y%m%d-%H%M%S)"
+  res="$root/$tag-$ts"
+  mkdir -p "$res/cluster-logs"
+  # latest 指向本次
+  rm -f "$root/$tag-latest"
+  ln -s "$(basename "$res")" "$root/$tag-latest"
+  echo "$res"
+}
+
+# 把一份日志/文件拷进结果目录（若存在）
+snapshot_file() { # src dst
+  local src="$1" dst="$2"
+  [ -f "$src" ] && cp -f "$src" "$dst" 2>/dev/null || true
+}
+
+# 快照当前集群日志到结果目录（metad/datanode/s3/fuse）
+snapshot_cluster_logs() { # res_dir
+  local res="$1"
+  snapshot_file "$METAD_LOG"     "$res/cluster-logs/metad.log"
+  snapshot_file "$DATANODE_LOG"  "$res/cluster-logs/datanode.log"
+  snapshot_file "$S3_LOG"        "$res/cluster-logs/nufs-s3.log"
+  snapshot_file "$FUSE_LOG"      "$res/cluster-logs/nufs-fuse.log"
+}
+
+# ---------------------------------------------------------------------------
 # 编译（裸机需要所有 4 个二进制）
 # ---------------------------------------------------------------------------
 host_build() {
