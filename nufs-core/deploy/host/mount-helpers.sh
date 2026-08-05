@@ -27,11 +27,18 @@ _hh_src="${BASH_SOURCE[0]:-$0}"
 HH_DIR="$(cd "$(dirname "$_hh_src")/../.." && pwd)"
 BIN_DIR="${NUFS_BIN_DIR:-$HH_DIR/bin}"
 
-# 各服务二进制
+# 各服务二进制。nufs-fuse 的默认路径与 /sbin/mount.nufs（标准 mount -t nufs，
+# 找 /usr/local/bin/nufs-fuse）对齐：发布安装（deploy/install.sh / make install /
+# make deploy）落到 /usr/local/bin，host 测试优先用已安装的，回退到仓库 bin/。
 METAD_BIN="${NUFS_METAD_BIN:-$BIN_DIR/metad}"
 DATANODE_BIN="${NUFS_DATANODE_BIN:-$BIN_DIR/datanode}"
 S3_BIN="${NUFS_S3_BIN:-$BIN_DIR/nufs-s3}"
-FUSE_BIN="${NUFS_FUSE_BIN:-$BIN_DIR/nufs-fuse}"
+# 默认取已安装路径 /usr/local/bin/nufs-fuse（与 mount.nufs 一致）；不存在则回退 bin/
+if [ -x /usr/local/bin/nufs-fuse ]; then
+  FUSE_BIN="${NUFS_FUSE_BIN:-/usr/local/bin/nufs-fuse}"
+else
+  FUSE_BIN="${NUFS_FUSE_BIN:-$BIN_DIR/nufs-fuse}"
+fi
 
 # 数据目录（默认放在 /tmp 下，裸机测试不污染系统盘；可用 NUFS_DATA_ROOT 覆盖）
 DATA_ROOT="${NUFS_DATA_ROOT:-/tmp/nufs-host}"
@@ -53,6 +60,16 @@ S3_HEALTH="${NUFS_S3_HEALTH:-http://localhost:8081/healthz}"
 
 # FUSE
 MOUNTPOINT="${NUFS_MOUNTPOINT:-/mnt/nufs-fuse}"
+# 标准 mount helper /sbin/mount.nufs（若装了）。host_mount 优先走它，让测试路径与
+# `mount -t nufs` 共享同一套挂载实现；未安装时回退到 host_mount 内联拉起 daemon。
+# 可用 NUFS_MOUNT_NUFS 显式指定（如非 root 环境放 /tmp/mount.nufs 也能用）。
+MOUNT_NUFS="${NUFS_MOUNT_NUFS:-}"
+if [ -z "$MOUNT_NUFS" ] && command -v mount.nufs >/dev/null 2>&1; then
+  MOUNT_NUFS="$(command -v mount.nufs)"
+fi
+if [ -z "$MOUNT_NUFS" ] && [ -x /sbin/mount.nufs ]; then
+  MOUNT_NUFS=/sbin/mount.nufs
+fi
 
 # 日志目录
 LOG_DIR="${NUFS_LOG_DIR:-$DATA_ROOT/log}"
@@ -311,9 +328,28 @@ host_sample_mem_mib() { # pidfile -> MiB（int），失败打印 -1
 host_mount() { # [mountpoint]
   local mp="${1:-$MOUNTPOINT}"
   command -v "$FUSE_BIN" >/dev/null 2>&1 || [ -x "$FUSE_BIN" ] || die "nufs-fuse not found: $FUSE_BIN"
-  mkdir -p "$mp"
+  mkdir -p "$mp" "$PID_DIR"
   fusermount -u "$mp" 2>/dev/null || true
   : > "$FUSE_LOG"
+
+  # 优先走标准 mount helper（/sbin/mount.nufs），让测试路径与 `mount -t nufs`
+  # 共享同一套挂载实现（参数翻译 + 防重复 + 30s 就绪等待）。未安装则回退内联拉起。
+  if [ -n "$MOUNT_NUFS" ] && [ -x "$MOUNT_NUFS" ]; then
+    # 把 daemon 日志指到 host 的 $FUSE_LOG（供结果归档），pid 写到 host 的 $PID_DIR
+    if NUFS_FUSE_BIN="$FUSE_BIN" NUFS_PID_DIR="$PID_DIR" NUFS_FUSE_LOG="$FUSE_LOG" \
+        "$MOUNT_NUFS" none "$mp" -o meta=localhost:8091,metrics=:9901,log=info; then
+      # mount.nufs 已等内核挂载就绪；把 daemon pid 登记进 $FUSE_PID 供 alive/host_stop_one
+      [ -f "$PID_DIR/nufs.pid" ] && cp -f "$PID_DIR/nufs.pid" "$FUSE_PID"
+      log "mounted at $mp (via $MOUNT_NUFS, fuse pid=$(cat "$FUSE_PID" 2>/dev/null))"
+      return 0
+    else
+      log "FAIL: mount.nufs 挂载失败（log: $FUSE_LOG）"
+      tail -40 "$FUSE_LOG" >&2 || tail -40 /tmp/nufs.log >&2 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  # 回退：内联拉起 daemon（mount.nufs 未安装时）
   "$FUSE_BIN" --backend=nufs --meta-addr=localhost:8091 \
     --dfs-metrics-addr=:9901 --log-level=info "$mp" > "$FUSE_LOG" 2>&1 &
   echo $! > "$FUSE_PID"

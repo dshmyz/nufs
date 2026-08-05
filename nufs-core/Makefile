@@ -1,4 +1,4 @@
-.PHONY: build test vet clean docker docker-up docker-down fmt lint help test-storage-p0 test-storage-crash install install-mount-helper
+.PHONY: build test vet clean docker docker-up docker-down fmt lint help test-storage-p0 test-storage-crash install install-mount-helper deploy
 
 # Binary output directory
 BIN_DIR := bin
@@ -97,6 +97,10 @@ install-mount-helper: ## Install mount helper to /sbin (root): enables `mount -t
 	@echo "installed: /sbin/mount.nufs"
 	@echo "用法:  mount -t nufs none /mnt/nufs-fuse [-o meta=host:port,log=level]"
 	@echo "       umount /mnt/nufs-fuse"
+
+deploy: ## One-click: install binaries + mount helper (root). Wraps deploy/install.sh
+	@[ "$$(id -u)" -eq 0 ] || { echo "需要 root:  sudo make deploy  (或 sudo ./deploy/install.sh)"; exit 1; }
+	@./deploy/install.sh
 
 tidy: ## Run go mod tidy
 	go mod tidy
