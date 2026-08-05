@@ -860,6 +860,24 @@ func (s *PebbleStore) getJSON(key string, v interface{}) (bool, error) {
 	return s.getValue(key, v)
 }
 
+// getRawBytes returns the current raw bytes stored at key, or (nil, false)
+// when absent. Unlike getValue it does not decode; it returns the exact on-disk
+// value so callers can use it as a CAS ExpectedValue for a conditional batch
+// (the precondition compares raw bytes).
+func (s *PebbleStore) getRawBytes(key string) ([]byte, bool, error) {
+	val, closer, err := s.db.Get([]byte(key))
+	if err == pebble.ErrNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("pebble store: get %q: %w", key, err)
+	}
+	defer closer.Close()
+	data := make([]byte, len(val))
+	copy(data, val)
+	return data, true, nil
+}
+
 // getValuesBatch fetches multiple keys in a single pass using a
 // Pebble iterator. It returns a map of key → raw value bytes for
 // all keys that exist. This avoids N independent Get calls (each
@@ -1239,16 +1257,19 @@ func (s *PebbleStore) GetBucketByRoot(ctx context.Context, rootInode InodeID) (*
 // ========== NamespaceService Implementation ==========
 
 // applyNamespaceConditional atomically applies a namespace-mutation batch
-// (e.g. MkDir/CreateFile/Link/Symlink) guarded by an nsKey existence
-// precondition. It fixes the non-atomic check-then-insert race in those
-// paths: two concurrent same-name creates both passed getJSON(nsKey), both
-// persisted distinct inodes, and the loser became an orphan inode with the
-// parent NLink increment lost. Reusing OpConditionalBatch (via
-// applyConditionalBatchWithHook, which is choke-point-generic) makes the
-// existence check and the inode/nsKey/NLink mutations atomic in one step:
-// the winner commits, the loser maps ErrRaftConditionalConflict to
-// ErrEntryExists.
-func (s *PebbleStore) applyNamespaceConditional(ctx context.Context, conditional *ConditionalBatch) error {
+// guarded by an nsKey precondition, returning conflictErr when the
+// precondition fails. It is used by both the create paths (ExpectAbsent →
+// concurrent same-name create maps to ErrEntryExists) and the delete paths
+// (CAS-on-value → concurrent same-name delete maps to ErrEntryNotFound).
+//
+// It fixes the non-atomic check-then-act race that both create and delete
+// paths shared: two concurrent same-name operations both passed the plain
+// getJSON(nsKey) check and both applied their mutations. Reusing
+// OpConditionalBatch (via applyConditionalBatchWithHook, which is
+// choke-point-generic) makes the check and the inode/nsKey/NLink mutations
+// atomic in one step: the winner commits, the loser maps
+// ErrRaftConditionalConflict to conflictErr.
+func (s *PebbleStore) applyNamespaceConditional(ctx context.Context, conditional *ConditionalBatch, conflictErr error) error {
 	if s.degradation.IsReadOnly() {
 		return ErrServiceClosed
 	}
@@ -1256,15 +1277,17 @@ func (s *PebbleStore) applyNamespaceConditional(ctx context.Context, conditional
 	if s.raft != nil {
 		err = s.raft.applyConditionalAccepted(ctx, &RaftLogEntry{Op: OpConditionalBatch, Conditional: conditional}, 10*time.Second)
 	} else {
+		// Direct (non-raft) path mirrors applyBatchViaRaft: we do NOT gate the
+		// commit on ctx cancellation. Recovery/cleanup writers (e.g. the S3
+		// write-attempt recovery worker) rely on the write committing even when
+		// a task context was canceled — ctx here only bounds raft waiting, not
+		// whether the single-node batch is applied.
 		s.mu.Lock()
-		err = ctx.Err()
-		if err == nil {
-			err = applyConditionalBatchWithHook(s.db, conditional, pebble.Sync, s.conditionalBatchBeforeCommit)
-		}
+		err = applyConditionalBatchWithHook(s.db, conditional, pebble.Sync, s.conditionalBatchBeforeCommit)
 		s.mu.Unlock()
 	}
 	if errors.Is(err, ErrRaftConditionalConflict) {
-		return ErrEntryExists
+		return conflictErr
 	}
 	return err
 }
@@ -1275,7 +1298,17 @@ func (s *PebbleStore) applyNamespaceConditional(ctx context.Context, conditional
 // set is never applied, so no orphan inode is persisted and the parent NLink
 // update is not partially lost.
 func buildNamespaceConditional(nsKey string, ops []batchOp) (*ConditionalBatch, error) {
-	mutations := make([]BatchOp, 0, len(ops))
+	return buildNamespaceConditionalOps(nsKey, ops, nil, nil)
+}
+
+// buildNamespaceConditionalOps is the general form: it encodes the mutations
+// and (optionally) raw deletes, and attaches a single precondition on nsKey.
+// When preCmp is ExpectAbsent the check is absence (create semantics); when
+// preCmp specifies an ExpectedValue it is a compare-and-swap on the nsKey's
+// current bytes (delete semantics). The precondition keys are caller-owned
+// and must be sorted before commit (canonicalConditionalBatch sorts them).
+func buildNamespaceConditionalOps(nsKey string, ops []batchOp, deletes []string, pre *ConditionalPrecondition) (*ConditionalBatch, error) {
+	mutations := make([]BatchOp, 0, len(ops)+len(deletes))
 	for _, op := range ops {
 		data, err := marshalValue(op.Value, codecMsgpack)
 		if err != nil {
@@ -1283,12 +1316,16 @@ func buildNamespaceConditional(nsKey string, ops []batchOp) (*ConditionalBatch, 
 		}
 		mutations = append(mutations, BatchOp{Key: []byte(op.Key), Value: data})
 	}
+	for _, del := range deletes {
+		mutations = append(mutations, BatchOp{Key: []byte(del), Delete: true})
+	}
+	if pre == nil {
+		pre = &ConditionalPrecondition{Key: []byte(nsKey), ExpectAbsent: true}
+	}
 	return &ConditionalBatch{
-		Version: conditionalBatchVersion,
-		Preconditions: []ConditionalPrecondition{
-			{Key: []byte(nsKey), ExpectAbsent: true},
-		},
-		Mutations: mutations,
+		Version:      conditionalBatchVersion,
+		Preconditions: []ConditionalPrecondition{*pre},
+		Mutations:    mutations,
 	}, nil
 }
 
@@ -1341,7 +1378,7 @@ func (s *PebbleStore) MkDir(ctx context.Context, parent InodeID, name string, mo
 	if err != nil {
 		return nil, err
 	}
-	if err := s.applyNamespaceConditional(ctx, conditional); err != nil {
+	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
 		return nil, err
 	}
 	return meta, nil
@@ -1383,20 +1420,37 @@ func (s *PebbleStore) RmDir(ctx context.Context, parent InodeID, name string) er
 	// Update parent nlink
 	var parentMeta InodeMeta
 	parentKey := fmt.Sprintf("%s%d", prefixInode, parent)
+	var ops []batchOp
 	pExists, _ := s.getJSON(parentKey, &parentMeta)
 	if pExists {
 		parentMeta.MTime = time.Now().UnixNano()
 		if parentMeta.NLink > 0 {
 			parentMeta.NLink--
 		}
-		ops := []batchOp{
-			{Key: parentKey, Value: &parentMeta},
-		}
-		s.releaseInodeID(entry.InodeID)
-		return s.applyBatchMsgpack(ops, deletes)
+		ops = append(ops, batchOp{Key: parentKey, Value: &parentMeta})
+	}
+
+	// Atomically delete the entry + inode + parent-NLink. The precondition is a
+	// compare-and-swap on nsKey's exact current bytes: if a concurrent
+	// create/delete/overwrite of this name committed since we read it, the CAS
+	// conflicts and we do NOT apply (mapping to ErrEntryNotFound) — preventing a
+	// double NLink-- and a double releaseInodeID here and in Unlink.
+	nsRaw, _, err := s.getRawBytes(nsKey)
+	if err != nil {
+		return err
+	}
+	conditional, err := buildNamespaceConditionalOps(nsKey, ops, deletes, &ConditionalPrecondition{
+		Key:           []byte(nsKey),
+		ExpectedValue: nsRaw,
+	})
+	if err != nil {
+		return err
+	}
+	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryNotFound); err != nil {
+		return err
 	}
 	s.releaseInodeID(entry.InodeID)
-	return s.applyBatchMsgpack(nil, deletes)
+	return nil
 }
 
 func (s *PebbleStore) ReadDir(ctx context.Context, parent InodeID, offset int, limit int) ([]DirEntry, error) {
@@ -1555,7 +1609,7 @@ func (s *PebbleStore) CreateFile(ctx context.Context, parent InodeID, name strin
 	if err != nil {
 		return nil, err
 	}
-	if err := s.applyNamespaceConditional(ctx, conditional); err != nil {
+	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
 		return nil, err
 	}
 	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", inodeID)})
@@ -1582,22 +1636,43 @@ func (s *PebbleStore) Unlink(ctx context.Context, parent InodeID, name string) e
 	var meta InodeMeta
 	inodeKey := fmt.Sprintf("%s%d", prefixInode, entry.InodeID)
 	pExists, _ := s.getJSON(inodeKey, &meta)
-	ops := []batchOp{}
+	var ops []batchOp
 	deletes := []string{nsKey}
 
+	var deleteInode bool
 	if pExists {
 		meta.NLink--
 		meta.MTime = time.Now().UnixNano()
 		if meta.NLink <= 0 {
 			s.addBucketStatsOp(meta.BucketRoot, -meta.Size, -1, &ops)
 			deletes = append(deletes, inodeKey)
-			s.releaseInodeID(meta.ID)
+			deleteInode = true
 		} else {
 			ops = append(ops, batchOp{Key: inodeKey, Value: &meta})
 		}
 	}
-	if err := s.applyBatchMsgpack(ops, deletes); err != nil {
+
+	// Atomically unlink the entry (+ inode, -NLink, bucket stats). The
+	// precondition CASes on nsKey's exact current bytes: if a concurrent
+	// create/delete/overwrite of this name committed since we read it, the CAS
+	// conflicts and nothing applies (mapped to ErrEntryNotFound) — no double
+	// NLink--, no double releaseInodeID.
+	nsRaw, _, err := s.getRawBytes(nsKey)
+	if err != nil {
 		return err
+	}
+	conditional, err := buildNamespaceConditionalOps(nsKey, ops, deletes, &ConditionalPrecondition{
+		Key:           []byte(nsKey),
+		ExpectedValue: nsRaw,
+	})
+	if err != nil {
+		return err
+	}
+	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryNotFound); err != nil {
+		return err
+	}
+	if deleteInode {
+		s.releaseInodeID(meta.ID)
 	}
 	// Invalidate cache for the deleted inode (or updated if still live)
 	s.inCache.del(entry.InodeID)
@@ -1835,7 +1910,7 @@ func (s *PebbleStore) Symlink(ctx context.Context, parent InodeID, name string, 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.applyNamespaceConditional(ctx, conditional); err != nil {
+	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
 		return nil, err
 	}
 	return meta, nil
@@ -1891,7 +1966,7 @@ func (s *PebbleStore) Link(ctx context.Context, parent InodeID, name string, tar
 	if err != nil {
 		return nil, err
 	}
-	if err := s.applyNamespaceConditional(ctx, conditional); err != nil {
+	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
 		return nil, err
 	}
 	return &meta, nil
@@ -2317,7 +2392,7 @@ func (s *PebbleStore) CreateObjectWithChunks(ctx context.Context, parent InodeID
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := s.applyNamespaceConditional(ctx, conditional); err != nil {
+	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
 		return nil, nil, err
 	}
 

@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -101,6 +102,52 @@ func TestRaftClusterConcurrentSameNameMkDir(t *testing.T) {
 	}
 	if parentMeta.NLink != 3 {
 		t.Fatalf("parent NLink = %d, want 3 (no lost/double update)", parentMeta.NLink)
+	}
+}
+
+// TestRaftClusterConcurrentSameNameUnlink verifies the distributed (Raft)
+// path of atomic namespace deletion: concurrent same-name Unlink through the
+// leader must yield exactly one winner and ErrEntryNotFound for every loser,
+// with no NLink double-decrement. This is the multi-node counterpart of
+// TestPebbleStore_ConcurrentSameNameUnlink and guards the CAS-on-value
+// precondition against concurrent same-name deletes in a distributed scenario.
+func TestRaftClusterConcurrentSameNameUnlink(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real raft integration test")
+	}
+
+	cluster := startRealRaftTestCluster(t, 3)
+	defer cluster.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	_ = cluster.CreateBucketOnLeader(t, ctx, "fs", PlacementPolicy{ReplicationFactor: 2})
+	leader := cluster.WaitForLeader(t, ctx)
+	bucket, err := leader.Store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	parent := bucket.RootInode
+	if _, err := leader.Store.CreateFile(ctx, parent, "race-file.txt", 0644); err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+	// Wait until the replica is committed on followers before racing the deletes.
+	cluster.WaitForBucketOnFollowers(t, ctx, leader.ID, "fs")
+
+	runConcurrentSameNameDelete(t, func() error {
+		return leader.Store.Unlink(ctx, parent, "race-file.txt")
+	})
+
+	if _, err := leader.Store.Lookup(ctx, parent, "race-file.txt"); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("Lookup after unlink = %v, want ErrEntryNotFound", err)
+	}
+	parentMeta, err := leader.Store.GetInode(ctx, parent)
+	if err != nil {
+		t.Fatalf("GetInode(parent): %v", err)
+	}
+	if parentMeta.NLink != 2 {
+		t.Fatalf("parent NLink = %d, want 2 (no double-decrement)", parentMeta.NLink)
 	}
 }
 

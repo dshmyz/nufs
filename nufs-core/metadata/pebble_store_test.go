@@ -3,6 +3,7 @@ package metadata
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -630,6 +631,117 @@ func TestPebbleStore_ConcurrentSameNameCreateFile(t *testing.T) {
 	}
 	if len(usage) != 1 || usage[0].Objects != 1 {
 		t.Fatalf("bucket usage = %+v, want exactly 1 object", usage)
+	}
+}
+
+// runConcurrentSameNameDelete fans out `n` goroutines all deleting the same
+// name under the same parent, then asserts the atomic namespace-delete
+// invariant: exactly one goroutine succeeds and every other gets
+// ErrEntryNotFound (a concurrent create/delete/overwrite won the CAS), and
+// the entry is gone afterwards. The delete closure returns the tracked error
+// from RmDir/Unlink. This exercises the CAS-on-value precondition of the
+// delete path — the pre-CAS code had both goroutines pass the getJSON check
+// and both decrement the parent/inode NLink (a double-decrement / underflow).
+func runConcurrentSameNameDelete(t *testing.T, del func() error) {
+	t.Helper()
+	const n = 32
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = del()
+		}(i)
+	}
+	wg.Wait()
+
+	var succeeded, notFound int
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case err == ErrEntryNotFound:
+			notFound++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("expected exactly 1 successful delete, got %d (notFound=%d)", succeeded, notFound)
+	}
+	if notFound != n-1 {
+		t.Fatalf("expected %d ErrEntryNotFound conflicts, got %d", n-1, notFound)
+	}
+}
+
+// TestPebbleStore_ConcurrentSameNameUnlink verifies that concurrent same-name
+// Unlink is atomic: one unlink succeeds, the rest conflict with
+// ErrEntryNotFound, and the inode NLink is decremented exactly once (the
+// pre-CAS code could double-decrement NLink / double-release the inode ID).
+func TestPebbleStore_ConcurrentSameNameUnlink(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+	if err := store.CreateBucket(ctx, "fs", PlacementPolicy{}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	parent := bucket.RootInode
+	if _, err := store.CreateFile(ctx, parent, "race-file.txt", 0644); err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+
+	runConcurrentSameNameDelete(t, func() error {
+		return store.Unlink(ctx, parent, "race-file.txt")
+	})
+
+	// Entry is gone.
+	if _, err := store.Lookup(ctx, parent, "race-file.txt"); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("Lookup after unlink = %v, want ErrEntryNotFound", err)
+	}
+	// Parent NLink is back to its pre-child value (2 for a bucket root dir),
+	// not underflowed by concurrent double-decrements.
+	parentMeta, err := store.GetInode(ctx, parent)
+	if err != nil {
+		t.Fatalf("GetInode(parent): %v", err)
+	}
+	if parentMeta.NLink != 2 {
+		t.Fatalf("parent NLink = %d, want 2 (double-decrement would give 1 or 0)", parentMeta.NLink)
+	}
+}
+
+// TestPebbleStore_ConcurrentSameNameRmDir mirrors the Unlink race for RmDir.
+func TestPebbleStore_ConcurrentSameNameRmDir(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+	if err := store.CreateBucket(ctx, "fs", PlacementPolicy{}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	parent := bucket.RootInode
+	if _, err := store.MkDir(ctx, parent, "race-dir", 0755); err != nil {
+		t.Fatalf("MkDir: %v", err)
+	}
+
+	runConcurrentSameNameDelete(t, func() error {
+		return store.RmDir(ctx, parent, "race-dir")
+	})
+
+	if _, err := store.Lookup(ctx, parent, "race-dir"); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("Lookup after rmdir = %v, want ErrEntryNotFound", err)
+	}
+	parentMeta, err := store.GetInode(ctx, parent)
+	if err != nil {
+		t.Fatalf("GetInode(parent): %v", err)
+	}
+	if parentMeta.NLink != 2 {
+		t.Fatalf("parent NLink = %d, want 2 (no double-decrement)", parentMeta.NLink)
 	}
 }
 
