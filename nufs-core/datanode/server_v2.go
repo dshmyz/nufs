@@ -89,8 +89,8 @@ type V2Store struct {
 	// updates both mutate them; reads take RLock.
 	mu    sync.RWMutex
 	locOf map[metadata.ChunkID]chunkLoc
-	// drainMu is the write-drain barrier (V1-b, DrainOps parity). Every write
-	// primitive takes drainMu.RLock for its duration; DrainWrites takes
+	// drainMu is the write-drain barrier (V1-b, §4 parity). Every write
+	// primitive takes drainMu.RLock for its duration; QuiesceWrites takes
 	// drainMu.Lock() to quiesce in-flight writes and block new ones, then
 	// returns a release func that Unlock()s to resume. It is a separate
 	// mutex from mu so writes are drained WITHOUT blocking concurrent reads
@@ -98,7 +98,6 @@ type V2Store struct {
 	// serving reads; after release it accepts writes again (non-destructive,
 	// unlike close which sets closing permanently).
 	drainMu sync.RWMutex
-	// shardDiskOf records, per EC chunk and per shard index, which shard store
 	// shardDiskOf records, per EC chunk and per shard index, which shard store
 	// disk hosts that shard extent, so ReadShard/DeleteShard route to the disk
 	// that wrote it. E3 spreads the 6+3 shards across distinct shard disks (disk
@@ -109,6 +108,19 @@ type V2Store struct {
 	// stateVersion increments on every durable state change (write or
 	// delete), so the heartbeat's incremental delta diff can detect change.
 	stateVersion atomic.Uint64
+
+	// Proactive disk-health monitor (§4, V1-c). The loop periodically probes
+	// each data backend's responsiveness (a non-intrusive Stat) and drives
+	// failCount upward on probe failure, so an idle or read-wedged disk
+	// escalates to degraded/failed even without write traffic. Recovery is
+	// write-path only: probe success never lowers failCount. diskMu guards
+	// the run/stop lifecycle (Start/Stop are idempotent); diskStop signals
+	// the loop to exit; diskWG joins it on Stop.
+	diskStop     chan struct{}
+	diskWG       sync.WaitGroup
+	diskMu       sync.Mutex
+	diskRun      bool
+	diskInterval time.Duration // probe cadence; <=0 falls back to diskHealthDefaultInterval
 }
 
 // NewV2Store wraps a single backend (legacy/plain single-disk use). An
@@ -1109,6 +1121,99 @@ func (v *V2Store) diskFailed(i int) bool {
 	return v.diskState(i) == DiskFailed
 }
 
+// diskHealthDefaultInterval is how often the proactive monitor probes each
+// data backend. It is behind StartDiskMonitor, so an operator can leave it
+// off; when on, a responsive disk is never penalized (see probeDisk).
+const diskHealthDefaultInterval = 30 * time.Second
+
+// StartDiskMonitor begins the proactive per-disk I/O health probe loop
+// (§4 V1-c). On each tick it probes every DATA backend (v.disks; EC shard
+// stores have their own self-heal path and are intentionally not probed
+// here) and escalates failCount on real I/O failure.
+//
+// This is the "monitor-only + write-path recovery" policy the user selected:
+//   - probe failure -> failCount++ -> diskState pushes the disk to
+//     degraded/failed, so a read-wedged or idle disk that never gets writes
+//     still escalates;
+//   - probe success -> NOTHING (failCount is never lowered); only a real
+//     write via writeTo (failCount.Store(0)) recovers a disk.
+//
+// StartDiskMonitor is idempotent: a second call while running is a no-op. The
+// loop exits on ctx.Done() or StopDiskMonitor. If v.diskInterval is zero the
+// default 30s cadence is used (tests can shrink it to drive ticks quickly).
+func (v *V2Store) StartDiskMonitor(ctx context.Context) {
+	v.diskMu.Lock()
+	defer v.diskMu.Unlock()
+	if v.diskRun {
+		return
+	}
+	v.diskRun = true
+	stopCh := make(chan struct{})
+	v.diskStop = stopCh
+
+	interval := v.diskInterval
+	if interval <= 0 {
+		interval = diskHealthDefaultInterval
+	}
+	ticker := time.NewTicker(interval)
+	v.diskWG.Add(1)
+	go func(stop <-chan struct{}) {
+		defer v.diskWG.Done()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				for i := range v.disks {
+					v.probeDisk(i)
+				}
+			}
+		}
+	}(stopCh)
+}
+
+// StopDiskMonitor stops the proactive probe loop and joins it. Safe to call
+// repeatedly; returns without blocking if the monitor was never started.
+func (v *V2Store) StopDiskMonitor() {
+	v.diskMu.Lock()
+	if !v.diskRun {
+		v.diskMu.Unlock()
+		return
+	}
+	v.diskRun = false
+	stopCh := v.diskStop
+	v.diskStop = nil
+	v.diskMu.Unlock()
+
+	if stopCh != nil {
+		close(stopCh)
+	}
+	v.diskWG.Wait()
+}
+
+// probeDisk performs a non-intrusive responsiveness check on one data
+// backend. It treats err==nil and storage.ErrExtentNotFound as RESPONSIVE
+// (the probe extent never exists, so a healthy store returns
+// ErrExtentNotFound — a responsive, non-error signal); any other error is a
+// real I/O failure and increments failCount, driving diskState toward
+// degraded/failed. probeDisk never decrements failCount — recovery is
+// write-path only (writeTo success -> Store(0)).
+func (v *V2Store) probeDisk(i int) {
+	b := v.disks[i]
+	probe := &storage.StatRequest{ExtentID: storage.ExtentID(0x7fffffffffffffff), Generation: 1}
+	_, err := b.store.Stat(context.Background(), probe)
+	if err == nil {
+		return
+	}
+	if errors.Is(err, storage.ErrExtentNotFound) {
+		return
+	}
+	b.failCount.Add(1)
+}
+
 // WriteErrorRate returns the aggregate write error rate (0.0-1.0) across
 // all disks, as a rolling window since the last call. Like the legacy
 // ChunkStore, the per-disk write-op/error counters are reset (Swap'd to 0)
@@ -1127,16 +1232,20 @@ func (v *V2Store) WriteErrorRate() float64 {
 	return float64(errs) / float64(ops)
 }
 
-// DrainWrites quiesces in-flight writes and blocks new ones until the
-// returned release func is called, satisfying the DrainOps structural
-// interface (this is what lights up POST /drain in the ops channel). It
-// takes drainMu.Lock(), which blocks until every in-flight write
-// (writeTo/writeShardAt/RebalanceOne — all hold drainMu.RLock for their
-// duration) has completed, then blocks all new writes. The returned release
-// func resumes writes; reads are never blocked (they do not take drainMu),
-// so a drained store continues serving reads. A ctx timeout returns
-// ctx.Err with no release func and no barrier held.
-func (v *V2Store) DrainWrites(ctx context.Context) (func(), error) {
+// QuiesceWrites is the V2.1-internal write-drain barrier: it blocks until
+// every in-flight write (writeTo/writeShardAt/RebalanceOne — all hold
+// drainMu.RLock for their duration) has completed, then blocks all new
+// writes. The returned release func resumes writes; reads are never blocked
+// (they do not take drainMu), so a drained store continues serving reads. A
+// ctx timeout returns ctx.Err with no release func and no barrier held.
+//
+// This is the §4 ("DrainWrites parity") graceful-shutdown path called by
+// runDataNodeV21 before closing the stores. It is deliberately NOT named
+// DrainWrites so V2Store does not structurally satisfy the DrainOps
+// capability interface: the management/ops channel therefore keeps reporting
+// "drain unsupported by this engine" for V2.1 (option A), even though the
+// internal shutdown barrier is real.
+func (v *V2Store) QuiesceWrites(ctx context.Context) (func(), error) {
 	acquired := make(chan struct{})
 	// release is idempotent so the success path and the timeout self-heal can
 	// both call it without risk of a double-unlock.

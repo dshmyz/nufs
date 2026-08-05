@@ -169,10 +169,11 @@ func TestV2StoreWriteErrorRateAndInterface(t *testing.T) {
 	var _ HeartbeatStore = v
 }
 
-// TestV2StoreDrainWrites verifies the DrainOps write barrier: DrainWrites
-// blocks until an in-flight write completes, then blocks new writes until
-// the returned release func is called, after which writes resume. Reads are
-// never blocked by a drain (they do not take drainMu).
+// TestV2StoreDrainWrites verifies the V2.1-internal write barrier
+// (QuiesceWrites — the §4 shutdown drain): it blocks until an in-flight
+// write completes, then blocks new writes until the returned release func is
+// called, after which writes resume. Reads are never blocked by a drain
+// (they do not take drainMu).
 func TestV2StoreDrainWrites(t *testing.T) {
 	v, _ := newTestMultiStore(t, 2)
 
@@ -182,7 +183,7 @@ func TestV2StoreDrainWrites(t *testing.T) {
 
 	drainDone := make(chan func(), 1)
 	go func() {
-		release, err := v.DrainWrites(context.Background())
+		release, err := v.QuiesceWrites(context.Background())
 		if err != nil {
 			t.Errorf("DrainWrites: %v", err)
 			close(drainDone)
@@ -239,7 +240,7 @@ func TestV2StoreDrainWrites(t *testing.T) {
 }
 
 // TestV2StoreDrainWritesTimeoutSelfHeals verifies the timeout path of the
-// drain barrier: when DrainWrites cannot acquire the barrier before its
+// drain barrier: when QuiesceWrites cannot acquire the barrier before its
 // deadline, it returns the deadline error and the store self-heals (the
 // barrier is not leaked), so writes resume once the in-flight write clears.
 func TestV2StoreDrainWritesTimeoutSelfHeals(t *testing.T) {
@@ -250,7 +251,7 @@ func TestV2StoreDrainWritesTimeoutSelfHeals(t *testing.T) {
 	v.drainMu.RLock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	release, err := v.DrainWrites(ctx)
+	release, err := v.QuiesceWrites(ctx)
 	if err == nil {
 		if release != nil {
 			release()

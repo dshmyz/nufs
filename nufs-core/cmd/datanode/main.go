@@ -702,6 +702,14 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	healer.SetOrphanResolver(metaStore, datanode.EcOrphanDefaultAge)
 	healer.Start(ctx)
 
+	// Program 8 / §4 V1-c: proactive per-disk I/O health monitor. Start it
+	// alongside the other background machinery so an idle or read-wedged disk
+	// (one that never gets writes and so never trips the reactive failCount in
+	// writeTo) still escalates to degraded/failed via periodic Stat probes.
+	// Recovery stays write-path only (a real write clears the streak); probe
+	// success never un-fails a disk. Stopped right before closeStores below.
+	v2Store.StartDiskMonitor(ctx)
+
 	if err := opsServer.Start(); err != nil {
 		log.Error("failed to start ops HTTP server", "error", err)
 		closeStores()
@@ -736,10 +744,12 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	replicator.Stop()
 	heartbeat.Stop()
 	healer.Stop()
-	// Drain in-flight writes before closing the stores (mirrors the V1
-	// shutdown Phase 3). The barrier quiesces writes without blocking reads.
+	// Stop the proactive disk monitor FIRST (it probes the stores), then drain
+	// in-flight writes before closing the stores (mirrors the V1 shutdown
+	// Phase 3). The barrier quiesces writes without blocking reads.
+	v2Store.StopDiskMonitor()
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	releaseDrain, err := v2Store.DrainWrites(drainCtx)
+	releaseDrain, err := v2Store.QuiesceWrites(drainCtx)
 	if err != nil {
 		log.Warn("drain timeout, some writes may be in-flight", "error", err)
 	} else {

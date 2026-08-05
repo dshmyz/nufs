@@ -39,7 +39,11 @@ type DiskLifecycleOps interface {
 }
 
 // DrainOps is the optional graceful-shutdown drain capability (V1 ChunkStore
-// has it; V2.1 V2Store defers shutdown ordering to runDataNodeV21).
+// has it). V2.1 does NOT advertise it to the ops channel: V2Store's internal
+// shutdown barrier is named QuiesceWrites (not DrainWrites), so it does not
+// structurally satisfy DrainOps and the management/ops channel keeps
+// returning "drain unsupported by this engine" for V2.1 (option A), even
+// though the internal §4 shutdown drain is real and wired in runDataNodeV21.
 type DrainOps interface {
 	DrainWrites(ctx context.Context) (func(), error)
 }
@@ -48,10 +52,7 @@ type DrainOps interface {
 var _ OpsStore = (*ChunkStore)(nil)
 var _ OpsStore = (*V2Store)(nil)
 
-// Compile-time: only the legacy ChunkStore exposes disk-lifecycle / drain
-// capabilities (V2.1 gates them out until Metadata V2 serving lands).
+// Compile-time: only the legacy ChunkStore exposes the disk-lifecycle and
+// drain capabilities. V2.1 gates both out of the management/ops channel.
 var _ DiskLifecycleOps = (*ChunkStore)(nil)
 var _ DrainOps = (*ChunkStore)(nil)
-// The V2.1 V2Store implements the drain capability too (its drainMu write
-// barrier quiesces writes without blocking reads), lighting up POST /drain.
-var _ DrainOps = (*V2Store)(nil)
