@@ -1,0 +1,176 @@
+#!/bin/sh
+#
+# NUFS FUSE mount helper /sbin/mount.nufs
+#
+# 让 NUFS DFS 可以用标准 mount(8) 语法挂载，并支持写入 /etc/fstab：
+#
+#   mount -t nufs <source> <mountpoint> [-o <options>]
+#   umount  <mountpoint>
+#
+# 语义对齐 Linux mount.<fstype> helper 约定：mount(8) 遇到未知类型
+# "nufs" 时会去执行 /sbin/mount.<type> = 本脚本，并传
+#   $1 = <source>（抽象标识；NUFS 无块设备，这里只作配置来源/标签）
+#   $2 = <mountpoint>
+#   -o <options> 在后方。
+#
+# 由于 NUFS 是分布式文件系统、"挂载源"没有磁盘语义，source 仅从两个地方取配置：
+#   1) -o 选项里的 NUFS 专属键（meta=host:port, metrics=addr, log=level）→ 优先级最高
+#   2) 环境变量 NUFS_META_ADDR / NUFS_DFS_METRICS_ADDR / NUFS_LOG_LEVEL
+#   3) 默认值（localhost:8091 / :9901 / info）
+#
+# 挂载动作本身仍由 nufs daemon 完成（内部经 fusermount，普通用户即可），
+# 本 helper 只负责：校验挂载点 → 防重复挂载 → 把标准选项翻译成 daemon flag →
+# 后台拉起 daemon → 等待内核挂载就绪 → 返回标准退出码（0=就绪 / 非0=失败）。
+# 注：allow_other / fsname / subtype 目前在 daemon 侧未接线（代码里 AllowOther=false），
+# helper 先解析并保留语义，等 daemon 支持后再透传。
+#
+# 安装（需 root）:
+#   sudo cp deploy/mount.nufs /sbin/mount.nufs
+#   sudo chmod 0755 /sbin/mount.nufs
+#
+# 用法示例:
+#   mount -t nufs none /mnt/nufs-fuse
+#   mount -t nufs -o meta=127.0.0.1:8091,allow_other,log=debug none /mnt/nufs-fuse
+#
+# 卸载 / 状态:
+#   umount /mnt/nufs-fuse          # 走内核标准 umount
+#   mountpoint -q /mnt/nufs-fuse   # 就绪判断（与 host_mount 一致）
+
+set -u
+
+FUSE_BIN="${NUFS_FUSE_BIN:-/usr/local/bin/nufs-fuse}"
+PID_DIR="${NUFS_PID_DIR:-/tmp}"
+
+META_ADDR="${NUFS_META_ADDR:-localhost:8091}"
+METRICS_ADDR="${NUFS_DFS_METRICS_ADDR:-:9901}"
+LOG_LEVEL="${NUFS_LOG_LEVEL:-info}"
+BACKEND="${NUFS_BACKEND:-nufs}"
+
+warn() { echo "mount.nufs: $*" >&2; }
+die()  { warn "FATAL: $*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+USAGE: mount [-t nufs] <source> <mountpoint> [-o <options>]
+
+  挂载 NUFS 分布式文件系统到 <mountpoint>。
+
+  -o 选项（NUFS 专属，挂载源通常填 "none"）:
+    meta=host:port      metad 地址（默认 localhost:8091；或设 NUFS_META_ADDR）
+    metrics=addr        DFS metrics/health 地址（默认 :9901）
+    log=level           debug/info/warn/error（默认 info）
+    allow_other         允许其他用户访问挂载点（需 /etc/fuse.conf user_allow_other）
+    标准 fuse 选项      （ro, fsname=..., 等）也会透传给底层 fusermount
+EOF
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 参数解析
+# ---------------------------------------------------------------------------
+source_spec=""   # $1（本过程不用，仅点位符）
+mountpoint=""
+options=""
+
+# 逐 token 消费：$1=mountpoint 之前是 source，之后是 -o。
+# 兼容: mount -t nufs none /mnt/x          （source, mountpoint）
+#       mount -t nufs -o a,b /mnt/x        （-o 在前，source 可省略→『-o』作 source 保护）
+#       mount -t nufs none /mnt/x -o a,b   （-o 在后）
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o)
+      [ $# -ge 2 ] || die "-o 需要参数"
+      if [ -n "$options" ]; then options="$options,$2"; else options="$2"; fi
+      shift 2
+      ;;
+    -h|-V|--help) usage ;;
+    -*)
+      # 其它未知短选项让给 mount 语义；此处忽略以免打断参数位
+      warn "忽略未知选项: $1（参考 mount(8) 用法）"
+      shift
+      ;;
+    *)
+      # 非选项 token：第一个是 source，第二个是 mountpoint
+      if [ -z "$source_spec" ]; then
+        source_spec="$1"
+      elif [ -z "$mountpoint" ]; then
+        mountpoint="$1"
+      else
+        die "多余参数: $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+[ -n "$mountpoint" ] || { warn "未指定挂载点"; usage; }
+
+# 必须支持 -o 里 NUFS 键优先于环境变量
+IFS=','; for opt in $options; do [ -n "$opt" ] || continue
+  case "$opt" in
+    meta=*)            META_ADDR="${opt#meta=}" ;;
+    metrics=*)         METRICS_ADDR="${opt#metrics=}" ;;
+    log=*)             LOG_LEVEL="${opt#log=}" ;;
+    allow_other)       FUSE_ALLOW_OTHER=1 ;;
+    fsname=*)          FS_NAME="${opt#fsname=}" ;;
+    subtype=*)         SUB_TYPE="${opt#subtype=}" ;;
+    *)                 : ;;   # 其余（ro/noexec 等）透传，由底层 fusermount 处理
+  esac
+done; unset IFS
+
+# ---------------------------------------------------------------------------
+# 校验
+# ---------------------------------------------------------------------------
+[ -x "$FUSE_BIN" ] || die "nufs daemon 不存在: $FUSE_BIN（设 NUFS_FUSE_BIN 或先安装）"
+
+# 挂载点必须是已存在目录（与 mount.minfs 一致）
+[ -d "$mountpoint" ] || die "挂载点不存在或不是目录: $mountpoint"
+
+# 防重复挂载（与 mount.minfs 检查 mtab 同义）
+if mountpoint -q "$mountpoint" 2>/dev/null; then
+  warn "$mountpoint 已经挂载（请先 umount）"
+  exit 32
+fi
+
+# ---------------------------------------------------------------------------
+# 构建 daemon flag 并后台拉起
+# ---------------------------------------------------------------------------
+# 标准 mount -o 里传进来的 fuse 选项：只保留我们能安全转发的（fusermount 认的）
+# 与 NUFS 专属键（已消费）。这里显式只传 NUFS 专属 flag，其余标准 fuse 选项
+# 由底层 fusermount 天然处理，无需再打包。
+DAEMON_ARGS="--backend=$BACKEND --meta-addr=$META_ADDR --dfs-metrics-addr=$METRICS_ADDR --log-level=$LOG_LEVEL"
+
+LOG_FILE="${NUFS_FUSE_LOG:-/var/log/nufs.log}"
+# 非 root 时 /var/log 不可写 → 静默回退到 /tmp，避免每次挂载报错噪音
+if ! { : > "$LOG_FILE"; } 2>/dev/null; then
+  LOG_FILE=/tmp/nufs.log
+  : > "$LOG_FILE" 2>/dev/null || true
+fi
+
+mkdir -p "$PID_DIR" 2>/dev/null || true
+
+# 后台启动 daemon；$! 记录 pid 供 host_mount 同款管理语义
+"$FUSE_BIN" $DAEMON_ARGS "$mountpoint" >"$LOG_FILE" 2>&1 &
+DAEMON_PID=$!
+echo "$DAEMON_PID" > "$PID_DIR/nufs.pid" 2>/dev/null || true
+warn "nufs pid=$DAEMON_PID -> $mountpoint (log: $LOG_FILE)"
+
+# 等待内核挂载就绪（同 host_mount 的 30s 窗口）
+i=0
+while [ "$i" -lt 30 ]; do
+  if mountpoint -q "$mountpoint" 2>/dev/null; then
+    warn "mounted at $mountpoint"
+    exit 0
+  fi
+  # daemon 提前退出 → 报错并给日志
+  if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+    warn "nufs daemon 提前退出；日志尾部:"
+    tail -40 "$LOG_FILE" >&2
+    exit 1
+  fi
+  sleep 1
+  i=$((i+1))
+done
+warn "挂载点 30s 内未就绪；日志尾部:"
+tail -40 "$LOG_FILE" >&2
+exit 1

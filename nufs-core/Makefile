@@ -1,4 +1,4 @@
-.PHONY: build test vet clean docker docker-up docker-down fmt lint help test-storage-p0 test-storage-crash
+.PHONY: build test vet clean docker docker-up docker-down fmt lint help test-storage-p0 test-storage-crash install install-mount-helper
 
 # Binary output directory
 BIN_DIR := bin
@@ -86,6 +86,17 @@ docker-logs: ## Tail logs of all services
 clean: ## Remove build artifacts
 	rm -rf $(BIN_DIR) coverage
 	go clean -testcache
+
+install: build ## Install binaries to /usr/local/bin
+	install -d /usr/local/bin
+	install -m 0755 bin/* /usr/local/bin/
+	@echo "installed: /usr/local/bin/{metad,datanode,nufs-s3,nufs-fuse,nufs-cli}"
+
+install-mount-helper: ## Install mount helper to /sbin (root): enables `mount -t nufs ...`
+	install -m 0755 deploy/mount.nufs /sbin/mount.nufs
+	@echo "installed: /sbin/mount.nufs"
+	@echo "用法:  mount -t nufs none /mnt/nufs-fuse [-o meta=host:port,log=level]"
+	@echo "       umount /mnt/nufs-fuse"
 
 tidy: ## Run go mod tidy
 	go mod tidy
