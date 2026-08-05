@@ -223,6 +223,95 @@ func TestDFSFile_Read_TruncateExtend_ServesZeros(t *testing.T) {
 	}
 }
 
+// TestDFSFile_Read_SparseCommittedChunkMap_ZeroFillsHoles exercises the
+// committed-chunk walk against a non-contiguous ChunkMap. A FUSE flush
+// always produces a contiguous map, but the committed layout can be sparse
+// (externally-produced inode, or a post-truncate map with a hole whose
+// bytes were never materialized). The walk must not collapse such a hole:
+// it must zero-fill it at the correct file coordinate and still return a
+// full (end-off)-byte window. (Same-class hardening of the committed-read
+// path — before the fix, out-of-order / gapped chunks were concatenated
+// back-to-back, misplacing bytes and returning a short read.)
+func TestDFSFile_Read_SparseCommittedChunkMap_ZeroFillsHoles(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	// First, write and flush a real file so the chunk store holds payloads
+	// under real (committed) chunk IDs, and f.buffer is nil'd by Flush so
+	// Read goes through the committed-chunk walk.
+	seed := []byte("0123456789abcdef") // 16 bytes
+	if _, errno := f.Write(context.Background(), nil, seed, 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+	if f.buffer != nil {
+		t.Fatalf("post-Flush: buffer=%v, want nil (committed-walk path)", f.buffer)
+	}
+
+	// Rewrite the committed ChunkMap to a sparse layout with a hole:
+	//   chunk A covers file [0,4)  → "0123"
+	//   hole covers      file [4,10) → zeros
+	//   chunk 2 covers   file [10,16) → "abcd" (second half of the seed)
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	// Grab a committed chunk ID already in the store from the seed flush.
+	if len(inode.ChunkMap) != 1 {
+		t.Fatalf("seed ChunkMap len=%d, want 1", len(inode.ChunkMap))
+	}
+	cid := inode.ChunkMap[0].ID
+
+	// Allocate + commit a second REAL chunk so UpdateInode considers it
+	// available for attachment (mirroring Flush: allocate → write → commit).
+	bucket, err := meta.GetBucket(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	alloc, err := meta.AllocateChunksBatch(context.Background(), id, []int64{10}, bucket.Policy)
+	if err != nil {
+		t.Fatalf("AllocateChunksBatch: %v", err)
+	}
+	if len(alloc) != 1 {
+		t.Fatalf("allocated %d chunks, want 1", len(alloc))
+	}
+	chunk2 := alloc[0]
+	if err := cs.WriteChunk(context.Background(), chunk2, seed[10:16]); err != nil {
+		t.Fatalf("WriteChunk (chunk2): %v", err)
+	}
+	if err := meta.CommitChunk(context.Background(), chunk2.ID, 0); err != nil {
+		t.Fatalf("CommitChunk (chunk2): %v", err)
+	}
+
+	sparse := []metadata.ChunkRef{
+		{ID: cid, Offset: 0, Length: 4, Version: 1},
+		{ID: chunk2.ID, Offset: 10, Length: 6, Version: 1},
+	}
+	inode.ChunkMap = sparse
+	inode.Size = 16
+	if err := meta.UpdateInode(context.Background(), inode); err != nil {
+		t.Fatalf("UpdateInode (sparse): %v", err)
+	}
+
+	dest := make([]byte, 16)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if len(got) != 16 {
+		t.Fatalf("Read: got %d bytes, want 16 (holes must be zero-filled)", len(got))
+	}
+	want := append([]byte("0123"), make([]byte, 6)...)
+	want = append(want, seed[10:16]...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("sparse read mismatch:\n got %q\nwant %q", got, want)
+	}
+}
+
 // ========== B2: Flush actually writes the buffer (was: only updated inode size) ==========
 
 // TestDFSFile_Flush_AllocatesChunk is the "first flush" path. After

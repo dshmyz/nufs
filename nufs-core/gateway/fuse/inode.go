@@ -258,16 +258,25 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 	bufp := readBufPool.Get().(*[]byte)
 	defer readBufPool.Put(bufp)
 
-	// Walk the ChunkMap and pick out the bytes that overlap the
-	// requested window. Each chunk owns [cref.Offset, +cref.Length).
-	// The window is in (off, end] in file coordinates; we trim
-	// each chunk payload to that range and concatenate.
+	// Walk the ChunkMap and pick out the bytes that overlap the requested
+	// window. Each chunk owns [cref.Offset, +cref.Length). The window is in
+	// (off, end] in file coordinates; we trim each chunk payload to that
+	// range and concatenate.
+	//
+	// (Same-class hardening) The ChunkMap is length-ordered, but it is not
+	// guaranteed contiguous: after a truncate or an externally-produced
+	// sparse layout there can be a hole between chunks whose bytes are never
+	// materialized. Collapsing such holes would both misplace every
+	// subsequent chunk at the wrong file coordinate and return a short read.
+	// So the walk zero-fills any gap before each overlapping chunk, and
+	// always returns a full (end-off)-byte window at correct coordinates.
 	out := make([]byte, 0, end-off)
+	next := off // next file offset already filled, in [off, end]
 	for _, cref := range metaInode.ChunkMap {
 		chunkStart := cref.Offset
 		chunkEnd := cref.Offset + int64(cref.Length)
-		if chunkEnd <= off || chunkStart >= end {
-			// chunk entirely outside the requested window
+		if chunkEnd <= next || chunkStart >= end {
+			// chunk entirely outside the remaining window
 			continue
 		}
 		var payload []byte
@@ -298,12 +307,24 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 				f.cache.Add(uint64(cref.ID), payload)
 			}
 		}
-		// Map file-coordinates [off,end) to chunk-local coordinates.
-		relStart := off - chunkStart
-		if relStart < 0 {
-			relStart = 0
+		// Zero-fill any hole between the last filled offset and this chunk.
+		if chunkStart > next {
+			gap := chunkStart - next
+			if gap > end-next {
+				gap = end - next
+			}
+			out = append(out, make([]byte, gap)...)
+			next += gap
 		}
+		// Map file-coordinates [off,end) to chunk-local coordinates. Bound
+		// by BOTH the chunk's declared file extent (cref.Length) and its
+		// actual payload length, so we never serve bytes past the file
+		// coordinate that this chunk genuinely owns.
+		relStart := next - chunkStart
 		relEnd := end - chunkStart
+		if relEnd > int64(cref.Length) {
+			relEnd = int64(cref.Length)
+		}
 		if relEnd > int64(len(payload)) {
 			relEnd = int64(len(payload))
 		}
@@ -320,9 +341,14 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 		} else {
 			out = append(out, payload[relStart:relEnd]...)
 		}
-		if int64(len(out)) >= end-off {
+		next += int64(chunkLen)
+		if next >= end {
 			break
 		}
+	}
+	// Zero-fill a trailing hole after the last chunk (before 'end').
+	if next < end {
+		out = append(out, make([]byte, end-next)...)
 	}
 	return fuse.ReadResultData(out), 0
 }
