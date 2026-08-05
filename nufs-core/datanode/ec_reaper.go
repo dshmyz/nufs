@@ -62,7 +62,9 @@ type ECLandingResolver interface {
 // it. When wired, the self-healer reclaims those shards via DeleteShard on a
 // periodic orphan pass; absent (e.g. the V1 transport's HTTPClient, which lacks
 // the local-only *metadata.ECStore method), orphan GC is disabled and the
-// healer only repairs — a documented deploy follow-on needs an HTTP RPC.
+// healer only repairs. On the production path (*metadata.HTTPClient satisfies
+// this interface by structural typing since Program 7), orphan GC is LIVE over
+// the metadata HTTP RPC — runDataNodeV21 wires SetOrphanResolver(metaStore, ...).
 type ECOrphanResolver interface {
 	IsChunkShardsOrphaned(ctx context.Context, chunkID metadata.ChunkID, olderThan time.Duration) (bool, error)
 }
