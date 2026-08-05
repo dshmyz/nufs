@@ -1370,6 +1370,49 @@ func (c *HTTPClient) PublishConversion(st *ECStripe) error {
 	return nil
 }
 
+// ResolveStripeLanding resolves a chunk's authoritative per-shard landing (§14)
+// over HTTP: the server loads the chunk by ID, resolves its durable
+// ECStripe.Shards, and returns them. It structurally satisfies the datanode
+// ECLandingResolver seam so a V2.1 node's ECSelfHealer repair-landing runs
+// against the *remote* metadata authority (Program 7). A chunk with no stripe
+// (not yet converted to EC) yields an empty landing.
+func (c *HTTPClient) ResolveStripeLanding(chunk *ChunkMeta) ([]ECShard, error) {
+	req := map[string]interface{}{"chunk_id": uint64(chunk.ID)}
+	resp, err := c.doRequestWithRetry(context.Background(), http.MethodPost, "/api/v1/ec/convert/resolve-landing", req)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Shards []ECShard `json:"shards"`
+	}
+	if err := c.readResponse(resp, &out); err != nil {
+		return nil, err
+	}
+	return out.Shards, nil
+}
+
+// IsChunkShardsOrphaned answers whether a chunk's shards on this node are
+// reclaimable orphans over HTTP: the server runs the authoritative
+// IsChunkShardsOrphaned decision (Complete → live; rolled-back-and-aged →
+// orphaned; in-flight/young → not) against the remote metadata authority
+// (Program 7). olderThan is the age gate below which a rolled-back stripe's
+// shards are not yet reclaimable. It structurally satisfies the datanode
+// ECorphanResolver seam so orphan GC works against the remote authority.
+func (c *HTTPClient) IsChunkShardsOrphaned(ctx context.Context, chunkID ChunkID, olderThan time.Duration) (bool, error) {
+	req := map[string]interface{}{"chunk_id": uint64(chunkID), "older_than_ns": int64(olderThan)}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/ec/convert/is-orphan", req)
+	if err != nil {
+		return false, err
+	}
+	var out struct {
+		Orphaned bool `json:"orphaned"`
+	}
+	if err := c.readResponse(resp, &out); err != nil {
+		return false, err
+	}
+	return out.Orphaned, nil
+}
+
 // RollbackConversion aborts a non-durable transaction on the remote authority.
 func (c *HTTPClient) RollbackConversion(st *ECStripe, reason string) error {
 	req := map[string]interface{}{"stripe_id": st.StripeID, "reason": reason}

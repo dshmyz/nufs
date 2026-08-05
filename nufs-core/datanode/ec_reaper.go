@@ -29,11 +29,12 @@ type ECSelfHealConfig struct {
 
 const ecSelfHealDefaultInterval = 30 * time.Second
 
-// ecOrphanDefaultAge is how long a stripe must stay rolled back before its
+// EcOrphanDefaultAge is how long a stripe must stay rolled back before its
 // partial shards are treated as reclaimable orphans (§14). It defers
 // reclamation past any in-progress retry or salvage, matching the product
-// expectation of "24h" in the F4 plan.
-const ecOrphanDefaultAge = 24 * time.Hour
+// expectation of "24h" in the F4 plan. Exported so runDataNodeV21 can feed it
+// to SetOrphanResolver against the remote HTTP authority (Program 7).
+const EcOrphanDefaultAge = 24 * time.Hour
 
 // ECChunkResolver resolves an EC chunk's metadata (notably its Size, which is
 // the only reliable source of the stripe's original pre-encoding length — the
@@ -98,7 +99,7 @@ func NewECSelfHealer(v *V2Store, resolver ECChunkResolver, cfg ECSelfHealConfig)
 	return &ECSelfHealer{
 		v: v, resolver: resolver,
 		interval:  cfg.Interval,
-		orphanAge: ecOrphanDefaultAge,
+		orphanAge: EcOrphanDefaultAge,
 		stopCh:    make(chan struct{}),
 	}
 }

@@ -689,13 +689,17 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// original length via the chunk's authoritative Size (the padding makes it
 	// unrecoverable from shard lengths alone, §14).
 	healer := datanode.NewECSelfHealer(v2Store, metaStore, datanode.ECSelfHealConfig{})
-	// Orphan GC (F4, §14) is enabled by default only when an orphan resolver is
-	// wired. The production metaStore (*metadata.HTTPClient) resolves the
-	// original length but lacks the local-only *metadata.ECStore orphan check
-	// (IsChunkShardsOrphaned), so SetOrphanResolver is not wired here — orphan
-	// reclamation is disabled on the production path until a counterpart HTTP
-	// RPC exists (documented deploy follow-on, same seam as F3's landing
-	// resolver). Tests wire a local ECStore-backed resolver directly.
+	// Program 7: the production metaStore (*metadata.HTTPClient) now carries the
+	// two EC resolver seams — ResolveStripeLanding (F3 repair-landing) and
+	// IsChunkShardsOrphaned (F4 orphan GC) — over the metadata ops HTTP RPCs
+	// (/api/v1/ec/convert/resolve-landing + is-orphan). Go interfaces are
+	// structural, so metaStore satisfies ECLandingResolver/ECOrphanResolver
+	// directly; wiring both turns on authoritative repair-landing (shards put
+	// back on their §14 home disk) and orphan-GC (reclaim of rolled-back
+	// conversion shards) against the *remote* metadata authority — the true
+	// production multi-node topology, replacing the F3/F4 local-Pebble stand-in.
+	healer.SetLandingResolver(metaStore)
+	healer.SetOrphanResolver(metaStore, datanode.EcOrphanDefaultAge)
 	healer.Start(ctx)
 
 	if err := opsServer.Start(); err != nil {

@@ -119,6 +119,13 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle
 	mux.HandleFunc("/api/v1/ec/convert/publish", mut(s.handleECConvertPublish))
 	mux.HandleFunc("/api/v1/ec/convert/rollback", mut(s.handleECConvertRollback))
 
+	// EC resolver seams (Program 7): expose the local *metadata.ECStore
+	// ResolveStripeLanding / IsChunkShardsOrphaned over HTTP so a V2.1
+	// datanode's ECSelfHealer runs its repair-landing + orphan GC against the
+	// *remote* metadata authority, not the in-process Pebble stand-in.
+	mux.HandleFunc("/api/v1/ec/convert/resolve-landing", mut(s.handleECResolveLanding))
+	mux.HandleFunc("/api/v1/ec/convert/is-orphan", mut(s.handleECIsOrphan))
+
 	// Watch — long-poll SSE stream of metadata change events
 	// (doesn't need leader check; followers already consume from their local EventBus)
 	mux.HandleFunc("/api/v1/watch", s.handleWatch)

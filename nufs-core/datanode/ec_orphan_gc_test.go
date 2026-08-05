@@ -9,6 +9,15 @@ import (
 	"github.com/example/dfs/metadata"
 )
 
+// Program 7: the production *metadata.HTTPClient must structurally satisfy both
+// EC resolver seams so runDataNodeV21 can wire the real (remote-authority)
+// metaStore as the healer's landing + orphan resolver over the metadata ops
+// HTTP RPCs. These are compile-time proofs of the interface contracts.
+var (
+	_ ECLandingResolver = (*metadata.HTTPClient)(nil)
+	_ ECOrphanResolver  = (*metadata.HTTPClient)(nil)
+)
+
 // This file is Program 6 Phase F4: the stripe-orphan GC pass. When a conversion
 // fails, RollbackConversion leaves partial shards on the node's shard stores
 // that no live chunk references (§14). ECSelfHealer.ReclaimOrphans, given an

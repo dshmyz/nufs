@@ -159,6 +159,172 @@ func TestECConvertHTTPContractRollback(t *testing.T) {
 	}
 }
 
+// seedPublishECChunk drives the full replication→6+3 conversion through the
+// given HTTP authority and publishes it, so the metad store ends up holding a
+// chunk whose ECStripeID references a durable Complete stripe with its 9-shard
+// landing. This is exactly the state the Program 7 resolver RPCs consume.
+func seedPublishECChunk(t *testing.T, store *metadata.PebbleStore, client *metadata.HTTPClient, v *datanode.V2Store) (*metadata.ChunkMeta, *metadata.ECStripe) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.RegisterNode(ctx, &metadata.NodeInfo{ID: 1, Addr: "datanode-1:9100", CapacityGB: 10, Tier: metadata.TierHot}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	if err := store.CreateBucket(ctx, "p7-bucket", metadata.PlacementPolicy{ReplicationFactor: 1}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "p7-bucket")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	inode, err := store.CreateFile(ctx, bucket.RootInode, "f", 0644)
+	if err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+	alloc, err := store.AllocateChunk(ctx, inode.ID, 0, metadata.PlacementPolicy{ReplicationFactor: 1})
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+	cid := alloc.ID
+	if cid == 0 {
+		t.Fatal("allocated chunk has zero ID")
+	}
+	payload := []byte("p7-resolver-rpc")
+	for i := 0; i < 128; i++ {
+		payload = append(payload, 0x5E)
+	}
+	if err := v.Write(cid, payload); err != nil {
+		t.Fatalf("write replicated chunk: %v", err)
+	}
+	svc := datanode.NewECService(v, client)
+	st, err := svc.ConvertToEC(ctx, cid, 1)
+	if err != nil {
+		t.Fatalf("ConvertToEC: %v", err)
+	}
+	if st.State != metadata.ECConversionComplete {
+		t.Fatalf("state = %s, want complete", st.State)
+	}
+	if err := client.PublishConversion(st); err != nil {
+		t.Fatalf("PublishConversion: %v", err)
+	}
+	chunk, err := store.GetChunk(ctx, cid)
+	if err != nil {
+		t.Fatalf("GetChunk: %v", err)
+	}
+	if chunk.ECStripeID != st.StripeID {
+		t.Fatalf("ECStripeID = %q, want %q", chunk.ECStripeID, st.StripeID)
+	}
+	return chunk, st
+}
+
+// TestECResolveLandingHTTP drives the F3 authoritative-landing seam over the
+// metadata HTTP RPC: after a conversion + publish, the remote authority's
+// ResolveStripeLanding returns the chunk's durable 9-shard landing, and each
+// landing shard's NodeID matches the materialized Replicas copy the server
+// published. The production *metadata.HTTPClient therefore structurally
+// satisfies the datanode ECLandingResolver seam.
+func TestECResolveLandingHTTP(t *testing.T) {
+	store, bundle := newOpsTestStore(t)
+	srv := httptest.NewServer(buildOpsTestMux(t, store, bundle))
+	defer srv.Close()
+
+	v, _ := opsECDatanode(t, 3)
+	auth := metadata.NewHTTPClient(srv.URL, 10*time.Second)
+	chunk, st := seedPublishECChunk(t, store, auth, v)
+
+	// The client-side HTTP RPC (Program 7): *HTTPClient → resolve-landing.
+	landing, err := auth.ResolveStripeLanding(chunk)
+	if err != nil {
+		t.Fatalf("ResolveStripeLanding HTTP: %v", err)
+	}
+	if len(landing) != 9 {
+		t.Fatalf("landing shards = %d, want 9", len(landing))
+	}
+	if len(landing) != len(st.Shards) {
+		t.Fatalf("landing %d != stripe %d", len(landing), len(st.Shards))
+	}
+	for i, sh := range landing {
+		if sh.Index != st.Shards[i].Index || sh.NodeID != st.Shards[i].NodeID || sh.DiskID != st.Shards[i].DiskID {
+			t.Fatalf("landing shard %d = %+v, want %+v", i, sh, st.Shards[i])
+		}
+	}
+	// And it matches the materialized replicas the server published.
+	for i, sh := range landing {
+		if uint64(chunk.Replicas[i].NodeID) != sh.NodeID {
+			t.Fatalf("landing node %d = %d, want published replica %d", i, sh.NodeID, chunk.Replicas[i].NodeID)
+		}
+	}
+}
+
+// TestECIsOrphanHTTP drives the F4 orphan-GC seam over the metadata HTTP RPC:
+// the remote authority's IsChunkShardsOrphaned decides reclaimability exactly
+// as the local ECStore does — a Complete stripe serves its chunk (not
+// orphaned), a rolled-back-and-aged stripe's shards are reclaimable (orphaned),
+// and a young rolled-back stripe is not yet reclaimable. The production
+// *metadata.HTTPClient therefore structurally satisfies the datanode
+// ECOrphanResolver seam.
+func TestECIsOrphanHTTP(t *testing.T) {
+	store, bundle := newOpsTestStore(t)
+	srv := httptest.NewServer(buildOpsTestMux(t, store, bundle))
+	defer srv.Close()
+
+	auth := metadata.NewHTTPClient(srv.URL, 10*time.Second)
+	ec := metadata.NewECStore(store)
+	ctx := context.Background()
+	gate := time.Hour
+
+	// (1) A rolled-back-and-aged stripe → shards are reclaimable orphans.
+	st, err := ec.BeginConversion("stripe-p7-orphan", 70001, 1, 0xabc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ec.RollbackConversion(st, "failed"); err != nil {
+		t.Fatal(err)
+	}
+	st.RolledBackAt = time.Now().Add(-48 * time.Hour).UnixNano()
+	if err := ec.PutStripe(st); err != nil {
+		t.Fatal(err)
+	}
+	orph, err := auth.IsChunkShardsOrphaned(ctx, 70001, gate)
+	if err != nil {
+		t.Fatalf("IsChunkShardsOrphaned HTTP (aged rollback): %v", err)
+	}
+	if !orph {
+		t.Fatal("aged rolled-back stripe shards should be orphaned over HTTP")
+	}
+
+	// (2) A young rolled-back stripe → not yet reclaimable.
+	st2, err := ec.BeginConversion("stripe-p7-young", 70002, 1, 0xdef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ec.RollbackConversion(st2, "retry window"); err != nil {
+		t.Fatal(err)
+	}
+	orph, err = auth.IsChunkShardsOrphaned(ctx, 70002, gate)
+	if err != nil {
+		t.Fatalf("IsChunkShardsOrphaned HTTP (young rollback): %v", err)
+	}
+	if orph {
+		t.Fatal("young rolled-back stripe shards must not be orphaned over HTTP")
+	}
+
+	// (3) A Complete stripe → chunk served from its shards, never orphaned.
+	st3, err := ec.BeginConversion("stripe-p7-live", 70003, 1, 0x1122)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ec.CompleteConversion(st3, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	orph, err = auth.IsChunkShardsOrphaned(ctx, 70003, gate)
+	if err != nil {
+		t.Fatalf("IsChunkShardsOrphaned HTTP (complete): %v", err)
+	}
+	if orph {
+		t.Fatal("Complete stripe shards must not be orphaned over HTTP")
+	}
+}
+
 // opsECDatanode builds a datanode V2Store over 3 disks, each hosting a data
 // segment store (StreamID 1) and an EC-shard segment store (StreamID 2), with
 // the shard stores attached — the same shape runDataNodeV21 wires for the S2

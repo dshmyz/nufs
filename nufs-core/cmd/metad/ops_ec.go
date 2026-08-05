@@ -215,3 +215,73 @@ func (h *opsHandlers) handleECConvertRollback(w http.ResponseWriter, r *http.Req
 	}
 	writeJSON(w, st)
 }
+
+// resolveLandingECConvert: POST /api/v1/ec/convert/resolve-landing
+// {chunk_id} → {shards} the chunk's authoritative per-shard landing (§14).
+//
+// Exposes the local *metadata.ECStore.ResolveStripeLanding over HTTP so a
+// V2.1 datanode's ECSelfHealer can run its repair-landing against a *remote*
+// metadata authority (production topology) instead of the in-process local
+// Pebble stand-in (Program 7). The server stays authoritative: it loads the
+// chunk itself and resolves the stripe from durable ECStripe.Shards. A chunk
+// with no stripe (not yet converted to EC) yields {"shards":null} — the caller
+// falls back to least-used disk placement; a referenced-but-missing stripe
+// yields an error (500), which the caller also degrades on.
+func (h *opsHandlers) handleECResolveLanding(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		ChunkID uint64 `json:"chunk_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChunkID == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	chunk, err := h.store.GetChunk(r.Context(), metadata.ChunkID(req.ChunkID))
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, "chunk not found")
+		return
+	}
+	shards, err := h.ecStore().ResolveStripeLanding(chunk)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, struct {
+		Shards []metadata.ECShard `json:"shards"`
+	}{Shards: shards})
+}
+
+// isOrphanECConvert: POST /api/v1/ec/convert/is-orphan
+// {chunk_id, older_than_ns} → {orphaned}.
+//
+// Exposes the local *metadata.ECStore.IsChunkShardsOrphaned over HTTP so a
+// V2.1 datanode's ECSelfHealer.ReclaimOrphans runs against a *remote* metadata
+// authority (production topology) instead of the in-process local Pebble
+// stand-in (Program 7). older_than_ns is the age gate below which a
+// rolled-back stripe's shards are not yet reclaimable, encoded as nanoseconds.
+func (h *opsHandlers) handleECIsOrphan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		ChunkID     uint64 `json:"chunk_id"`
+		OlderThanNS int64  `json:"older_than_ns"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChunkID == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	orphaned, err := h.ecStore().IsChunkShardsOrphaned(
+		r.Context(), metadata.ChunkID(req.ChunkID), time.Duration(req.OlderThanNS))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, struct {
+		Orphaned bool `json:"orphaned"`
+	}{Orphaned: orphaned})
+}
