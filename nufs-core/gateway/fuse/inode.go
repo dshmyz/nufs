@@ -4,8 +4,10 @@ package fuse
 
 import (
 	"context"
+	"fmt"
 	"hash/crc32"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -407,9 +409,50 @@ func (f *DFSFile) AppendWrite(ctx context.Context, fh fs.FileHandle, data []byte
 	return f.writeLocked(ctx, data, tail, rec)
 }
 
+// =====================================================================
+// Buffer-image invariant guard
+// =====================================================================
+//
+// DFSFile's core state invariant is:
+//
+//	loaded == true  ⟹  f.buffer is a faithful image of the committed
+//	                   prefix [0, committedSize), i.e. len(buffer) >= committed
+//
+// Every path that sets loaded=true must uphold it. Production never enforces
+// this (it only reads a package-level atomic flag and costs nothing when
+// off); tests turn it on so a future violation panics at the point of the
+// write, instead of surfacing much later as silent data loss on Flush / a
+// stale Read. The same-class bugs fixed in this series (most notably the
+// off-0 partial-overwrite data loss) were all violations of this invariant,
+// so it doubles as a regression tripwire.
+var bufferImageInvariantOn atomic.Bool
+
+// EnableBufferImageInvariant turns on the debug invariant assertion. Only
+// tests should call it; production stays off for zero overhead.
+func EnableBufferImageInvariant() { bufferImageInvariantOn.Store(true) }
+
+// assertBufferImageLocked verifies that, when loaded, the buffer is at least
+// as large as the currently committed file size. Must be called with f.mu
+// held. It is a no-op when the invariant guard is off, or when a metadata
+// read fails (an I/O failure is a real error path, not an invariant break).
+func (f *DFSFile) assertBufferImageLocked(ctx context.Context) {
+	if !bufferImageInvariantOn.Load() || !f.loaded {
+		return
+	}
+	meta, err := f.meta.GetInode(ctx, f.inodeID)
+	if err != nil {
+		return
+	}
+	if int64(len(f.buffer)) < meta.Size {
+		panic(fmt.Sprintf("DFSFile invariant violated: loaded=true but buffer len=%d < committed size=%d (inode %d)",
+			len(f.buffer), meta.Size, f.inodeID))
+	}
+}
+
 // writeLocked applies a buffered write at the given offset. Must be called
-// with f.mu held and the buffer hydrated (unless it's a full overwrite from
-// offset 0, where hydration is intentionally skipped).
+// with f.mu held and the buffer hydrated to cover the committed prefix
+// (callers — Write, AppendWrite — hydrate whenever !loaded regardless of
+// offset, so a partial off-0 overwrite cannot drop the committed tail).
 func (f *DFSFile) writeLocked(ctx context.Context, data []byte, off int64, rec MetricsRecorder) (uint32, syscall.Errno) {
 	// Buffer write data locally until flush
 	needed := int(off) + len(data)
@@ -421,6 +464,7 @@ func (f *DFSFile) writeLocked(ctx context.Context, data []byte, off int64, rec M
 	copy(f.buffer[off:], data)
 	f.dirty = true
 	f.loaded = true
+	f.assertBufferImageLocked(ctx)
 
 	return uint32(len(data)), 0
 }
@@ -449,6 +493,7 @@ func (f *DFSFile) ensureHydratedLocked(ctx context.Context, rec MetricsRecorder)
 	committed := int(metaInode.Size)
 	if committed <= 0 {
 		f.loaded = true
+		f.assertBufferImageLocked(ctx)
 		return nil
 	}
 
@@ -467,6 +512,7 @@ func (f *DFSFile) ensureHydratedLocked(ctx context.Context, rec MetricsRecorder)
 		copy(f.buffer[committed:], tail)
 	}
 	f.loaded = true
+	f.assertBufferImageLocked(ctx)
 	return nil
 }
 

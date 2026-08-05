@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"hash/crc32"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -16,6 +17,16 @@ import (
 	"github.com/example/dfs/metadata"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
+
+// TestMain enables the runtime buffer-image invariant assertion for the whole
+// package. With it on, any test path that breaks the invariant
+// (loaded=true but buffer shorter than the committed file size) panics
+// immediately instead of silently producing wrong data — the regression
+// tripwire for the off-0 overwrite / hydration bug class.
+func TestMain(m *testing.M) {
+	EnableBufferImageInvariant()
+	os.Exit(m.Run())
+}
 
 // ========== Test fixtures ==========
 
