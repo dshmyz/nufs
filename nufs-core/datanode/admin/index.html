@@ -114,6 +114,36 @@
   .bay .bay-sub{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.04em}
   .bay-empty{grid-column:1/-1;border:1px dashed var(--line-hi);border-radius:10px;
        padding:26px;text-align:center;color:var(--dim);font-family:var(--mono);font-size:12px}
+  /* per-bay lifecycle actions */
+  .bay-actions{display:flex;flex-wrap:wrap;gap:6px;border-top:1px solid var(--line);padding-top:9px}
+  .dbtn{font-family:var(--mono);font-size:10px;color:var(--dim);background:var(--panel2);
+       border:1px solid var(--line);border-radius:6px;padding:4px 8px;cursor:pointer;
+       transition:color .15s,border-color .15s,background .15s}
+  .dbtn:hover{color:var(--ink);border-color:var(--line-hi);background:#161b20}
+  .dbtn.danger{color:var(--crit)}
+  .dbtn.danger:hover{border-color:rgba(223,90,78,.5);background:rgba(223,90,78,.1)}
+  .dbtn[disabled]{opacity:.45;cursor:default;pointer-events:none}
+  .drift{color:var(--brand)}
+  /* disk ops controls (adopt + drain) */
+  .disk-ops{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:14px}
+  .disk-ops input{flex:1 1 240px;font-family:var(--mono);font-size:12px;color:var(--ink);
+       background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:7px 10px}
+  .disk-ops input::placeholder{color:var(--faint)}
+  .opbtn{font-family:var(--mono);font-size:11px;color:var(--ink);background:var(--panel2);
+       border:1px solid var(--line-hi);border-radius:6px;padding:7px 14px;cursor:pointer}
+  .opbtn:hover{background:#161b20;border-color:var(--brand)}
+  .opbtn.warnb{border-color:rgba(224,164,60,.45);color:var(--warn)}
+  .opbtn.warnb:hover{border-color:var(--warn);background:rgba(224,164,60,.08)}
+  .opbtn[disabled]{opacity:.45;cursor:default;pointer-events:none}
+  /* status toast */
+  .toast{position:fixed;right:18px;bottom:18px;z-index:60;min-width:220px;max-width:360px;
+       background:var(--panel2);border:1px solid var(--line-hi);border-left:3px solid var(--brand);
+       border-radius:8px;padding:11px 14px;font-family:var(--mono);font-size:12px;color:var(--ink);
+       box-shadow:0 10px 28px rgba(0,0,0,.45);opacity:0;transform:translateY(10px);
+       transition:opacity .2s,transform .2s;pointer-events:none}
+  .toast.show{opacity:1;transform:translateY(0)}
+  .toast.okk{border-left-color:var(--ok)}
+  .toast.err{border-left-color:var(--crit)}
 
   /* ---------- KPI strip ---------- */
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-top:14px}
@@ -412,11 +442,17 @@
     <!-- ============ DISKS ============ -->
     <section class="view" id="view-disks" hidden>
       <div class="panel">
-        <h3><span class="h-key">02</span> Disks</h3>
+        <h3><span class="h-key">02</span> Disks lifecycle</h3>
         <table>
-          <thead><tr><th>Bay</th><th>Dir</th><th>State</th><th>Chunks</th><th>Used</th></tr></thead>
-          <tbody id="diskRows"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+          <thead><tr><th>Bay</th><th>Dir</th><th>State</th><th>Chunks</th><th>Used</th><th></th></tr></thead>
+          <tbody id="diskRows"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
         </table>
+        <div class="disk-ops">
+          <input id="adoptDir" placeholder="/mnt/disk3   (path to mount as a new disk)" spellcheck="false"/>
+          <button class="opbtn" id="btnAdopt">Adopt</button>
+          <span class="spacer" style="flex:1"></span>
+          <button class="opbtn warnb" id="btnDrain">Drain writes (pre-restart)</button>
+        </div>
       </div>
     </section>
 
@@ -443,6 +479,9 @@
         <pre class="json" id="metricsInfo">Loading…</pre>
       </div>
     </section>
+
+    <!-- status toast (position:fixed; direct child of main so it survives view toggling) -->
+    <div class="toast" id="toast"></div>
   </main>
 </div>
 
@@ -643,14 +682,20 @@ async function loadDisks(){
             <td><span class="pill ${esc(pillFor(disk.state))}"><span class="led ${esc(ledFor(disk.state))}"></span>${esc(disk.state||"—")}</span></td>
             <td class="mono">${fmtNum(disk.chunks)}</td>
             <td class="mono">${fmtBytes(disk.bytes)}</td>
+            <td class="mono" style="text-align:right">
+              <button class="dbtn drift" data-act="verify" data-dir="${esc(disk.dir)}">Verify</button>
+              <button class="dbtn drift" data-act="migrate" data-dir="${esc(disk.dir)}">Migrate</button>
+              <button class="dbtn danger" data-act="decommission" data-dir="${esc(disk.dir)}">Decomm</button>
+              <button class="dbtn danger" data-act="retire" data-dir="${esc(disk.dir)}">Retire</button>
+            </td>
           </tr>`).join("")
-      : `<tr><td colspan="5" class="empty">No disks</td></tr>`;
+      : `<tr><td colspan="6" class="empty">No disks</td></tr>`;
 
     // drive bay hero
     $("baywrap").innerHTML = disks.length
       ? disks.map(disk=>{
           const mb = ledFor(disk.state); // "ok" | "warn" | "crit"
-          return `<div class="bay bay-${esc(mb)}">
+          return `<div class="bay bay-${esc(mb)}" data-dir="${esc(disk.dir)}" data-state="${esc(disk.state||"online")}">
             <div class="bay-top">
               <span class="bay-idx">bay ${esc(disk.index)}</span>
               <span class="bay-state">${esc(disk.state||"online")}</span>
@@ -667,6 +712,12 @@ async function loadDisks(){
             <div class="bay-sub">${fmtNum(disk.chunks)} chunks</div>
             <div class="bay-ondisk">on disk ${fmtBytes(disk.on_disk_bytes||0)}</div>
             <div class="bay-rate" data-bay="${esc(disk.index)}"><span class="up">▲</span> <span class="bw">—</span></div>
+            <div class="bay-actions" data-dir="${esc(disk.dir)}">
+              <button class="dbtn drift" data-act="verify">Verify</button>
+              <button class="dbtn drift" data-act="migrate">Migrate</button>
+              <button class="dbtn danger" data-act="decommission">Decommission</button>
+              <button class="dbtn danger" data-act="retire">Retire</button>
+            </div>
           </div>`;
         }).join("")
       : `<div class="bay-empty">No disks mounted.</div>`;
@@ -702,6 +753,72 @@ function pctOf(disk){
 }
 function pillFor(s){ return (s||"online").toLowerCase(); }
 function ledFor(s){ s=(s||"online").toLowerCase(); return s==="failed"?"crit":s==="degraded"?"warn":"ok"; }
+
+/* ---------- disk lifecycle actions ---------- */
+let toastTimer = null;
+function toast(msg, kind){
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show"+(kind==="ok"?" okk":kind==="err"?" err":"");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=> t.className = "toast", 3200);
+}
+async function postDisk(action, dir){
+  const url = "/api/v1/disks/"+action+(dir!=null ? "?dir="+encodeURIComponent(dir) : "");
+  const r = await fetch(url, { method:"POST" });
+  let d = {};
+  try{ d = await r.json(); }catch(e){}
+  if(!r.ok) throw new Error(d.error || ("HTTP "+r.status));
+  return d;
+}
+const DISK_CONFIRM = {
+  decommission:"Decommissioning drains this disk's chunks onto others, then removes it. Continue?",
+  retire:"Retiring removes this disk from the node immediately without migrating chunks (for failed disks only — data loss risk). Continue?",
+};
+async function runDiskAction(act, dir, btn){
+  btn.disabled = true;
+  try{
+    if(DISK_CONFIRM[act] && !confirm(DISK_CONFIRM[act])) return;
+    const d = await postDisk(act, dir);
+    toast(act==="verify" ? `Verify started on ${dir}`
+        : act==="migrate" ? `Migrate ${dir}: ${d.migrated||0} chunks moved`
+        : act==="decommission" ? `Decommissioned ${dir}: ${d.migrated||0} chunks moved, removed`
+        : `Retired ${dir}`, "ok");
+    loadDisks();
+  }catch(e){
+    toast(e.message || "Disk action failed", "err");
+  }finally{
+    btn.disabled = false;
+  }
+}
+document.addEventListener("click", ev => {
+  const btn = ev.target.closest(".dbtn[data-act]");
+  if(!btn) return;
+  const act = btn.dataset.act;
+  const dir = btn.closest("[data-dir]").dataset.dir;
+  runDiskAction(act, dir, btn);
+});
+async function adoptDisk(){
+  const dir = $("adoptDir").value.trim();
+  if(!dir){ toast("Enter a directory path to adopt", "err"); return; }
+  try{
+    const d = await postDisk("adopt", dir);
+    toast(`Adopted ${d.dir} as bay ${d.index}`, "ok");
+    $("adoptDir").value = "";
+    loadDisks();
+  }catch(e){ toast(e.message || "Adopt failed", "err"); }
+}
+async function drainNode(){
+  try{
+    const d = await postDisk("drain", null);
+    toast("Writes drained — safe to restart", "ok");
+  }catch(e){ toast(e.message || "Drain failed", "err"); }
+}
+document.addEventListener("DOMContentLoaded", ()=>{
+  const adopt = $("btnAdopt"), drain = $("btnDrain");
+  if(adopt) adopt.addEventListener("click", adoptDisk);
+  if(drain) drain.addEventListener("click", drainNode);
+});
 
 /* ---------- repair queue ---------- */
 async function loadRepair(){
