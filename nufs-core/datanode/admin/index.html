@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Datanode Admin</title>
+<style>
+  :root { --bg:#0f1420; --panel:#1a2233; --fg:#e6edf7; --muted:#8b98ad; --accent:#4c8dff; --warn:#f0a73c; --crit:#e5534b; --ok:#3fb27f; --border:#2a3550; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:16px 24px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  .badge { padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+  .badge.none  { background:#223; color:var(--muted); }
+  .badge.warn  { background:#3a2c12; color:var(--warn); }
+  .badge.critical { background:#3a1a18; color:var(--crit); }
+  .muted { color:var(--muted); }
+  main { padding:24px; display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  @media (max-width:900px){ main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px 20px; }
+  .panel h2 { font-size:15px; margin:0 0 12px; border-bottom:1px solid var(--border); padding-bottom:8px; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); font-size:13px; }
+  th { color:var(--muted); font-weight:600; }
+  .bar { height:8px; background:#2a3550; border-radius:4px; overflow:hidden; min-width:80px; }
+  .bar > span { display:block; height:100%; background:var(--accent); }
+  .bar > span.warn { background:var(--warn); }
+  .bar > span.critical { background:var(--crit); }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; }
+  .pill.online{ background:#143023; color:var(--ok); }
+  .pill.degraded{ background:#3a2c12; color:var(--warn); }
+  .pill.failed{ background:#3a1a18; color:var(--crit); }
+  ul { margin:0; padding-left:20px; }
+  li { margin:4px 0; }
+  .stat { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid var(--border); }
+  .error { color:var(--crit); }
+</style>
+</head>
+<body>
+<header>
+  <h1>NUFS Datanode</h1>
+  <span id="nodeBadge" class="badge none">unknown</span>
+  <span class="muted" id="nodeVersion"></span>
+</header>
+<main>
+  <div class="panel" style="grid-column:1/-1">
+    <h2>Capacity</h2>
+    <div class="stat"><span>Used</span><span id="capUsed"></span></div>
+    <div class="stat"><span>Total</span><span id="capTotal"></span></div>
+    <div class="stat"><span>Usage</span><span id="capUsage"></span></div>
+    <div style="margin-top:8px" class="bar"><span id="capBar"></span></div>
+  </div>
+
+  <div class="panel">
+    <h2>Disks</h2>
+    <table>
+      <thead><tr><th>Disk</th><th>Dir</th><th>Used</th><th>Chunks</th><th>State</th></tr></thead>
+      <tbody id="diskRows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Capacity Alerts</h2>
+    <table>
+      <thead><tr><th>Level</th><th>Usage</th><th>Used / Total</th><th>Time</th></tr></thead>
+      <tbody id="alertRows"><tr><td colspan="4" class="muted">None</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Repair Queue</h2>
+    <div id="repairInfo" class="muted">Loading…</div>
+  </div>
+
+  <div class="panel">
+    <h2>Metrics Stream</h2>
+    <div id="metricsInfo" class="muted">Loading…</div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmtBytes = b => {
+  if (b == null) return "—";
+  const u = ["B","KB","MB","GB","TB"];
+  let i=0, v=b;
+  while (v >= 1024 && i < u.length-1){ v/=1024; i++; }
+  return v.toFixed(i?1:0)+" "+u[i];
+};
+const fmtPct = p => p==null ? "—" : (p*100).toFixed(1)+"%";
+const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function loadAlerts(){
+  try {
+    const r = await fetch("/api/v1/admin/alerts");
+    const d = await r.json();
+    const b = $("nodeBadge");
+    b.textContent = "alert: "+d.level;
+    b.className = "badge "+(d.level==="critical"?"critical":d.level==="warn"?"warn":"none");
+    $("nodeVersion").textContent = "v"+(d.version && d.version.version || "");
+    const o = d.overview || {};
+    $("capUsed").textContent = fmtBytes(o.used_bytes);
+    $("capTotal").textContent = fmtBytes(o.total_bytes);
+    $("capUsage").textContent = fmtPct(o.usage_pct);
+    const pb = $("capBar");
+    pb.className = "";
+    const p = o.usage_pct||0;
+    pb.style.width = Math.min(100, (p*100).toFixed(0))+"%";
+    if (p >= 0.85) pb.className="critical"; else if (p >= 0.75) pb.className="warn";
+    const rows = (d.alerts||[]).slice().reverse();
+    $("alertRows").innerHTML = rows.length
+      ? rows.map(a=>`<tr><td>${esc(a.level)}</td><td>${fmtPct(a.usage_pct)}</td><td>${fmtBytes(a.used_bytes)} / ${fmtBytes(a.total_bytes)}</td><td>${esc(a.ts)}</td></tr>`).join("")
+      : `<tr><td colspan="4" class="muted">None</td></tr>`;
+  } catch(e){ $("capUsed").textContent = "error"; }
+}
+
+async function loadDisks(){
+  try {
+    const r = await fetch("/api/v1/disks");
+    const d = await r.json();
+    const disks = d.disks || d || [];
+    $("diskRows").innerHTML = disks.length
+      ? disks.map(disk=>`<tr>
+          <td>${esc(disk.index)}</td><td>${esc(disk.dir)}</td>
+          <td>${fmtBytes(disk.used_bytes)}</td><td>${esc(disk.chunk_count)}</td>
+          <td><span class="pill ${esc(disk.state)}">${esc(disk.state)}</span></td>
+        </tr>`).join("")
+      : `<tr><td colspan="5" class="muted">No disks</td></tr>`;
+  } catch(e){ $("diskRows").innerHTML = `<tr><td colspan="5" class="error">failed to load</td></tr>`; }
+}
+
+async function loadRepair(){
+  try {
+    const r = await fetch("/api/v1/repair/queue");
+    const d = await r.json();
+    const q = d.queue || d.tasks || d;
+    $("repairInfo").innerHTML = Array.isArray(q) && q.length
+      ? `<ul>${q.slice(0,20).map(t=>`<li>${esc(t.chunk_id||t.chunk||"?")} · ${esc(t.status||t.state||"pending")}</li>`).join("")}</ul>`
+      : "Queue empty";
+  } catch(e){ $("repairInfo").innerHTML = `<span class="error">failed to load</span>`; }
+}
+
+async function loadMetrics(){
+  try {
+    const r = await fetch("/api/v1/metrics");
+    const d = await r.json();
+    $("metricsInfo").innerHTML = "<pre style='margin:0;overflow:auto'>"+esc(JSON.stringify(d,null,2))+"</pre>";
+  } catch(e){ $("metricsInfo").innerHTML = `<span class="error">failed to load</span>`; }
+}
+
+loadAlerts(); loadDisks(); loadRepair(); loadMetrics();
+setInterval(loadAlerts, 5000);
+setInterval(loadDisks, 10000);
+</script>
+</body>
+</html>

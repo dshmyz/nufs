@@ -36,7 +36,10 @@ func newTestMultiStore(t *testing.T, n int) (*V2Store, []*segment.Store) {
 	for i := 0; i < n; i++ {
 		stores[i] = backends[i]
 	}
-	v := NewMultiV2Store(stores)
+	// Pass the per-disk dirs through so the V2Store's disk Dir fields are
+	// populated (as in runDataNodeV21's NewMultiV2Store(stores, dataDirs...)),
+	// which DiskInfos/capacity-overview rely on for the Statfs total.
+	v := NewMultiV2Store(stores, dirs...)
 	t.Cleanup(func() {
 		for _, s := range backends {
 			s.Close()

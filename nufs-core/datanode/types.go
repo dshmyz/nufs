@@ -129,6 +129,11 @@ type Config struct {
 	// it cannot silently listen in plaintext in a production setting.
 	AllowInsecureDev bool
 
+	// AlertWebhook is an optional URL that receives capacity-alert events as a
+	// JSON POST (async, non-blocking). Empty disables webhook delivery; alerts
+	// still land in the admin ring buffer + logs.
+	AlertWebhook string
+
 	// StorageVersion selects the storage engine: "v1" (legacy ChunkStore)
 	// or "v2.1" (new segment/commit-log engine).
 	StorageVersion string

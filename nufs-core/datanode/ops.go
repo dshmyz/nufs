@@ -52,6 +52,13 @@ type OpsServer struct {
 	listener   *http.Server
 	running    atomic.Bool
 	shutdownWg sync.WaitGroup
+
+	// Instance-scoped capacity-alert state (admin ring + webhook). Lived on the
+	// server so multiple OpsServers (e.g. across tests) stay isolated.
+	alertWebhook   string
+	alertMu        sync.RWMutex
+	alertRing      []capacityAlertEvent
+	lastAlertLevel atomic.Int64
 }
 
 // NewOpsServer creates the operations HTTP server.
@@ -138,6 +145,9 @@ func NewOpsServerWithRepair(cfg Config, store OpsStore, meta OpsMetadata,
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(version.Info())
 	})
+
+	// Datanode admin web view + capacity-alert feed.
+	s.registerAdminRoutes(mux)
 
 	if cfg.OpsAuthToken != "" {
 		public := map[string]struct{}{
@@ -614,14 +624,14 @@ func (s *OpsServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *OpsServer) handleCapacityAlerts(w http.ResponseWriter, r *http.Request) {
-	stats := s.diskStats()
-	alertLevel := s.diskAlertLevel()
+	ov := s.capacityOverview()
+	level := s.currentAlertLevel()
 	s.writeJSON(w, map[string]interface{}{
-		"alert_level": alertLevel.String(),
-		"usage_pct":   fmt.Sprintf("%.1f%%", stats.UsagePct*100),
-		"used_bytes":  stats.UsedBytes,
-		"total_bytes": stats.TotalBytes,
-		"avail_bytes": stats.AvailBytes,
+		"alert_level": level.String(),
+		"usage_pct":   fmt.Sprintf("%.1f%%", ov.UsagePct*100),
+		"used_bytes":  ov.UsedBytes,
+		"total_bytes": ov.TotalBytes,
+		"avail_bytes": ov.TotalBytes - ov.UsedBytes,
 	})
 }
 

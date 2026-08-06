@@ -68,6 +68,7 @@ func main() {
 		kmsKeyEnv            = flag.String("kms-key-env", "", "Environment variable name holding the at-rest KEK (64 hex chars or 32 raw bytes)")
 		kmsKeyHex            = flag.String("kms-key-hex", "", "At-rest KEK as 64 hex characters (dev/test convenience)")
 		allowInsecureDev     = flag.Bool("allow-insecure-dev", false, "Allow running without TLS, auth, or production hardening (dev only)")
+		alertWebhook         = flag.String("alert-webhook", "", "Optional URL that receives capacity-alert events as JSON POSTs")
 		storageVersion       = flag.String("storage-version", "v1", "Storage engine version: v1 (legacy ChunkStore) or v2.1 (new engine)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON              = flag.Bool("log-json", false, "JSON log output")
@@ -143,6 +144,7 @@ func main() {
 		KMSKeyEnv:         *kmsKeyEnv,
 		KMSKeyHex:         *kmsKeyHex,
 		AllowInsecureDev:  *allowInsecureDev,
+		AlertWebhook:      *alertWebhook,
 		StorageVersion:    *storageVersion,
 		LogLevel:          *logLevel,
 	})
@@ -236,7 +238,8 @@ func buildAtRestKMS(cfg datanode.Config) (crypto.KMS, error) {
 	return kms, nil
 }
 
-func readMachineID() string {	b, err := os.ReadFile("/etc/machine-id")
+func readMachineID() string {
+	b, err := os.ReadFile("/etc/machine-id")
 	if err == nil {
 		return strings.TrimSpace(string(b))
 	}
@@ -417,6 +420,14 @@ func runDataNode(cfg datanode.Config) {
 	heartbeat.Start()
 
 	opsServer := datanode.NewOpsServerWithRepair(cfg, chunkStore, metaStore, diskManager, chainRepl, antiEntropy, repairWorker)
+	opsServer.SetAlertWebhook(cfg.AlertWebhook)
+	// Register the V1 DiskManager's capacity-alert callback so transitions are
+	// recorded in the admin ring and delivered to the webhook (the DiskManager
+	// already de-dups by level change).
+	diskManager.SetOnCapacityAlert(func(level datanode.AlertLevel, usagePct float64, dm *datanode.DiskManager) {
+		st := dm.Stats()
+		opsServer.NotifyCapacityAlert(level, st.UsagePct, st.UsedBytes, st.TotalBytes)
+	})
 	if err := opsServer.Start(); err != nil {
 		log.Error("failed to start ops server", "error", err)
 		os.Exit(1)
@@ -803,6 +814,26 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		return disks
 	})
 	opsServer.SetECService(ecService)
+	// V2.1 capacity alerts: no DiskManager callback exists (disk==nil), so poll
+	// the unified capacity overview on a timer and push any level transition
+	// through the same NotifyCapacityAlert ring+webhook path as V1.
+	opsServer.SetAlertWebhook(cfg.AlertWebhook)
+	{
+		alertStop := make(chan struct{})
+		go func() {
+			t := time.NewTicker(30 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-t.C:
+					opsServer.CheckAndNotifyCapacity()
+				case <-alertStop:
+					return
+				}
+			}
+		}()
+		defer func() { close(alertStop) }()
+	}
 
 	// Program 6 / F2: EC self-heal scan. A background sweep discovers every
 	// degraded 6+3 stripe on this node (shards lost to disk/node ageing or
