@@ -14,7 +14,7 @@
   <div class="card-body p-0">
     <table class="table" id="nodeTable">
       <thead>
-        <tr><th data-sort="int">ID</th><th data-sort="string">Address</th><th data-sort="string">Disk</th><th data-sort="string">Machine</th><th data-sort="string">State</th><th data-sort="int">Capacity</th><th data-sort="int">Used</th><th data-sort="int">Chunks</th><th>Actions</th></tr>
+        <tr><th data-sort="int">ID</th><th data-sort="string">Address</th><th data-sort="string">Disk</th><th data-sort="string">Machine</th><th data-sort="string">State</th><th data-sort="int">Capacity</th><th data-sort="int">Used</th><th data-sort="int">On disk</th><th data-sort="int">Chunks</th><th>Actions</th></tr>
       </thead>
       <tbody>
         {{range .Nodes}}
@@ -24,8 +24,9 @@
           <td><code>{{basename .DataDir}}</code></td>
           <td>{{.MachineID}}</td>
           <td><span class="badge badge-{{stateClass .State}}">{{stateLabel .State}}</span></td>
-          <td>{{.CapacityGB}} GB</td>
-          <td>{{.UsedGB}} GB</td>
+          <td>{{humanBytes .CapacityBytes}}</td>
+          <td>{{humanBytes .UsedBytes}}</td>
+          <td class="on-disk">{{humanBytes .OnDiskBytes}}</td>
           <td>{{.ChunkCount}}</td>
           <td>
             {{if eq .State 0}}
@@ -35,7 +36,7 @@
             {{end}}
           </td>
         </tr>
-        {{else}}<tr><td colspan="9" class="empty">No nodes registered</td></tr>
+        {{else}}<tr><td colspan="10" class="empty">No nodes registered</td></tr>
         {{end}}
       </tbody>
     </table>

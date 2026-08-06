@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/example/dfs/datanode/storage"
+	"github.com/example/dfs/datanode/storage/maintenance"
 	"github.com/example/dfs/datanode/storage/segment"
 	"github.com/example/dfs/metadata"
 )
@@ -85,6 +86,13 @@ type V2Store struct {
 	// replica, because a shard is a fragment, not a whole-chunk replica.
 	shards []*diskBackend
 
+	// caps holds one capacity guard per physical disk root, parallel to
+	// disks (index i guards the disk hosting data store i and shard store
+	// i). A nil entry means capacity protection is disabled for that disk
+	// (unknown filesystem root / legacy single-disk without a dir). Written
+	// once at construction and read on the write path, so it needs no lock.
+	caps []*maintenance.CapacityGuard
+
 	// mu guards locOf and shardDiskOf. Reconstruction at startup and serving
 	// updates both mutate them; reads take RLock.
 	mu    sync.RWMutex
@@ -137,6 +145,7 @@ func NewV2Store(store storage.Store, dir ...string) *V2Store {
 			b.lister = lister
 		}
 		v.disks = append(v.disks, b)
+		v.caps = append(v.caps, capacityForDisk(d))
 	}
 	return v
 }
@@ -167,8 +176,21 @@ func NewMultiV2Store(stores []storage.Store, dirs ...string) *V2Store {
 			}
 		}
 		v.disks = append(v.disks, b)
+		v.caps = append(v.caps, capacityForDisk(d))
 	}
 	return v
+}
+
+// DataStores returns the per-disk data-stream segment stores (the same
+// backing storage.Store instances passed to NewV2Store/NewMultiV2Store),
+// in disk order. EC-shard stores are excluded. The background compaction
+// worker drives these to reclaim superseded record bytes.
+func (v *V2Store) DataStores() []storage.Store {
+	out := make([]storage.Store, 0, len(v.disks))
+	for _, b := range v.disks {
+		out = append(out, b.store)
+	}
+	return out
 }
 
 // Write implements LocalChunkStore.Write. Route an overwrite to its
@@ -221,6 +243,11 @@ func (v *V2Store) writeTo(chunkID metadata.ChunkID, disk int, gen storage.Genera
 	// starve the disk of the success that would clear its streak.
 	if v.diskFailed(disk) {
 		return fmt.Errorf("datanode: disk %d is FAILED, refusing write", disk)
+	}
+	// Capacity admission: reject the write before the disk fills (avoids
+	// ENOSPC). No-op when capacity protection is disabled for this disk.
+	if err := v.admitDiskWrite(disk, int64(len(data))); err != nil {
+		return err
 	}
 	newChunk := gen == 1
 	b := v.disks[disk]
@@ -399,6 +426,11 @@ func (v *V2Store) writeShardAt(chunkID metadata.ChunkID, shardIndex, disk int, d
 		return fmt.Errorf("write shard: no shard store attached (disk %d, have %d)", disk, len(v.shards))
 	}
 	b := v.shards[disk]
+	// Capacity admission for the shard's physical disk (shares the root with
+	// disks[disk], so the guard at caps[disk] governs both data and shards).
+	if err := v.admitDiskWrite(disk, int64(len(data))); err != nil {
+		return err
+	}
 	if _, err := b.store.Write(context.Background(), &storage.WriteRequest{
 		ExtentID:   storage.ExtentID(chunkID),
 		Generation: shardGen(shardIndex),
@@ -1081,12 +1113,13 @@ func (v *V2Store) DiskStats() []DiskStatsItem {
 	out := make([]DiskStatsItem, len(v.disks))
 	for i, b := range v.disks {
 		out[i] = DiskStatsItem{
-			Index:      i,
-			UsedBytes:  b.usedByts.Load(),
-			TotalBytes: detectCapacityBytes(b.dir),
-			ChunkCount: b.extCount.Load(),
-			Failed:     v.diskFailed(i),
-			State:      v.diskState(i),
+			Index:       i,
+			UsedBytes:   b.usedByts.Load(),
+			TotalBytes:  detectCapacityBytes(b.dir),
+			OnDiskBytes: dataFilesOnDiskBytes(b.dir, ".seg"),
+			ChunkCount:  b.extCount.Load(),
+			Failed:      v.diskFailed(i),
+			State:       v.diskState(i),
 		}
 	}
 	return out
@@ -1303,17 +1336,20 @@ func (v *V2Store) ReadWriteBytes() (read int64, write int64) {
 
 // DiskInfos returns per-disk metadata for the management/ops channel,
 // mirroring the legacy ChunkStore.DiskInfos. Each V2.1 disk is one segment
-// store; Index/Dir/UsedBytes/ChunkCount/Failed derive from its accounting.
+// store; Index/Dir/UsedBytes/ChunkCount/Failed derive from its accounting and
+// OnDiskBytes from the actual .seg physical footprint (so an admin can show
+// logical live vs physical on-disk side by side).
 func (v *V2Store) DiskInfos() []DiskInfo {
 	out := make([]DiskInfo, len(v.disks))
 	for i, b := range v.disks {
 		out[i] = DiskInfo{
-			Index:      i,
-			Dir:        b.dir,
-			UsedBytes:  b.usedByts.Load(),
-			ChunkCount: b.extCount.Load(),
-			Failed:     v.diskFailed(i),
-			State:      v.diskState(i),
+			Index:       i,
+			Dir:         b.dir,
+			UsedBytes:   b.usedByts.Load(),
+			OnDiskBytes: dataFilesOnDiskBytes(b.dir, ".seg"),
+			ChunkCount:  b.extCount.Load(),
+			Failed:      v.diskFailed(i),
+			State:       v.diskState(i),
 		}
 	}
 	return out

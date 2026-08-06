@@ -46,6 +46,7 @@ func newAdminServer(store *metadata.PebbleStore, bundle *metadata.ServiceBundle)
 		"hasPrefix":  strings.HasPrefix,
 		"stateClass": stateClass,
 		"stateLabel": stateLabel,
+		"humanBytes": humanBytes,
 		"formatTime": func(t time.Time) string {
 			if t.IsZero() {
 				return "-"
@@ -180,9 +181,14 @@ type overviewData struct {
 	OnlineNodes   int
 	OfflineNodes  int
 	DrainingNodes int
-	TotalCapacity int64
-	UsedCapacity  int64
-	CapacityPct   float64
+	TotalCapacity  int64
+	UsedCapacity   int64
+	OnDiskCapacity int64
+	// Byte-accurate cluster aggregates for precise logical-vs-physical render.
+	UsedBytes         int64
+	OnDiskBytes       int64
+	CapacityBytes     int64
+	CapacityPct       float64
 	IsEmpty       bool
 	Topology      []topoGroup
 }
@@ -197,13 +203,18 @@ type topoNode struct {
 	StateName string // Online / Draining / Offline / Failed / Unknown
 	StateCls  string // success / warning / danger / secondary (CSS)
 	Capacity  int64  // GB
-	Used      int64  // GB
-	UsagePct  float64
-	DashOffset float64 // capacity-ring stroke offset (precomputed; html/template has no arithmetic)
-	Chunks    int64
-	Machine   string
-	Zone      string
-	Rack      string
+	Used      int64  // GB (logical live bytes)
+	OnDisk    int64  // GB (physical on-disk footprint, incl. un-compacted superseded)
+	// Byte-accurate footprints for rendering logical-vs-physical precisely.
+	UsedBytes     int64
+	OnDiskBytes   int64
+	CapacityBytes int64
+	UsagePct    float64
+	DashOffset  float64 // capacity-ring stroke offset (precomputed; html/template has no arithmetic)
+	Chunks      int64
+	Machine     string
+	Zone        string
+	Rack        string
 }
 
 // stateClass maps a node state to a CSS badge class (success/warning/danger/
@@ -239,6 +250,26 @@ func stateLabel(s metadata.NodeState) string {
 	}
 }
 
+// humanBytes renders a byte count as a compact human-readable string
+// ("211 KB", "1.4 GB"), so logical-vs-physical can be shown side by side at
+// any scale — the persistent GB fields round sub-GB movements to 0.
+func humanBytes(b int64) string {
+	switch {
+	case b < 0:
+		return "-"
+	case b < 1024:
+		return fmt.Sprintf("%d B", b)
+	case b < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	case b < 1024*1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
+	case b < 1024*1024*1024*1024:
+		return fmt.Sprintf("%.1f GB", float64(b)/(1024*1024*1024))
+	default:
+		return fmt.Sprintf("%.2f TB", float64(b)/(1024*1024*1024*1024))
+	}
+}
+
 // topoGroup groups rendered node cards by fault domain (rack/zone).
 type topoGroup struct {
 	Name  string
@@ -259,16 +290,20 @@ func buildTopology(nodes []metadata.NodeInfo) []topoGroup {
 			domain = n.Rack + " / " + n.Zone
 		}
 		tn := topoNode{
-			ID:        n.ID,
-			Addr:      n.Addr,
-			StateName: stateLabel(n.State),
-			StateCls:  stateClass(n.State),
-			Capacity:  n.CapacityGB,
-			Used:      n.UsedGB,
-			Chunks:    n.ChunkCount,
-			Machine:   n.MachineID,
-			Zone:      n.Zone,
-			Rack:      n.Rack,
+			ID:            n.ID,
+			Addr:          n.Addr,
+			StateName:     stateLabel(n.State),
+			StateCls:      stateClass(n.State),
+			Capacity:      n.CapacityGB,
+			Used:          n.UsedGB,
+			OnDisk:        n.OnDiskGB,
+			UsedBytes:     n.UsedBytes,
+			OnDiskBytes:   n.OnDiskBytes,
+			CapacityBytes: n.CapacityBytes,
+			Chunks:        n.ChunkCount,
+			Machine:       n.MachineID,
+			Zone:          n.Zone,
+			Rack:          n.Rack,
 		}
 		if n.CapacityGB > 0 {
 			tn.UsagePct = float64(n.UsedGB) / float64(n.CapacityGB) * 100
@@ -303,12 +338,16 @@ func (a *adminServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 	buckets, _ := a.store.ListBuckets(ctx)
 	tasks, _ := a.store.GetRepairQueue(ctx)
 
-	var chunkCount, totalCap, usedCap int64
+	var chunkCount, totalCap, usedCap, onDiskCap, usedBytes, onDiskBytes, capBytes int64
 	online, offline, draining := 0, 0, 0
 	for _, n := range nodes {
 		chunkCount += n.ChunkCount
 		totalCap += n.CapacityGB
 		usedCap += n.UsedGB
+		onDiskCap += n.OnDiskGB
+		usedBytes += n.UsedBytes
+		onDiskBytes += n.OnDiskBytes
+		capBytes += n.CapacityBytes
 		switch n.State {
 		case metadata.NodeOnline:
 			online++
@@ -332,9 +371,13 @@ func (a *adminServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 		OnlineNodes:   online,
 		OfflineNodes:  offline,
 		DrainingNodes: draining,
-		TotalCapacity: totalCap,
-		UsedCapacity:  usedCap,
-		CapacityPct:   capPct,
+		TotalCapacity:  totalCap,
+		UsedCapacity:   usedCap,
+		OnDiskCapacity: onDiskCap,
+		UsedBytes:      usedBytes,
+		OnDiskBytes:    onDiskBytes,
+		CapacityBytes:  capBytes,
+		CapacityPct:    capPct,
 		IsEmpty:       len(nodes) == 0 && len(buckets) == 0,
 		Topology:      buildTopology(nodes),
 	})

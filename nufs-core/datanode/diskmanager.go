@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -179,6 +180,48 @@ func detectCapacityBytes(dir string) int64 {
 	return int64(s.Blocks) * int64(s.Bsize)
 }
 
+// dataFilesOnDiskBytes sums the logical sizes of all files under root whose
+// name ends in one of the given extensions. It reports the on-disk physical
+// footprint (stat Size of non-sparse files == allocated blocks) of the store's
+// data files, so a console can distinguish "logical live bytes" from "physical
+// bytes occupied including reclaimed-able superseded record generations".
+//
+// - V2.1 segment stores: root = datanode data dir, exts = {".seg"} (files under
+//   segments/*/active/).
+// - V1 ChunkStore: root = disk data dir, exts = {".dat"} (chunk records).
+//
+// Used on the heartbeat path (every few seconds) only while a disk is healthy
+// and the file count is small; it avoids a full Statfs that would sweep in
+// unrelated OS/other-file usage on a shared volume.
+func dataFilesOnDiskBytes(root string, exts ...string) int64 {
+	if root == "" {
+		return 0
+	}
+	var total int64
+	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		found := false
+		for _, e := range exts {
+			if strings.HasSuffix(d.Name(), e) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+		// os.Stat (following symlinks, none expected here) gives the real on-disk
+		// allocation for these non-sparse files.
+		if fi, err := os.Stat(path); err == nil {
+			total += fi.Size()
+		}
+		return nil
+	})
+	return total
+}
+
 func defaultTierConfig() map[metadata.StorageTier]*TierConfig {
 	return map[metadata.StorageTier]*TierConfig{
 		metadata.TierHot:     {Tier: metadata.TierHot, MaxPct: 0.30, MinAgeDays: 0},
@@ -212,6 +255,10 @@ func (dm *DiskManager) Stop() {
 type DiskStatsSnapshot struct {
 	TotalBytes  int64     `json:"total_bytes"`
 	UsedBytes   int64     `json:"used_bytes"`
+	// OnDiskBytes is the physical on-disk footprint (compressed .seg/.dat
+	// bytes incl. not-yet-reclaimed superseded generations), distinct from
+	// UsedBytes which is logical live. 0 when the engine doesn't expose it.
+	OnDiskBytes int64     `json:"on_disk_bytes,omitempty"`
 	AvailBytes  int64     `json:"avail_bytes"`
 	UsagePct    float64   `json:"usage_pct"`
 	ChunkCount  int64     `json:"chunk_count"`

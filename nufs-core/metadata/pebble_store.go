@@ -2936,12 +2936,22 @@ func (s *PebbleStore) HeartbeatLiveness(ctx context.Context, nodeID NodeID, repo
 	info.State = NodeOnline
 	if report != nil {
 		info.UsedGB = report.UsedGB
+		info.UsedBytes = report.UsedBytes
 		info.ChunkCount = report.ChunkCount
-		// Persist the node's reported physical capacity (GB) so the admin
-		// console can render honest per-node capacity/usage%. Only nodes that
-		// report it get updated; legacy nodes keep their registration value.
+		// Persist the node's reported physical capacity (GB + exact bytes) so
+		// the admin console can render honest per-node capacity/usage%. Only
+		// nodes that report it get updated; legacy nodes keep their register.
 		if report.TotalCapacityBytes > 0 {
 			info.CapacityGB = report.TotalCapacityBytes / (1024 * 1024 * 1024)
+			info.CapacityBytes = report.TotalCapacityBytes
+		}
+		// Persist the node's physical on-disk footprint (GB + exact bytes)
+		// alongside logical UsedGB/UsedBytes so consoles can show both honestly
+		// — they diverge under overwrite/delete until seal+compaction reclaims
+		// superseded record generations.
+		if report.OnDiskBytes > 0 {
+			info.OnDiskGB = report.OnDiskBytes / (1024 * 1024 * 1024)
+			info.OnDiskBytes = report.OnDiskBytes
 		}
 		s.placement.UpdateLoad(nodeID, report.DiskIO)
 		s.placement.UpdateErrorRate(nodeID, report.WriteErrorRate)

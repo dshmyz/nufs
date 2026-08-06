@@ -3,153 +3,836 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Datanode Admin</title>
+<title>Datanode · Instrument</title>
 <style>
-  :root { --bg:#0f1420; --panel:#1a2233; --fg:#e6edf7; --muted:#8b98ad; --accent:#4c8dff; --warn:#f0a73c; --crit:#e5534b; --ok:#3fb27f; --border:#2a3550; }
-  * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
-  header { padding:16px 24px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
-  header h1 { font-size:18px; margin:0; }
-  .badge { padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
-  .badge.none  { background:#223; color:var(--muted); }
-  .badge.warn  { background:#3a2c12; color:var(--warn); }
-  .badge.critical { background:#3a1a18; color:var(--crit); }
-  .muted { color:var(--muted); }
-  main { padding:24px; display:grid; grid-template-columns:1fr 1fr; gap:20px; }
-  @media (max-width:900px){ main { grid-template-columns:1fr; } }
-  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px 20px; }
-  .panel h2 { font-size:15px; margin:0 0 12px; border-bottom:1px solid var(--border); padding-bottom:8px; }
-  table { width:100%; border-collapse:collapse; }
-  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); font-size:13px; }
-  th { color:var(--muted); font-weight:600; }
-  .bar { height:8px; background:#2a3550; border-radius:4px; overflow:hidden; min-width:80px; }
-  .bar > span { display:block; height:100%; background:var(--accent); }
-  .bar > span.warn { background:var(--warn); }
-  .bar > span.critical { background:var(--crit); }
-  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; }
-  .pill.online{ background:#143023; color:var(--ok); }
-  .pill.degraded{ background:#3a2c12; color:var(--warn); }
-  .pill.failed{ background:#3a1a18; color:var(--crit); }
-  ul { margin:0; padding-left:20px; }
-  li { margin:4px 0; }
-  .stat { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid var(--border); }
-  .error { color:var(--crit); }
+  /* ============================================================
+     NUFS datanode — instrument panel
+     Palette: warm graphite chassis + drive-status LED language.
+     Readouts are monospace; brand/headings are a technical grotesque.
+     ============================================================ */
+  :root{
+    --chassis:#14181d;
+    --panel:#1b2128;
+    --panel2:#232b34;
+    --line:#2b333d;
+    --line-hi:#36404c;
+    --ink:#e7e5df;
+    --dim:#8a929e;
+    --faint:#5c6570;
+    --brand:#d99f3f;   /* warm copper — signature accent, used sparingly */
+    --ok:#4fc08f;
+    --warn:#e0a43c;
+    --crit:#df5a4e;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,"Cascadia Mono",Consolas,monospace;
+    --disp:"Space Grotesk","Avenir Next","Segoe UI",system-ui,sans-serif;
+    --body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --nav-w:232px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--chassis);color:var(--ink);
+       font:13px/1.5 var(--body);-webkit-font-smoothing:antialiased}
+  a{color:inherit;text-decoration:none}
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .dim{color:var(--dim)}
+  .faint{color:var(--faint)}
+
+  /* ---------- app shell: sidebar + content ---------- */
+  .shell{display:grid;grid-template-columns:var(--nav-w) 1fr;min-height:100vh}
+  .side{border-right:1px solid var(--line);background:var(--panel);
+        display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+  .side .brand{padding:18px 18px 14px;border-bottom:1px solid var(--line)}
+  .side .mark{display:flex;align-items:center;gap:10px}
+  .side .glyph{width:26px;height:26px;border:1px solid var(--brand);border-radius:50%;
+       display:grid;place-items:center;color:var(--brand);font-family:var(--mono);
+       font-size:13px;position:relative;flex:none}
+  .side .glyph::after{content:"";position:absolute;inset:4px;border-radius:50%;
+       background:var(--brand);opacity:.14}
+  .side .brand-name{font-family:var(--disp);font-weight:600;font-size:15px;letter-spacing:.02em}
+  .side .brand-sub{font-family:var(--mono);font-size:10px;color:var(--dim);
+       letter-spacing:.14em;text-transform:uppercase;margin-top:1px}
+  nav.nav{padding:10px 10px}
+  .nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:7px;
+       color:var(--dim);font-size:13px;cursor:pointer;border:1px solid transparent;
+       font-variant-numeric:tabular-nums}
+  .nav-item:hover{color:var(--ink);background:var(--panel2)}
+  .nav-item.active{color:var(--ink);background:var(--panel2);border-color:var(--line-hi)}
+  .nav-item.active .nav-key{color:var(--brand)}
+  .nav-key{font-family:var(--mono);font-size:10px;letter-spacing:.05em;width:22px;color:var(--faint)}
+  .side .foot{margin-top:auto;padding:14px 18px;border-top:1px solid var(--line);
+       font-family:var(--mono);font-size:10px;color:var(--faint);line-height:1.8}
+
+  /* ---------- content ---------- */
+  .content{padding:22px 26px 40px;min-width:0}
+  .topbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:20px}
+  .topbar h1{font-family:var(--disp);font-weight:600;font-size:20px;margin:0;
+       letter-spacing:.01em}
+  .topbar .crumb{font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .spacer{flex:1}
+
+  /* health + status pills */
+  .led{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+  .led.ok{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .led.warn{background:var(--warn);box-shadow:0 0 6px var(--warn)}
+  .led.crit{background:var(--crit);box-shadow:0 0 6px var(--crit)}
+  .led.off{background:var(--faint)}
+  .pill{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:999px;
+       font-family:var(--mono);font-size:11px;letter-spacing:.04em;border:1px solid var(--line-hi)}
+  .pill.ok{color:var(--ok);border-color:rgba(79,192,143,.35);background:rgba(79,192,143,.08)}
+  .pill.warn{color:var(--warn);border-color:rgba(224,164,60,.4);background:rgba(224,164,60,.08)}
+  .pill.crit{color:var(--crit);border-color:rgba(223,90,78,.45);background:rgba(223,90,78,.1)}
+  .pill.off{color:var(--dim)}
+  .ver{font-family:var(--mono);font-size:11px;color:var(--dim)}
+
+  /* ---------- drive bay (signature hero) ---------- */
+  .baywrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}
+  .bay{background:linear-gradient(180deg,var(--panel2),var(--panel));
+       border:1px solid var(--line);border-radius:10px;padding:14px 14px 12px;
+       display:flex;flex-direction:column;gap:10px;position:relative;overflow:hidden}
+  .bay::before{content:"";position:absolute;inset:0;background:
+       repeating-linear-gradient(0deg,transparent 0 26px,rgba(255,255,255,.015) 26px 27px);
+       pointer-events:none}
+  .bay .bay-top{display:flex;align-items:center;justify-content:space-between}
+  .bay .bay-idx{font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:.06em}
+  .bay .bay-state{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+  .bay.bay-ok .bay-state{color:var(--ok)}
+  .bay.bay-warn .bay-state{color:var(--warn)}
+  .bay.bay-crit .bay-state{color:var(--crit)}
+  .bay .fill-wrap{height:104px;border:1px solid var(--line);border-radius:6px;
+       background:#0f1317;position:relative;overflow:hidden}
+  .fill-wrap .capmark{position:absolute;left:0;right:0;height:1px;background:var(--line)}
+  .fill-wrap .capmark.w75{top:75%}
+  .fill-wrap .capmark.w85{top:85%}
+  .fill-wrap .fill{position:absolute;left:0;right:0;bottom:0;
+       background:linear-gradient(180deg,var(--brand),rgba(217,159,63,.55));
+       transition:height 1.1s cubic-bezier(.22,1,.36,1)}
+  .fill-wrap .fill.lev-warn{background:linear-gradient(180deg,var(--warn),rgba(224,164,60,.5))}
+  .fill-wrap .fill.lev-crit{background:linear-gradient(180deg,var(--crit),rgba(223,90,78,.5))}
+  .fill-wrap .fill-amt{position:absolute;left:8px;bottom:6px;font-family:var(--mono);
+       font-size:11px;color:#0f1317;font-weight:700;letter-spacing:.02em;z-index:2}
+  .bay .bay-used{font-family:var(--mono);font-size:15px;font-weight:600;color:var(--ink)}
+  .bay .bay-sub{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.04em}
+  .bay-empty{grid-column:1/-1;border:1px dashed var(--line-hi);border-radius:10px;
+       padding:26px;text-align:center;color:var(--dim);font-family:var(--mono);font-size:12px}
+
+  /* ---------- KPI strip ---------- */
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-top:14px}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .kpi .k-label{font-family:var(--mono);font-size:10px;letter-spacing:.1em;
+       text-transform:uppercase;color:var(--dim)}
+  .kpi .k-value{font-family:var(--mono);font-size:22px;font-weight:600;margin-top:7px;
+       font-variant-numeric:tabular-nums;letter-spacing:.01em}
+  .kpi .k-value.accent{color:var(--brand)}
+  .kpi .k-value.ondisk{color:var(--warn)}
+  .kpi .k-sub{font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:3px}
+  .kpi .k-bar{height:4px;border-radius:2px;background:#0f1317;margin-top:10px;overflow:hidden}
+  .kpi .k-bar > span{display:block;height:100%;background:var(--brand);border-radius:2px}
+  .kpi .k-bar > span.lev-warn{background:var(--warn)}
+  .kpi .k-bar > span.lev-crit{background:var(--crit)}
+
+  /* ---------- panels ---------- */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+       padding:16px 18px;margin-top:14px}
+  .panel > h3{font-family:var(--disp);font-weight:600;font-size:13px;margin:0 0 12px;
+       color:var(--ink);display:flex;align-items:center;gap:9px}
+  .panel > h3 .h-key{font-family:var(--mono);font-size:10px;color:var(--brand);letter-spacing:.08em}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);font-size:12px}
+  th{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+     color:var(--dim);font-weight:500}
+  th:first-child,td:first-child{padding-left:2px}
+  th:last-child,td:last-child{padding-right:2px}
+  tbody tr:hover{background:rgba(255,255,255,.02)}
+  td.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .empty{color:var(--dim);font-style:normal;padding:18px 2px;text-align:center;font-family:var(--mono);font-size:12px}
+  .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}
+  .readout{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .readout .r-label{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+  .readout .r-value{font-family:var(--mono);font-size:17px;font-weight:600;margin-top:5px;font-variant-numeric:tabular-nums}
+  .readout .r-value .unit{font-size:11px;color:var(--dim);font-weight:400;margin-left:3px}
+  .readout .r-sub{font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:3px}
+
+  .alert-row{display:flex;align-items:center;gap:12px;padding:9px 2px;border-bottom:1px solid var(--line)}
+  .alert-row:last-child{border-bottom:none}
+  .alert-row .when{font-family:var(--mono);font-size:11px;color:var(--dim);white-space:nowrap}
+  .alert-row .amt{font-family:var(--mono);font-size:12px;color:var(--ink);margin-left:auto}
+
+  .repair-list{list-style:none;margin:0;padding:0}
+  .repair-list li{display:flex;align-items:center;gap:12px;padding:9px 2px;border-bottom:1px solid var(--line);
+       font-family:var(--mono);font-size:12px}
+  .repair-list li:last-child{border-bottom:none}
+  .repair-list .cid{color:var(--ink)}
+  .repair-list .st{margin-left:auto;font-size:11px}
+
+  .json{font-family:var(--mono);font-size:11px;line-height:1.6;color:#b9c1cc;
+       background:#0f1317;border:1px solid var(--line);border-radius:8px;padding:14px 16px;
+       overflow:auto;max-height:420px;white-space:pre}
+
+  /* ---------- live rate strip (signature live element) ---------- */
+  .ratestrip{display:grid;grid-template-columns:auto auto 1fr auto;gap:0;align-items:stretch;
+       background:var(--panel);border:1px solid var(--line);border-radius:10px;
+       margin-bottom:14px;overflow:hidden}
+  .ratestrip .rs-cell{padding:12px 18px;display:flex;flex-direction:column;justify-content:center;
+       gap:2px;border-right:1px solid var(--line);min-width:150px}
+  .ratestrip .rs-cell:last-child{border-right:none}
+  .ratestrip .rs-label{font-family:var(--mono);font-size:9px;letter-spacing:.14em;
+       text-transform:uppercase;color:var(--dim);display:flex;align-items:center;gap:6px}
+  .ratestrip .rs-label .dot{width:6px;height:6px;border-radius:50%;background:var(--faint)}
+  .ratestrip .rs-label .dot.read{background:var(--brand)}
+  .ratestrip .rs-label .dot.write{background:var(--ok)}
+  .ratestrip .rs-value{font-family:var(--mono);font-size:20px;font-weight:600;
+       font-variant-numeric:tabular-nums;line-height:1}
+  .ratestrip .rs-value .u{font-size:11px;color:var(--dim);font-weight:400;margin-left:4px}
+  .ratestrip .rs-value.read{color:var(--brand)}
+  .ratestrip .rs-value.write{color:var(--ok)}
+  .ratestrip .rs-foot{font-family:var(--mono);font-size:9px;color:var(--faint)}
+  .ratestrip .rs-spark{position:relative;padding:10px 12px;display:flex;flex-direction:column;gap:4px}
+  .ratestrip .rs-spark .spark-title{font-family:var(--mono);font-size:9px;letter-spacing:.14em;
+       text-transform:uppercase;color:var(--faint)}
+  .ratestrip .rs-spark canvas{width:100%;height:56px;display:block}
+  .ratestrip .rs-spark .spark-legend{display:flex;gap:16px;font-family:var(--mono);font-size:9px;color:var(--dim)}
+  .ratestrip .rs-spark .spark-legend .lg{display:inline-flex;align-items:center;gap:5px}
+  .ratestrip .rs-spark .spark-legend .sw{width:12px;height:2px;border-radius:1px}
+  .ratestrip .live-tag{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);
+       font-size:9px;letter-spacing:.16em;color:var(--ok);text-transform:uppercase}
+  .ratestrip .live-tag .pl{width:7px;height:7px;border-radius:50%;background:var(--ok);
+       animation:pulse 1.6s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+
+  /* ---------- per-bay live density ---------- */
+  .bay .bay-usedwrap{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+  .bay .bay-pct{font-family:var(--mono);font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+  .bay .bay-rate{display:flex;align-items:center;gap:5px;font-family:var(--mono);
+       font-size:9px;color:var(--faint);letter-spacing:.04em;margin-top:1px}
+  .bay .bay-rate .up{color:var(--ok)}
+  .bay .bay-sub{margin-top:2px}
+  .bay .bay-ondisk{font-family:var(--mono);font-size:10px;color:var(--warn);margin-top:1px;letter-spacing:.03em}
+
+  /* ============================================================
+     LAYER 1 — verdict band (one-glance health + live activity)
+     ============================================================ */
+  .verdict-band{display:grid;grid-template-columns:auto 1fr;gap:0;align-items:stretch;
+       background:var(--panel);border:1px solid var(--line-hi);border-radius:12px;
+       margin-bottom:14px;overflow:hidden}
+  /* health ring (SVG) */
+  .ring{display:grid;place-items:center;padding:16px 22px;border-right:1px solid var(--line);
+       min-width:196px}
+  .ring svg{width:132px;height:132px}
+  .ring .ring-track{fill:none;stroke:var(--line);stroke-width:7}
+  .ring .ring-fill{fill:none;stroke:var(--ok);stroke-width:7;stroke-linecap:round;
+       transform:rotate(-90deg);transform-origin:66px 66px;transition:stroke-dashoffset 1.1s cubic-bezier(.22,1,.36,1),stroke .3s}
+  .ring .ring-center{font-family:var(--mono);font-size:13px;font-weight:600;fill:var(--ink);text-anchor:middle}
+  .ring .ring-cap{font-family:var(--mono);font-size:12px;font-weight:600;fill:var(--ink);
+       text-anchor:middle;font-variant-numeric:tabular-nums}
+  .ring .ring-nodes{font-family:var(--mono);font-size:9px;fill:var(--faint);text-anchor:middle}
+  .ring .ring-verdict{font-family:var(--disp);font-weight:600;font-size:16px;letter-spacing:.02em}
+  .ring .ring-verdict.ok{fill:var(--ok)} .ring .ring-verdict.warn{fill:var(--warn)}
+  .ring .ring-verdict.crit{fill:var(--crit)}
+  .ring .ring-detail{display:flex;flex-direction:column;align-items:center;gap:1px;
+       margin-top:6px;font-family:var(--mono)}
+  /* compact rate strip beside the ring */
+  .verdict-band .ratestrip{border:none;border-radius:0;margin-bottom:0;grid-template-columns:repeat(3,minmax(130px,1fr)) auto}
+  .verdict-band .ratestrip .rs-cell{padding:14px 20px}
+
+  /* ============================================================
+     LAYER 2 — cluster topology (fault-domain)
+     ============================================================ */
+  .band-title{display:flex;align-items:baseline;gap:9px;margin:0 0 12px}
+  .band-title .bt-key{font-family:var(--mono);font-size:10px;color:var(--brand);letter-spacing:.12em}
+  .band-title h3{font-family:var(--disp);font-weight:600;font-size:13px;margin:0;color:var(--ink)}
+  .band-title .bt-sub{font-family:var(--mono);font-size:10px;color:var(--faint)}
+  .topo{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+  .topo .tnode{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+       padding:13px 15px;position:relative;display:flex;flex-direction:column;gap:9px}
+  .topo .tnode.self{border-color:var(--brand);box-shadow:0 0 0 1px rgba(217,159,63,.25)}
+  .topo .tn-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .topo .tn-id{font-family:var(--disp);font-weight:600;font-size:15px;color:var(--ink);
+       display:flex;align-items:center;gap:8px}
+  .topo .tn-id .nid{color:var(--dim);font-family:var(--mono);font-size:11px}
+  .topo .tn-self{font-family:var(--mono);font-size:8px;letter-spacing:.12em;color:var(--brand);
+       text-transform:uppercase;border:1px solid rgba(217,159,63,.4);border-radius:999px;padding:2px 7px}
+  .topo .tn-state{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);
+       font-size:9px;letter-spacing:.08em;text-transform:uppercase}
+  .topo .tn-state.ok{color:var(--ok)} .topo .tn-state.warn{color:var(--warn)} .topo .tn-state.crit{color:var(--crit)}
+  .topo .tn-meta{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;font-family:var(--mono);font-size:10px;color:var(--dim)}
+  .topo .tn-meta b{color:var(--ink);font-weight:600}
+  .topo .tn-addr{font-family:var(--mono);font-size:10px;color:var(--faint);
+       border-top:1px solid var(--line);padding-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .topo .topo-empty{grid-column:1/-1;border:1px dashed var(--line-hi);border-radius:10px;padding:24px;
+       text-align:center;color:var(--dim);font-family:var(--mono);font-size:12px}
+
+  /* honest replication / anti-entropy badges */
+  .sys-badges{display:flex;flex-wrap:wrap;gap:10px}
+  .sys-badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:10px;
+       color:var(--dim);border:1px solid var(--line);border-radius:8px;padding:9px 14px;background:var(--panel)}
+  .sys-badge .sb-l{letter-spacing:.1em;text-transform:uppercase;color:var(--faint);font-size:9px}
+  .sys-badge .sb-v{color:var(--ink);font-weight:600}
+  .sys-badge .sb-v.idle{color:var(--dim)}
+  .sys-badge .sb-v.ok{color:var(--ok)} .sys-badge .sb-v.warn{color:var(--warn)} .sys-badge .sb-v.crit{color:var(--crit)}
+
+  /* ---------- responsive: sidebar collapses to top bar ---------- */
+  @media (max-width:760px){
+    .shell{grid-template-columns:1fr}
+    .side{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line)}
+    .side .foot{display:none}
+    nav.nav{display:flex;flex-wrap:wrap;gap:4px;padding:8px}
+    .nav-item{flex:1;min-width:110px;justify-content:center}
+    .nav-key{display:none}
+    .content{padding:16px}
+  }
+
+  @media (prefers-reduced-motion:reduce){
+    .fill-wrap .fill{transition:none}
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>NUFS Datanode</h1>
-  <span id="nodeBadge" class="badge none">unknown</span>
-  <span class="muted" id="nodeVersion"></span>
-</header>
-<main>
-  <div class="panel" style="grid-column:1/-1">
-    <h2>Capacity</h2>
-    <div class="stat"><span>Used</span><span id="capUsed"></span></div>
-    <div class="stat"><span>Total</span><span id="capTotal"></span></div>
-    <div class="stat"><span>Usage</span><span id="capUsage"></span></div>
-    <div style="margin-top:8px" class="bar"><span id="capBar"></span></div>
-  </div>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <div class="mark">
+        <div class="glyph">◐</div>
+        <div>
+          <div class="brand-name">NUFS</div>
+          <div class="brand-sub">Datanode</div>
+        </div>
+      </div>
+    </div>
+    <nav class="nav" id="nav">
+      <a class="nav-item active" data-view="overview" href="#overview"><span class="nav-key">01</span>Overview</a>
+      <a class="nav-item" data-view="disks" href="#disks"><span class="nav-key">02</span>Disks</a>
+      <a class="nav-item" data-view="alerts" href="#alerts"><span class="nav-key">03</span>Alerts</a>
+      <a class="nav-item" data-view="repair" href="#repair"><span class="nav-key">04</span>Repair</a>
+      <a class="nav-item" data-view="engine" href="#engine"><span class="nav-key">05</span>Engine</a>
+    </nav>
+    <div class="foot">
+      <div id="footNode">node —</div>
+      <div id="footAddr"></div>
+    </div>
+  </aside>
 
-  <div class="panel">
-    <h2>Disks</h2>
-    <table>
-      <thead><tr><th>Disk</th><th>Dir</th><th>Used</th><th>Chunks</th><th>State</th></tr></thead>
-      <tbody id="diskRows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
-    </table>
-  </div>
+  <main class="content">
+    <div class="topbar">
+      <span class="crumb" id="nodeCrumb">node</span>
+      <h1 id="pageTitle">Overview</h1>
+      <div class="spacer"></div>
+      <span class="pill off" id="healthPill"><span class="led off"></span><span id="healthText">…</span></span>
+      <span class="ver" id="verText"></span>
+    </div>
 
-  <div class="panel">
-    <h2>Capacity Alerts</h2>
-    <table>
-      <thead><tr><th>Level</th><th>Usage</th><th>Used / Total</th><th>Time</th></tr></thead>
-      <tbody id="alertRows"><tr><td colspan="4" class="muted">None</td></tr></tbody>
-    </table>
-  </div>
+    <!-- ============ OVERVIEW ============ -->
+    <section class="view" id="view-overview">
 
-  <div class="panel">
-    <h2>Repair Queue</h2>
-    <div id="repairInfo" class="muted">Loading…</div>
-  </div>
+      <!-- LAYER 1 — verdict band: health ring + live activity -->
+      <div class="verdict-band">
+        <div class="ring" id="healthRing" aria-label="node health verdict">
+          <svg viewBox="0 0 132 132" role="img" aria-hidden="true">
+            <circle class="ring-track" cx="66" cy="66" r="56"></circle>
+            <circle class="ring-fill" id="ringFill" cx="66" cy="66" r="56"
+              stroke-dasharray="351.86" stroke-dashoffset="351.86"></circle>
+            <text class="ring-verdict ok" id="ringVerdict" x="66" y="56" text-anchor="middle">—</text>
+            <text class="ring-cap" id="ringPct" x="66" y="74" text-anchor="middle">—</text>
+            <text class="ring-nodes" id="ringNodes" x="66" y="96">—</text>
+          </svg>
+          <div class="ring-detail">
+            <span id="ringCap" class="mono dim">—</span>
+            <span id="ringCapSub" class="mono faint">of node capacity</span>
+          </div>
+        </div>
 
-  <div class="panel">
-    <h2>Metrics Stream</h2>
-    <div id="metricsInfo" class="muted">Loading…</div>
-  </div>
-</main>
+        <div class="ratestrip" id="rateStrip">
+          <div class="rs-cell">
+            <span class="rs-label"><span class="dot read"></span>Read <span class="live-tag"><span class="pl"></span>live</span></span>
+            <span class="rs-value read" id="rsRead">—</span>
+            <span class="rs-foot" id="rsReadChunk">0 chunks/s</span>
+          </div>
+          <div class="rs-cell">
+            <span class="rs-label"><span class="dot write"></span>Write <span class="live-tag"><span class="pl"></span>live</span></span>
+            <span class="rs-value write" id="rsWrite">—</span>
+            <span class="rs-foot" id="rsWriteChunk">0 chunks/s</span>
+          </div>
+          <div class="rs-cell">
+            <span class="rs-label"><span class="dot"></span>Throughput</span>
+            <span class="rs-value" id="rsThroughput">—</span>
+            <span class="rs-foot" id="rsActive">0 active</span>
+          </div>
+          <div class="rs-spark">
+            <span class="spark-title">I/O activity · last 30s</span>
+            <canvas id="spark" width="360" height="56"></canvas>
+            <span class="spark-legend"><span class="lg"><span class="sw" style="background:var(--brand)"></span>read</span><span class="lg"><span class="sw" style="background:var(--ok)"></span>write</span></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- LAYER 2 — cluster topology (fault-domain roster) -->
+      <div class="panel">
+        <div class="band-title"><span class="bt-key">FM</span><h3>Fault domain</h3>
+          <span class="bt-sub" id="topoSub">loading members…</span></div>
+        <div class="topo" id="topo">…</div>
+      </div>
+
+      <!-- LAYER 3 — system detail: capacity KPIs + drive bay + engine -->
+      <div class="kpis">
+        <div class="kpi">
+          <div class="k-label">Capacity used</div>
+          <div class="k-value accent" id="kUsed">—</div>
+          <div class="k-sub" id="kUsedSub"></div>
+        </div>
+        <div class="kpi">
+          <div class="k-label">On disk</div>
+          <div class="k-value ondisk" id="kOnDisk">—</div>
+          <div class="k-sub" id="kOnDiskSub"></div>
+        </div>
+        <div class="kpi">
+          <div class="k-label">Capacity total</div>
+          <div class="k-value" id="kTotal">—</div>
+          <div class="k-sub">aggregate across disks</div>
+        </div>
+        <div class="kpi">
+          <div class="k-label">Usage</div>
+          <div class="k-value" id="kUsage">—</div>
+          <div class="k-bar"><span id="kUsageBar"></span></div>
+        </div>
+        <div class="kpi">
+          <div class="k-label">Chunks</div>
+          <div class="k-value" id="kChunks">—</div>
+          <div class="k-sub">stored on this node</div>
+        </div>
+      </div>
+
+      <div class="baywrap" id="baywrap"><div class="bay-empty">No disks</div></div>
+
+      <div class="panel">
+        <h3><span class="h-key">LIVE</span> Engine</h3>
+        <div class="sys-badges" id="sysBadges"></div>
+        <div class="row" id="teleRow" style="margin-top:12px"></div>
+      </div>
+    </section>
+
+    <!-- ============ DISKS ============ -->
+    <section class="view" id="view-disks" hidden>
+      <div class="panel">
+        <h3><span class="h-key">02</span> Disks</h3>
+        <table>
+          <thead><tr><th>Bay</th><th>Dir</th><th>State</th><th>Chunks</th><th>Used</th></tr></thead>
+          <tbody id="diskRows"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ============ ALERTS ============ -->
+    <section class="view" id="view-alerts" hidden>
+      <div class="panel">
+        <h3><span class="h-key">03</span> Capacity alerts</h3>
+        <div id="alertList"></div>
+      </div>
+    </section>
+
+    <!-- ============ REPAIR ============ -->
+    <section class="view" id="view-repair" hidden>
+      <div class="panel">
+        <h3><span class="h-key">04</span> Repair queue</h3>
+        <ul class="repair-list" id="repairList"></ul>
+      </div>
+    </section>
+
+    <!-- ============ ENGINE ============ -->
+    <section class="view" id="view-engine" hidden>
+      <div class="panel">
+        <h3><span class="h-key">05</span> Metrics stream</h3>
+        <pre class="json" id="metricsInfo">Loading…</pre>
+      </div>
+    </section>
+  </main>
+</div>
+
 <script>
+"use strict";
 const $ = id => document.getElementById(id);
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ---------- formatting ---------- */
 const fmtBytes = b => {
-  if (b == null) return "—";
+  if (b == null || isNaN(b)) return "—";
   const u = ["B","KB","MB","GB","TB"];
-  let i=0, v=b;
+  let i = 0, v = +b;
   while (v >= 1024 && i < u.length-1){ v/=1024; i++; }
   return v.toFixed(i?1:0)+" "+u[i];
 };
 const fmtPct = p => p==null ? "—" : (p*100).toFixed(1)+"%";
-const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmtNum = n => n==null||isNaN(n) ? "—" : (+n).toLocaleString("en-US");
+const esc = s => String(s==null?"":s).replace(/[&<>"']/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+/* ---------- view routing (hash-based) ---------- */
+const views = ["overview","disks","alerts","repair","engine"];
+const titles = {overview:"Overview",disks:"Disks",alerts:"Alerts",repair:"Repair",engine:"Engine"};
+function showView(name){
+  if(!views.includes(name)) name = "overview";
+  views.forEach(v => $("view-"+v).hidden = (v!==name));
+  document.querySelectorAll(".nav-item").forEach(a =>
+    a.classList.toggle("active", a.dataset.view===name));
+  $("pageTitle").textContent = titles[name];
+}
+window.addEventListener("hashchange", ()=>showView(location.hash.slice(1)||"overview"));
+showView(location.hash.slice(1)||"overview");
+
+/* ---------- health / alerts ---------- */
 async function loadAlerts(){
-  try {
+  try{
     const r = await fetch("/api/v1/admin/alerts");
     const d = await r.json();
-    const b = $("nodeBadge");
-    b.textContent = "alert: "+d.level;
-    b.className = "badge "+(d.level==="critical"?"critical":d.level==="warn"?"warn":"none");
-    $("nodeVersion").textContent = "v"+(d.version && d.version.version || "");
+    const level = d.level || "none";
+    const pill = $("healthPill");
+    pill.className = "pill "+(level==="critical"?"crit":level==="warn"?"warn":"ok");
+    pill.querySelector(".led").className = "led "+(level==="critical"?"crit":level==="warn"?"warn":"ok");
+    $("healthText").textContent = level;
+    if(d.version && d.version.version) $("verText").textContent = "v"+d.version.version;
+    if(d.node_id != null) $("nodeCrumb").textContent = "node "+d.node_id;
+    $("footNode").textContent = "node "+(d.node_id!=null?d.node_id:"—");
+
     const o = d.overview || {};
-    $("capUsed").textContent = fmtBytes(o.used_bytes);
-    $("capTotal").textContent = fmtBytes(o.total_bytes);
-    $("capUsage").textContent = fmtPct(o.usage_pct);
-    const pb = $("capBar");
-    pb.className = "";
-    const p = o.usage_pct||0;
-    pb.style.width = Math.min(100, (p*100).toFixed(0))+"%";
-    if (p >= 0.85) pb.className="critical"; else if (p >= 0.75) pb.className="warn";
-    const rows = (d.alerts||[]).slice().reverse();
-    $("alertRows").innerHTML = rows.length
-      ? rows.map(a=>`<tr><td>${esc(a.level)}</td><td>${fmtPct(a.usage_pct)}</td><td>${fmtBytes(a.used_bytes)} / ${fmtBytes(a.total_bytes)}</td><td>${esc(a.ts)}</td></tr>`).join("")
-      : `<tr><td colspan="4" class="muted">None</td></tr>`;
-  } catch(e){ $("capUsed").textContent = "error"; }
+    const used = o.used_bytes, total = o.total_bytes, p = o.usage_pct||0;
+    const onDisk = o.on_disk_bytes||0;
+    $("kUsed").textContent = fmtBytes(used);
+    $("kUsedSub").textContent = fmtPct(p)+" of node";
+    $("kOnDisk").textContent = fmtBytes(onDisk);
+    $("kOnDiskSub").textContent = onDisk>0 ? (used>0?Math.round(onDisk/used*100)+"% of logical":"physical .seg") : "physical .seg";
+    $("kTotal").textContent = fmtBytes(total);
+    $("kUsage").textContent = fmtPct(p);
+    const bar = $("kUsageBar");
+    bar.style.width = Math.min(100,(p*100).toFixed(0))+"%";
+    bar.className = p>=0.85?"lev-crit":p>=0.75?"lev-warn":"";
+
+    // capacity alert log
+    const alerts = (d.alerts||[]).slice().slice(-20).reverse();
+    $("alertList").innerHTML = alerts.length
+      ? alerts.map(a=>`<div class="alert-row">
+            <span class="led ${esc(a.level==="critical"?"crit":a.level==="warn"?"warn":"ok")}"></span>
+            <span class="pill ${esc(a.level==="critical"?"crit":a.level==="warn"?"warn":"ok")}">${esc(a.level)}</span>
+            <span class="amt">${fmtBytes(a.used_bytes)} / ${fmtBytes(a.total_bytes)} · ${fmtPct(a.usage_pct)}</span>
+            <span class="when">${esc(safeTs(a.ts))}</span>
+          </div>`).join("")
+      : `<div class="empty">No capacity alerts — this node is well within limits.</div>`;
+  }catch(e){
+    $("kUsed").textContent = "offline";
+    $("healthText").textContent = "offline";
+  }
+}
+function safeTs(ts){
+  if(!ts) return "—";
+  const iso = String(ts).includes("T")?ts:String(ts).replace(" ","T")+"Z";
+  const dt = new Date(iso);
+  if(isNaN(dt)) return String(ts);
+  return dt.toISOString().replace("T"," ").slice(0,19)+" UTC";
 }
 
+/* ---------- LAYER 1 · health verdict ring ---------- */
+// Dashboard-visible state keywords (NodeState.String()): online/draining/maint/offline/failed
+const NODE_STATE = { online:"ok", draining:"warn", maint:"warn", offline:"crit", failed:"crit" };
+function nodeStateKey(n){ return NODE_STATE[(n||"online").toLowerCase()]||"warn"; }
+const CIRC = 2*Math.PI*56; // r=56
+
+function setRing(okClass, verdict, pct, nodes, capBytes, capTotal){
+  const fill = $("ringFill");
+  fill.style.stroke = okClass==="ok"?"var(--ok)":okClass==="warn"?"var(--warn)":"var(--crit)";
+  fill.setAttribute("stroke-dashoffset", String(CIRC*(1-Math.min(1,Math.max(0,pct)))));
+  const v = $("ringVerdict");
+  v.textContent = verdict;
+  v.setAttribute("class","ring-verdict "+okClass);
+  $("ringPct").textContent = (pct*100).toFixed(1)+"%";
+  $("ringNodes").textContent = nodes;
+  $("ringCap").textContent = fmtBytes(capBytes||0);
+  $("ringCapSub").textContent = (capTotal>0 ? (capBytes/capTotal*100).toFixed(2) : "0.00")+"% of node capacity";
+}
+
+async function loadHealth(){
+  try{
+    const [h, cs] = await Promise.all([
+      fetch("/api/v1/health").then(r=>r.json()).catch(()=>({})),
+      fetch("/api/v1/cluster/status").then(r=>r.json()).catch(()=>({}))
+    ]);
+    const ds = cs.disk_stats||{};
+    const pct = ds.usage_pct||0;
+    const healthy = h.status==="healthy";
+    const ok = healthy ? "ok":"crit";
+    setRing(ok, healthy?"HEALTH OK":"DEGRADED", pct, "node "+($("nodeCrumb").textContent.replace("node ","")||"—"),
+      ds.used_bytes, ds.total_bytes);
+  }catch(e){ setRing("crit","OFFLINE",0,"node —",0,0); }
+}
+
+/* ---------- LAYER 2 · cluster topology ---------- */
+// /api/v1/nodes returns NodeInfo.State as an int (NodeState): 0 online,
+// 1 draining, 2 maint, 3 offline, 4 failed — plus optionally a string state.
+const NS_INT = ["online","draining","maint","offline","failed"];
+function nodeStateName(n){
+  const s = n.State ?? n.state;
+  if(typeof s === "number") return NS_INT[s]||"online";
+  return String(s||"online").toLowerCase();
+}
+function topoCard(n, isSelf){
+  const st = nodeStateName(n);
+  const key = nodeStateKey(st);
+  return `<div class="tnode${isSelf?" self":""}">
+    <div class="tn-head">
+      <span class="tn-id">node <span class="nid">${esc(n.id)}</span>${isSelf?`<span class="tn-self">this node</span>`:""}</span>
+      <span class="tn-state ${key}"><span class="led ${key}"></span>${esc(st)}</span>
+    </div>
+    <div class="tn-meta">
+      <span>chunks <b>${fmtNum(n.chunk_count)}</b></span>
+      <span>shards <b>${fmtNum(n.shard_disk_count)}</b></span>
+      ${n.rack?`<span>rack <b>${esc(n.rack)}</b></span>`:""}
+      ${n.zone?`<span>zone <b>${esc(n.zone)}</b></span>`:""}
+    </div>
+    <div class="tn-addr">${esc(n.addr||n.Addr||"—")}</div>
+  </div>`;
+}
+
+async function loadTopo(){
+  try{
+    const r = await fetch("/api/v1/nodes");
+    const nodes = await r.json();
+    const list = Array.isArray(nodes)?nodes:[];
+
+    // worst node state decides the fault-domain verdict
+    let dom="ok";
+    list.forEach(n=>{ const k=nodeStateKey(nodeStateName(n)); if(k==="crit")dom="crit"; else if(k==="warn"&&dom==="ok")dom="warn"; });
+
+    const selfId = ($("nodeCrumb").textContent.match(/\d+/)||[])[0];
+    const online = list.filter(n=>nodeStateName(n)==="online").length;
+    $("topoSub").textContent = list.length
+      ? (list.length+" member"+(list.length>1?"s":"")+" · "+online+"/"+list.length+" online"+(list.length===1?" · standalone, no peers":""))
+      : "no members";
+    $("topo").innerHTML = list.length
+      ? list.map(n=>topoCard(n, String(n.id)===String(selfId))).join("")
+      : `<div class="topo-empty">No cluster members registered.</div>`;
+
+    // honest replication / anti-entropy state
+    const cs = await fetch("/api/v1/cluster/status").then(r=>r.json()).catch(()=>({}));
+    const repl = cs.replication||{}, ae = cs.anti_entropy||{};
+    const replBadge = (repl.writes>0)
+      ? `<span class="sys-badge"><span class="sb-l">Replication</span><span class="sb-v ok">active</span></span>`
+      : `<span class="sys-badge"><span class="sb-l">Replication</span><span class="sb-v idle">idle · single node</span></span>`;
+    const aeBadge = (ae.scanned>0)
+      ? `<span class="sys-badge"><span class="sb-l">Anti-entropy</span><span class="sb-v ok">${fmtNum(ae.scanned)} scanned</span></span>`
+      : `<span class="sys-badge"><span class="sb-l">Anti-entropy</span><span class="sb-v idle">idle</span></span>`;
+    const errBadge = (repl.errors>0)
+      ? `<span class="sys-badge"><span class="sb-l">Repair</span><span class="sb-v crit">${fmtNum(repl.errors)} errors</span></span>`
+      : `<span class="sys-badge"><span class="sb-l">Repair</span><span class="sb-v idle">in sync</span></span>`;
+    $("sysBadges").innerHTML = replBadge+aeBadge+errBadge;
+  }catch(e){
+    $("topo").innerHTML = `<div class="topo-empty">Topology unavailable.</div>`;
+    $("sysBadges").innerHTML = "";
+  }
+}
+
+/* ---------- disks + drive bay ---------- */
 async function loadDisks(){
-  try {
+  try{
     const r = await fetch("/api/v1/disks");
     const d = await r.json();
-    const disks = d.disks || d || [];
+    const disks = d.disks || [];
+    $("kChunks").textContent = fmtNum(d.total_chunks);
+    keepLastDisks(disks);
+
+    // table
     $("diskRows").innerHTML = disks.length
       ? disks.map(disk=>`<tr>
-          <td>${esc(disk.index)}</td><td>${esc(disk.dir)}</td>
-          <td>${fmtBytes(disk.used_bytes)}</td><td>${esc(disk.chunk_count)}</td>
-          <td><span class="pill ${esc(disk.state)}">${esc(disk.state)}</span></td>
-        </tr>`).join("")
-      : `<tr><td colspan="5" class="muted">No disks</td></tr>`;
-  } catch(e){ $("diskRows").innerHTML = `<tr><td colspan="5" class="error">failed to load</td></tr>`; }
-}
+            <td class="mono">bay ${esc(disk.index)}</td>
+            <td class="mono">${esc(disk.dir)}</td>
+            <td><span class="pill ${esc(pillFor(disk.state))}"><span class="led ${esc(ledFor(disk.state))}"></span>${esc(disk.state||"—")}</span></td>
+            <td class="mono">${fmtNum(disk.chunks)}</td>
+            <td class="mono">${fmtBytes(disk.bytes)}</td>
+          </tr>`).join("")
+      : `<tr><td colspan="5" class="empty">No disks</td></tr>`;
 
+    // drive bay hero
+    $("baywrap").innerHTML = disks.length
+      ? disks.map(disk=>{
+          const mb = ledFor(disk.state); // "ok" | "warn" | "crit"
+          return `<div class="bay bay-${esc(mb)}">
+            <div class="bay-top">
+              <span class="bay-idx">bay ${esc(disk.index)}</span>
+              <span class="bay-state">${esc(disk.state||"online")}</span>
+            </div>
+            <div class="fill-wrap">
+              <span class="capmark w75"></span>
+              <span class="capmark w85"></span>
+              <span class="fill" data-pct="${pctOf(disk)}" data-pctval="${(pctOf(disk)*100).toFixed(0)}"></span>
+            </div>
+            <div class="bay-usedwrap">
+              <div class="bay-used">${fmtBytes(disk.bytes)}</div>
+              <div class="bay-pct">${(pctOf(disk)*100).toFixed(1)}%</div>
+            </div>
+            <div class="bay-sub">${fmtNum(disk.chunks)} chunks</div>
+            <div class="bay-ondisk">on disk ${fmtBytes(disk.on_disk_bytes||0)}</div>
+            <div class="bay-rate" data-bay="${esc(disk.index)}"><span class="up">▲</span> <span class="bw">—</span></div>
+          </div>`;
+        }).join("")
+      : `<div class="bay-empty">No disks mounted.</div>`;
+
+    // animate fills once (skip under reduced motion)
+    if(!reduceMotion){
+      requestAnimationFrame(()=>requestAnimationFrame(()=>{
+        document.querySelectorAll(".fill").forEach(f=>{
+          const p = Math.max(2, Math.min(100, parseFloat(f.dataset.pct)*100));
+          const cls = p>=85?"lev-crit":p>=75?"lev-warn":"";
+          f.className = cls?("fill "+cls):"fill";
+          f.style.height = "0%";
+          requestAnimationFrame(()=>{ f.style.height = p.toFixed(1)+"%"; });
+        });
+      }));
+    } else {
+      document.querySelectorAll(".fill").forEach(f=>{
+        const p = Math.max(0, Math.min(100, parseFloat(f.dataset.pct)*100));
+        const cls = p>=85?"lev-crit":p>=75?"lev-warn":"";
+        f.className = cls?("fill "+cls):"fill";
+        f.style.height = p.toFixed(1)+"%";
+      });
+    }
+  }catch(e){
+    $("diskRows").innerHTML = `<tr><td colspan="5" class="empty">Disk telemetry unavailable.</td></tr>`;
+  }
+}
+function pctOf(disk){
+  // Prefer real per-disk total (server now reports total_bytes); fall back to
+  // the aggregate node usage when unavailable.
+  if(disk.total_bytes > 0) return Math.min(1, (disk.bytes||0)/disk.total_bytes);
+  return 0;
+}
+function pillFor(s){ return (s||"online").toLowerCase(); }
+function ledFor(s){ s=(s||"online").toLowerCase(); return s==="failed"?"crit":s==="degraded"?"warn":"ok"; }
+
+/* ---------- repair queue ---------- */
 async function loadRepair(){
-  try {
+  try{
     const r = await fetch("/api/v1/repair/queue");
     const d = await r.json();
-    const q = d.queue || d.tasks || d;
-    $("repairInfo").innerHTML = Array.isArray(q) && q.length
-      ? `<ul>${q.slice(0,20).map(t=>`<li>${esc(t.chunk_id||t.chunk||"?")} · ${esc(t.status||t.state||"pending")}</li>`).join("")}</ul>`
-      : "Queue empty";
-  } catch(e){ $("repairInfo").innerHTML = `<span class="error">failed to load</span>`; }
+    // endpoint returns literal `null` for an empty queue — be null-safe.
+    const q = d && (d.queue || d.tasks) || (Array.isArray(d) ? d : []);
+    $("repairList").innerHTML = Array.isArray(q) && q.length
+      ? q.slice(0,50).map(t=>`<li>
+            <span class="led ${esc(ledFor(t.status||t.state))}"></span>
+            <span class="cid">chunk ${esc(t.chunk_id||t.chunk||"?")}</span>
+            <span class="st" style="color:var(--warn)">${esc(t.status||t.state||"pending")}</span>
+          </li>`).join("")
+      : `<li class="empty" style="border:none;font-style:normal">No repairs in flight — the node is healthy.</li>`;
+  }catch(e){
+    $("repairList").innerHTML = `<li class="empty" style="border:none;font-style:normal">Repair queue unavailable.</li>`;
+  }
 }
 
-async function loadMetrics(){
-  try {
+/* ---------- live rate strip + sparkline ---------- */
+const SPARK_LEN = 30;
+const rateHist = { read: new Array(SPARK_LEN).fill(0), write: new Array(SPARK_LEN).fill(0) };
+let lastBytes = { read: null, write: null, at: 0 };
+let lastDisks = null;
+
+function fmtRate(bps){
+  if(bps == null || isNaN(bps)) return "—";
+  const u = ["B/s","KB/s","MB/s","GB/s"];
+  let i = 0, v = bps;
+  while (v >= 1024 && i < u.length-1){ v/=1024; i++; }
+  return v.toFixed(i?1:0)+" "+u[i];
+}
+
+function drawSpark(){
+  const c = $("spark"); if(!c) return;
+  const ctx = c.getContext("2d");
+  const W = c.width, H = c.height;
+  ctx.clearRect(0,0,W,H);
+  let max = 1;
+  for(let i=0;i<SPARK_LEN;i++){ max = Math.max(max, rateHist.read[i], rateHist.write[i]); }
+  if(max <= 0) return;
+  function line(arr, color){
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    for(let i=0;i<SPARK_LEN;i++){
+      const x = (i/(SPARK_LEN-1))*W;
+      const y = H - (arr[i]/max)*H;
+      i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+    }
+    ctx.stroke();
+  }
+  line(rateHist.read, "#d99f3f");
+  line(rateHist.write, "#4fc08f");
+}
+
+async function loadRates(){
+  try{
     const r = await fetch("/api/v1/metrics");
     const d = await r.json();
-    $("metricsInfo").innerHTML = "<pre style='margin:0;overflow:auto'>"+esc(JSON.stringify(d,null,2))+"</pre>";
-  } catch(e){ $("metricsInfo").innerHTML = `<span class="error">failed to load</span>`; }
+    const disk = d.disk||{};
+    const readB = disk.read_bytes||0, writeB = disk.write_bytes||0;
+    const now = performance.now();
+    if(lastBytes.read != null){
+      const dt = (now - lastBytes.at)/1000;
+      const readRate = dt>0 ? Math.max(0,(readB-lastBytes.read))/dt : 0;
+      const writeRate = dt>0 ? Math.max(0,(writeB-lastBytes.write))/dt : 0;
+      rateHist.read.push(readRate); rateHist.read.shift();
+      rateHist.write.push(writeRate); rateHist.write.shift();
+
+      const rv = $("rsRead").firstChild, wv = $("rsWrite").firstChild;
+      rv.nodeValue = fmtRate(readRate);
+      wv.nodeValue = fmtRate(writeRate);
+      $("rsThroughput").firstChild.nodeValue = fmtRate(readRate+writeRate);
+
+      // write rate chunk/sec: derive from writeRate / avg chunk write size (64KiB when known)
+      $("rsWriteChunk").textContent = fmtNum(Math.round(writeRate / 65536))+" chunks/s";
+
+      // distribute aggregate write rate across bays by their bytes share
+      if(lastDisks && lastDisks.length){
+        const total = lastDisks.reduce((a,dd)=>a+(dd.bytes||0),0);
+        document.querySelectorAll(".bay-rate").forEach(el=>{
+          const idx = parseInt(el.dataset.bay,10);
+          const dd = lastDisks.find(x=>x.index===idx);
+          const share = dd && total>0 ? (dd.bytes||0)/total : 0;
+          el.querySelector(".bw").textContent = fmtRate(writeRate*share);
+        });
+      }
+    }
+    lastBytes = { read: readB, write: writeB, at: now };
+    drawSpark();
+  }catch(e){ /* keep last values during a restart gap */ }
 }
 
-loadAlerts(); loadDisks(); loadRepair(); loadMetrics();
-setInterval(loadAlerts, 5000);
+function keepLastDisks(d){ lastDisks = d; }
+function teleCard(label, value, unit, sub){
+  return `<div class="readout"><div class="r-label">${esc(label)}</div>
+    <div class="r-value">${esc(value)}${unit?`<span class="unit">${esc(unit)}</span>`:""}</div>
+    ${sub?`<div class="r-sub">${esc(sub)}</div>`:""}</div>`;
+}
+async function loadMetrics(){
+  try{
+    const r = await fetch("/api/v1/metrics");
+    const d = await r.json();
+    $("metricsInfo").textContent = JSON.stringify(d,null,2);
+
+    const disk = d.disk||{}, perf = d.perf||{};
+    // Curated telemetry — only surface figures with a story. Replication &
+    // anti-entropy are reported as honest status badges in the topology (loadTopo),
+    // and live read/write throughput lives in the rate strip — so the engine
+    // block here shows lifetime/work figures rather than a wall of device zeros.
+    const readL = disk.read_bytes||0, writeL = disk.write_bytes||0;
+    const readAmp = perf.read_requested_bytes ? (perf.read_requested_bytes/(readL||1)) : null;
+    $("teleRow").innerHTML =
+      teleCard("Lifetime read", fmtBytes(readL), "", "cumulative") +
+      teleCard("Lifetime written", fmtBytes(writeL), "", "cumulative") +
+      teleCard("Read amplification", readAmp!=null?readAmp.toFixed(2)+"×":"—", "", "requested / read") +
+      teleCard("Fsync", fmtNum(perf.fsync_count||0), "", "since start");
+  }catch(e){
+    $("metricsInfo").textContent = "Metrics unavailable.";
+  }
+}
+
+/* ---------- boot ---------- */
+loadAlerts(); loadDisks(); loadRepair(); loadMetrics(); loadRates(); loadHealth(); loadTopo();
+setInterval(loadAlerts, 4000);
 setInterval(loadDisks, 10000);
+setInterval(loadMetrics, 2000);
+setInterval(loadRepair, 8000);
+setInterval(loadRates, 1000);
+setInterval(loadHealth, 3000);
+setInterval(loadTopo, 5000);
 </script>
 </body>
 </html>

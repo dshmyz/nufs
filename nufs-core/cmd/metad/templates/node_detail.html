@@ -19,7 +19,7 @@
 <div class="stats-grid">
   <div class="stat-card stat-blue"><div class="stat-value">{{.Node.ID}}</div><div class="stat-label">Node ID</div></div>
   <div class="stat-card"><div class="stat-value"><span class="badge badge-{{stateClass .Node.State}}" style="font-size:1rem">{{stateLabel .Node.State}}</span></div><div class="stat-label">State</div></div>
-  <div class="stat-card stat-green"><div class="stat-value">{{.Node.CapacityGB}} GB</div><div class="stat-label">Capacity</div></div>
+  <div class="stat-card stat-green"><div class="stat-value">{{humanBytes .Node.CapacityBytes}}</div><div class="stat-label">Capacity</div></div>
   <div class="stat-card stat-orange"><div class="stat-value">{{len .Chunks}}</div><div class="stat-label">Chunks</div></div>
 </div>
 
@@ -32,8 +32,9 @@
       <tr><td>Rack</td><td>{{.Node.Rack}}</td></tr>
       <tr><td>Zone</td><td>{{.Node.Zone}}</td></tr>
       <tr><td>Tier</td><td>{{tierLabel .Node.Tier}}</td></tr>
-      <tr><td>Capacity</td><td>{{.Node.CapacityGB}} GB</td></tr>
-      <tr><td>Used</td><td>{{.Node.UsedGB}} GB</td></tr>
+      <tr><td>Capacity</td><td>{{humanBytes .Node.CapacityBytes}}</td></tr>
+      <tr><td>Used (logical)</td><td>{{humanBytes .Node.UsedBytes}}</td></tr>
+      <tr><td>On disk (physical)</td><td class="on-disk">{{humanBytes .Node.OnDiskBytes}}</td></tr>
       <tr><td>Chunks</td><td>{{.Node.ChunkCount}}</td></tr>
       <tr><td>Last Seen</td><td>{{formatUnix .Node.LastSeen}}</td></tr>
     </table>

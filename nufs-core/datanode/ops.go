@@ -264,12 +264,83 @@ func (s *OpsServer) aeStats() (scanned, mismatches, repaired int64) {
 	return s.ae.Stats()
 }
 
-// diskStats returns the V1 disk-manager snapshot. V2.1 has no DiskManager,
-// so it defaults to an empty snapshot and reports per-disk state through
-// DiskStats/DiskInfos instead.
+// diskStats returns the disk-capacity/IO snapshot for the ops dashboard.
+//
+// V1 path (s.disk set): hands through to the legacy DiskManager snapshot.
+//
+// V2.1 path (s.disk nil): there is no DiskManager, so synthesize the snapshot
+// from the engine's per-disk DiskInfos + aggregate Stats (and ReadWriteBytes
+// cumulative counters when the store exposes them). Without this branch the
+// V2.1 metrics/admin telemetry would report all-zero capacity/chunk-count/IO.
+// diskStateName returns the string form of a DiskState for the metrics snapshot.
+func diskStateName(s DiskState) string {
+	switch s {
+	case DiskDegraded:
+		return "degraded"
+	case DiskFailed:
+		return "failed"
+	default:
+		return "online"
+	}
+}
+
+// stateRank orders disk states so the worst health wins when aggregating a
+// multi-disk node's state (failed > degraded > online).
+func stateRank(name string) int {
+	switch name {
+	case "failed":
+		return 2
+	case "degraded":
+		return 1
+	default:
+		return 0
+	}
+}
+
 func (s *OpsServer) diskStats() DiskStatsSnapshot {
 	if s.disk == nil {
-		return DiskStatsSnapshot{}
+		// V2.1 path: no legacy DiskManager, so synthesize the snapshot from the
+		// engine's per-disk DiskInfos + aggregate Stats. This is what makes
+		// /api/v1/metrics (and the admin dashboard's telemetry) reflect real
+		// capacity/chunk-count on a V2.1 node instead of all-zero fields
+		// (V2.1 previously had no capacity/metrics source here).
+		totalBytes, chunkCount := s.store.Stats()
+		var readBytes, writeBytes int64
+		if rw, ok := s.store.(interface{ ReadWriteBytes() (int64, int64) }); ok {
+			readBytes, writeBytes = rw.ReadWriteBytes()
+		}
+		var used, total, onDisk int64
+		state := "online"
+		for _, d := range s.store.DiskInfos() {
+			used += d.UsedBytes
+			onDisk += d.OnDiskBytes
+			if cap := detectCapacityBytes(d.Dir); cap > 0 {
+				total += cap
+			}
+			// Use the worst state observed across disks for the node-level state.
+			if st := diskStateName(d.State); stateRank(st) > stateRank(state) {
+				state = st
+			}
+		}
+		if totalBytes > used {
+			used = totalBytes
+		}
+		usage := 0.0
+		if total > 0 {
+			usage = float64(used) / float64(total)
+		}
+		return DiskStatsSnapshot{
+			TotalBytes:  total,
+			UsedBytes:   used,
+			OnDiskBytes: onDisk,
+			AvailBytes:  total - used,
+			UsagePct:    usage,
+			ChunkCount:  chunkCount,
+			ReadBytes:   readBytes,
+			WriteBytes:  writeBytes,
+			DiskState:   state,
+			LastUpdated: time.Now(),
+		}
 	}
 	return s.disk.Stats()
 }
@@ -673,12 +744,14 @@ func (s *OpsServer) handleDisks(w http.ResponseWriter, r *http.Request) {
 	infos := s.store.DiskInfos()
 
 	type diskJSON struct {
-		Index  int    `json:"index"`
-		Dir    string `json:"dir"`
-		Failed bool   `json:"failed"`
-		State  string `json:"state"`
-		Chunks int64  `json:"chunks"`
-		Bytes  int64  `json:"bytes"`
+		Index       int    `json:"index"`
+		Dir         string `json:"dir"`
+		Failed      bool   `json:"failed"`
+		State       string `json:"state"`
+		Chunks      int64  `json:"chunks"`
+		Bytes       int64  `json:"bytes"`
+		OnDiskBytes int64  `json:"on_disk_bytes,omitempty"`
+		TotalBytes  int64  `json:"total_bytes"`
 	}
 
 	chunksPerDisk := make(map[int]struct{ count, bytes int64 })
@@ -695,6 +768,7 @@ func (s *OpsServer) handleDisks(w http.ResponseWriter, r *http.Request) {
 		disks = append(disks, diskJSON{
 			Index: di.Index, Dir: di.Dir, Failed: di.Failed,
 			State: di.State.String(), Chunks: v.count, Bytes: v.bytes,
+			OnDiskBytes: di.OnDiskBytes, TotalBytes: detectCapacityBytes(di.Dir),
 		})
 	}
 

@@ -922,8 +922,13 @@ type DiskStatsItem struct {
 	Index      int
 	UsedBytes  int64
 	TotalBytes int64
-	ChunkCount int64
-	Failed     bool
+	// OnDiskBytes is the physical bytes occupied by the store's data files
+	// (segment/chunk records) on this disk, including superseded record
+	// generations not yet reclaimed by seal+compaction. Distinct from
+	// UsedBytes (logical live bytes); a console can show both honestly.
+	OnDiskBytes int64
+	ChunkCount  int64
+	Failed      bool
 	// State is the derived 3-tier health (DiskOnline/DiskDegraded/DiskFailed).
 	// V2.1 V2Store fills it from failCount thresholds; V1 ChunkStore reports
 	// DiskOnline (its own DiskManager state is surfaced via the legacy channel).
@@ -936,12 +941,13 @@ func (cs *ChunkStore) DiskStats() []DiskStatsItem {
 	result := make([]DiskStatsItem, len(cs.disks))
 	for i, d := range cs.disks {
 		result[i] = DiskStatsItem{
-			Index:      i,
-			UsedBytes:  d.usedBytes.Load(),
-			TotalBytes: detectCapacityBytes(d.dataDir),
-			ChunkCount: d.chunkCount.Load(),
-			Failed:     d.failed.Load(),
-			State:      DiskOnline,
+			Index:       i,
+			UsedBytes:   d.usedBytes.Load(),
+			TotalBytes:  detectCapacityBytes(d.dataDir),
+			OnDiskBytes: dataFilesOnDiskBytes(d.dataDir, ".dat"),
+			ChunkCount:  d.chunkCount.Load(),
+			Failed:      d.failed.Load(),
+			State:       DiskOnline,
 		}
 	}
 	return result
@@ -1067,6 +1073,7 @@ type DiskInfo struct {
 	Index      int
 	Dir        string
 	UsedBytes  int64
+	OnDiskBytes int64
 	ChunkCount int64
 	Failed     bool
 	// State is the derived 3-tier health (DiskOnline/DiskDegraded/DiskFailed).
@@ -1080,12 +1087,13 @@ func (cs *ChunkStore) DiskInfos() []DiskInfo {
 	infos := make([]DiskInfo, len(cs.disks))
 	for i, d := range cs.disks {
 		infos[i] = DiskInfo{
-			Index:      d.index,
-			Dir:        d.dataDir,
-			UsedBytes:  d.usedBytes.Load(),
-			ChunkCount: d.chunkCount.Load(),
-			Failed:     d.failed.Load(),
-			State:      DiskOnline,
+			Index:       d.index,
+			Dir:         d.dataDir,
+			UsedBytes:   d.usedBytes.Load(),
+			OnDiskBytes: dataFilesOnDiskBytes(d.dataDir, ".dat"),
+			ChunkCount:  d.chunkCount.Load(),
+			Failed:      d.failed.Load(),
+			State:       DiskOnline,
 		}
 	}
 	return infos

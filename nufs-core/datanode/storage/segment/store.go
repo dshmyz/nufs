@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1209,6 +1211,72 @@ func (s *Store) Index() *index.Index { return s.index }
 
 // Overlay exposes the committed-delta overlay.
 func (s *Store) Overlay() *Overlay { return s.overlay }
+
+// SealedSegment identifies one sealed data-stream segment file: the parsed
+// segment id and its absolute path under segments/<class>/active.
+type SealedSegment struct {
+	SegmentID storage.SegmentID
+	Path      string
+}
+
+// DataStreamDir returns the absolute path of this store's active
+// data-stream segment directory (segments/<class>/active). The background
+// compaction worker lists sealed segments here.
+func (s *Store) DataStreamDir() string {
+	return filepath.Join(s.segDir, streamClassDir(s.streamID), "active")
+}
+
+// SealedSegments lists this store's sealed data-stream segment files in
+// ascending segment-id order. Only segments carrying a valid encoded
+// footer (sealed) are returned — the currently-open active segment has no
+// footer and is excluded. This is the compaction worker's input set
+// (§10.3 step 1).
+func (s *Store) SealedSegments() ([]SealedSegment, error) {
+	dir := s.DataStreamDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []SealedSegment
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".seg") {
+			continue
+		}
+		id, parseErr := strconv.ParseUint(strings.TrimSuffix(name, ".seg"), 10, 64)
+		if parseErr != nil {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if !s.isSealed(path) {
+			continue
+		}
+		out = append(out, SealedSegment{SegmentID: storage.SegmentID(id), Path: path})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SegmentID < out[j].SegmentID })
+	return out, nil
+}
+
+// isSealed reports whether path carries a valid encoded segment footer.
+func (s *Store) isSealed(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	sealed, err := hasEncodedSegmentFooter(f, st.Size())
+	if err != nil {
+		return false
+	}
+	return sealed
+}
 
 // LiveExtent is one enumerated extent in the read-authority view,
 // carrying its latest generation so callers can route generation-fenced

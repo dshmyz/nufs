@@ -36,6 +36,7 @@ type capacityAlertEvent struct {
 // UsedBytes and detecting each disk dir's filesystem total via Statfs.
 type capacityOverview struct {
 	UsedBytes  int64   `json:"used_bytes"`
+	OnDiskBytes int64  `json:"on_disk_bytes,omitempty"`
 	TotalBytes int64   `json:"total_bytes"`
 	UsagePct   float64 `json:"usage_pct"`
 }
@@ -209,15 +210,18 @@ func (s *OpsServer) capacityOverview() capacityOverview {
 		}
 		return ov
 	}
-	// V2.1 path: aggregate per-disk DiskInfo usage + Statfs totals.
-	var used, total int64
+	// V2.1 path: aggregate per-disk DiskInfo usage + Statfs totals. The
+	// physical OnDiskBytes (compressed .seg footprint) is summed alongside so
+	// an admin can show logical live vs physical on-disk side by side.
+	var used, total, onDisk int64
 	for _, d := range s.store.DiskInfos() {
 		used += d.UsedBytes
+		onDisk += d.OnDiskBytes
 		if cap := detectCapacityBytes(d.Dir); cap > 0 {
 			total += cap
 		}
 	}
-	ov := capacityOverview{UsedBytes: used, TotalBytes: total}
+	ov := capacityOverview{UsedBytes: used, OnDiskBytes: onDisk, TotalBytes: total}
 	if total > 0 {
 		ov.UsagePct = float64(used) / float64(total)
 	}

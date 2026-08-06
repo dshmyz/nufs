@@ -138,6 +138,15 @@ type Config struct {
 	// or "v2.1" (new segment/commit-log engine).
 	StorageVersion string
 
+	// SegmentSize is the V2.1 per-stream segment size in bytes. 0 keeps the
+	// storage default (4GiB); a smaller value seals segments sooner so the
+	// compaction worker reclaims superseded bytes faster (demos/CI).
+	SegmentSize int64
+
+	// CompactionInterval is the background compaction scan cadence for the
+	// V2.1 worker. 0 keeps the maintenance default (30s).
+	CompactionInterval time.Duration
+
 	// LogLevel is the initial log level (debug/info/warn/error).
 	// Can be changed at runtime via SIGHUP signal.
 	LogLevel string

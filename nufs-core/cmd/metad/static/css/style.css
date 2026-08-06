@@ -620,6 +620,23 @@ select.input {
   font-weight: 500;
 }
 
+/* Physical on-disk footprint (logical-vs-physical, byte-accurate) is visually
+   distinguished in amber across the admin view. */
+.capacity-ondisk {
+  color: var(--orange);
+  font-weight: 600;
+}
+
+.capacity-labels .lbl {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+td.on-disk {
+  color: var(--orange);
+  font-weight: 600;
+}
+
 .mini-bar {
   display: inline-block;
   width: 64px;
@@ -1053,6 +1070,11 @@ select.input {
   font-size: 0.72rem;
   color: var(--text-muted);
   white-space: nowrap;
+}
+
+.tnode-sub.tnode-ondisk {
+  color: var(--orange);
+  font-weight: 600;
 }
 
 .tnode-no-cap {

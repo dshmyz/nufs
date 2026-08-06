@@ -19,6 +19,7 @@ import (
 	"github.com/example/dfs/datanode/storage"
 	"github.com/example/dfs/datanode/storage/encryption"
 	"github.com/example/dfs/datanode/storage/journal"
+	"github.com/example/dfs/datanode/storage/maintenance"
 	"github.com/example/dfs/datanode/storage/segment"
 	"github.com/example/dfs/internal/config"
 	"github.com/example/dfs/internal/crypto"
@@ -69,6 +70,8 @@ func main() {
 		kmsKeyHex            = flag.String("kms-key-hex", "", "At-rest KEK as 64 hex characters (dev/test convenience)")
 		allowInsecureDev     = flag.Bool("allow-insecure-dev", false, "Allow running without TLS, auth, or production hardening (dev only)")
 		alertWebhook         = flag.String("alert-webhook", "", "Optional URL that receives capacity-alert events as JSON POSTs")
+		segmentSize          = flag.Int64("segment-size", 0, "V2.1 segment size in bytes (0 = DefaultDataSegmentSize, 4GiB); smaller values seal segments sooner so compaction can reclaim superseded bytes — useful for demos and CI")
+		compactInterval      = flag.Duration("compaction-interval", 30*time.Second, "Background compaction scan cadence for the V2.1 worker")
 		storageVersion       = flag.String("storage-version", "v1", "Storage engine version: v1 (legacy ChunkStore) or v2.1 (new engine)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON              = flag.Bool("log-json", false, "JSON log output")
@@ -146,6 +149,8 @@ func main() {
 		AllowInsecureDev:  *allowInsecureDev,
 		AlertWebhook:      *alertWebhook,
 		StorageVersion:    *storageVersion,
+		SegmentSize:       *segmentSize,
+		CompactionInterval: *compactInterval,
 		LogLevel:          *logLevel,
 	})
 }
@@ -560,10 +565,19 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		closeStores()
 		os.Exit(1)
 	}
+	// Effective per-stream segment size: the operator flag when set,
+	// else the storage default (4GiB). A smaller value seals segments
+	// sooner, so superseded (dead) bytes enter sealed segments faster and
+	// the compaction worker reclaims them sooner — useful for demos/CI,
+	// and harmless in production where 0 keeps the existing 4GiB default.
+	segSize := int64(storage.DefaultDataSegmentSize)
+	if cfg.SegmentSize > 0 {
+		segSize = cfg.SegmentSize
+	}
 	for _, dir := range dataDirs {
 		segCfg := segment.Config{
 			Dir:           dir,
-			SegmentSize:   storage.DefaultDataSegmentSize,
+			SegmentSize:   segSize,
 			UseMemIndex:   false,
 			StreamID:      1, // data stream (0 = small)
 			ChangeJournal: changeJournal,
@@ -598,7 +612,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		shardCfg := segment.Config{
 			Dir:           dir,
 			IndexDir:      filepath.Join(dir, "index-ecshard"),
-			SegmentSize:   storage.DefaultDataSegmentSize,
+			SegmentSize:   segSize,
 			UseMemIndex:   false,
 			StreamID:      2, // EC shard stream
 			ChangeJournal: changeJournal,
@@ -869,6 +883,21 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// success never un-fails a disk. Stopped right before closeStores below.
 	v2Store.StartDiskMonitor(ctx)
 
+	// Program 13: background compaction + reclaim worker. Segments only
+	// rotate on write-full; without this loop the physical on-disk footprint
+	// grows without bound as overwritten generations leave dead bytes in
+	// sealed segments. It scans each disk's sealed data-stream segments and
+	// compacts the highest-value eligible one per tick, removing the source
+	// so reclaimed bytes return to the filesystem. Stopped right before
+	// closeStores below (it drives the stores, so it must not outlive them).
+	compactionCtx, compactionCancel := context.WithCancel(context.Background())
+	var compactOpts []maintenance.CompressionWorkerOption
+	if cfg.CompactionInterval > 0 {
+		compactOpts = append(compactOpts, maintenance.WithCompactionInterval(cfg.CompactionInterval))
+	}
+	compactionWorker := maintenance.NewCompressionWorker(v2Store.DataStores(), compactOpts...)
+	go compactionWorker.Run(compactionCtx)
+
 	if err := opsServer.Start(); err != nil {
 		log.Error("failed to start ops HTTP server", "error", err)
 		closeStores()
@@ -907,6 +936,9 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// in-flight writes before closing the stores (mirrors the V1 shutdown
 	// Phase 3). The barrier quiesces writes without blocking reads.
 	v2Store.StopDiskMonitor()
+	// Stop the compaction worker (it drives the stores) before draining and
+	// closing them below.
+	compactionCancel()
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	releaseDrain, err := v2Store.QuiesceWrites(drainCtx)
 	if err != nil {

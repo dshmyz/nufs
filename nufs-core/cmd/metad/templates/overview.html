@@ -54,8 +54,9 @@
       <div class="capacity-fill" id="capacity-fill" style="width: {{printf "%.0f" .CapacityPct}}%"></div>
     </div>
     <div class="capacity-labels">
-      <span id="capacity-used">{{.UsedCapacity}} GB used</span>
-      <span id="capacity-total">{{.TotalCapacity}} GB total ({{printf "%.1f" .CapacityPct}}%)</span>
+      <span id="capacity-used">{{humanBytes .UsedBytes}} used <span class="lbl">(logical)</span></span>
+      <span class="capacity-ondisk">{{humanBytes .OnDiskBytes}} on disk</span>
+      <span id="capacity-total">/ {{humanBytes .CapacityBytes}} total ({{printf "%.1f" .CapacityPct}}%)</span>
     </div>
   </div>
 </div>
@@ -94,7 +95,9 @@
             </svg>
             <div class="tnode-ring-label">
               <span class="tnode-pct">{{printf "%.1f" .UsagePct}}%</span>
-              <span class="tnode-sub">{{.Used}} / {{.Capacity}} GB</span>
+              <span class="tnode-sub">{{humanBytes .UsedBytes}} used</span>
+              <span class="tnode-sub tnode-ondisk">{{humanBytes .OnDiskBytes}} on disk</span>
+              <span class="tnode-sub">{{humanBytes .CapacityBytes}} total</span>
             </div>
           </div>
           {{else}}
@@ -122,15 +125,16 @@
   <div class="card-header"><h3>Nodes</h3><a href="/admin/nodes" class="btn btn-sm">View All</a></div>
   <div class="card-body p-0">
     <table class="table">
-      <thead><tr><th>ID</th><th>Address</th><th>State</th><th>Capacity</th><th>Used</th><th>Chunks</th></tr></thead>
+      <thead><tr><th>ID</th><th>Address</th><th>State</th><th>Capacity</th><th>Used</th><th>On disk</th><th>Chunks</th></tr></thead>
       <tbody>
         {{range .Nodes}}
         <tr>
           <td><a href="/admin/nodes/{{.ID}}">{{.ID}}</a></td>
           <td>{{.Addr}}</td>
           <td><span class="badge badge-{{stateClass .State}}">{{stateLabel .State}}</span></td>
-          <td>{{.CapacityGB}} GB</td>
-          <td>{{.UsedGB}} GB</td>
+          <td>{{humanBytes .CapacityBytes}}</td>
+          <td>{{humanBytes .UsedBytes}}</td>
+          <td class="on-disk">{{humanBytes .OnDiskBytes}}</td>
           <td>{{.ChunkCount}}</td>
         </tr>
         {{else}}<tr><td colspan="6" class="empty">No nodes registered</td></tr>

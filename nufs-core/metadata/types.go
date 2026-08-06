@@ -310,7 +310,23 @@ type NodeInfo struct {
 	Tier       StorageTier `json:"tier"`
 	CapacityGB int64       `json:"capacity_gb"`
 	UsedGB     int64       `json:"used_gb"`
-	ChunkCount int64       `json:"chunk_count"`
+	// OnDiskGB is the physical GB occupied by the node's data files on disk,
+	// including superseded (not-yet-compacted) record generations. Distinct
+	// from UsedGB (logical live bytes): both are persisted from the heartbeat
+	// so consoles can show honest logical-vs-physical divergence.
+	OnDiskGB  int64       `json:"on_disk_gb,omitempty"`
+	ChunkCount int64      `json:"chunk_count"`
+
+	// Byte-accurate counterparts persisted from the heartbeat. UsedBytes is
+	// the logical live footprint; OnDiskBytes the physical on-disk footprint
+	// (incl. superseded generations not yet reclaimed by compaction);
+	// CapacityBytes the node's aggregate physical disk capacity. These let the
+	// admin console render honest logical-vs-physical side by side at any
+	// scale — the GB fields round sub-GB movements to 0. Omitempty keeps
+	// legacy/registered-only nodes (no heartbeat yet) zero-valued.
+	UsedBytes     int64 `json:"used_bytes,omitempty"`
+	OnDiskBytes   int64 `json:"on_disk_bytes,omitempty"`
+	CapacityBytes int64 `json:"capacity_bytes,omitempty"`
 	State      NodeState   `json:"state"`
 	LastSeen   int64       `json:"last_seen"`
 
@@ -359,6 +375,10 @@ func (s NodeState) String() string {
 // NodeReport is sent by data nodes during heartbeat.
 type NodeReport struct {
 	UsedGB         int64                    `json:"used_gb"`
+	// UsedBytes is the node's logical live bytes (exact; supersedes the
+	// GB-rounded UsedGB for byte-accurate admin rendering). Metadata persists
+	// it into NodeInfo.UsedBytes.
+	UsedBytes      int64                    `json:"used_bytes,omitempty"`
 	ChunkCount     int64                    `json:"chunk_count"`
 	DiskIO         float64                  `json:"disk_io"`          // 0.0 - 1.0 utilization
 	WriteErrorRate float64                  `json:"write_error_rate"` // 0.0 - 1.0, rolling write failure ratio
@@ -370,6 +390,13 @@ type NodeReport struct {
 	// 0 for nodes that never report it (legacy/V1); metadata persists it into
 	// NodeInfo.CapacityGB so the admin console can render honest usage%.
 	TotalCapacityBytes int64 `json:"total_capacity_bytes,omitempty"`
+
+	// OnDiskBytes is the node's aggregate physical bytes occupied by its
+	// data files (segment/chunk records), including superseded generations
+	// not yet reclaimed by seal+compaction. Metadata persists it into
+	// NodeInfo.OnDiskGB so a console can show "logical live" vs "on-disk"
+	// usage honestly (they diverge under overwrite/delete until compaction).
+	OnDiskBytes int64 `json:"on_disk_bytes,omitempty"`
 
 	// ChangeEvents carries the node's locally-detected async changes
 	// (corruption, disk/segment loss — thing the delta ChunkStates does not
@@ -442,8 +469,12 @@ type DiskReport struct {
 	Index      int   `json:"index"`
 	UsedBytes  int64 `json:"used_bytes"`
 	TotalBytes int64 `json:"total_bytes,omitempty"`
-	ChunkCount int64 `json:"chunk_count"`
-	Failed     bool  `json:"failed"`
+	// OnDiskBytes is this disk's physical bytes occupied by data files
+	// (including un-reclaimed superseded generations). Distinct from
+	// UsedBytes (logical live bytes).
+	OnDiskBytes int64 `json:"on_disk_bytes,omitempty"`
+	ChunkCount  int64 `json:"chunk_count"`
+	Failed      bool  `json:"failed"`
 }
 
 // RepairTask represents a pending repair operation.

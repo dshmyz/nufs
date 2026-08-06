@@ -207,6 +207,7 @@ func (h *HeartbeatReporter) send() {
 
 	report := &metadata.NodeReport{
 		UsedGB:         usedGB,
+		UsedBytes:      totalBytes, // byte-accurate logical live footprint
 		ChunkCount:     chunkCount,
 		DiskIO:         h.lastDiskIO,
 		WriteErrorRate: h.chunkSt.WriteErrorRate(),
@@ -233,22 +234,27 @@ func (h *HeartbeatReporter) send() {
 	// console; a single disk still reports its total capacity even though
 	// the per-disk breakdown below is only shipped for multi-disk nodes.
 	ds := h.chunkSt.DiskStats()
-	var totalCapacityBytes int64
+	var totalCapacityBytes, onDiskBytes int64
 	for _, d := range ds {
 		if d.TotalBytes > 0 {
 			totalCapacityBytes += d.TotalBytes
 		}
+		if d.OnDiskBytes > 0 {
+			onDiskBytes += d.OnDiskBytes
+		}
 	}
 	report.TotalCapacityBytes = totalCapacityBytes
+	report.OnDiskBytes = onDiskBytes
 	if len(ds) > 1 {
 		diskReports := make([]metadata.DiskReport, len(ds))
 		for i, d := range ds {
 			diskReports[i] = metadata.DiskReport{
-				Index:      d.Index,
-				UsedBytes:  d.UsedBytes,
-				TotalBytes: d.TotalBytes,
-				ChunkCount: d.ChunkCount,
-				Failed:     d.Failed,
+				Index:       d.Index,
+				UsedBytes:   d.UsedBytes,
+				TotalBytes:  d.TotalBytes,
+				OnDiskBytes: d.OnDiskBytes,
+				ChunkCount:  d.ChunkCount,
+				Failed:      d.Failed,
 			}
 		}
 		report.DiskStats = diskReports
