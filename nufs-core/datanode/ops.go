@@ -59,6 +59,12 @@ type OpsServer struct {
 	alertMu        sync.RWMutex
 	alertRing      []capacityAlertEvent
 	lastAlertLevel atomic.Int64
+	// alertDispatch is a FIFO queue of alert events awaiting webhook delivery.
+	// A single worker goroutine drains it so POSTs arrive in notification order
+	// (independent goroutines would race and could reorder them). Lazy-started
+	// on first use so servers that never set a webhook don't leak a worker.
+	alertDispatch    chan capacityAlertEvent
+	alertDispatchOne sync.Once
 }
 
 // NewOpsServer creates the operations HTTP server.
@@ -859,11 +865,11 @@ func (s *OpsServer) handleECConvert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{
-		"stripe_id":        st.StripeID,
+		"stripe_id":         st.StripeID,
 		"state":             st.State.String(),
-		"converted_at":     st.ConvertedAt,
+		"converted_at":      st.ConvertedAt,
 		"original_checksum": st.OriginalChecksum,
-		"shards":           len(st.Shards),
+		"shards":            len(st.Shards),
 	})
 }
 
@@ -948,12 +954,12 @@ func (s *OpsServer) handleHTTPVerifyDisk(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, map[string]interface{}{
-		"dir":        dir,
-		"total":      verified + corrupted + failed,
-		"verified":   verified,
-		"corrupted":  corrupted,
-		"failed":     failed,
-		"chunks":     results,
+		"dir":       dir,
+		"total":     verified + corrupted + failed,
+		"verified":  verified,
+		"corrupted": corrupted,
+		"failed":    failed,
+		"chunks":    results,
 	})
 }
 

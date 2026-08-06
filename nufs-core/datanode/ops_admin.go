@@ -73,11 +73,11 @@ func (s *OpsServer) registerAdminRoutes(mux *http.ServeMux) {
 // handleAdminAlerts returns the recent capacity-alert ring buffer as JSON.
 func (s *OpsServer) handleAdminAlerts(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, map[string]interface{}{
-		"node_id":   uint64(s.cfg.NodeID),
-		"alerts":    s.alertRingSnapshot(),
-		"level":     s.currentAlertLevel().String(),
-		"overview":  s.capacityOverview(),
-		"version":   version.Info(),
+		"node_id":  uint64(s.cfg.NodeID),
+		"alerts":   s.alertRingSnapshot(),
+		"level":    s.currentAlertLevel().String(),
+		"overview": s.capacityOverview(),
+		"version":  version.Info(),
 	})
 }
 
@@ -114,11 +114,10 @@ func (s *OpsServer) NotifyCapacityAlert(level AlertLevel, usagePct float64, used
 		return
 	}
 
-	if url := s.alertWebhook; url != "" {
-		// Async, non-blocking delivery — never stall the alert caller on the
-		// webhook network round-trip.
-		go s.deliverWebhook(url, ev)
-	}
+	// Async, non-blocking delivery — never stall the alert caller on the
+	// webhook network round-trip. Events go through a single serialized worker
+	// so POST order matches notification order (see deliverWebhook).
+	s.enqueueAlertWebhook(ev)
 	if level == AlertCritical {
 		slog.Error("datanode: capacity CRITICAL", "node_id", s.cfg.NodeID, "usage", pctStr(usagePct))
 	} else {
@@ -128,6 +127,29 @@ func (s *OpsServer) NotifyCapacityAlert(level AlertLevel, usagePct float64, used
 
 func pctStr(pct float64) string {
 	return fmt.Sprintf("%.1f%%", pct*100)
+}
+
+// enqueueAlertWebhook hands an alert event to the single serialized webhook
+// worker. The worker is lazy-started on first use and reads events in FIFO
+// order, so concurrent NotifyCapacityAlert calls cannot reorder deliveries.
+func (s *OpsServer) enqueueAlertWebhook(ev capacityAlertEvent) {
+	s.alertDispatchOne.Do(func() {
+		s.alertDispatch = make(chan capacityAlertEvent, 64)
+		go s.webhookWorker()
+	})
+	s.alertDispatch <- ev
+}
+
+// webhookWorker drains the alert dispatch queue in order, delivering each
+// event (when a webhook URL is configured) asynchronously of the alert caller
+// but serially with respect to other events.
+func (s *OpsServer) webhookWorker() {
+	for ev := range s.alertDispatch {
+		url := s.alertWebhook
+		if url != "" {
+			s.deliverWebhook(url, ev)
+		}
+	}
 }
 
 func (s *OpsServer) deliverWebhook(url string, ev capacityAlertEvent) {
