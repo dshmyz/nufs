@@ -298,6 +298,9 @@ func (c *HTTPClient) readResponse(resp *http.Response, v interface{}) error {
 				}
 				return fmt.Errorf("%w: allocation_outcome_unknown: %s", ErrRaftConditionalOutcomeUnknown, errResp.Error)
 			}
+			if errResp.Code == "entry_exists" {
+				return ErrEntryExists
+			}
 		}
 		if resp.StatusCode == http.StatusNotFound {
 			switch errResp.Code {
@@ -1297,6 +1300,7 @@ func (c *HTTPClient) WatchEventsStream(ctx context.Context, prefix string) <-cha
 	}()
 	return ch
 }
+
 // --- EC conversion lifecycle authority (Program A / S2) ---
 //
 // These methods implement the metadata.ECAuthority seam (datanode/ec_service.go)

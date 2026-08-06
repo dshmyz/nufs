@@ -19,7 +19,7 @@ import (
 func buildOpsTestMux(t *testing.T, store *metadata.PebbleStore, bundle *metadata.ServiceBundle) *http.ServeMux {
 	t.Helper()
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle, "")
+	registerOpsHandlers(mux, store, store, bundle, "")
 	return mux
 }
 

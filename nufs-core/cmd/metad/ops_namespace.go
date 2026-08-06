@@ -33,8 +33,12 @@ func (h *opsHandlers) handleMkDir(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	meta, err := h.store.MkDir(r.Context(), req.Parent, req.Name, req.Mode)
+	meta, err := h.dataStore.MkDir(r.Context(), req.Parent, req.Name, req.Mode)
 	if err != nil {
+		if errors.Is(err, metadata.ErrEntryExists) {
+			writeEntryExistsError(w, err)
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -55,7 +59,7 @@ func (h *opsHandlers) handleRmDir(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.store.RmDir(r.Context(), req.Parent, req.Name); err != nil {
+	if err := h.dataStore.RmDir(r.Context(), req.Parent, req.Name); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -73,7 +77,7 @@ func (h *opsHandlers) handleReadDir(w http.ResponseWriter, r *http.Request) {
 	fmt.Sscanf(r.URL.Query().Get("parent"), "%d", &parent)
 	fmt.Sscanf(r.URL.Query().Get("offset"), "%d", &offset)
 	fmt.Sscanf(r.URL.Query().Get("limit"), "%d", &limit)
-	entries, err := h.store.ReadDir(r.Context(), parent, offset, limit)
+	entries, err := h.dataStore.ReadDir(r.Context(), parent, offset, limit)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -95,8 +99,12 @@ func (h *opsHandlers) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	meta, err := h.store.CreateFile(r.Context(), req.Parent, req.Name, req.Mode)
+	meta, err := h.dataStore.CreateFile(r.Context(), req.Parent, req.Name, req.Mode)
 	if err != nil {
+		if errors.Is(err, metadata.ErrEntryExists) {
+			writeEntryExistsError(w, err)
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -114,18 +122,22 @@ func (h *opsHandlers) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Parent metadata.InodeID `json:"parent"`
-		Name   string           `json:"name"`
+		Parent metadata.InodeID  `json:"parent"`
+		Name   string            `json:"name"`
 		Type   metadata.FileType `json:"type"`
-		Mode   uint32           `json:"mode"`
-		Rdev   uint32           `json:"rdev"`
+		Mode   uint32            `json:"mode"`
+		Rdev   uint32            `json:"rdev"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	meta, err := h.store.CreateNode(r.Context(), req.Parent, req.Name, req.Type, req.Mode, req.Rdev)
+	meta, err := h.dataStore.CreateNode(r.Context(), req.Parent, req.Name, req.Type, req.Mode, req.Rdev)
 	if err != nil {
+		if errors.Is(err, metadata.ErrEntryExists) {
+			writeEntryExistsError(w, err)
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -146,7 +158,7 @@ func (h *opsHandlers) handleUnlink(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.store.Unlink(r.Context(), req.Parent, req.Name); err != nil {
+	if err := h.dataStore.Unlink(r.Context(), req.Parent, req.Name); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -161,7 +173,7 @@ func (h *opsHandlers) handleLookup(w http.ResponseWriter, r *http.Request) {
 	var parent metadata.InodeID
 	name := r.URL.Query().Get("name")
 	fmt.Sscanf(r.URL.Query().Get("parent"), "%d", &parent)
-	meta, err := h.store.Lookup(r.Context(), parent, name)
+	meta, err := h.dataStore.Lookup(r.Context(), parent, name)
 	if err != nil {
 		// Use writeJSONErrorC so the HTTP client can map the 404 to
 		// ErrEntryNotFound via the machine-readable code (readResponse
@@ -198,7 +210,11 @@ func (h *opsHandlers) handleRename(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.store.Rename(r.Context(), req.OldParent, req.OldName, req.NewParent, req.NewName); err != nil {
+	if err := h.dataStore.Rename(r.Context(), req.OldParent, req.OldName, req.NewParent, req.NewName); err != nil {
+		if errors.Is(err, metadata.ErrEntryExists) {
+			writeEntryExistsError(w, err)
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -219,8 +235,12 @@ func (h *opsHandlers) handleSymlink(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	meta, err := h.store.Symlink(r.Context(), req.Parent, req.Name, req.Target)
+	meta, err := h.dataStore.Symlink(r.Context(), req.Parent, req.Name, req.Target)
 	if err != nil {
+		if errors.Is(err, metadata.ErrEntryExists) {
+			writeEntryExistsError(w, err)
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -235,7 +255,7 @@ func (h *opsHandlers) handleReadlink(w http.ResponseWriter, r *http.Request) {
 	}
 	var id metadata.InodeID
 	fmt.Sscanf(r.URL.Query().Get("id"), "%d", &id)
-	target, err := h.store.Readlink(r.Context(), id)
+	target, err := h.dataStore.Readlink(r.Context(), id)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
@@ -257,8 +277,12 @@ func (h *opsHandlers) handleLink(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	meta, err := h.store.Link(r.Context(), req.Parent, req.Name, req.Target)
+	meta, err := h.dataStore.Link(r.Context(), req.Parent, req.Name, req.Target)
 	if err != nil {
+		if errors.Is(err, metadata.ErrEntryExists) {
+			writeEntryExistsError(w, err)
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -283,7 +307,7 @@ func (h *opsHandlers) handleInodesByID(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		meta, err := h.store.GetInode(r.Context(), inodeID)
+		meta, err := h.dataStore.GetInode(r.Context(), inodeID)
 		if err != nil {
 			writeJSONError(w, http.StatusNotFound, err.Error())
 			return
@@ -296,7 +320,7 @@ func (h *opsHandlers) handleInodesByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		meta.ID = inodeID
-		if err := h.store.UpdateInode(r.Context(), &meta); err != nil {
+		if err := h.dataStore.UpdateInode(r.Context(), &meta); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -318,7 +342,7 @@ func (h *opsHandlers) handleXAttrs(w http.ResponseWriter, r *http.Request, inode
 			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		attrs, err := h.store.ListXAttr(r.Context(), inodeID)
+		attrs, err := h.dataStore.ListXAttr(r.Context(), inodeID)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -338,7 +362,7 @@ func (h *opsHandlers) handleXAttrs(w http.ResponseWriter, r *http.Request, inode
 
 	switch r.Method {
 	case http.MethodGet:
-		value, err := h.store.GetXAttr(r.Context(), inodeID, name)
+		value, err := h.dataStore.GetXAttr(r.Context(), inodeID, name)
 		if errors.Is(err, metadata.ErrXAttrNotFound) {
 			writeJSONErrorC(w, http.StatusNotFound, "xattr_not_found", err.Error())
 			return
@@ -356,13 +380,13 @@ func (h *opsHandlers) handleXAttrs(w http.ResponseWriter, r *http.Request, inode
 			writeJSONError(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
-		if err := h.store.SetXAttr(r.Context(), inodeID, name, req.Value); err != nil {
+		if err := h.dataStore.SetXAttr(r.Context(), inodeID, name, req.Value); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, map[string]string{"status": "updated"})
 	case http.MethodDelete:
-		if err := h.store.RemoveXAttr(r.Context(), inodeID, name); err != nil {
+		if err := h.dataStore.RemoveXAttr(r.Context(), inodeID, name); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}

@@ -37,6 +37,7 @@ func main() {
 		nodeID               = flag.String("node-id", "1", "Metadata node ID or StatefulSet pod name ending in -<ordinal>")
 		memTableSize         = flag.Uint64("memtable-size", 256<<20, "Pebble memtable size in bytes")
 		bucketStats          = flag.Bool("bucket-stats", true, "Enable persisted per-bucket usage counters")
+		shards               = flag.Int("shards", 1, "In-process metadata data-plane shards (1 = single PebbleStore; N>1 requires --raft=false)")
 		enableRaft           = flag.Bool("raft", true, "Enable Raft consensus")
 		raftAddr             = flag.String("raft-addr", "0.0.0.0:7000", "Raft bind address")
 		raftAdvertiseAddr    = flag.String("raft-advertise-addr", "", "Advertised Raft address for peers (default: raft-addr)")
@@ -62,7 +63,7 @@ func main() {
 		tlsRequireClientCert = flag.Bool("tls-require-client-cert", false, "Require clients to present a certificate signed by tls-ca")
 		tlsSkipVerify        = flag.Bool("tls-skip-verify", false, "Skip TLS server certificate verification (dev only)")
 		authToken            = flag.String("auth-token", "", "Bearer token for ops API auth (empty = no auth)")
-	allowInsecureDev    = flag.Bool("allow-insecure-dev", false, "Allow running without auth, TLS, or multi-node Raft (dev only)")
+		allowInsecureDev     = flag.Bool("allow-insecure-dev", false, "Allow running without auth, TLS, or multi-node Raft (dev only)")
 		backupEnabled        = flag.Bool("backup-enabled", false, "Enable leader-only metadata backups")
 		backupLocalDir       = flag.String("backup-local-dir", "/var/lib/dfs/backup-tmp", "Local temporary directory for metadata backups")
 		backupInterval       = flag.Duration("backup-interval", time.Hour, "Metadata backup interval")
@@ -86,6 +87,19 @@ func main() {
 	flag.Parse()
 	if *restoreMinReplicas < 1 {
 		fmt.Fprintln(os.Stderr, "invalid restore readiness configuration: --restore-minimum-readable-replicas must be at least 1")
+		os.Exit(1)
+	}
+	if *shards < 1 {
+		fmt.Fprintln(os.Stderr, "invalid shard configuration: --shards must be at least 1")
+		os.Exit(1)
+	}
+	// In-process sharding is a data-plane extension for a single metad
+	// process; it deliberately does NOT combine with Raft (cross-node
+	// multi-metad routing of shards is out of scope and listed as future
+	// work). Reject that combination up front rather than boot a config the
+	// binary cannot honor.
+	if *shards > 1 && *enableRaft {
+		fmt.Fprintln(os.Stderr, "invalid configuration: --shards N>1 requires --raft=false (in-process data-plane sharding; Raft+sharded is not supported)")
 		os.Exit(1)
 	}
 
@@ -170,6 +184,23 @@ func main() {
 	// subscribe to metadata changes. Without this, watch returns 501.
 	store.SetEventBus(metadata.NewEventBus(1024))
 	log.Info("PebbleStore initialized", "dir", *dataDir)
+
+	// Data-plane selection. The primary PebbleStore above carries the
+	// control plane (service-bundle subsystems, admin, prometheus) and is
+	// the data plane for --shards 1 (the default, byte-identical to before).
+	// For --shards N>1 (non-raft only), the gateway-facing data-plane
+	// handlers route through an in-process ShardedStore instead; control
+	// plane stays on the primary store.
+	dataStore := opsDataStore(store)
+	if *shards > 1 {
+		sharded, err := buildShardedDataPlane(*dataDir, *shards, nodeIDValue, *memTableSize, *bucketStats)
+		if err != nil {
+			log.Error("failed to build sharded data plane", "error", err)
+			os.Exit(1)
+		}
+		dataStore = sharded
+		log.Info("sharded data plane active", "shards", *shards, "dir", *dataDir)
+	}
 
 	var raftNode *metadata.RaftNode
 
@@ -323,7 +354,7 @@ func main() {
 			repository:  backupRepository,
 		})
 	}
-	registerOpsHandlers(mux, store, bundle, advertiseOpsURL, backupDeps...)
+	registerOpsHandlers(mux, store, dataStore, bundle, advertiseOpsURL, backupDeps...)
 
 	admin := newAdminServer(store, bundle)
 	admin.RegisterRoutes(mux)

@@ -21,7 +21,7 @@ func (h *opsHandlers) handleChunks(w http.ResponseWriter, r *http.Request) {
 				writeJSONError(w, http.StatusBadRequest, "invalid inode_id")
 				return
 			}
-			refs, err := h.store.ListChunks(r.Context(), inodeID)
+			refs, err := h.dataStore.ListChunks(r.Context(), inodeID)
 			if err != nil {
 				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
@@ -41,7 +41,7 @@ func (h *opsHandlers) handleChunks(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
-		chunk, err := h.store.AllocateChunk(r.Context(), req.InodeID, req.Offset, req.Policy)
+		chunk, err := h.dataStore.AllocateChunk(r.Context(), req.InodeID, req.Offset, req.Policy)
 		if err != nil {
 			writeChunkAllocationError(w, err)
 			return
@@ -72,7 +72,7 @@ func (h *opsHandlers) handleChunksByID(w http.ResponseWriter, r *http.Request) {
 	case rest == "":
 		switch r.Method {
 		case http.MethodGet:
-			chunk, err := h.store.GetChunk(r.Context(), chunkID)
+			chunk, err := h.dataStore.GetChunk(r.Context(), chunkID)
 			if err != nil {
 				writeJSONError(w, http.StatusNotFound, err.Error())
 				return
@@ -85,13 +85,13 @@ func (h *opsHandlers) handleChunksByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			chunk.ID = chunkID
-			if err := h.store.UpdateChunk(r.Context(), &chunk); err != nil {
+			if err := h.dataStore.UpdateChunk(r.Context(), &chunk); err != nil {
 				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			writeJSON(w, map[string]string{"status": "updated"})
 		case http.MethodDelete:
-			if err := h.store.DeleteChunk(r.Context(), chunkID); err != nil {
+			if err := h.dataStore.DeleteChunk(r.Context(), chunkID); err != nil {
 				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
@@ -111,7 +111,7 @@ func (h *opsHandlers) handleChunksByID(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
-		if err := h.store.CommitChunk(r.Context(), chunkID, req.Checksum); err != nil {
+		if err := h.dataStore.CommitChunk(r.Context(), chunkID, req.Checksum); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -121,7 +121,7 @@ func (h *opsHandlers) handleChunksByID(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		if err := h.store.SealChunk(r.Context(), chunkID); err != nil {
+		if err := h.dataStore.SealChunk(r.Context(), chunkID); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -145,7 +145,7 @@ func (h *opsHandlers) handleMigrateReplica(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.store.MigrateChunkReplica(r.Context(), req.ChunkID, req.FromNode, req.ToNode); err != nil {
+	if err := h.dataStore.MigrateChunkReplica(r.Context(), req.ChunkID, req.FromNode, req.ToNode); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -165,7 +165,7 @@ func (h *opsHandlers) handleReportChunkState(w http.ResponseWriter, r *http.Requ
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.store.ReportChunkState(r.Context(), req.NodeID, req.States); err != nil {
+	if err := h.dataStore.ReportChunkState(r.Context(), req.NodeID, req.States); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -186,7 +186,7 @@ func (h *opsHandlers) handleChunksBatch(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	chunks, err := h.store.AllocateChunksBatch(r.Context(), req.InodeID, req.Offsets, req.Policy)
+	chunks, err := h.dataStore.AllocateChunksBatch(r.Context(), req.InodeID, req.Offsets, req.Policy)
 	if err != nil {
 		writeChunkAllocationError(w, err)
 		return

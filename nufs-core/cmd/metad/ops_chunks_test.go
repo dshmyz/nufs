@@ -48,7 +48,7 @@ func TestChunkAllocationUnknownOutcomeIsConflictWithMachineCode(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chunks", bytes.NewReader(reqBody))
 	rr := httptest.NewRecorder()
-	(&opsHandlers{store: store, bundle: bundle}).handleChunks(rr, req)
+	(&opsHandlers{store: store, dataStore: store, bundle: bundle}).handleChunks(rr, req)
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409, body=%s", rr.Code, rr.Body.String())
 	}

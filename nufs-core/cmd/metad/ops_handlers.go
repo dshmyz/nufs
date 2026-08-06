@@ -10,13 +10,34 @@ import (
 	"github.com/example/dfs/metadata"
 )
 
+// opsDataStore is the data-plane store surface the gateway-facing
+// namespace/bucket/chunk handlers need: the full metadata service (their
+// method calls all come from this interface), plus the three leader-view
+// methods. Both *metadata.PebbleStore (the default, --shards 1) and the
+// sharded wrapper for --shards N>1 satisfy it, so the same data handlers
+// serve either wiring. Control-plane handlers (nodes/repair/EC/scrub/
+// watch/backup/write-attempts) keep operating on the primary store.
+type opsDataStore interface {
+	metadata.MetadataService
+	IsLeader() bool
+	LeaderAddr() string
+	LeaderOpsAddr() string
+}
+
 // opsHandlers holds the dependencies for the HTTP ops API. Methods on
 // this type are defined across ops_handlers.go (this file),
 // ops_buckets.go, ops_nodes.go, ops_chunks.go, ops_namespace.go and
 // ops_repair.go, grouped by resource domain.
 type opsHandlers struct {
-	store  *metadata.PebbleStore
-	bundle *metadata.ServiceBundle
+	// store is the primary PebbleStore: it carries the control plane
+	// (status, leader view, cluster balance) and every handler that needs a
+	// PebbleStore-specific method (EC/scrub/watch/backup/write-attempts).
+	store *metadata.PebbleStore
+	// dataStore is the gateway data plane (namespace/bucket/chunk). It is
+	// the same primary store for --shards 1, or a ShardedStore for
+	// --shards N>1.
+	dataStore opsDataStore
+	bundle    *metadata.ServiceBundle
 
 	backupCoordinator backupOpsCoordinator
 	backupRepository  backupVerifierRepository
@@ -57,8 +78,8 @@ func leaderRedirectTarget(leaderAddr string, requestURL *url.URL) string {
 // is grouped by resource domain so that adding a new endpoint means
 // adding the route here and the handler in the matching ops_*.go
 // file.
-func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, bundle *metadata.ServiceBundle, advertiseOpsAddr string, backupDeps ...backupOpsDependency) {
-	s := &opsHandlers{store: store, bundle: bundle, advertiseOpsAddr: advertiseOpsAddr}
+func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, dataStore opsDataStore, bundle *metadata.ServiceBundle, advertiseOpsAddr string, backupDeps ...backupOpsDependency) {
+	s := &opsHandlers{store: store, dataStore: dataStore, bundle: bundle, advertiseOpsAddr: advertiseOpsAddr}
 	if len(backupDeps) > 0 {
 		s.backupCoordinator = backupDeps[0].coordinator
 		s.backupRepository = backupDeps[0].repository
@@ -236,13 +257,13 @@ func (h *opsHandlers) handleClusterBalance(w http.ResponseWriter, _ *http.Reques
 	}
 
 	type nodeBalance struct {
-		ID       metadata.NodeID `json:"id"`
-		Addr     string          `json:"addr"`
-		CapGB    int64           `json:"capacity_gb"`
-		UsedGB   int64           `json:"used_gb"`
-		UsedPct  float64         `json:"used_pct"`
-		Tier     string          `json:"tier"`
-		Online   bool            `json:"online"`
+		ID      metadata.NodeID `json:"id"`
+		Addr    string          `json:"addr"`
+		CapGB   int64           `json:"capacity_gb"`
+		UsedGB  int64           `json:"used_gb"`
+		UsedPct float64         `json:"used_pct"`
+		Tier    string          `json:"tier"`
+		Online  bool            `json:"online"`
 	}
 
 	var totalUsed, totalCap int64
@@ -290,13 +311,13 @@ func (h *opsHandlers) handleClusterBalance(w http.ResponseWriter, _ *http.Reques
 	}
 
 	writeJSON(w, map[string]interface{}{
-		"nodes":         nodeBalances,
-		"total_used_gb": totalUsed,
-		"total_cap_gb":  totalCap,
+		"nodes":          nodeBalances,
+		"total_used_gb":  totalUsed,
+		"total_cap_gb":   totalCap,
 		"total_used_pct": totalPct,
-		"imbalance":     imbalance,
-		"min_used_pct":  minPct,
-		"max_used_pct":  maxPct,
+		"imbalance":      imbalance,
+		"min_used_pct":   minPct,
+		"max_used_pct":   maxPct,
 		"recommendation": recommendation,
 	})
 }
@@ -349,6 +370,14 @@ func writeJSONErrorC(w http.ResponseWriter, code int, errCode, msg string) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg, "code": errCode})
 }
 
+// writeEntryExistsError maps ErrEntryExists to an HTTP 409 with a
+// machine-readable "entry_exists" code, so the metadata HTTP client can return
+// ErrEntryExists to callers (e.g. the S3 gateway's duplicate-PUT path) instead
+// of an opaque 500. Mirrors the existing entry_not_found convention.
+func writeEntryExistsError(w http.ResponseWriter, err error) {
+	writeJSONErrorC(w, http.StatusConflict, "entry_exists", err.Error())
+}
+
 func tierName(t metadata.StorageTier) string {
 	switch t {
 	case metadata.TierHot:
@@ -387,8 +416,8 @@ func (h *opsHandlers) handleTransferLeader(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, map[string]interface{}{
-		"status":   "transferred",
-		"target":   targetID,
-		"message":  "leadership transfer initiated, check leader status",
+		"status":  "transferred",
+		"target":  targetID,
+		"message": "leadership transfer initiated, check leader status",
 	})
 }

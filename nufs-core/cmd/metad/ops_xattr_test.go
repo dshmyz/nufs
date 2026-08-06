@@ -47,7 +47,7 @@ func TestOpsHandlersXAttrRoundTrip(t *testing.T) {
 	defer bundle.Close()
 
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle, "")
+	registerOpsHandlers(mux, store, store, bundle, "")
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -101,7 +101,7 @@ func TestOpsHandlersXAttrRejectsInvalidInodeID(t *testing.T) {
 	defer bundle.Close()
 
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle, "")
+	registerOpsHandlers(mux, store, store, bundle, "")
 	body, _ := json.Marshal(map[string][]byte{"value": []byte("x")})
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/inodes/not-a-number/xattrs/user.key", bytes.NewReader(body))
 	rr := httptest.NewRecorder()

@@ -49,7 +49,7 @@ func (h *opsHandlers) handleBucketQuota(w http.ResponseWriter, r *http.Request, 
 	case http.MethodPut:
 		h.putBucketQuota(w, r, bucket)
 	case http.MethodDelete:
-		if err := h.store.DeleteBucketQuota(r.Context(), bucket); err != nil {
+		if err := h.dataStore.DeleteBucketQuota(r.Context(), bucket); err != nil {
 			writeBucketQuotaError(w, err)
 			return
 		}
@@ -60,12 +60,12 @@ func (h *opsHandlers) handleBucketQuota(w http.ResponseWriter, r *http.Request, 
 }
 
 func (h *opsHandlers) getBucketQuota(w http.ResponseWriter, r *http.Request, bucket string) {
-	quota, err := h.store.GetBucketQuota(r.Context(), bucket)
+	quota, err := h.dataStore.GetBucketQuota(r.Context(), bucket)
 	if err != nil {
 		writeBucketQuotaError(w, err)
 		return
 	}
-	usage, err := h.store.GetBucketUsage(r.Context(), bucket)
+	usage, err := h.dataStore.GetBucketUsage(r.Context(), bucket)
 	if err != nil {
 		writeBucketQuotaError(w, err)
 		return
@@ -85,11 +85,11 @@ func (h *opsHandlers) putBucketQuota(w http.ResponseWriter, r *http.Request, buc
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.store.SetBucketQuota(r.Context(), bucket, &quota); err != nil {
+	if err := h.dataStore.SetBucketQuota(r.Context(), bucket, &quota); err != nil {
 		writeBucketQuotaError(w, err)
 		return
 	}
-	usage, err := h.store.GetBucketUsage(r.Context(), bucket)
+	usage, err := h.dataStore.GetBucketUsage(r.Context(), bucket)
 	if err != nil {
 		writeBucketQuotaError(w, err)
 		return
@@ -108,7 +108,7 @@ func (h *opsHandlers) checkBucketQuota(w http.ResponseWriter, r *http.Request, b
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.store.CheckBucketQuota(r.Context(), bucket, req.AdditionalBytes, req.AdditionalObjects); err != nil {
+	if err := h.dataStore.CheckBucketQuota(r.Context(), bucket, req.AdditionalBytes, req.AdditionalObjects); err != nil {
 		writeBucketQuotaError(w, err)
 		return
 	}

@@ -32,7 +32,7 @@ func TestHandleLookup_EntryNotFoundCode(t *testing.T) {
 	url := "/api/v1/namespace/lookup?parent=" + strconv.FormatUint(uint64(bucket.RootInode), 10) + "&name=nope"
 	req := httptest.NewRequest(http.MethodGet, url, nil)
 	rr := httptest.NewRecorder()
-	(&opsHandlers{store: store}).handleLookup(rr, req)
+	(&opsHandlers{store: store, dataStore: store}).handleLookup(rr, req)
 
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404, body=%s", rr.Code, rr.Body.String())

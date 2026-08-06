@@ -206,7 +206,7 @@ func TestWriteBucketQuotaErrorClassifiesExceededAndBackendFailure(t *testing.T) 
 func newOpsTestHTTPServer(t *testing.T, store *metadata.PebbleStore, bundle *metadata.ServiceBundle) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle, "")
+	registerOpsHandlers(mux, store, store, bundle, "")
 	server := httptest.NewServer(rejectEmptyBucketQuotaPath(mux))
 	t.Cleanup(server.Close)
 	return server

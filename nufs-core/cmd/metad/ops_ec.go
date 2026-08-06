@@ -370,11 +370,11 @@ func (h *opsHandlers) handleECRecordDirect(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var req struct {
-		ChunkID           uint64               `json:"chunk_id"`
-		Shards            []metadata.ECShard   `json:"shards"`
-		DataShards        int                  `json:"data_shards"`
-		ParityShards      int                  `json:"parity_shards"`
-		OriginalChecksum  uint32               `json:"original_checksum"`
+		ChunkID          uint64             `json:"chunk_id"`
+		Shards           []metadata.ECShard `json:"shards"`
+		DataShards       int                `json:"data_shards"`
+		ParityShards     int                `json:"parity_shards"`
+		OriginalChecksum uint32             `json:"original_checksum"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChunkID == 0 || len(req.Shards) == 0 {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
@@ -386,8 +386,8 @@ func (h *opsHandlers) handleECRecordDirect(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, struct {
-		Chunk  *metadata.ChunkMeta  `json:"chunk"`
-		Stripe *metadata.ECStripe   `json:"stripe"`
+		Chunk  *metadata.ChunkMeta `json:"chunk"`
+		Stripe *metadata.ECStripe  `json:"stripe"`
 	}{Chunk: layout, Stripe: st})
 }
 

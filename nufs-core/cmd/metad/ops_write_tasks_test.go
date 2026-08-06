@@ -17,7 +17,7 @@ func TestOpsHandlersWriteAttemptRoundTrip(t *testing.T) {
 	store, bundle := newOpsTestStore(t)
 
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle, "")
+	registerOpsHandlers(mux, store, store, bundle, "")
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -58,7 +58,7 @@ func TestOpsHandlersBackgroundTaskLeaseLifecycle(t *testing.T) {
 	store, bundle := newOpsTestStore(t)
 
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle, "")
+	registerOpsHandlers(mux, store, store, bundle, "")
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -121,7 +121,7 @@ func TestOpsHandlersWriteOpsStatus(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle, "")
+	registerOpsHandlers(mux, store, store, bundle, "")
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	client := metadata.NewHTTPClient(server.URL, 0)
@@ -151,7 +151,7 @@ func TestOpsHandlersMetricsIncludesWriteOpsStatus(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	registerOpsHandlers(mux, store, bundle, "")
+	registerOpsHandlers(mux, store, store, bundle, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
