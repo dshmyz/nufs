@@ -14,7 +14,10 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/example/dfs/datanode/storage"
@@ -42,18 +45,27 @@ type KeyRegistry struct {
 	// the string KeyID used by the KMS.
 	numericToID map[uint64]crypto.KeyID
 	idToNumeric map[crypto.KeyID]uint64
-	nextNumeric uint64
 }
 
-// NewKeyRegistry creates a registry backed by a KMS.
+// NewKeyRegistry creates a registry backed by a KMS. It eagerly primes the
+// active DEK's numeric↔string mapping so record reads resolve immediately
+// after a process restart (the active key is what new data was written with).
 func NewKeyRegistry(kms crypto.KMS) *KeyRegistry {
-	return &KeyRegistry{
+	r := &KeyRegistry{
 		kms:         kms,
 		cache:       make(map[crypto.KeyID][]byte),
 		numericToID: make(map[uint64]crypto.KeyID),
 		idToNumeric: make(map[crypto.KeyID]uint64),
-		nextNumeric: 1,
 	}
+	if kms != nil {
+		// Prime the active key's mapping. KeyIDs from FileKMS/LocalKMS are
+		// "name-N", whose stable numeric is the N suffix, so a fresh registry
+		// derives the same numeric as the one that wrote the records.
+		if id, _, err := kms.ActiveDEK(); err == nil {
+			r.numericOf(id)
+		}
+	}
+	return r
 }
 
 // ActiveKey returns the current active DEK for new writes, plus its
@@ -69,22 +81,59 @@ func (r *KeyRegistry) ActiveKey() (uint64, []byte, error) {
 	return r.numericOf(id), key, nil
 }
 
-// numericOf assigns (or returns) the stable numeric ID for a KeyID.
-func (r *KeyRegistry) numericOf(id crypto.KeyID) uint64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if n, ok := r.idToNumeric[id]; ok {
-		return n
+// numericFor derives a stable, deterministic numeric ID for a KeyID so that
+// any registry process—across restarts—maps the string id to the same numeric
+// stored in record headers. For the "name-N" ids emitted by LocalKMS and
+// FileKMS the numeric is the decimal N suffix. For any other string it falls
+// back to a stable FNV-1a hash (never 0, which means plaintext).
+func numericFor(id crypto.KeyID) uint64 {
+	s := string(id)
+	if i := strings.LastIndexByte(s, '-'); i >= 0 && i+1 < len(s) {
+		if n, err := strconv.ParseUint(s[i+1:], 10, 64); err == nil && n > 0 {
+			return n
+		}
 	}
-	n := r.nextNumeric
-	r.nextNumeric++
-	r.idToNumeric[id] = n
-	r.numericToID[n] = id
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	n := h.Sum64()
+	if n == 0 {
+		n = 1
+	}
 	return n
 }
 
+// numericOf returns the stable numeric ID for a KeyID, recording the
+// numeric↔string mapping for Reverse lookup.
+func (r *KeyRegistry) numericOf(id crypto.KeyID) uint64 {
+	n := numericFor(id)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing, ok := r.numericToID[n]; ok && existing != id {
+		// Deterministic collision: two ids hashing to the same numeric. This
+		// cannot happen for the "name-N" form (suffix is unique per id); it
+		// would only matter for a pathological hash collision on non-suffixed
+		// ids, which is not a production path. Keep the first mapping and log
+		// nothing—the collision is theoretically possible but astronomically
+		// unlikely (FNV-1a 64-bit).
+		return n
+	}
+	r.numericToID[n] = id
+	r.idToNumeric[id] = n
+	return n
+}
+
+// KeyEnumerator is the optional interface a KMS may implement to enumerate its
+// known DEK ids. KeyRegistry uses it to rebuild the numeric→string mapping on
+// a fresh process, so records written under a rotated (non-active) key still
+// resolve after restart. FileKMS implements it.
+type KeyEnumerator interface {
+	ListDEKIDs() ([]crypto.KeyID, error)
+}
+
 // ResolveNumeric returns the AES-256 key for a numeric record-header
-// key ID, resolving through the string KeyID.
+// key ID, resolving through the string KeyID. On a fresh process the
+// mapping is rebuilt from the KMS's known ids when the numeric is not
+// already known.
 func (r *KeyRegistry) ResolveNumeric(numeric uint64) ([]byte, error) {
 	if r == nil || r.kms == nil {
 		return nil, nil
@@ -92,10 +141,26 @@ func (r *KeyRegistry) ResolveNumeric(numeric uint64) ([]byte, error) {
 	r.mu.RLock()
 	id, ok := r.numericToID[numeric]
 	r.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("encryption: unknown numeric key id %d", numeric)
+	if ok {
+		return r.Resolve(id)
 	}
-	return r.Resolve(id)
+	// Mapping not primed (e.g. a rotated key's record read first). Rebuild
+	// from the KMS's enumerable id set if available.
+	if enum, ok := r.kms.(KeyEnumerator); ok {
+		if ids, err := enum.ListDEKIDs(); err == nil {
+			for _, cand := range ids {
+				if numericFor(cand) == numeric {
+					id = cand
+					r.mu.Lock()
+					r.numericToID[numeric] = id
+					r.idToNumeric[id] = numeric
+					r.mu.Unlock()
+					return r.Resolve(id)
+				}
+			}
+		}
+	}
+	return nil, fmt.Errorf("encryption: unknown numeric key id %d", numeric)
 }
 
 // Resolve returns the AES-256 key for a KeyID, cached.

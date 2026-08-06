@@ -3,6 +3,7 @@ package segment
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/example/dfs/datanode/storage"
@@ -50,6 +51,57 @@ func TestEncryptionRoundtrip(t *testing.T) {
 	}
 	if !bytes.Equal(got2.Data, data) {
 		t.Fatal("reopen encrypted roundtrip mismatch")
+	}
+}
+
+// TestEncryptionRoundtripFileKMS proves the FileKMS restart-survivability
+// property through the real frame-encryption path: the store writes with one
+// FileKMS instance, then is reopened with a *brand-new* FileKMS built over the
+// same <dataDir>/kms + KEK file (simulating a process restart). The DEK is
+// recovered from disk, so the encrypted bytes decrypt back to the original —
+// unlike LocalKMS, which only works because the same in-memory key is reused.
+func TestEncryptionRoundtripFileKMS(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "seg")      // segment store data dir
+	keyFile := filepath.Join(root, "kek") // KEK file (0600, created on first start)
+
+	// First "process": a FileKMS that generates + persists a DEK.
+	kms1, err := crypto.NewFileKMS(crypto.FileKMSConfig{KeyFile: keyFile}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg1 := encryption.NewKeyRegistry(kms1)
+	s1, err := New(Config{Dir: dir, UseMemIndex: false, Enc: reg1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("filekms-restart-survivable-write")
+	if _, err := s1.Write(context.Background(), &storage.WriteRequest{ExtentID: 1, Generation: 1, Data: data}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.Read(context.Background(), &storage.ReadRequest{ExtentID: 1, Generation: 1}); err != nil {
+		t.Fatalf("in-memory read: %v", err)
+	}
+	s1.Close()
+
+	// Second "process": a NEW FileKMS over the same KEK file and data dir.
+	// No in-memory key is reused — everything comes back from disk.
+	kms2, err := crypto.NewFileKMS(crypto.FileKMSConfig{KeyFile: keyFile}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg2 := encryption.NewKeyRegistry(kms2)
+	s2, err := New(Config{Dir: dir, UseMemIndex: false, Enc: reg2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	got, err := s2.Read(context.Background(), &storage.ReadRequest{ExtentID: 1, Generation: 1})
+	if err != nil {
+		t.Fatalf("reopen-with-fresh-FileKMS read: %v (DEK not recovered from disk?)", err)
+	}
+	if !bytes.Equal(got.Data, data) {
+		t.Fatal("FileKMS restart roundtrip mismatch")
 	}
 }
 

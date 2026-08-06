@@ -115,6 +115,20 @@ type Config struct {
 	// encryption. It is not production safe because keys are lost on restart.
 	AllowLocalKMS bool
 
+	// KMSKeyFile / KMSKeyEnv / KMSKeyHex configure a production FileKMS
+	// (envelope encryption: KEK in a file, env var, or hex string; DEKs
+	// persisted on disk so they survive restart). When any is set and
+	// EncryptAtRest is true, the FileKMS is used instead of LocalKMS and
+	// AllowLocalKMS is not required.
+	KMSKeyFile string
+	KMSKeyEnv  string
+	KMSKeyHex  string
+
+	// AllowInsecureDev permits running the datanode without TLS (dev only).
+	// Without it and without --tls-cert, the datanode refuses to start so
+	// it cannot silently listen in plaintext in a production setting.
+	AllowInsecureDev bool
+
 	// StorageVersion selects the storage engine: "v1" (legacy ChunkStore)
 	// or "v2.1" (new segment/commit-log engine).
 	StorageVersion string

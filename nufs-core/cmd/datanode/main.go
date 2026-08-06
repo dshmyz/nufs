@@ -64,6 +64,10 @@ func main() {
 		traceInsecure        = flag.Bool("trace-insecure", true, "Use insecure OTLP connection")
 		encryptAtRest        = flag.Bool("encrypt-at-rest", false, "Enable at-rest data encryption (AES-256-GCM)")
 		allowLocalKMS        = flag.Bool("allow-local-kms", false, "Allow in-memory development KMS; not production safe")
+		kmsKeyFile           = flag.String("kms-key-file", "", "Path to a 32-byte KEK file for at-rest encryption (created with 0600 perms on first start)")
+		kmsKeyEnv            = flag.String("kms-key-env", "", "Environment variable name holding the at-rest KEK (64 hex chars or 32 raw bytes)")
+		kmsKeyHex            = flag.String("kms-key-hex", "", "At-rest KEK as 64 hex characters (dev/test convenience)")
+		allowInsecureDev     = flag.Bool("allow-insecure-dev", false, "Allow running without TLS, auth, or production hardening (dev only)")
 		storageVersion       = flag.String("storage-version", "v1", "Storage engine version: v1 (legacy ChunkStore) or v2.1 (new engine)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON              = flag.Bool("log-json", false, "JSON log output")
@@ -135,6 +139,10 @@ func main() {
 		TraceInsecure:     *traceInsecure,
 		EncryptAtRest:     *encryptAtRest,
 		AllowLocalKMS:     *allowLocalKMS,
+		KMSKeyFile:        *kmsKeyFile,
+		KMSKeyEnv:         *kmsKeyEnv,
+		KMSKeyHex:         *kmsKeyHex,
+		AllowInsecureDev:  *allowInsecureDev,
 		StorageVersion:    *storageVersion,
 		LogLevel:          *logLevel,
 	})
@@ -191,8 +199,44 @@ func registerAddr(cfg datanode.Config) string {
 	return cfg.ListenAddr
 }
 
-func readMachineID() string {
-	b, err := os.ReadFile("/etc/machine-id")
+// buildAtRestKMS constructs the KMS backing at-rest encryption.
+//
+// When a production KEK source is configured (--kms-key-file / --kms-key-env /
+// --kms-key-hex) it returns a FileKMS — DEKs are wrapped with the KEK and
+// persisted under <dataDir>/kms so they survive restarts, making at-rest
+// encryption production-usable without --allow-local-kms.
+//
+// Otherwise it falls back to the in-memory dev LocalKMS, which is only
+// permitted when --allow-local-kms is set (fail-closed otherwise: a LocalKMS
+// loses its keys on restart and must not be silently used in production).
+func buildAtRestKMS(cfg datanode.Config) (crypto.KMS, error) {
+	if cfg.KMSKeyFile != "" || cfg.KMSKeyEnv != "" || cfg.KMSKeyHex != "" {
+		root := cfg.DataDir
+		if len(cfg.DataDirs) > 0 {
+			root = cfg.DataDirs[0]
+		}
+		kms, err := crypto.NewFileKMS(crypto.FileKMSConfig{
+			KeyFile: cfg.KMSKeyFile,
+			KeyEnv:  cfg.KMSKeyEnv,
+			KeyHex:  cfg.KMSKeyHex,
+		}, root)
+		if err != nil {
+			return nil, fmt.Errorf("at-rest KMS: %w", err)
+		}
+		return kms, nil
+	}
+	if !cfg.AllowLocalKMS {
+		return nil, fmt.Errorf("at-rest encryption requires a production KMS (set --kms-key-file/--kms-key-env/--kms-key-hex), or pass --allow-local-kms for development only (LocalKMS loses keys on restart)")
+	}
+	kms, err := crypto.NewLocalKMS()
+	if err != nil {
+		return nil, fmt.Errorf("init LocalKMS: %w", err)
+	}
+	logging.Named("datanode").Warn("at-rest encryption enabled with LocalKMS; keys are in-memory and not production safe")
+	return kms, nil
+}
+
+func readMachineID() string {	b, err := os.ReadFile("/etc/machine-id")
 	if err == nil {
 		return strings.TrimSpace(string(b))
 	}
@@ -211,6 +255,15 @@ func readMachineID() string {
 func runDataNode(cfg datanode.Config) {
 	log := logging.Named("datanode")
 	log.Info("starting data node", "node_id", cfg.NodeID, "addr", cfg.ListenAddr, "data", cfg.DataDir, "machine", cfg.MachineID)
+
+	// Production safety gate (mirrors metad's ValidateProductionConfig):
+	// without the explicit dev opt-out, a datanode must not listen in
+	// plaintext. Refuse to start so a TLS-less node cannot silently accept
+	// chunk/ops traffic in a production setting.
+	if !cfg.AllowInsecureDev && (cfg.TLS.CertFile == "" || cfg.TLS.KeyFile == "") {
+		log.Error("production datanode requires TLS; refusing to start in plaintext", "hint", "set --tls-cert/--tls-key, or pass --allow-insecure-dev for development only")
+		os.Exit(1)
+	}
 
 	_, traceShutdown, err := tracing.Init(tracing.Config{
 		Enabled:  cfg.TraceEnabled,
@@ -254,20 +307,17 @@ func runDataNode(cfg datanode.Config) {
 		os.Exit(1)
 	}
 
-	// Configure at-rest encryption if enabled. LocalKMS is intentionally
-	// fail-closed unless the operator explicitly opts into dev-only keys.
+	// Configure at-rest encryption if enabled. A production FileKMS (file/
+	// env/hex KEK) is used when configured and does not require the dev-only
+	// --allow-local-kms opt-in. Otherwise it is intentionally fail-closed
+	// unless the operator explicitly opts into the dev-only LocalKMS.
 	if cfg.EncryptAtRest {
-		if !cfg.AllowLocalKMS {
-			log.Error("at-rest encryption requires a production KMS; LocalKMS is in-memory/dev-only and loses keys on restart", "hint", "set --allow-local-kms only for development")
-			os.Exit(1)
-		}
-		kms, err := crypto.NewLocalKMS()
+		kms, err := buildAtRestKMS(cfg)
 		if err != nil {
-			log.Error("failed to init encryption KMS", "error", err)
+			log.Error("failed to configure at-rest encryption", "error", err)
 			os.Exit(1)
 		}
 		chunkStore.SetEncryptor(crypto.NewEncryptor(kms))
-		log.Warn("at-rest encryption enabled with LocalKMS; keys are in-memory and not production safe")
 	}
 
 	totalBytes, chunkCount := chunkStore.Stats()
@@ -509,14 +559,9 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		}
 		// Configure at-rest encryption if enabled.
 		if cfg.EncryptAtRest {
-			if !cfg.AllowLocalKMS {
-				log.Error("at-rest encryption requires a production KMS; LocalKMS is in-memory/dev-only and loses keys on restart")
-				closeStores()
-				os.Exit(1)
-			}
-			kms, err := crypto.NewLocalKMS()
+			kms, err := buildAtRestKMS(cfg)
 			if err != nil {
-				log.Error("failed to init encryption KMS", "error", err)
+				log.Error("failed to configure at-rest encryption", "error", err)
 				closeStores()
 				os.Exit(1)
 			}

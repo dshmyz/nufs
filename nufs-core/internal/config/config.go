@@ -96,6 +96,12 @@ var flagAliases = map[string]string{
 	"tls.cert": "tls-cert",
 	"tls.key":  "tls-key",
 	"tls.ca":   "tls-ca",
+
+	"kms.key-file": "kms-key-file",
+	"kms.key_env":  "kms-key-env",
+	"kms.keyEnv":   "kms-key-env",
+	"kms.key-hex":  "kms-key-hex",
+	"kms.key_hex":  "kms-key-hex",
 }
 
 func resolveFlagName(name string) string {
