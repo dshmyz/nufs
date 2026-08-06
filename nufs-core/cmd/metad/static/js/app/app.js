@@ -22,18 +22,23 @@
   // ---- AppLayout: sidebar nav + topbar + routed page ----
   // Uses the existing stylesheet's .layout/.sidebar/.main structure (including
   // the responsive icon-rail collapse on mobile), so no new layout CSS.
-  var ICONS = { overview: '◆', nodes: '◫', repair: '↻', rebalance: '⇄', namespace: '◈', backups: '▣' };
+  var ICONS = { overview: '◆', nodes: '◫', repair: '↻', rebalance: '⇄', namespace: '◈', chunks: '▣', quota: '◻', ops: '⌁', backups: '▣' };
   var AppLayout = {
     data: function () {
       return { state: R.state, nav: R.PAGES };
     },
     computed: {
-      title: function () { return R.titleFor(this.state.key); }
+      title: function () { return R.titleFor(this.state.key); },
+      routedComponent: function () {
+        var k = this.state.key;
+        if (k === 'node_detail' || k === 'chunk_detail') return k;
+        return k;
+      }
     },
     methods: {
       isActive: function (k) {
         var pk = this.state.key;
-        return pk === k || (k === 'nodes' && pk === 'node_detail');
+        return pk === k || (k === 'nodes' && pk === 'node_detail') || (k === 'chunks' && pk === 'chunk_detail');
       },
       icon: function (k) { return ICONS[k] || '•'; }
     },
@@ -61,7 +66,7 @@
             </div>
           </header>
           <main class="content">
-            <component :is="state.key === 'node_detail' ? 'node_detail' : state.key" :id="state.params.id"></component>
+            <component :is="routedComponent" :id="state.params.id"></component>
           </main>
         </div>
         <ToastRoot/>

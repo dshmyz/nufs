@@ -1496,3 +1496,30 @@ td.on-disk {
 
 /* Current breadcrumb leaf */
 .crumb-current { color: var(--text); font-weight: 600; }
+
+/* --- 4.1 Quota/Ops/Chunks pages (metad console feature-completion) --- */
+
+/* Generic muted/small helpers used across the new pages */
+.muted { color: var(--text-muted); }
+.small { font-size: 0.8rem; }
+
+/* Namespace / file rows: action buttons push right */
+.file-row .row-actions { display: flex; gap: 6px; margin-left: auto; flex-shrink: 0; }
+.file-list .file-row.dir .name { cursor: pointer; }
+
+/* Quota editor form rows */
+.form-row { display: flex; flex-direction: column; gap: 4px; }
+.form-row label { font-size: 0.8rem; color: var(--text-muted); font-weight: 500; }
+
+/* Ops page: write-pipeline state chips */
+.stat-chips { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.stat-chip {
+  background: var(--gray-bg); border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm); padding: 10px 12px; text-align: center;
+}
+.stat-chip-num { font-family: var(--mono); font-size: 1.3rem; font-weight: 600; color: var(--text); }
+.stat-chip-label { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-muted); margin-top: 2px; }
+
+/* Chunks page: highlighted row for the inspected chunk */
+.table tr.row-active { background: var(--primary-bg, var(--gray-bg)); }
+.table tr.row-active td { font-weight: 500; }

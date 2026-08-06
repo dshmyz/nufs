@@ -42,6 +42,7 @@
   };
 
   A.post = function (path, body) { return request(path, { method: 'POST', body: body }); };
+  A.put = function (path, body) { return request(path, { method: 'PUT', body: body }); };
   A.del = function (path) { return request(path, { method: 'DELETE' }); };
 
   // ---- cluster / resource helpers ----
@@ -66,6 +67,49 @@
   };
   A.inode = function (id) { return A.get('/api/v1/inodes/' + id); };
   A.mkdir = function (parent, name) { return A.post('/api/v1/namespace/mkdir', { parent: parent, name: name }); };
+  // file/namespace mutations (all POST, may 500 with a message on failure)
+  A.createFile = function (parent, name) { return A.post('/api/v1/namespace/createfile', { parent: parent, name: name }); };
+  A.unlink = function (parent, name) { return A.post('/api/v1/namespace/unlink', { parent: parent, name: name }); };
+  A.rmdir = function (parent, name) { return A.post('/api/v1/namespace/rmdir', { parent: parent, name: name }); };
+  A.renameEntry = function (oldParent, oldName, newParent, newName) {
+    return A.post('/api/v1/namespace/rename', { old_parent: oldParent, old_name: oldName, new_parent: newParent, new_name: newName });
+  };
+  A.symlink = function (parent, name, target) { return A.post('/api/v1/namespace/symlink', { parent: parent, name: name, target: target }); };
+  A.readlink = function (id) { return A.get('/api/v1/namespace/readlink?id=' + id); };
+
+  // ---- bucket quota ----
+  // GET .../quota → { bucket, quota|null, usage:{used_bytes,objects}, ratios }
+  A.bucketQuota = function (name) { return A.get('/api/v1/buckets/' + encodeURIComponent(name) + '/quota'); };
+  A.setBucketQuota = function (name, quota) { return A.put('/api/v1/buckets/' + encodeURIComponent(name) + '/quota', quota); };
+  A.deleteBucketQuota = function (name) { return A.del('/api/v1/buckets/' + encodeURIComponent(name) + '/quota'); };
+  A.checkBucketQuota = function (name, addB, addO) {
+    return A.post('/api/v1/buckets/' + encodeURIComponent(name) + '/quota/check', { additional_bytes: addB, additional_objects: addO });
+  };
+
+  // ---- data-maintenance observability ----
+  A.scrub = function () { return A.post('/api/v1/scrub'); };
+  A.writeOpsStatus = function () { return A.get('/api/v1/write-ops/status'); };
+  A.writeAttempts = function (state) {
+    var q = '?state=' + encodeURIComponent(state) + '&limit=200';
+    return A.get('/api/v1/write-attempts' + q);
+  };
+  A.writeAttempt = function (id) { return A.get('/api/v1/write-attempts/' + encodeURIComponent(id)); };
+  A.audit = function (opts) {
+    opts = opts || {};
+    var q = '?start=' + (opts.start || 0) + '&end=' + (opts.end || 0) + '&limit=' + (opts.limit || 100);
+    return A.get('/api/v1/audit' + q);
+  };
+  A.locks = function (inode) { return A.get('/api/v1/locks?inode=' + inode); };
+
+  // ---- chunk-level ops ----
+  A.chunksByInode = function (id) { return A.get('/api/v1/chunks?inode_id=' + id); };
+  A.chunk = function (id) { return A.get('/api/v1/chunks/' + id); };
+  A.chunkSeal = function (id) { return A.post('/api/v1/chunks/' + id + '/seal'); };
+  A.chunkCommit = function (id, checksum) { return A.post('/api/v1/chunks/' + id + '/commit', { checksum: checksum }); };
+  A.migrateReplica = function (chunkId, fromNode, toNode) {
+    return A.post('/api/v1/chunks/migrate-replica', { chunk_id: chunkId, from_node: fromNode, to_node: toNode });
+  };
+  A.deleteChunk = function (id) { return A.del('/api/v1/chunks/' + id); };
 
   // ---- backups ----
   // backups/status → { status, catalog? }; backups → { tasks, catalog?, status }

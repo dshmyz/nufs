@@ -14,6 +14,9 @@
     { key: 'repair', label: 'Repair', href: '#/repair' },
     { key: 'rebalance', label: 'Rebalance', href: '#/rebalance' },
     { key: 'namespace', label: 'Namespace', href: '#/namespace' },
+    { key: 'chunks', label: 'Chunks', href: '#/chunks' },
+    { key: 'quota', label: 'Quota', href: '#/quota' },
+    { key: 'ops', label: 'Ops', href: '#/ops' },
     { key: 'backups', label: 'Backups', href: '#/backups' }
   ];
 
@@ -25,7 +28,8 @@
     var key = 'overview';
 
     if (parts.length >= 1) key = parts[0];
-    if (parts.length >= 3 && parts[0] === 'nodes') params.id = parts[1];
+    if (parts.length >= 2 && parts[0] === 'nodes') params.id = parts[1];
+    if (parts.length >= 2 && parts[0] === 'chunks') params.id = parts[1];
 
     return { key: key, params: params };
   }
@@ -41,6 +45,7 @@
     var p = params || {};
     var target;
     if (key === 'node_detail' && p.id) target = '#/nodes/' + p.id;
+    else if (key === 'chunk_detail' && p.id) target = '#/chunks/' + p.id;
     else if (key === 'overview') target = '#/overview';
     else target = '#' + key; // '#/nodes', '#/repair', ...
     if (window.location.hash === target) { apply(); } else { window.location.hash = target; }
@@ -60,6 +65,9 @@
       repair: 'Repair Queue',
       rebalance: 'Rebalance',
       namespace: 'Namespace Browser',
+      chunks: 'Chunk Operations',
+      quota: 'Bucket Quota',
+      ops: 'Data Ops Observability',
       backups: 'Backups'
     };
     return map[pageKey] || 'NUFS';
