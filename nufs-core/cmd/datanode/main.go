@@ -633,6 +633,11 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	if err := metaStore.RegisterNode(ctx, &metadata.NodeInfo{
 		ID:             cfg.NodeID,
 		Addr:           registerAddr(cfg),
+		DataDir:        cfg.DataDir,
+		Rack:           cfg.Rack,
+		Zone:           cfg.Zone,
+		MachineID:      cfg.MachineID,
+		Tier:           cfg.Tier,
 		State:          metadata.NodeOnline,
 		ShardDiskCount: len(shardStores),
 	}); err != nil && err != metadata.ErrNodeAlreadyExists {

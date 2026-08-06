@@ -227,13 +227,26 @@ func (h *HeartbeatReporter) send() {
 		}
 	}
 
-	// Per-disk stats for JBOD multi-disk deployments.
-	if ds := h.chunkSt.DiskStats(); len(ds) > 1 {
+	// Per-disk stats for JBOD multi-disk deployments. Aggregate real
+	// physical capacity (filesystem totals, via Statfs) into the report so
+	// metadata can persist an honest per-node CapacityGB for the admin
+	// console; a single disk still reports its total capacity even though
+	// the per-disk breakdown below is only shipped for multi-disk nodes.
+	ds := h.chunkSt.DiskStats()
+	var totalCapacityBytes int64
+	for _, d := range ds {
+		if d.TotalBytes > 0 {
+			totalCapacityBytes += d.TotalBytes
+		}
+	}
+	report.TotalCapacityBytes = totalCapacityBytes
+	if len(ds) > 1 {
 		diskReports := make([]metadata.DiskReport, len(ds))
 		for i, d := range ds {
 			diskReports[i] = metadata.DiskReport{
 				Index:      d.Index,
 				UsedBytes:  d.UsedBytes,
+				TotalBytes: d.TotalBytes,
 				ChunkCount: d.ChunkCount,
 				Failed:     d.Failed,
 			}

@@ -932,3 +932,157 @@ select.input {
   font-size: 1rem;
   border-radius: 8px;
 }
+
+/* ===== Node Topology (Overview) ===== */
+.topo-group + .topo-group {
+  margin-top: 22px;
+}
+
+.topo-group-name {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  padding-left: 2px;
+}
+
+.topo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 14px;
+}
+
+.tnode {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 14px 12px;
+  box-shadow: var(--shadow);
+  transition: box-shadow var(--transition), border-color var(--transition);
+}
+
+.tnode:hover {
+  box-shadow: var(--shadow-md);
+  border-color: var(--primary);
+}
+
+.tnode-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.tnode-led {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tnode-led-success { background: var(--green); box-shadow: 0 0 0 3px var(--green-bg); }
+.tnode-led-warning { background: var(--orange); box-shadow: 0 0 0 3px var(--orange-bg); }
+.tnode-led-danger  { background: var(--red); box-shadow: 0 0 0 3px var(--red-bg); }
+.tnode-led-secondary { background: var(--gray); box-shadow: 0 0 0 3px var(--gray-bg); }
+
+.tnode-id {
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: var(--text);
+}
+
+.tnode-id a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.tnode-id a:hover { text-decoration: underline; }
+
+.tnode-state {
+  margin-left: auto;
+}
+
+.tnode-metric {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--gray-bg);
+  border-radius: var(--radius-sm);
+}
+
+.tnode-ring {
+  flex-shrink: 0;
+}
+
+.ring-track {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 4;
+}
+
+.ring-fill {
+  fill: none;
+  stroke: var(--primary);
+  stroke-width: 4;
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-origin: center;
+  transition: stroke-dashoffset 600ms var(--transition);
+}
+
+.tnode-danger .ring-fill { stroke: var(--red); }
+.tnode-warning .ring-fill { stroke: var(--orange); }
+
+.tnode-ring-label {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.tnode-pct {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.tnode-sub {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.tnode-no-cap {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.tnode-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 2px;
+}
+
+.tnode-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.74rem;
+  color: var(--text-secondary);
+}
+
+.tnode-k {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+}

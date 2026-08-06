@@ -1083,6 +1083,7 @@ func (v *V2Store) DiskStats() []DiskStatsItem {
 		out[i] = DiskStatsItem{
 			Index:      i,
 			UsedBytes:  b.usedByts.Load(),
+			TotalBytes: detectCapacityBytes(b.dir),
 			ChunkCount: b.extCount.Load(),
 			Failed:     v.diskFailed(i),
 			State:      v.diskState(i),

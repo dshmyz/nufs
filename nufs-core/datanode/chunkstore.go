@@ -921,6 +921,7 @@ func (cs *ChunkStore) ChunkStateSnapshot() map[metadata.ChunkID]metadata.Replica
 type DiskStatsItem struct {
 	Index      int
 	UsedBytes  int64
+	TotalBytes int64
 	ChunkCount int64
 	Failed     bool
 	// State is the derived 3-tier health (DiskOnline/DiskDegraded/DiskFailed).
@@ -937,6 +938,7 @@ func (cs *ChunkStore) DiskStats() []DiskStatsItem {
 		result[i] = DiskStatsItem{
 			Index:      i,
 			UsedBytes:  d.usedBytes.Load(),
+			TotalBytes: detectCapacityBytes(d.dataDir),
 			ChunkCount: d.chunkCount.Load(),
 			Failed:     d.failed.Load(),
 			State:      DiskOnline,

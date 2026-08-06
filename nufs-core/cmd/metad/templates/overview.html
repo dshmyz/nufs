@@ -67,6 +67,57 @@
   </div>
 </div>
 
+<div class="card topo-card">
+  <div class="card-header">
+    <h3>Node Topology</h3>
+    {{if gt (len .Nodes) 1}}<span class="badge badge-info">{{len .Nodes}} nodes &middot; {{len .Topology}} fault domain{{if gt (len .Topology) 1}}s{{end}}</span>
+    {{else}}<span class="badge badge-secondary">standalone &middot; no peers</span>{{end}}
+  </div>
+  <div class="card-body">
+    {{range .Topology}}
+    <div class="topo-group">
+      <div class="topo-group-name">{{.Name}}</div>
+      <div class="topo-grid">
+        {{range .Nodes}}
+        <div class="tnode tnode-{{.StateCls}}">
+          <div class="tnode-head">
+            <span class="tnode-led tnode-led-{{.StateCls}}"></span>
+            <span class="tnode-id"><a href="/admin/nodes/{{.ID}}">node {{.ID}}</a></span>
+            <span class="tnode-state badge badge-{{.StateCls}}">{{.StateName}}</span>
+          </div>
+          {{if gt .Capacity 0}}
+          <div class="tnode-metric">
+            <svg class="tnode-ring" viewBox="0 0 44 44" width="44" height="44">
+              <circle class="ring-track" cx="22" cy="22" r="19" />
+              <circle class="ring-fill" cx="22" cy="22" r="19"
+                stroke-dasharray="119.4" stroke-dashoffset="{{printf "%.1f" .DashOffset}}" />
+            </svg>
+            <div class="tnode-ring-label">
+              <span class="tnode-pct">{{printf "%.1f" .UsagePct}}%</span>
+              <span class="tnode-sub">{{.Used}} / {{.Capacity}} GB</span>
+            </div>
+          </div>
+          {{else}}
+          <div class="tnode-metric">
+            <span class="tnode-no-cap">capacity unknown</span>
+          </div>
+          {{end}}
+          <div class="tnode-detail">
+            <div class="tnode-row"><span class="tnode-k">chunks</span><span>{{.Chunks}}</span></div>
+            {{if .Machine}}<div class="tnode-row"><span class="tnode-k">machine</span><span class="mono">{{.Machine}}</span></div>{{end}}
+            {{if .Zone}}<div class="tnode-row"><span class="tnode-k">zone</span><span>{{.Zone}}</span></div>{{end}}
+            <div class="tnode-row"><span class="tnode-k">addr</span><span class="mono">{{.Addr}}</span></div>
+          </div>
+        </div>
+        {{end}}
+      </div>
+    </div>
+    {{else}}
+    <p class="empty">No nodes registered</p>
+    {{end}}
+  </div>
+</div>
+
 <div class="card">
   <div class="card-header"><h3>Nodes</h3><a href="/admin/nodes" class="btn btn-sm">View All</a></div>
   <div class="card-body p-0">

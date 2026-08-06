@@ -43,35 +43,9 @@ type adminServer struct {
 
 func newAdminServer(store *metadata.PebbleStore, bundle *metadata.ServiceBundle) *adminServer {
 	funcMap := template.FuncMap{
-		"hasPrefix": strings.HasPrefix,
-		"stateClass": func(s metadata.NodeState) string {
-			switch s {
-			case metadata.NodeOnline:
-				return "success"
-			case metadata.NodeDraining:
-				return "warning"
-			case metadata.NodeOffline:
-				return "secondary"
-			case metadata.NodeFailed:
-				return "danger"
-			default:
-				return "secondary"
-			}
-		},
-		"stateLabel": func(s metadata.NodeState) string {
-			switch s {
-			case metadata.NodeOnline:
-				return "Online"
-			case metadata.NodeDraining:
-				return "Draining"
-			case metadata.NodeOffline:
-				return "Offline"
-			case metadata.NodeFailed:
-				return "Failed"
-			default:
-				return "Unknown"
-			}
-		},
+		"hasPrefix":  strings.HasPrefix,
+		"stateClass": stateClass,
+		"stateLabel": stateLabel,
 		"formatTime": func(t time.Time) string {
 			if t.IsZero() {
 				return "-"
@@ -210,6 +184,113 @@ type overviewData struct {
 	UsedCapacity  int64
 	CapacityPct   float64
 	IsEmpty       bool
+	Topology      []topoGroup
+}
+
+// topoNode is a rendered node card in the Overview topology. CapacityGB is
+// the physical capacity reported via heartbeat; UsagePct is used/Capacity
+// (0 when capacity is unknown — old nodes), so the console never draws a
+// misleading ring for a node we have no capacity for.
+type topoNode struct {
+	ID        metadata.NodeID
+	Addr      string
+	StateName string // Online / Draining / Offline / Failed / Unknown
+	StateCls  string // success / warning / danger / secondary (CSS)
+	Capacity  int64  // GB
+	Used      int64  // GB
+	UsagePct  float64
+	DashOffset float64 // capacity-ring stroke offset (precomputed; html/template has no arithmetic)
+	Chunks    int64
+	Machine   string
+	Zone      string
+	Rack      string
+}
+
+// stateClass maps a node state to a CSS badge class (success/warning/danger/
+// secondary), used both by templates and the Overview topology rendering.
+func stateClass(s metadata.NodeState) string {
+	switch s {
+	case metadata.NodeOnline:
+		return "success"
+	case metadata.NodeDraining:
+		return "warning"
+	case metadata.NodeOffline:
+		return "secondary"
+	case metadata.NodeFailed:
+		return "danger"
+	default:
+		return "secondary"
+	}
+}
+
+// stateLabel maps a node state to a human-readable name.
+func stateLabel(s metadata.NodeState) string {
+	switch s {
+	case metadata.NodeOnline:
+		return "Online"
+	case metadata.NodeDraining:
+		return "Draining"
+	case metadata.NodeOffline:
+		return "Offline"
+	case metadata.NodeFailed:
+		return "Failed"
+	default:
+		return "Unknown"
+	}
+}
+
+// topoGroup groups rendered node cards by fault domain (rack/zone).
+type topoGroup struct {
+	Name  string
+	Nodes []topoNode
+}
+
+func buildTopology(nodes []metadata.NodeInfo) []topoGroup {
+	groups := make([]topoGroup, 0, 4)
+	byName := make(map[string]int)
+	for _, n := range nodes {
+		domain := n.Rack
+		if domain == "" {
+			domain = "unassigned"
+			if n.Zone != "" {
+				domain = "zone / " + n.Zone
+			}
+		} else if n.Zone != "" {
+			domain = n.Rack + " / " + n.Zone
+		}
+		tn := topoNode{
+			ID:        n.ID,
+			Addr:      n.Addr,
+			StateName: stateLabel(n.State),
+			StateCls:  stateClass(n.State),
+			Capacity:  n.CapacityGB,
+			Used:      n.UsedGB,
+			Chunks:    n.ChunkCount,
+			Machine:   n.MachineID,
+			Zone:      n.Zone,
+			Rack:      n.Rack,
+		}
+		if n.CapacityGB > 0 {
+			tn.UsagePct = float64(n.UsedGB) / float64(n.CapacityGB) * 100
+			// Ring circumference is 2*pi*r for r=19 (119.4); dashoffset
+			// reveals the used fraction. Precomputed here because
+			// html/template has no arithmetic builtins.
+			const ringC = 119.4
+			used := tn.UsagePct / 100
+			if used > 1 {
+				used = 1
+			}
+			tn.DashOffset = ringC - ringC*used
+		}
+		idx, ok := byName[domain]
+		if !ok {
+			idx = len(groups)
+			byName[domain] = idx
+			groups = append(groups, topoGroup{Name: domain})
+		}
+		groups[idx].Nodes = append(groups[idx].Nodes, tn)
+	}
+	return groups
 }
 
 func (a *adminServer) handleOverview(w http.ResponseWriter, r *http.Request) {
@@ -255,6 +336,7 @@ func (a *adminServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 		UsedCapacity:  usedCap,
 		CapacityPct:   capPct,
 		IsEmpty:       len(nodes) == 0 && len(buckets) == 0,
+		Topology:      buildTopology(nodes),
 	})
 }
 

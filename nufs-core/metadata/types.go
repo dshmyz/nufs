@@ -365,6 +365,12 @@ type NodeReport struct {
 	ChunkStates    map[ChunkID]ReplicaState `json:"chunk_states"`
 	DiskStats      []DiskReport             `json:"disk_stats,omitempty"` // per-disk breakdown (JBOD)
 
+	// TotalCapacityBytes is the node's aggregate physical disk capacity (sum
+	// of per-disk filesystem totals, via Statfs) reported on each heartbeat.
+	// 0 for nodes that never report it (legacy/V1); metadata persists it into
+	// NodeInfo.CapacityGB so the admin console can render honest usage%.
+	TotalCapacityBytes int64 `json:"total_capacity_bytes,omitempty"`
+
 	// ChangeEvents carries the node's locally-detected async changes
 	// (corruption, disk/segment loss — thing the delta ChunkStates does not
 	// convey because a corrupt-but-present extent still looks "present").
@@ -435,6 +441,7 @@ type ChangeEventRecord struct {
 type DiskReport struct {
 	Index      int   `json:"index"`
 	UsedBytes  int64 `json:"used_bytes"`
+	TotalBytes int64 `json:"total_bytes,omitempty"`
 	ChunkCount int64 `json:"chunk_count"`
 	Failed     bool  `json:"failed"`
 }

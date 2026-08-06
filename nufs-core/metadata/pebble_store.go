@@ -2646,6 +2646,21 @@ func (s *PebbleStore) RegisterNode(ctx context.Context, info *NodeInfo) error {
 			existing.ShardDiskCount = info.ShardDiskCount
 			changed = true
 		}
+		// Refresh fault-domain identity (rack/zone/machine/tier) on restart so
+		// the admin topology re-groups correctly even when the node was first
+		// registered before these were reported.
+		if info.Rack != "" && info.Rack != existing.Rack {
+			existing.Rack = info.Rack
+			changed = true
+		}
+		if info.Zone != "" && info.Zone != existing.Zone {
+			existing.Zone = info.Zone
+			changed = true
+		}
+		if info.MachineID != "" && info.MachineID != existing.MachineID {
+			existing.MachineID = info.MachineID
+			changed = true
+		}
 		if changed {
 			if err := s.putMsgpack(key, &existing); err != nil {
 				return err
@@ -2922,6 +2937,12 @@ func (s *PebbleStore) HeartbeatLiveness(ctx context.Context, nodeID NodeID, repo
 	if report != nil {
 		info.UsedGB = report.UsedGB
 		info.ChunkCount = report.ChunkCount
+		// Persist the node's reported physical capacity (GB) so the admin
+		// console can render honest per-node capacity/usage%. Only nodes that
+		// report it get updated; legacy nodes keep their registration value.
+		if report.TotalCapacityBytes > 0 {
+			info.CapacityGB = report.TotalCapacityBytes / (1024 * 1024 * 1024)
+		}
 		s.placement.UpdateLoad(nodeID, report.DiskIO)
 		s.placement.UpdateErrorRate(nodeID, report.WriteErrorRate)
 	}
