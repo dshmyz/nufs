@@ -329,6 +329,25 @@ S3 兼容 API:
   属性转换: InodeMeta → fuse.Attr (含 POSIX 权限/时间戳)
 ```
 
+**POSIX 语义缺口/接受约束**（Program 12 审计后定稿）：
+
+- **mknod（已实现）**：FUSE `Mknod` 支持 fifo / char-dev / block-dev / unix socket。
+  FIFO 的 read/write 由内核 pipe 完全接管（fs 只提供 inode 身份 + 属性，`Open` 返回
+  `FOPEN_NONSEEKABLE`）；设备节点与 socket 为 identity-only stub，`open()` 拒绝
+  （`EOPNOTSUPP`）——用户态 FUSE 无法路由真实设备/套接字 I/O，需依赖 `/dev` 上真实设备。
+- **fallocate（已实现）**：`DFSFile.Allocate` 支持预分配（扩 Size + 补零）、
+  `FALLOC_FL_KEEP_SIZE`（物理预分配但不改逻辑 Size）、`FALLOC_FL_ZERO_RANGE`（区间清零并可延展）、
+  `FALLOC_FL_PUNCH_HOLE`（clamp 到当前 Size 清除；对象存储无真实"孔"，补零即 POSIX 可见语义）。
+  区间移动类 flag（`COLLAPSE_RANGE`/`INSERT_RANGE`/`UNSHARE_RANGE`）→ `EOPNOTSUPP`。
+- **Advisory 锁 ≠ 完整 POSIX fcntl/flock（接受约束，不改代码）**：本网关采用**单写者对象存储
+  模型**——同一文件通常由单一客户端以独占读写方式访问，跨进程字节区间锁（`fcntl(F_SETLK)` /
+  `flock`）未实现，`O_EXCL`/独占打开等竞争语义不保证。作为对象存储网关这被认定为**可接受的
+  约束**（与 S3 语义一致：无跨客户端持锁）。多写者并发协作不在此模型支持范围内。
+
+**性能项（已明确延后，非缺口）**：`copy_file_range`（服务端复制）、`readdirplus`、
+`SEEK_HOLE`/`SEEK_DATA`、`poll`/`epoll`、设备 `ioctl` 均未实现——纯优化项，不影响正确性，
+列为延后清单。
+
 #### 2.3.3 客户端缓存 (cache.go)
 
 ```

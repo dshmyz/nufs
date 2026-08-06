@@ -1781,3 +1781,314 @@ func TestDFSFile_Open_OTrunc_VisibleImmediately(t *testing.T) {
 		t.Fatalf("immediately after Open(O_TRUNC): Size=%d, want 0", inode.Size)
 	}
 }
+
+// ========== Program 12 Commit 3: fallocate (NodeAllocater) ==========
+
+// TestDFSFile_Allocate_ExtendsSizeAndZeroFills covers the default
+// preallocate path (mode 0): Allocate(off,size) must extend the file's
+// logical Size to off+size, zero-fill the new range in the buffer, and
+// mark the buffer dirty so the next Flush persists the zeros.
+func TestDFSFile_Allocate_ExtendsSizeAndZeroFills(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	const off, size = 16, 100
+	if errno := f.Allocate(context.Background(), nil, off, size, 0); errno != 0 {
+		t.Fatalf("Allocate: errno=%v", errno)
+	}
+
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != off+size {
+		t.Fatalf("after Allocate: Size=%d, want %d", inode.Size, off+size)
+	}
+
+	// Bytes [0,off) are a hole too (file was empty); all must read as zero.
+	dest := make([]byte, off+size)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	for i, b := range got {
+		if b != 0 {
+			t.Fatalf("Read after Allocate: byte[%d]=0x%02x, want 0x00", i, b)
+		}
+	}
+}
+
+// TestDFSFile_Allocate_Flush_ReadbackByteExact proves the preallocated
+// zeros survive a full Flush/rebuild: Allocate extends, then Flush writes
+// the whole buffer (including the zero-filled tail) to the chunk store,
+// and a fresh Read returns the same byte-exact image.
+func TestDFSFile_Allocate_Flush_ReadbackByteExact(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("head"), 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	const off, size = 16, 40
+	if errno := f.Allocate(context.Background(), nil, off, size, 0); errno != 0 {
+		t.Fatalf("Allocate: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	const wantLen = off + size // 56
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != wantLen {
+		t.Fatalf("after Flush: Size=%d, want %d", inode.Size, wantLen)
+	}
+
+	dest := make([]byte, wantLen)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read after Flush: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	want := make([]byte, wantLen)
+	copy(want, []byte("head"))
+	for i, b := range got {
+		if b != want[i] {
+			t.Fatalf("Readback after Flush: byte[%d]=0x%02x, want 0x%02x", i, b, want[i])
+		}
+	}
+}
+
+// TestDFSFile_Allocate_KeepSize_GrowsBufferNotSize covers FALLOC_FL_KEEP_SIZE:
+// physically preallocate (buffer grows) but leave the logical Size unchanged.
+// The extra physical bytes carry into a later Flush but never extend Size.
+func TestDFSFile_Allocate_KeepSize_GrowsBufferNotSize(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("abc"), 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	// Preallocate 0..(32) with KEEP_SIZE. Logical Size must stay 3 even though
+	// the buffer physically grows to 32.
+	if errno := f.Allocate(context.Background(), nil, 0, 32, fallocKeepSize); errno != 0 {
+		t.Fatalf("Allocate(KEEP_SIZE): errno=%v", errno)
+	}
+
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != 3 {
+		t.Fatalf("after Allocate(KEEP_SIZE): Size=%d, want 3 (unchanged)", inode.Size)
+	}
+	if len(f.buffer) != 32 {
+		t.Fatalf("after Allocate(KEEP_SIZE): buffer len=%d, want 32 (physical prealloc)", len(f.buffer))
+	}
+
+	// The written head must still be intact in the buffer.
+	if string(f.buffer[:3]) != "abc" {
+		t.Fatalf("KEEP_SIZE clobbered head: buffer[:3]=%q, want \"abc\"", f.buffer[:3])
+	}
+}
+
+// TestDFSFile_Allocate_ZeroRange_ClearsInterval covers FALLOC_FL_ZERO_RANGE:
+// bytes [off,off+size) are zeroed. The range is within the current file so
+// the logical Size must not grow (extends only when the range exceeds Size).
+func TestDFSFile_Allocate_ZeroRange_ClearsInterval(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	payload := bytes.Repeat([]byte{0xAA}, 100)
+	if _, errno := f.Write(context.Background(), nil, payload, 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	// Flush so the committed Size reflects the written bytes (the kernel
+	// commits a size via write+fsync before a later fallocate would run).
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	const off, size = 20, 30
+	if errno := f.Allocate(context.Background(), nil, off, size, fallocZeroRange); errno != 0 {
+		t.Fatalf("Allocate(ZERO_RANGE): errno=%v", errno)
+	}
+
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != 100 {
+		t.Fatalf("after in-range ZERO_RANGE: Size=%d, want 100 (unchanged)", inode.Size)
+	}
+
+	// Bytes [20,50) zeroed, everything else untouched.
+	dest := make([]byte, 100)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	for i, b := range got {
+		if i >= int(off) && i < int(off+size) {
+			if b != 0 {
+				t.Fatalf("ZERO_RANGE: byte[%d]=0x%02x, want 0x00", i, b)
+			}
+		} else if b != 0xAA {
+			t.Fatalf("ZERO_RANGE outside interval: byte[%d]=0x%02x, want 0xAA", i, b)
+		}
+	}
+}
+
+// TestDFSFile_Allocate_PunchHole_ClampsToSize covers FALLOC_FL_PUNCH_HOLE:
+// the zeroed range is clamped to the current file size and never grows Size.
+func TestDFSFile_Allocate_PunchHole_ClampsToSize(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	payload := bytes.Repeat([]byte{0xBB}, 40)
+	if _, errno := f.Write(context.Background(), nil, payload, 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+
+	// Punch [30, 1000): only [30,40) (within Size=40) is clamped and zeroed;
+	// Size must stay 40.
+	if errno := f.Allocate(context.Background(), nil, 30, 970, fallocPunchHole); errno != 0 {
+		t.Fatalf("Allocate(PUNCH_HOLE): errno=%v", errno)
+	}
+
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != 40 {
+		t.Fatalf("after PUNCH_HOLE: Size=%d, want 40 (clamped, no grow)", inode.Size)
+	}
+
+	dest := make([]byte, 40)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	for i, b := range got {
+		if i >= 30 && b != 0 {
+			t.Fatalf("PUNCH_HOLE: byte[%d]=0x%02x, want 0x00", i, b)
+		}
+		if i < 30 && b != 0xBB {
+			t.Fatalf("PUNCH_HOLE outside: byte[%d]=0x%02x, want 0xBB", i, b)
+		}
+	}
+}
+
+// TestDFSFile_Allocate_UnsupportedFlags_EOPNOTSUPP ensures range-shifting
+// / unshare flags that we do not implement are rejected with EOPNOTSUPP and
+// leave both buffer and Size untouched.
+func TestDFSFile_Allocate_UnsupportedFlags_EOPNOTSUPP(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("xy"), 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush: errno=%v", errno)
+	}
+	for _, bad := range []uint32{fallocCollapseRng, fallocInsertRng, fallocUnshareRange, fallocCollapseRng | fallocZeroRange} {
+		if errno := f.Allocate(context.Background(), nil, 0, 8, bad); errno != syscall.EOPNOTSUPP {
+			t.Errorf("Allocate(mode=%#x) errno=%v, want EOPNOTSUPP", bad, errno)
+		}
+	}
+
+	// Nothing was changed: committed Size intact, buffer unchanged (still nil
+	// after Flush, since no Allocate mutated state), and the data still reads
+	// back byte-exact.
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != 2 {
+		t.Fatalf("after rejected Allocate: Size=%d, want 2", inode.Size)
+	}
+	if f.buffer != nil {
+		t.Fatalf("after rejected Allocate: buffer=%v, want nil (state untouched)", f.buffer)
+	}
+	dest := make([]byte, 4)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if string(got) != "xy" {
+		t.Fatalf("after rejected Allocate: got %q, want \"xy\"", got)
+	}
+}
+
+// TestDFSFile_Allocate_Overflow_EFBIG covers the off+size overflow guard:
+// a range that would wrap (or exceed MaxInt64) is rejected with EFBIG.
+func TestDFSFile_Allocate_Overflow_EFBIG(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if errno := f.Allocate(context.Background(), nil, 1<<63-1, 2, 0); errno != syscall.EFBIG {
+		t.Errorf("Allocate(overflow) errno=%v, want EFBIG", errno)
+	}
+}
+
+// TestDFSFile_Allocate_ZeroRange_ExtendsBeyondSize covers the ZERO_RANGE
+// growth semantics: when the range exceeds the current Size (no KEEP_SIZE),
+// the file extends to off+size and the new tail is zeroed.
+func TestDFSFile_Allocate_ZeroRange_ExtendsBeyondSize(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	if _, errno := f.Write(context.Background(), nil, []byte("abc"), 0); errno != 0 {
+		t.Fatalf("Write: errno=%v", errno)
+	}
+	if errno := f.Allocate(context.Background(), nil, 10, 20, fallocZeroRange); errno != 0 {
+		t.Fatalf("Allocate(ZERO_RANGE extend): errno=%v", errno)
+	}
+
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	// off+size = 30 > Size 3 → extended to 30 (fills [10,30) with zeros,
+	// [3,10) is a hole).
+	if inode.Size != 30 {
+		t.Fatalf("after extending ZERO_RANGE: Size=%d, want 30", inode.Size)
+	}
+
+	dest := make([]byte, 30)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if string(got[:3]) != "abc" {
+		t.Fatalf("extending ZERO_RANGE clobbered head: got[:3]=%q, want \"abc\"", got[:3])
+	}
+	for i := 3; i < 30; i++ {
+		if got[i] != 0 {
+			t.Fatalf("extending ZERO_RANGE: byte[%d]=0x%02x, want 0x00", i, got[i])
+		}
+	}
+}

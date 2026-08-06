@@ -241,6 +241,27 @@ func (m *mockMetaService) CreateFile(_ context.Context, parent metadata.InodeID,
 	return inode, nil
 }
 
+// CreateNode mirrors CreateFile but honors the generic file type (FIFO /
+// char-dev / block-dev / socket) and Rdev, so mockMetaService satisfies the
+// full MetadataService interface (added for FUSE mknod, Program 12).
+func (m *mockMetaService) CreateNode(_ context.Context, parent metadata.InodeID, name string, ftype metadata.FileType, mode uint32, rdev uint32) (*metadata.InodeMeta, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pk := m.parentKey(parent)
+	if _, ok := m.entries[pk]; !ok {
+		m.entries[pk] = make(map[string]*metadata.InodeMeta)
+	}
+	if _, ok := m.entries[pk][name]; ok {
+		return nil, metadata.ErrEntryExists
+	}
+	id := m.allocID()
+	now := time.Now().UnixNano()
+	inode := &metadata.InodeMeta{ID: id, Type: ftype, Mode: mode, Rdev: rdev, NLink: 1, CTime: now, MTime: now, ATime: now}
+	m.inodes[id] = inode
+	m.entries[pk][name] = inode
+	return inode, nil
+}
+
 func (m *mockMetaService) Unlink(ctx context.Context, parent metadata.InodeID, name string) error {
 	if m.unlinkHook != nil {
 		if err := m.unlinkHook(ctx, parent, name); err != nil {

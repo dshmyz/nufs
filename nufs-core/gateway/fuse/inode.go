@@ -121,6 +121,21 @@ var _ = (fs.NodeFsyncer)((*DFSFile)(nil))
 var _ = (fs.NodeFlusher)((*DFSFile)(nil))
 var _ = (fs.NodeReleaser)((*DFSFile)(nil))
 var _ = (fs.NodeAccesser)((*DFSFile)(nil))
+var _ = (fs.NodeAllocater)((*DFSFile)(nil))
+
+// FALLOC_FL_* mode bits for NodeAllocater.Allocate. The syscall package on
+// Linux does not export these (they live in golang.org/x/sys/unix), so we
+// define the ones we honor here, matching <linux/falloc.h>. Unsupported
+// range-manipulation flags (COLLAPSE_RANGE/INSERT_RANGE/UNSHARE_RANGE) return
+// EOPNOTSUPP.
+const (
+	fallocKeepSize     = 0x01 // FALLOC_FL_KEEP_SIZE
+	fallocPunchHole    = 0x02 // FALLOC_FL_PUNCH_HOLE
+	fallocCollapseRng  = 0x08 // FALLOC_FL_COLLAPSE_RANGE (unsupported)
+	fallocZeroRange    = 0x10 // FALLOC_FL_ZERO_RANGE
+	fallocInsertRng    = 0x20 // FALLOC_FL_INSERT_RANGE (unsupported)
+	fallocUnshareRange = 0x40 // FALLOC_FL_UNSHARE_RANGE (unsupported)
+)
 
 // DFSFileHandle wraps DFSFile for per-open-file state.
 type DFSFileHandle struct {
@@ -892,6 +907,169 @@ func (f *DFSFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 	}
 
 	out.Attr = inodeMetaToAttr(metaInode)
+	return 0
+}
+
+// Allocate implements posix_fallocate(3) and friends (NodeAllocater). In the
+// object-store model there are no physical blocks to reserve, so allocation is
+// expressed purely through the byte-range semantics the kernel/userland
+// expects:
+//
+//   - default (mode 0): extend the logical file to cover [off, off+size),
+//     zero-filling the new region (same truncate-extend path as Setattr).
+//   - FALLOC_FL_ZERO_RANGE: zero [off, off+size) in place, extending the file
+//     (and logical Size) if the range runs past the current end.
+//   - FALLOC_FL_PUNCH_HOLE: zero [off, off+size) clamped to the current file
+//     length (no true holes exist in an object store; zero-filling yields the
+//     POSIX-visible "reads as zero" result without shrinking Size).
+//   - FALLOC_FL_KEEP_SIZE is honored with the default path: the physical
+//     (buffered) length grows to off+size while the logical Size stays at its
+//     committed value. Extra physical bytes beyond Size are harmless on Flush
+//     (the multi-chunk ChunkMap covers only the logical length).
+//
+// Range-manipulation flags (COLLAPSE/INSERT/UNSHARE) are not supported and
+// return EOPNOTSUPP. All paths take f.mu, hydrate a committed prefix when the
+// buffer doesn't yet reflect it (so an extension never zeroes committed
+// bytes), mark the file dirty, bump mtime, and persist Size when it changes.
+func (f *DFSFile) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size uint64, mode uint32) syscall.Errno {
+	rec := recorderFor(f.recorder)
+	rec.IncOp("allocate")
+
+	// The kernel passes off/size as unsigned; reject anything that overflows
+	// the int64 file model or the int buffer indexing.
+	if off > uint64(1<<63-1) || size > uint64(1<<63-1) || off+size > uint64(1<<63-1) {
+		return syscall.EFBIG
+	}
+
+	// Reject unsupported range-manipulation modes outright before touching any
+	// state.
+	if mode&^(fallocKeepSize|fallocZeroRange|fallocPunchHole) != 0 {
+		return syscall.EOPNOTSUPP
+	}
+
+	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
+	if err != nil {
+		rec.IncOpError("allocate")
+		return syscall.EIO
+	}
+
+	// PUNCH_HOLE never extends: clamp the window to the current file length,
+	// zero-fill in place, and never touch Size.
+	if mode&fallocPunchHole != 0 {
+		return f.zeroRange(ctx, rec, metaInode, off, size, false)
+	}
+	// ZERO_RANGE zeroes in place and grows the file (and, absent KEEP_SIZE, the
+	// logical size) when the window runs past the current end.
+	if mode&fallocZeroRange != 0 {
+		return f.zeroRange(ctx, rec, metaInode, off, size, mode&fallocKeepSize == 0)
+	}
+
+	// Default (preallocate) path: extend the file to cover [off, off+size),
+	// honoring KEEP_SIZE by leaving the logical Size untouched.
+	f.mu.Lock()
+	if !f.loaded && int64(off+size) >= int64(len(f.buffer)) {
+		// Fetch the committed prefix before extending so the added region is
+		// genuinely zero and the pre-existing bytes survive the whole-file
+		// rebuild in Flush.
+		if err := f.ensureHydratedLocked(ctx, rec); err != nil {
+			f.mu.Unlock()
+			rec.IncOpError("allocate")
+			return syscall.EIO
+		}
+	}
+	end := off + size
+	// Captured before the buffer is grown: the current extent (max of the
+	// buffered tail and the committed size) is the threshold against which
+	// we decide whether this window actually extends the file. The committed
+	// Size lags the buffer until Flush, so comparing against it alone would
+	// under-report an extension over already-buffered data.
+	ef := int64(len(f.buffer))
+	if metaInode.Size > ef {
+		ef = metaInode.Size
+	}
+	if int(end) > len(f.buffer) {
+		newBuf := make([]byte, end)
+		copy(newBuf, f.buffer)
+		f.buffer = newBuf
+	}
+	f.dirty = true
+	if mode&fallocKeepSize == 0 && int64(end) > ef {
+		metaInode.Size = int64(end)
+	}
+	metaInode.MTime = time.Now().UnixNano()
+	f.mu.Unlock()
+
+	if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+		rec.IncOpError("allocate")
+		return syscall.EIO
+	}
+	return 0
+}
+
+// zeroRange zero-fills [off, off+size). If extend is true (default allocate or
+// ZERO_RANGE without KEEP_SIZE) the file (and logical Size) is grown to cover
+// the window; otherwise (PUNCH_HOLE, or ZERO_RANGE with KEEP_SIZE) the window
+// is clamped to the current length and Size is untouched. Returns the errno
+// (0 on success). Callers must pass metaInode fetched under the inode's meta
+// contract; this helper manages f.mu itself so the UpdateInode lands after the
+// lock is released.
+func (f *DFSFile) zeroRange(ctx context.Context, rec MetricsRecorder, metaInode *metadata.InodeMeta, off uint64, size uint64, extend bool) syscall.Errno {
+	f.mu.Lock()
+	cur := int64(len(f.buffer))
+	if metaInode.Size > cur {
+		cur = metaInode.Size
+	}
+	end := off + size
+	if !extend && int64(end) > cur {
+		// Clamp to current committed + buffered length (never grow on punch).
+		end = uint64(cur)
+	}
+	if end <= off {
+		// Nothing to zero; still refresh mtime per POSIX and persist.
+		metaInode.MTime = time.Now().UnixNano()
+		f.mu.Unlock()
+		if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+			rec.IncOpError("allocate")
+			return syscall.EIO
+		}
+		return 0
+	}
+	// If the buffer doesn't yet reflect the committed prefix, hydrate before
+	// zeroing so the hole is punched over real committed bytes (not zeros where
+	// committed data should remain, or stale bytes where it should be zeroed).
+	// Extensions also hydrate so the pre-existing prefix survives Flush.
+	if !f.loaded {
+		if err := f.ensureHydratedLocked(ctx, rec); err != nil {
+			f.mu.Unlock()
+			rec.IncOpError("allocate")
+			return syscall.EIO
+		}
+	}
+	if int(end) > len(f.buffer) {
+		newBuf := make([]byte, end)
+		copy(newBuf, f.buffer)
+		f.buffer = newBuf
+	}
+	for i := off; i < end; i++ {
+		f.buffer[i] = 0
+	}
+	f.dirty = true
+	// Grow the logical Size only when the window runs past the file's current
+	// extent. `cur` (captured at the top, before the buffer was grown to the
+	// window) is the pre-operation extent = max(buffered tail, committed size);
+	// the committed Size lags the buffer until Flush, so comparing against it
+	// alone would shrink the logical size below buffered data when zeroing an
+	// in-range window (truncating on the next whole-file Flush rebuild).
+	if extend && int64(end) > cur {
+		metaInode.Size = int64(end)
+	}
+	metaInode.MTime = time.Now().UnixNano()
+	f.mu.Unlock()
+
+	if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+		rec.IncOpError("allocate")
+		return syscall.EIO
+	}
 	return 0
 }
 
