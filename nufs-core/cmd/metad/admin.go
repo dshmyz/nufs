@@ -6,21 +6,13 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"io/fs"
 	"log"
 	"net/http"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/example/dfs/internal/version"
 	"github.com/example/dfs/metadata"
 )
-
-//go:embed templates/*.html
-var adminTemplateFS embed.FS
 
 //go:embed static/*
 var adminStaticRaw embed.FS
@@ -35,190 +27,49 @@ func init() {
 	}
 }
 
+// adminServer serves the NUFS admin console as a Vue single-page app.
+//
+// The page is entirely static (a shell that mounts a Vue app via a hash
+// router); all data comes from the /api/v1/* JSON endpoints that
+// registerOpsHandlers mounts on the same mux/port. This type only owns the
+// static shell, the demo-seed action, and the SSE metrics stream that feeds
+// the Overview's live chart.
 type adminServer struct {
 	store  *metadata.PebbleStore
 	bundle *metadata.ServiceBundle
-	tmpls  map[string]*template.Template
+	shell  []byte // static/index.html bytes, read once at startup
 }
 
 func newAdminServer(store *metadata.PebbleStore, bundle *metadata.ServiceBundle) *adminServer {
-	funcMap := template.FuncMap{
-		"hasPrefix":  strings.HasPrefix,
-		"stateClass": stateClass,
-		"stateLabel": stateLabel,
-		"humanBytes": humanBytes,
-		"formatTime": func(t time.Time) string {
-			if t.IsZero() {
-				return "-"
-			}
-			return t.Format("2006-01-02 15:04:05")
-		},
-		"formatUnix": func(ts int64) string {
-			if ts == 0 {
-				return "-"
-			}
-			return time.Unix(0, ts).Format("2006-01-02 15:04:05")
-		},
-		"basename": func(path string) string {
-			return filepath.Base(path)
-		},
-		"tierLabel": func(t metadata.StorageTier) string {
-			switch t {
-			case metadata.StorageTierAny:
-				return "Any"
-			case metadata.TierHot:
-				return "Hot (NVMe)"
-			case metadata.TierWarm:
-				return "Warm (SSD)"
-			case metadata.TierCold:
-				return "Cold (HDD)"
-			case metadata.TierArchive:
-				return "Archive"
-			default:
-				return fmt.Sprintf("Tier %d", t)
-			}
-		},
-		"chunkStateClass": func(s metadata.ChunkState) string {
-			switch s {
-			case metadata.ChunkCreated:
-				return "info"
-			case metadata.ChunkSealed:
-				return "primary"
-			case metadata.ChunkReady:
-				return "success"
-			case metadata.ChunkDegraded:
-				return "warning"
-			case metadata.ChunkOrphan:
-				return "secondary"
-			default:
-				return "secondary"
-			}
-		},
-		"chunkStateLabel": func(s metadata.ChunkState) string {
-			switch s {
-			case metadata.ChunkCreated:
-				return "Created"
-			case metadata.ChunkSealed:
-				return "Sealed"
-			case metadata.ChunkReady:
-				return "Ready"
-			case metadata.ChunkDegraded:
-				return "Degraded"
-			case metadata.ChunkOrphan:
-				return "Orphan"
-			default:
-				return "Unknown"
-			}
-		},
+	shell, err := fs.ReadFile(adminStaticFS, "index.html")
+	if err != nil {
+		log.Fatalf("admin: cannot read embedded shell index.html: %v", err)
 	}
-
-	pages := []string{"overview", "nodes", "node_detail", "buckets", "chunks", "repair", "rebalance"}
-	tmpls := make(map[string]*template.Template, len(pages))
-	for _, p := range pages {
-		tmpls[p] = template.Must(
-			template.New("").Funcs(funcMap).ParseFS(adminTemplateFS,
-				"templates/layout.html",
-				"templates/"+p+".html",
-			),
-		)
-	}
-	return &adminServer{store: store, bundle: bundle, tmpls: tmpls}
+	return &adminServer{store: store, bundle: bundle, shell: shell}
 }
 
 func (a *adminServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("/admin/static/", http.StripPrefix("/admin/static/", http.FileServer(http.FS(adminStaticFS))))
-	mux.HandleFunc("/admin/", a.handleOverview)
-	mux.HandleFunc("/admin/nodes", a.handleNodes)
-	mux.HandleFunc("/admin/nodes/", a.handleNodeDetail)
-	mux.HandleFunc("/admin/buckets", a.handleBuckets)
-	mux.HandleFunc("/admin/chunks", a.handleChunks)
-	mux.HandleFunc("/admin/repair", a.handleRepair)
-	mux.HandleFunc("/admin/rebalance", a.handleRebalance)
+	// The SPA uses a hash router, so every path under /admin/ serves the same
+	// shell; the JavaScript reads location.hash to pick the page component.
+	// /admin/seed and /admin/metrics/stream are exact patterns and therefore
+	// win over this subtree in the new ServeMux.
+	mux.HandleFunc("/admin/", a.serveShell)
 	mux.HandleFunc("/admin/seed", a.handleSeedDemo)
 	mux.HandleFunc("/admin/metrics/stream", a.handleMetricsStream)
 }
 
-type pageData struct {
-	Title      string
-	IsLeader   bool
-	LeaderAddr string
-	Version    string
-}
-
-func (a *adminServer) baseData(title string) pageData {
-	return pageData{
-		Title:      title,
-		IsLeader:   a.store.IsLeader(),
-		LeaderAddr: a.store.LeaderAddr(),
-		Version:    version.Version,
-	}
-}
-
-func (a *adminServer) render(w http.ResponseWriter, page string, data interface{}) {
-	tmpl, ok := a.tmpls[page]
-	if !ok {
-		http.Error(w, "template not found", http.StatusInternalServerError)
-		return
-	}
-	var buf bytes.Buffer
-	if err := tmpl.ExecuteTemplate(&buf, page, data); err != nil {
-		log.Printf("admin: template error (%s): %v", page, err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
+func (a *adminServer) serveShell(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(buf.Bytes())
+	if _, err := w.Write(a.shell); err != nil {
+		log.Printf("admin: write shell: %v", err)
+	}
 }
 
-// --- Overview ---
-
-type overviewData struct {
-	pageData
-	Nodes         []metadata.NodeInfo
-	Buckets       []metadata.BucketInfo
-	RepairLen     int
-	ChunkCount    int
-	OnlineNodes   int
-	OfflineNodes  int
-	DrainingNodes int
-	TotalCapacity  int64
-	UsedCapacity   int64
-	OnDiskCapacity int64
-	// Byte-accurate cluster aggregates for precise logical-vs-physical render.
-	UsedBytes         int64
-	OnDiskBytes       int64
-	CapacityBytes     int64
-	CapacityPct       float64
-	IsEmpty       bool
-	Topology      []topoGroup
-}
-
-// topoNode is a rendered node card in the Overview topology. CapacityGB is
-// the physical capacity reported via heartbeat; UsagePct is used/Capacity
-// (0 when capacity is unknown — old nodes), so the console never draws a
-// misleading ring for a node we have no capacity for.
-type topoNode struct {
-	ID        metadata.NodeID
-	Addr      string
-	StateName string // Online / Draining / Offline / Failed / Unknown
-	StateCls  string // success / warning / danger / secondary (CSS)
-	Capacity  int64  // GB
-	Used      int64  // GB (logical live bytes)
-	OnDisk    int64  // GB (physical on-disk footprint, incl. un-compacted superseded)
-	// Byte-accurate footprints for rendering logical-vs-physical precisely.
-	UsedBytes     int64
-	OnDiskBytes   int64
-	CapacityBytes int64
-	UsagePct    float64
-	DashOffset  float64 // capacity-ring stroke offset (precomputed; html/template has no arithmetic)
-	Chunks      int64
-	Machine     string
-	Zone        string
-	Rack        string
-}
+// --- Pure data helpers (also exercised by admin_topology_test.go) ---
 
 // stateClass maps a node state to a CSS badge class (success/warning/danger/
-// secondary), used both by templates and the Overview topology rendering.
+// secondary).
 func stateClass(s metadata.NodeState) string {
 	switch s {
 	case metadata.NodeOnline:
@@ -251,8 +102,7 @@ func stateLabel(s metadata.NodeState) string {
 }
 
 // humanBytes renders a byte count as a compact human-readable string
-// ("211 KB", "1.4 GB"), so logical-vs-physical can be shown side by side at
-// any scale — the persistent GB fields round sub-GB movements to 0.
+// ("211 KB", "1.4 GB").
 func humanBytes(b int64) string {
 	switch {
 	case b < 0:
@@ -268,6 +118,30 @@ func humanBytes(b int64) string {
 	default:
 		return fmt.Sprintf("%.2f TB", float64(b)/(1024*1024*1024*1024))
 	}
+}
+
+// topoNode is a rendered node card in the Overview topology. CapacityGB is
+// the physical capacity reported via heartbeat; UsagePct is used/Capacity
+// (0 when capacity is unknown), so the console never draws a misleading ring
+// for a node we have no capacity for.
+type topoNode struct {
+	ID        metadata.NodeID
+	Addr      string
+	StateName string // Online / Draining / Offline / Failed / Unknown
+	StateCls  string // success / warning / danger / secondary (CSS)
+	Capacity  int64  // GB
+	Used      int64  // GB (logical live bytes)
+	OnDisk    int64  // GB (physical on-disk footprint)
+	// Byte-accurate footprints for rendering logical-vs-physical precisely.
+	UsedBytes     int64
+	OnDiskBytes   int64
+	CapacityBytes int64
+	UsagePct      float64
+	DashOffset    float64 // capacity-ring stroke offset (precomputed)
+	Chunks        int64
+	Machine       string
+	Zone          string
+	Rack          string
 }
 
 // topoGroup groups rendered node cards by fault domain (rack/zone).
@@ -308,8 +182,7 @@ func buildTopology(nodes []metadata.NodeInfo) []topoGroup {
 		if n.CapacityGB > 0 {
 			tn.UsagePct = float64(n.UsedGB) / float64(n.CapacityGB) * 100
 			// Ring circumference is 2*pi*r for r=19 (119.4); dashoffset
-			// reveals the used fraction. Precomputed here because
-			// html/template has no arithmetic builtins.
+			// reveals the used fraction.
 			const ringC = 119.4
 			used := tn.UsagePct / 100
 			if used > 1 {
@@ -326,180 +199,6 @@ func buildTopology(nodes []metadata.NodeInfo) []topoGroup {
 		groups[idx].Nodes = append(groups[idx].Nodes, tn)
 	}
 	return groups
-}
-
-func (a *adminServer) handleOverview(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/admin/" {
-		http.NotFound(w, r)
-		return
-	}
-	ctx := r.Context()
-	nodes, _ := a.store.ListNodes(ctx)
-	buckets, _ := a.store.ListBuckets(ctx)
-	tasks, _ := a.store.GetRepairQueue(ctx)
-
-	var chunkCount, totalCap, usedCap, onDiskCap, usedBytes, onDiskBytes, capBytes int64
-	online, offline, draining := 0, 0, 0
-	for _, n := range nodes {
-		chunkCount += n.ChunkCount
-		totalCap += n.CapacityGB
-		usedCap += n.UsedGB
-		onDiskCap += n.OnDiskGB
-		usedBytes += n.UsedBytes
-		onDiskBytes += n.OnDiskBytes
-		capBytes += n.CapacityBytes
-		switch n.State {
-		case metadata.NodeOnline:
-			online++
-		case metadata.NodeOffline:
-			offline++
-		case metadata.NodeDraining:
-			draining++
-		}
-	}
-	capPct := 0.0
-	if totalCap > 0 {
-		capPct = float64(usedCap) / float64(totalCap) * 100
-	}
-
-	a.render(w, "overview", overviewData{
-		pageData:      a.baseData("Cluster Overview"),
-		Nodes:         nodes,
-		Buckets:       buckets,
-		RepairLen:     len(tasks),
-		ChunkCount:    int(chunkCount),
-		OnlineNodes:   online,
-		OfflineNodes:  offline,
-		DrainingNodes: draining,
-		TotalCapacity:  totalCap,
-		UsedCapacity:   usedCap,
-		OnDiskCapacity: onDiskCap,
-		UsedBytes:      usedBytes,
-		OnDiskBytes:    onDiskBytes,
-		CapacityBytes:  capBytes,
-		CapacityPct:    capPct,
-		IsEmpty:       len(nodes) == 0 && len(buckets) == 0,
-		Topology:      buildTopology(nodes),
-	})
-}
-
-// --- Nodes ---
-
-type nodesData struct {
-	pageData
-	Nodes []metadata.NodeInfo
-}
-
-func (a *adminServer) handleNodes(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/admin/nodes" {
-		http.NotFound(w, r)
-		return
-	}
-	nodes, err := a.store.ListNodes(r.Context())
-	if err != nil {
-		nodes = nil
-	}
-	a.render(w, "nodes", nodesData{
-		pageData: a.baseData("Nodes"),
-		Nodes:    nodes,
-	})
-}
-
-// --- Node Detail ---
-
-type nodeDetailData struct {
-	pageData
-	Node   *metadata.NodeInfo
-	Chunks []metadata.ChunkMeta
-	Found  bool
-}
-
-func (a *adminServer) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/admin/nodes/")
-	id, err := strconv.ParseUint(path, 10, 64)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-
-	ctx := r.Context()
-	node, err := a.store.GetNode(ctx, metadata.NodeID(id))
-	if err != nil {
-		a.render(w, "node_detail", nodeDetailData{pageData: a.baseData("Node Detail"), Found: false})
-		return
-	}
-
-	chunks, _ := a.store.ChunksByNode(ctx, metadata.NodeID(id))
-	a.render(w, "node_detail", nodeDetailData{
-		pageData: a.baseData(fmt.Sprintf("Node %d", id)),
-		Node:     node,
-		Chunks:   chunks,
-		Found:    true,
-	})
-}
-
-// --- Buckets ---
-
-type bucketsData struct {
-	pageData
-	Buckets []metadata.BucketInfo
-}
-
-func (a *adminServer) handleBuckets(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/admin/buckets" {
-		http.NotFound(w, r)
-		return
-	}
-	buckets, err := a.store.ListBuckets(r.Context())
-	if err != nil {
-		buckets = nil
-	}
-	a.render(w, "buckets", bucketsData{
-		pageData: a.baseData("Buckets"),
-		Buckets:  buckets,
-	})
-}
-
-// --- Chunks ---
-
-func (a *adminServer) handleChunks(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/admin/chunks" {
-		http.NotFound(w, r)
-		return
-	}
-	a.render(w, "chunks", struct{ pageData }{pageData: a.baseData("Chunks")})
-}
-
-// --- Repair ---
-
-type repairData struct {
-	pageData
-	Tasks []metadata.RepairTask
-}
-
-func (a *adminServer) handleRepair(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/admin/repair" {
-		http.NotFound(w, r)
-		return
-	}
-	tasks, err := a.store.GetRepairQueue(r.Context())
-	if err != nil {
-		tasks = nil
-	}
-	a.render(w, "repair", repairData{
-		pageData: a.baseData("Repair Queue"),
-		Tasks:    tasks,
-	})
-}
-
-// --- Rebalance ---
-
-func (a *adminServer) handleRebalance(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/admin/rebalance" {
-		http.NotFound(w, r)
-		return
-	}
-	a.render(w, "rebalance", struct{ pageData }{pageData: a.baseData("Rebalance")})
 }
 
 // --- Seed Demo Data ---

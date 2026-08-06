@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NUFS · Cluster Console</title>
+  <link rel="stylesheet" href="/admin/static/css/style.css">
+  <style>
+    /* SPA-loading shimmer: kept minimal so it never flashes a jarring shell. */
+    #app { min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <!-- Vue 3 (runtime + compiler) global build, vendored so the console is
+       fully offline-capable and the repo keeps its zero-build-chain property. -->
+  <script src="/admin/static/js/vendor/vue.global.prod.js"></script>
+
+  <script src="/admin/static/js/app/util.js"></script>
+  <script src="/admin/static/js/app/api.js"></script>
+  <script src="/admin/static/js/app/router.js"></script>
+  <script src="/admin/static/js/app/components.js"></script>
+  <script src="/admin/static/js/app/pages/overview.js"></script>
+  <script src="/admin/static/js/app/pages/nodes.js"></script>
+  <script src="/admin/static/js/app/pages/nodeDetail.js"></script>
+  <script src="/admin/static/js/app/pages/repair.js"></script>
+  <script src="/admin/static/js/app/pages/rebalance.js"></script>
+  <script src="/admin/static/js/app/pages/namespace.js"></script>
+  <script src="/admin/static/js/app/pages/backups.js"></script>
+  <script src="/admin/static/js/app/app.js"></script>
+</body>
+</html>

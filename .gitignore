@@ -14,6 +14,7 @@ coverage.txt
 
 # Vendor / go workspace
 vendor/
+!nufs-core/cmd/metad/static/js/vendor/
 go.work
 go.work.sum
 
@@ -75,3 +76,10 @@ DEFECTS_ANALYSIS_*.md
 NON_GATEWAY_ANALYSIS.md
 PROBLEM_ANALYSIS.md
 社会研究方法课程论文.*
+
+# Verification / browser screenshots (transient artifacts, not source)
+*.png
+!nufs-core/cmd/metad/static/**/*.png
+!nufs-core/datanode/admin/**/*.png
+.playwright-mcp/
+.claude/
