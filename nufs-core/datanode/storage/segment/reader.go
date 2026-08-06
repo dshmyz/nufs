@@ -90,15 +90,40 @@ func (r *Reader) ReadPayloadFrames(offset int64, storedLen uint32, logicalLen ui
 	if err != nil {
 		return nil, err
 	}
-	payload := make([]byte, 0, logicalLen)
+	payload := make([]byte, logicalLen)
+	// Unencrypted AND uncompressed record: pread each frame straight into
+	// the payload in place, one copy per frame off disk with no temp buffer
+	// and no final append (zero-copy fast path).
+	if layout.decKey == nil && recordIsPlain(layout) {
+		write := 0
+		for i := range layout.frameIndex.Entries {
+			e := layout.frameIndex.Entries[i]
+			if int64(e.Offset)+int64(e.StoredLen) > layout.totalStored {
+				return nil, storage.ErrIndexCorrupt
+			}
+			dst := payload[write : write+int(e.StoredLen)]
+			if _, err := r.f.ReadAt(dst, layout.firstFrameAt+int64(e.Offset)); err != nil {
+				return nil, err
+			}
+			if err := VerifyFrameCRC(dst, e.CRC); err != nil {
+				return nil, err
+			}
+			write += int(e.StoredLen)
+		}
+		if write != int(logicalLen) {
+			return nil, storage.ErrIndexCorrupt
+		}
+		return payload, nil
+	}
+	write := 0
 	for i := range layout.frameIndex.Entries {
 		logical, err := r.readLogicalFrame(layout, i)
 		if err != nil {
 			return nil, err
 		}
-		payload = append(payload, logical...)
+		write += copy(payload[write:], logical)
 	}
-	if uint32(len(payload)) != logicalLen {
+	if write != int(logicalLen) {
 		return nil, storage.ErrIndexCorrupt
 	}
 	return payload, nil
@@ -137,28 +162,49 @@ func (r *Reader) ReadRangeFrames(offset int64, storedLen uint32, logicalLen uint
 		return nil, storage.ErrIndexCorrupt
 	}
 
-	out := make([]byte, 0, length)
+	out := make([]byte, length)
+	write := 0
 	for i := first; i <= last; i++ {
-		logical, err := r.readLogicalFrame(layout, i)
-		if err != nil {
-			return nil, err
+		e := layout.frameIndex.Entries[i]
+		if int64(e.Offset)+int64(e.StoredLen) > layout.totalStored {
+			return nil, storage.ErrIndexCorrupt
 		}
-		// Trim this frame to its intersection with the request.
 		frameStart := int64(i) * frameSize
 		lo := logicalOffset - frameStart
 		if lo < 0 {
 			lo = 0
 		}
 		hi := logicalOffset + int64(length) - frameStart
+		// Zero-copy fast path: a frame that is entirely inside the request
+		// AND stored verbatim (unencrypted, uncompressed) is pread straight
+		// into `out` at its final position — no temp frame buffer and no
+		// trailing append. Anything else (an overlapped boundary frame, or
+		// one needing decrypt/decompress) falls through to the buffered path
+		// so CRC/checksum semantics are byte-for-byte unchanged.
+		if layout.decKey == nil && e.Codec == storage.CompressionNone && lo == 0 && hi >= int64(e.StoredLen) {
+			dst := out[write : write+int(e.StoredLen)]
+			if _, err := r.f.ReadAt(dst, layout.firstFrameAt+int64(e.Offset)); err != nil {
+				return nil, err
+			}
+			if err := VerifyFrameCRC(dst, e.CRC); err != nil {
+				return nil, err
+			}
+			write += int(e.StoredLen)
+			continue
+		}
+		logical, err := r.readLogicalFrame(layout, i)
+		if err != nil {
+			return nil, err
+		}
 		if hi > int64(len(logical)) {
 			hi = int64(len(logical))
 		}
 		if lo >= hi {
 			return nil, storage.ErrIndexCorrupt
 		}
-		out = append(out, logical[lo:hi]...)
+		write += copy(out[write:], logical[lo:hi])
 	}
-	if len(out) != int(length) {
+	if write != int(length) {
 		return nil, storage.ErrIndexCorrupt
 	}
 	return out, nil
@@ -190,6 +236,20 @@ func (r *Reader) readLogicalFrame(layout *recordLayout, i int) ([]byte, error) {
 		return DecompressFrame(frame)
 	}
 	return frame, nil
+}
+
+// recordIsPlain reports whether every frame in the record is stored
+// uncompressed. Combined with decKey == nil at the call site, this means
+// the whole record is stored verbatim (stored bytes == logical bytes), so
+// it can be read straight into the destination buffer with no per-frame
+// temp allocation and no second copy.
+func recordIsPlain(layout *recordLayout) bool {
+	for _, e := range layout.frameIndex.Entries {
+		if e.Codec != storage.CompressionNone {
+			return false
+		}
+	}
+	return true
 }
 
 // readRecordLayout reads and verifies the header, frame index, and

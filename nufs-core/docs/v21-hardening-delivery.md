@@ -111,6 +111,15 @@
 
 从 `7474509` 起的 P0 加固提交群：group commit 连续无死锁、恢复 checkpoint 硬化、tombstone 在恢复中保留、恢复字节预算、stream V3 segment 恢复、fail-closed on recovery apply error、V2 store 幂等关闭、范围读只读相交帧、进程崩溃（SIGKILL）验收、durable delete recovery、V3 CRC 硬化、V2.1 P0 正确性 gate。
 
+## 12. Program 13 P3-性能：元数据分片接线 + 读路径零拷贝 + 基准 gate
+
+Program 13 三域（安全 KMS/门禁 → Dashboard/告警 → 性能）的性能收官。性能域两个提交，`--shards N` 仅 in-process 数据面接线（非 raft、不引入跨节点 multi-metad 路由），零拷贝仅作用于未加密未压缩帧且保 byte-exact：
+
+| Commit | 内容 |
+|--------|------|
+| `feat(metadata): wire in-process ShardedStore into metad --shards N (P3)` | metad `--shards N`（默认 1 = 现状）：控制面仍走主 `*metadata.PebbleStore`（raft/节点/repair/EC/scrub/watch/backup），仅网关数据面（namespace/bucket/chunk/bucket-quota）经 `ShardedStore` 由 **parent-inode / chunk-id 路由**到对应 shard；`N>1` 需 `--raft=false`。`registerOpsHandlers` 的 `opsDataStore` 接口（`MetadataService` + leader 三方法）同时被 `*PebbleStore` 与 `shardedOpsStore` 满足。`Rename` 按 oldParent 单 shard 路由（跨 shard 目标需两阶段提交，明示不做）。副产品：HTTP `entry_exists` 409 机器码 → 客户端 `ErrEntryExists`（修掉 S3 重复 PUT 的既有 HTTP gap）。 |
+| `perf(storage): reduce read-path copies (zero-copy) when unencrypted/uncompressed + bench gate (P3)` | `segment.ReadRangeFrames`/`ReadPayloadFrames` 对未加密未压缩帧直接 `pread` 进目标缓冲（去掉临时帧 `make`+append 双拷贝），CRC 逐帧保留、checksum 语义不变；仅 `enc==nil && recordIsPlain` 走快路径，其余走原缓冲路径。新增 `BenchmarkReadRangeFrames_Plain`（48KiB plain 读 ~16.6µs/op，~2.9 GiB/s）+ `deploy/scripts/run-bench.sh` gate。`ShardedStore` 现于 `metadata/shard.go`（原仅测试），跨 shard 建 bucket/文件/目录、Readdir、按 oldParent Rename、同名 `ErrEntryExists` 均 e2e 覆盖（`--shards 2`，`-race`）。 |
+
 ---
 
 ## 任务清单映射
