@@ -332,12 +332,22 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 				)
 			}
 
-			if err := c.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
-				primaryErr := fmt.Errorf("%w: failed to commit chunk: %v", ErrObjectCommitFailed, err)
-				return PutObjectResult{}, c.compensateFailedWrite(
-					ctx, attemptID, req, inode, b.RootInode, newObject, oldInodeSnapshot,
-					allAllocatedChunkRefs, primaryErr,
-				)
+			if chunk.ECGroup != nil {
+				// Direct-EC write (WriteChunk→writeECShardDirect), the V2.1 path for an
+				// ECConfig bucket, already lifts the chunk to durable ChunkReady + a
+				// Complete stripe carrying the original checksum (RecordDirect). The
+				// generic CommitChunk requires ChunkCreated and would 500 on ChunkReady,
+				// so skip it for EC chunks — SealChunk stays (it is idempotent on
+				// ChunkReady and otherwise advances ChunkSealed→ChunkReady).
+				_ = checksum // EC path carries its checksum in the recorded stripe
+			} else {
+				if err := c.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
+					primaryErr := fmt.Errorf("%w: failed to commit chunk: %v", ErrObjectCommitFailed, err)
+					return PutObjectResult{}, c.compensateFailedWrite(
+						ctx, attemptID, req, inode, b.RootInode, newObject, oldInodeSnapshot,
+						allAllocatedChunkRefs, primaryErr,
+					)
+				}
 			}
 
 			if err := c.meta.SealChunk(ctx, chunk.ID); err != nil {
@@ -405,7 +415,12 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 				)
 			}
 
-			if err := c.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
+			if chunk.ECGroup != nil {
+				// Direct-EC write already recorded the durable stripe + checksum
+				// (WriteChunk→writeECShardDirect→RecordDirect lifts to ChunkReady);
+				// CommitChunk requires ChunkCreated and would 500 on ChunkReady.
+				// SealChunk is idempotent on ChunkReady, so leave it in place.
+			} else if err := c.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
 				primaryErr := fmt.Errorf("%w: failed to commit chunk: %v", ErrObjectCommitFailed, err)
 				return PutObjectResult{}, c.compensateFailedWrite(
 					ctx, attemptID, req, inode, b.RootInode, newObject, oldInodeSnapshot,
