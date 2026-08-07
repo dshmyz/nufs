@@ -78,13 +78,14 @@ func TestManagementServer_V2StoreStatus(t *testing.T) {
 // TestManagementServer_V2StoreLifecycleUnsupported proves disk-lifecycle
 // socket commands degrade cleanly for a factory-less V2Store (the operational
 // degrade path when the datanode main has NOT injected a disk factory via
-// SetDiskFactory). V2Store now satisfies DiskLifecycleOps, so:
+// SetDiskFactory). V2Store now satisfies DiskLifecycleOps and DrainOps, so:
 //   - adopt degrades to "add disk: not configured (no disk factory)…" because
 //     the engine cannot construct a segment store for an arbitrary new dir;
 //   - retire/decommission/migrate route through DiskInfos() and answer
-//     "dir not found" for an unknown path;
-//   - drain still answers "drain unsupported by this engine" (V2.1 exposes no
-//     DrainOps).
+//     "dir not found" for an unknown path.
+//
+// (drain is NOT in this table: V2Store exposes DrainOps, so /drain succeeds —
+// it is exercised positively in TestManagementServer_V2StoreDrain.)
 //
 // None of these panic on the missing capability; production main always wires
 // the factory, which is exercised end-to-end in datanode/ops_v2store_test.go.
@@ -108,16 +109,12 @@ func TestManagementServer_V2StoreLifecycleUnsupported(t *testing.T) {
 		{cmd: "retire", wantErr: "dir not found"},
 		{cmd: "decommission", wantErr: "dir not found"},
 		{cmd: "migrate", wantErr: "dir not found"},
-		{cmd: "drain", wantErr: "drain unsupported by this engine"},
 	} {
 		c, err := net.Dial("unix", sockPath)
 		if err != nil {
 			t.Fatalf("dial socket (%s): %v", tc.cmd, err)
 		}
-		msg := sockMsg{Cmd: tc.cmd}
-		if tc.cmd != "drain" {
-			msg.Path = "/tmp/nonexistent"
-		}
+		msg := sockMsg{Cmd: tc.cmd, Path: "/tmp/nonexistent"}
 		if err := json.NewEncoder(c).Encode(msg); err != nil {
 			c.Close()
 			t.Fatalf("encode %s: %v", tc.cmd, err)
@@ -131,5 +128,44 @@ func TestManagementServer_V2StoreLifecycleUnsupported(t *testing.T) {
 		if resp.Status != "error" || resp.Error != tc.wantErr {
 			t.Fatalf("%s status=%q error=%q, want error %q", tc.cmd, resp.Status, resp.Error, tc.wantErr)
 		}
+	}
+}
+
+// TestManagementServer_V2StoreDrain proves the management unix-socket /drain
+// channel serves V2.1 drain (DrainOps parity): it acquires the QuiesceWrites
+// barrier and reports "drained" instead of the previous "drain unsupported by
+// this engine".
+func TestManagementServer_V2StoreDrain(t *testing.T) {
+	v, dir := newV2StoreForTest(t)
+	stop, err := startManagementServer(v, nil, []string{dir})
+	if err != nil {
+		t.Fatalf("startManagementServer: %v", err)
+	}
+	defer stop()
+
+	sockPath := filepath.Join(dir, ".datanode.sock")
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial socket: %v", err)
+	}
+	defer conn.Close()
+
+	msg := sockMsg{Cmd: "drain"}
+	if err := json.NewEncoder(conn).Encode(msg); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var resp sockResp
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Fatalf("drain status=%q error=%q, want ok", resp.Status, resp.Error)
+	}
+	data, ok := resp.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("drain data type %T, want map", resp.Data)
+	}
+	if data["status"] != "drained" {
+		t.Fatalf("drain status field=%v, want 'drained'", data["status"])
 	}
 }

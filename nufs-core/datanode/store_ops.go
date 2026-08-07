@@ -40,12 +40,10 @@ type DiskLifecycleOps interface {
 	MigrateDisk(srcIdx int) (int, error)
 }
 
-// DrainOps is the optional graceful-shutdown drain capability (V1 ChunkStore
-// has it). V2.1 does NOT advertise it to the ops channel: V2Store's internal
-// shutdown barrier is named QuiesceWrites (not DrainWrites), so it does not
-// structurally satisfy DrainOps and the management/ops channel keeps
-// returning "drain unsupported by this engine" for V2.1 (option A), even
-// though the internal §4 shutdown drain is real and wired in runDataNodeV21.
+// DrainOps is the optional graceful-shutdown drain capability. Both the V1
+// ChunkStore and the V2.1 V2Store expose it; the management/ops channel
+// advertises /drain when a backend implements the capability. V2Store's
+// DrainWrites delegates to its internal QuiesceWrites write barrier.
 type DrainOps interface {
 	DrainWrites(ctx context.Context) (func(), error)
 }
@@ -54,12 +52,12 @@ type DrainOps interface {
 var _ OpsStore = (*ChunkStore)(nil)
 var _ OpsStore = (*V2Store)(nil)
 
-// Compile-time: both storage engines expose the disk-lifecycle capability so
-// the management/ops channel can advertise adopt/retire/decommission/migrate
-// for either engine. Only the legacy ChunkStore exposes the drain capability:
-// V2.1's internal shutdown barrier is named QuiesceWrites (not DrainWrites),
-// so it does not structurally satisfy DrainOps and the management/ops channel
-// keeps returning "drain unsupported by this engine" for V2.1 (option A).
+// Compile-time: both storage engines expose the disk-lifecycle and drain
+// capabilities, so the management/ops channel can advertise
+// adopt/retire/decommission/migrate/drain for either engine. V2Store exposes
+// drain via DrainWrites, which delegates to its internal QuiesceWrites write
+// barrier.
 var _ DiskLifecycleOps = (*ChunkStore)(nil)
 var _ DiskLifecycleOps = (*V2Store)(nil)
 var _ DrainOps = (*ChunkStore)(nil)
+var _ DrainOps = (*V2Store)(nil)

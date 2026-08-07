@@ -291,11 +291,19 @@ func (ms *managementServer) handleDrain(conn net.Conn) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := drain.DrainWrites(ctx); err != nil {
+	release, err := drain.DrainWrites(ctx)
+	if err != nil {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
 		return
 	}
+	// Point-in-time quiesce: report drained, then hand the barrier back so a
+	// concurrent write never observes the response before writes are permitted
+	// again (and a sole drain never permanently wedges the store). A rolling
+	// restart exits the process right after, before this matters.
 	json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{"status": "drained"}})
+	if release != nil {
+		release()
+	}
 }
 
 func (ms *managementServer) handleVerify(conn net.Conn, dir string) {

@@ -1480,6 +1480,16 @@ func (v *V2Store) WriteErrorRate() float64 {
 	return float64(errs) / float64(ops)
 }
 
+// DrainWrites is the V2.1 drain surface (DrainOps parity with the legacy
+// ChunkStore). It delegates to the internal QuiesceWrites barrier: block
+// until every in-flight write has completed, then block all new writes;
+// the returned release func resumes writes. Reads are never blocked, so a
+// drained V2Store keeps serving reads. The ops and management /drain
+// channels acquire this barrier to quiesce writes before a rolling restart.
+func (v *V2Store) DrainWrites(ctx context.Context) (func(), error) {
+	return v.QuiesceWrites(ctx)
+}
+
 // QuiesceWrites is the V2.1-internal write-drain barrier: it blocks until
 // every in-flight write (writeTo/writeShardAt/RebalanceOne — all hold
 // drainMu.RLock for their duration) has completed, then blocks all new
@@ -1487,12 +1497,9 @@ func (v *V2Store) WriteErrorRate() float64 {
 // (they do not take drainMu), so a drained store continues serving reads. A
 // ctx timeout returns ctx.Err with no release func and no barrier held.
 //
-// This is the §4 ("DrainWrites parity") graceful-shutdown path called by
-// runDataNodeV21 before closing the stores. It is deliberately NOT named
-// DrainWrites so V2Store does not structurally satisfy the DrainOps
-// capability interface: the management/ops channel therefore keeps reporting
-// "drain unsupported by this engine" for V2.1 (option A), even though the
-// internal shutdown barrier is real.
+// This is the graceful-shutdown path called by runDataNodeV21 before closing
+// the stores. DrainWrites exposes it to the management/ops channel (DrainOps
+// parity); QuiesceWrites remains the internal name used by the shutdown path.
 func (v *V2Store) QuiesceWrites(ctx context.Context) (func(), error) {
 	acquired := make(chan struct{})
 	// release is idempotent so the success path and the timeout self-heal can

@@ -959,7 +959,11 @@ func writeJSONError(w http.ResponseWriter, code int, msg string) {
 }
 
 // handleHTTPDrain stops accepting new writes and waits for in-flight
-// writes to complete. Use before rolling restarts.
+// writes to complete, then resumes writes. A point-in-time quiesce: it
+// confirms the moment in-flight writes have drained (for a rolling restart,
+// the operator restarts the process right after; the barrier must NOT stay
+// held or the store would be permanently write-blocked). The returned
+// release is invoked once "drained" has been reported so writes resume.
 func (s *OpsServer) handleHTTPDrain(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -972,11 +976,18 @@ func (s *OpsServer) handleHTTPDrain(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotImplemented, "drain unsupported by this engine")
 		return
 	}
-	if _, err := drain.DrainWrites(ctx); err != nil {
+	release, err := drain.DrainWrites(ctx)
+	if err != nil {
 		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	// Report drained first, then hand the barrier back so a concurrent write
+	// never observes the response before writes are permitted again. If a
+	// rolling restart follows, the process exits before this matters.
 	writeJSON(w, map[string]interface{}{"status": "drained"})
+	if release != nil {
+		release()
+	}
 }
 
 // handleHTTPVerifyDisk verifies checksums of all chunks on a specific disk.

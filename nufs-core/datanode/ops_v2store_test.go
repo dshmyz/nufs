@@ -140,22 +140,18 @@ func mustV2Store(t *testing.T) *V2Store {
 	return v
 }
 
-// TestOpsServer_V2StoreDrain documents the option-A policy for V2.1: the
-// V2.1 engine's REAL internal shutdown drain (QuiesceWrites in runDataNodeV21)
-// is not advertised to the ops surface. V2Store does NOT structurally satisfy
-// DrainOps (its internal method is named QuiesceWrites, not DrainWrites), so
-// POST /api/v1/disks/drain answers 501 "drain unsupported by this engine" —
-// matching the management unix-socket /drain behavior. This is the deliberate
-// parity choice until the management channel advertises V2.1 drain. (The
-// proactive disk monitor is write-path only and independent of this.)
+// TestOpsServer_V2StoreDrain proves the V2.1 engine exposes the drain surface
+// (DrainOps parity): POST /api/v1/disks/drain acquires the QuiesceWrites
+// barrier and reports "drained" instead of the previous 501 degrade.
 func TestOpsServer_V2StoreDrain(t *testing.T) {
 	_, dispatch := newV2OpsServer(t)
+
 	rec := dispatch(http.MethodPost, "/api/v1/disks/drain")
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("/api/v1/disks/drain code=%d, want 501 (body: %s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/v1/disks/drain code=%d, want 200 (body: %s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "drain unsupported by this engine") {
-		t.Fatalf("/api/v1/disks/drain body=%q, want 'drain unsupported by this engine'", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "drained") {
+		t.Fatalf("/api/v1/disks/drain body=%q, want 'drained'", rec.Body.String())
 	}
 
 	// The unsupported method forms still 405.
