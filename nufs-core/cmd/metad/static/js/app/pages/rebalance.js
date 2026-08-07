@@ -5,12 +5,13 @@
   var U = window.NUFS.Util;
   var A = window.NUFS.API;
   var C = window.NUFS.Components;
+  var I = window.NUFS.I18n;
   var P = window.NUFS.Pages;
 
   P.rebalance = {
     components: { Empty: C.Empty },
     data: function () {
-      return { balance: null, loading: true, busy: false };
+      return { balance: null, loading: true, busy: false, t: I.t };
     },
     mounted: function () { this.load(); },
     methods: {
@@ -25,10 +26,10 @@
         var self = this;
         this.busy = true;
         A.triggerRebalance().then(function () {
-          C.toast.ok('Rebalance triggered — rebalance runs in the background');
+          C.toast.ok(this.t('rb.toast_triggered'));
           self.busy = false;
           self.load();
-        }).catch(function (e) { self.busy = false; C.toast.err(e.message); });
+        }.bind(this)).catch(function (e) { self.busy = false; C.toast.err(e.message); });
       },
       spreadClass: function () {
         var b = this.balance;
@@ -42,36 +43,36 @@
     template: `
       <div>
         <div class="page-head">
-          <h2 class="page-title">Rebalance</h2>
-          <div class="page-sub">Move replicas across peers to even out capacity waterlines</div>
+          <h2 class="page-title">{{ t('rb.title') }}</h2>
+          <div class="page-sub">{{ t('rb.sub') }}</div>
           <div class="actions-row">
-            <button class="btn" @click="load()">Refresh</button>
-            <button class="btn btn-primary" :disabled="busy" @click="trigger">{{ busy ? 'Triggering…' : 'Trigger rebalance' }}</button>
+            <button class="btn" @click="load()">{{ t('rb.refresh') }}</button>
+            <button class="btn btn-primary" :disabled="busy" @click="trigger">{{ busy ? t('rb.triggering') : t('rb.trigger') }}</button>
           </div>
         </div>
 
-        <div v-if="loading" class="loading">Loading balance posture…</div>
+        <div v-if="loading" class="loading">{{ t('rb.loading') }}</div>
 
         <template v-else-if="balance">
           <div class="card">
-            <div class="card-header"><h3>Spread</h3>
+            <div class="card-header"><h3>{{ t('rb.spread') }}</h3>
               <span class="badge" :class="'badge-' + spreadClass()">{{ (balance.imbalance * 100).toFixed(1) }}%</span>
             </div>
             <div class="card-body">
               <div class="kv-grid">
-                <div class="kv"><div class="k">Nodes</div><div class="v">{{ (balance.nodes || []).length }}</div></div>
-                <div class="kv"><div class="k">Cluster used</div><div class="v">{{ (balance.total_used_pct * 100).toFixed(1) }}%</div></div>
-                <div class="kv"><div class="k">Recommendation</div><div class="v">{{ balance.recommendation || '—' }}</div></div>
+                <div class="kv"><div class="k">{{ t('rb.k_nodes') }}</div><div class="v">{{ (balance.nodes || []).length }}</div></div>
+                <div class="kv"><div class="k">{{ t('rb.k_used') }}</div><div class="v">{{ (balance.total_used_pct * 100).toFixed(1) }}%</div></div>
+                <div class="kv"><div class="k">{{ t('rb.k_reco') }}</div><div class="v">{{ balance.recommendation || '—' }}</div></div>
               </div>
-              <p class="text-muted" style="font-size:.85rem;margin-top:12px">Triggers a background pass that relocates replicas from the fullest peers to the emptiest, respecting fault-domain spread.</p>
+              <p class="text-muted" style="font-size:.85rem;margin-top:12px">{{ t('rb.note') }}</p>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-header"><h3>Per-node waterline</h3></div>
+            <div class="card-header"><h3>{{ t('rb.waterlines') }}</h3></div>
             <div class="card-body p-0">
               <table class="table">
-                <thead><tr><th>Node</th><th>Capacity</th><th>Used</th><th>Used %</th></tr></thead>
+                <thead><tr><th>{{ t('rb.th_node') }}</th><th>{{ t('rb.th_capacity') }}</th><th>{{ t('rb.th_used') }}</th><th>{{ t('rb.th_usedpct') }}</th></tr></thead>
                 <tbody>
                   <tr v-for="n in (balance.nodes || [])" :key="n.id">
                     <td class="mono">{{ n.id }}</td>
@@ -79,7 +80,7 @@
                     <td>{{ U.humanBytes(n.used_gb * 1073741824) }}</td>
                     <td>{{ (n.used_pct * 100).toFixed(1) }}%</td>
                   </tr>
-                  <tr v-if="!(balance.nodes || []).length"><td colspan="4" class="empty">No balance data</td></tr>
+                  <tr v-if="!(balance.nodes || []).length"><td colspan="4" class="empty">{{ t('rb.no_data') }}</td></tr>
                 </tbody>
               </table>
             </div>
@@ -87,8 +88,8 @@
         </template>
 
         <div v-else class="empty-state">
-          <div class="ops-empty-title">No balance data</div>
-          <div>Register nodes to compute rebalance posture.</div>
+          <div class="ops-empty-title">{{ t('rb.no_data') }}</div>
+          <div>{{ t('rb.no_data_hint') }}</div>
         </div>
         <ToastRoot/>
       </div>

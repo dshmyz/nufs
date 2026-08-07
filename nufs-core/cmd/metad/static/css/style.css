@@ -240,6 +240,34 @@ body {
   border: 1px solid var(--border-light);
 }
 
+.lang-toggle {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--gray-bg);
+}
+
+.lang-btn {
+  border: none;
+  background: transparent;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 5px 10px;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.lang-btn + .lang-btn {
+  border-left: 1px solid var(--border-light);
+}
+
+.lang-btn.active {
+  background: #0b7285;
+  color: #fff;
+}
+
 /* ===== Notice ===== */
 .notice {
   padding: 10px 32px;

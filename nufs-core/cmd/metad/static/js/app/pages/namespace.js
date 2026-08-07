@@ -7,18 +7,13 @@
   var U = window.NUFS.Util;
   var A = window.NUFS.API;
   var C = window.NUFS.Components;
+  var I = window.NUFS.I18n;
   var P = window.NUFS.Pages;
 
   var ROOT = 1;
 
   // Numerical FileType (0=regular, 1=dir, 2=symlink, ...).
   function isDir(t) { return t === 1; }
-  function typeLabel(t) {
-    if (t === 0) return 'file';
-    if (t === 1) return 'directory';
-    if (t === 2) return 'symlink';
-    return 'special';
-  }
   function ico(t) {
     if (t === 1) return '▸';
     if (t === 2) return '→';
@@ -36,7 +31,8 @@
         // modal state — one active dialog at a time
         dlg: null,            // 'mkdir' | 'file' | 'symlink' | 'rename' | 'delete'
         dlgName: '', dlgTarget: '', dlgOld: null, // pending (name / target / row)
-        busy: false
+        busy: false,
+        t: I.t
       };
     },
     mounted: function () { this.open(ROOT); },
@@ -47,7 +43,8 @@
       showSymlink: function () { return this.dlg === 'symlink'; },
       showRename: function () { return this.dlg === 'rename'; },
       showDelete: function () { return this.dlg === 'delete'; },
-      deleteKind: function () { return this.dlgOld && isDir(this.dlgOld.type) ? 'directory' : 'file'; }
+      deleteKind: function () { return isDir(this.dlgOld && this.dlgOld.type) ? this.t('ns.kind_directory') : this.t('ns.kind_file'); },
+      deleteOp: function () { return isDir(this.dlgOld && this.dlgOld.type) ? this.t('ns.op_rmdir') : this.t('ns.op_unlink'); }
     },
     methods: {
       open: function (id) {
@@ -72,7 +69,12 @@
         this.open(this.trail[idx].id);
       },
       isDir: isDir,
-      typeLabel: typeLabel,
+      typeLabel: function (t) {
+        if (t === 0) return this.t('ns.type_file');
+        if (t === 1) return this.t('ns.type_directory');
+        if (t === 2) return this.t('ns.type_symlink');
+        return this.t('ns.type_special');
+      },
       ico: ico,
 
       // ---- dialog openers ----
@@ -93,38 +95,38 @@
       // ---- submit actions ----
       doMkdir: function () {
         var self = this; var name = (this.dlgName || '').trim();
-        if (!name) { C.toast.err('Enter a directory name'); return; }
+        if (!name) { C.toast.err(this.t('ns.toast_dirname')); return; }
         this.busy = true;
-        A.mkdir(this.cur, name).then(function () { C.toast.ok('Created directory ' + name); self.closeReload(); })
+        A.mkdir(this.cur, name).then(function () { C.toast.ok(self.t('ns.toast_created_dir', { name: name })); self.closeReload(); })
           .catch(function (e) { self.busy = false; C.toast.err(e.message); });
       },
       doFile: function () {
         var self = this; var name = (this.dlgName || '').trim();
-        if (!name) { C.toast.err('Enter a file name'); return; }
+        if (!name) { C.toast.err(this.t('ns.toast_filename')); return; }
         this.busy = true;
-        A.createFile(this.cur, name).then(function () { C.toast.ok('Created file ' + name); self.closeReload(); })
+        A.createFile(this.cur, name).then(function () { C.toast.ok(self.t('ns.toast_created_file', { name: name })); self.closeReload(); })
           .catch(function (e) { self.busy = false; C.toast.err(e.message); });
       },
       doSymlink: function () {
         var self = this; var name = (this.dlgName || '').trim(); var target = (this.dlgTarget || '').trim();
-        if (!name) { C.toast.err('Enter a link name'); return; }
-        if (!target) { C.toast.err('Enter a link target'); return; }
+        if (!name) { C.toast.err(this.t('ns.toast_linkname')); return; }
+        if (!target) { C.toast.err(this.t('ns.toast_target')); return; }
         this.busy = true;
-        A.symlink(this.cur, name, target).then(function () { C.toast.ok('Created symlink ' + name); self.closeReload(); })
+        A.symlink(this.cur, name, target).then(function () { C.toast.ok(self.t('ns.toast_created_link', { name: name })); self.closeReload(); })
           .catch(function (e) { self.busy = false; C.toast.err(e.message); });
       },
       doRename: function () {
         var self = this; var name = (this.dlgName || '').trim();
-        if (!name) { C.toast.err('Enter a new name'); return; }
+        if (!name) { C.toast.err(this.t('ns.toast_newname')); return; }
         var old = this.dlgOld; this.busy = true;
         A.renameEntry(this.cur, old.name, this.cur, name).then(function () {
-          C.toast.ok('Renamed ' + old.name + ' → ' + name); self.closeReload();
+          C.toast.ok(self.t('ns.toast_renamed', { old: old.name, name: name })); self.closeReload();
         }).catch(function (e) { self.busy = false; C.toast.err(e.message); });
       },
       doDelete: function () {
         var self = this; var row = this.dlgOld; if (!row) return; this.busy = true;
         var op = isDir(row.type) ? A.rmdir(this.cur, row.name) : A.unlink(this.cur, row.name);
-        op.then(function () { C.toast.ok('Removed ' + row.name); self.closeReload(); })
+        op.then(function () { C.toast.ok(self.t('ns.toast_removed', { name: row.name })); self.closeReload(); })
           .catch(function (e) { self.busy = false; C.toast.err(e.message); });
       },
       closeReload: function () { this.dlg = null; this.busy = false; this.reload(); }
@@ -132,12 +134,12 @@
     template: `
       <div>
         <div class="page-head">
-          <h2 class="page-title">Namespace</h2>
-          <div class="page-sub">Browse and manage the metadata namespace (mkdir, create, symlink, rename, delete)</div>
+          <h2 class="page-title">{{ t('ns.title') }}</h2>
+          <div class="page-sub">{{ t('ns.sub') }}</div>
           <div class="actions-row">
-            <button class="btn" @click="askMkdir" :disabled="notFound">New folder</button>
-            <button class="btn" @click="askFile" :disabled="notFound">New file</button>
-            <button class="btn" @click="askSymlink" :disabled="notFound">New symlink</button>
+            <button class="btn" @click="askMkdir" :disabled="notFound">{{ t('ns.new_folder') }}</button>
+            <button class="btn" @click="askFile" :disabled="notFound">{{ t('ns.new_file') }}</button>
+            <button class="btn" @click="askSymlink" :disabled="notFound">{{ t('ns.new_symlink') }}</button>
           </div>
         </div>
 
@@ -149,79 +151,78 @@
           </template>
         </div>
 
-        <div v-if="loading" class="loading">Reading inode {{ cur }}…</div>
+        <div v-if="loading" class="loading">{{ t('ns.loading', { cur: cur }) }}</div>
 
         <div v-else-if="notFound" class="ops-empty">
-          <div class="ops-empty-title">Inode {{ cur }} not found</div>
-          <div>This directory may have been removed. <a href="javascript:void(0)" @click="upTo(0)">Back to root</a></div>
+          <div class="ops-empty-title">{{ t('ns.notfound', { cur: cur }) }}</div>
+          <div v-html="t('ns.notfound_hint')"></div>
         </div>
 
-        <div v-else-if="!entries.length" class="card"><div class="card-body"><p class="empty">Empty directory. Use the buttons above to add entries.</p></div></div>
+        <div v-else-if="!entries.length" class="card"><div class="card-body"><p class="empty">{{ t('ns.empty') }}</p></div></div>
 
         <div v-else class="file-list">
           <template v-for="e in entries" :key="e.inode">
             <div v-if="isDir(e.type)" class="file-row dir">
               <span class="ico">{{ ico(e.type) }}</span>
               <span class="name" @click="enter(e)">{{ e.name }}/</span>
-              <span class="meta">directory &middot; inode {{ e.inode }}</span>
+              <span class="meta">{{ t('ns.meta', { type: t('ns.type_directory'), inode: e.inode }) }}</span>
               <span class="row-actions">
-                <button class="btn btn-sm" @click="askRename(e)">Rename</button>
-                <button class="btn btn-sm btn-danger" @click="askDelete(e)">Delete</button>
+                <button class="btn btn-sm" @click="askRename(e)">{{ t('common.rename') }}</button>
+                <button class="btn btn-sm btn-danger" @click="askDelete(e)">{{ t('common.delete') }}</button>
               </span>
             </div>
             <div v-else :class="['file-row', 'dir-' + typeLabel(e.type)]">
               <span class="ico">{{ ico(e.type) }}</span>
               <span class="name">{{ e.name }}</span>
-              <span class="meta">{{ typeLabel(e.type) }} &middot; inode {{ e.inode }}</span>
+              <span class="meta">{{ t('ns.meta', { type: typeLabel(e.type), inode: e.inode }) }}</span>
               <span class="row-actions">
-                <button class="btn btn-sm" @click="askRename(e)">Rename</button>
-                <button class="btn btn-sm btn-danger" @click="askDelete(e)">Delete</button>
+                <button class="btn btn-sm" @click="askRename(e)">{{ t('common.rename') }}</button>
+                <button class="btn btn-sm btn-danger" @click="askDelete(e)">{{ t('common.delete') }}</button>
               </span>
             </div>
           </template>
         </div>
 
-        <Modal :show="showMkdir" title="New folder" @close="cancel">
-          <input class="input" v-model="dlgName" placeholder="folder name" @keyup.enter="doMkdir"/>
+        <Modal :show="showMkdir" :title="t('ns.modal_folder')" @close="cancel">
+          <input class="input" v-model="dlgName" :placeholder="t('ns.ph_folder')" @keyup.enter="doMkdir"/>
           <template #footer>
-            <button class="btn" @click="cancel" :disabled="busy">Cancel</button>
-            <button class="btn btn-primary" @click="doMkdir" :disabled="busy">{{ busy ? 'Creating…' : 'Create' }}</button>
+            <button class="btn" @click="cancel" :disabled="busy">{{ t('common.cancel') }}</button>
+            <button class="btn btn-primary" @click="doMkdir" :disabled="busy">{{ busy ? t('ov.creating') : t('common.create') }}</button>
           </template>
         </Modal>
 
-        <Modal :show="showFile" title="New file" @close="cancel">
-          <input class="input" v-model="dlgName" placeholder="file name" @keyup.enter="doFile"/>
+        <Modal :show="showFile" :title="t('ns.modal_file')" @close="cancel">
+          <input class="input" v-model="dlgName" :placeholder="t('ns.ph_file')" @keyup.enter="doFile"/>
           <template #footer>
-            <button class="btn" @click="cancel" :disabled="busy">Cancel</button>
-            <button class="btn btn-primary" @click="doFile" :disabled="busy">{{ busy ? 'Creating…' : 'Create' }}</button>
+            <button class="btn" @click="cancel" :disabled="busy">{{ t('common.cancel') }}</button>
+            <button class="btn btn-primary" @click="doFile" :disabled="busy">{{ busy ? t('ov.creating') : t('common.create') }}</button>
           </template>
         </Modal>
 
-        <Modal :show="showSymlink" title="New symlink" @close="cancel">
-          <p style="font-size:.85rem">A symlink is a named pointer to a target path; it does not create new data.</p>
-          <input class="input" v-model="dlgName" placeholder="link name" @keyup.enter="doSymlink"/>
-          <input class="input" v-model="dlgTarget" placeholder="target path (e.g. /dir/file)" @keyup.enter="doSymlink" style="margin-top:8px"/>
+        <Modal :show="showSymlink" :title="t('ns.modal_symlink')" @close="cancel">
+          <p style="font-size:.85rem">{{ t('ns.symlink_desc') }}</p>
+          <input class="input" v-model="dlgName" :placeholder="t('ns.ph_link')" @keyup.enter="doSymlink"/>
+          <input class="input" v-model="dlgTarget" :placeholder="t('ns.ph_target')" @keyup.enter="doSymlink" style="margin-top:8px"/>
           <template #footer>
-            <button class="btn" @click="cancel" :disabled="busy">Cancel</button>
-            <button class="btn btn-primary" @click="doSymlink" :disabled="busy">{{ busy ? 'Creating…' : 'Create link' }}</button>
+            <button class="btn" @click="cancel" :disabled="busy">{{ t('common.cancel') }}</button>
+            <button class="btn btn-primary" @click="doSymlink" :disabled="busy">{{ busy ? t('ov.creating') : t('ns.create_link') }}</button>
           </template>
         </Modal>
 
-        <Modal :show="showRename" title="Rename" @close="cancel">
-          <p style="font-size:.85rem">Rename <strong>{{ dlgOld ? dlgOld.name : '' }}</strong> in this directory.</p>
-          <input class="input" v-model="dlgName" placeholder="new name" @keyup.enter="doRename"/>
+        <Modal :show="showRename" :title="t('ns.modal_rename')" @close="cancel">
+          <p style="font-size:.85rem" v-html="t('ns.rename_desc', { name: dlgOld ? dlgOld.name : '' })"></p>
+          <input class="input" v-model="dlgName" :placeholder="t('ns.ph_new')" @keyup.enter="doRename"/>
           <template #footer>
-            <button class="btn" @click="cancel" :disabled="busy">Cancel</button>
-            <button class="btn btn-primary" @click="doRename" :disabled="busy">{{ busy ? 'Renaming…' : 'Rename' }}</button>
+            <button class="btn" @click="cancel" :disabled="busy">{{ t('common.cancel') }}</button>
+            <button class="btn btn-primary" @click="doRename" :disabled="busy">{{ busy ? t('ns.renaming') : t('common.rename') }}</button>
           </template>
         </Modal>
 
-        <Modal :show="showDelete" title="Delete {{ deleteKind }}" @close="cancel">
-          <p style="font-size:.9rem">Permanently {{ isDir((dlgOld||{}).type) ? 'rmdir' : 'unlink' }} <strong>{{ dlgOld ? dlgOld.name : '' }}</strong> from inode {{ cur }}?<br>
-          <span style="color:var(--danger);font-size:.8rem">This cannot be undone.</span></p>
+        <Modal :show="showDelete" :title="t('ns.modal_delete', { kind: deleteKind })" @close="cancel">
+          <p style="font-size:.9rem" v-html="t('ns.delete_desc', { op: deleteOp, name: dlgOld ? dlgOld.name : '', cur: cur })"></p>
           <template #footer>
-            <button class="btn" @click="cancel" :disabled="busy">Cancel</button>
-            <button class="btn btn-danger" @click="doDelete" :disabled="busy">{{ busy ? 'Removing…' : 'Delete' }}</button>
+            <button class="btn" @click="cancel" :disabled="busy">{{ t('common.cancel') }}</button>
+            <button class="btn btn-danger" @click="doDelete" :disabled="busy">{{ busy ? t('ns.removing') : t('common.delete') }}</button>
           </template>
         </Modal>
         <ToastRoot/>

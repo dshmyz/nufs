@@ -5,6 +5,7 @@
   var U = window.NUFS.Util;
   var A = window.NUFS.API;
   var C = window.NUFS.Components;
+  var I = window.NUFS.I18n;
   var P = window.NUFS.Pages;
 
   P.nodes = {
@@ -13,7 +14,8 @@
       return {
         nodes: [], loading: true,
         confirm: null, // node being decommissioned, or null
-        busy: false
+        busy: false,
+        t: I.t
       };
     },
     mounted: function () { this.load(); },
@@ -33,7 +35,7 @@
         if (!n) return;
         this.busy = true;
         A.decommissionNode(n.id).then(function () {
-          C.toast.ok('Node ' + n.id + ' is draining');
+          C.toast.ok(self.t('nd.toast_draining', { id: n.id }));
           self.confirm = null; self.busy = false;
           self.load();
         }).catch(function (e) { self.busy = false; C.toast.err(e.message); });
@@ -44,20 +46,20 @@
     template: `
       <div>
         <div class="page-head">
-          <h2 class="page-title">Nodes</h2>
-          <div class="page-sub">{{ nodes.length }} registered peer{{ nodes.length !== 1 ? 's' : '' }}</div>
+          <h2 class="page-title">{{ t('nd.title') }}</h2>
+          <div class="page-sub">{{ t('nd.sub', { n: nodes.length }) }}</div>
         </div>
 
-        <div v-if="loading" class="loading">Loading nodes…</div>
+        <div v-if="loading" class="loading">{{ t('nd.loading') }}</div>
 
         <div v-else class="card">
           <div class="card-body p-0">
             <table class="table">
               <thead><tr>
-                <th data-sort="int">ID</th><th data-sort="string">Address</th><th data-sort="string">State</th>
-                <th data-sort="string">Rack</th><th data-sort="string">Zone</th>
-                <th data-sort="int">Capacity</th><th data-sort="int">Used</th><th data-sort="int">On disk</th>
-                <th data-sort="int">Chunks</th><th data-sort="string">Last seen</th><th></th>
+                <th data-sort="int">ID</th><th data-sort="string">{{ t('nd.th_address') }}</th><th data-sort="string">{{ t('nd.th_state') }}</th>
+                <th data-sort="string">{{ t('nd.th_rack') }}</th><th data-sort="string">{{ t('nd.th_zone') }}</th>
+                <th data-sort="int">{{ t('nd.th_capacity') }}</th><th data-sort="int">{{ t('nd.th_used') }}</th><th data-sort="int">{{ t('nd.th_ondisk') }}</th>
+                <th data-sort="int">{{ t('nd.th_chunks') }}</th><th data-sort="string">{{ t('nd.th_lastseen') }}</th><th></th>
               </tr></thead>
               <tbody>
                 <tr v-for="n in nodes" :key="n.id">
@@ -72,22 +74,21 @@
                   <td>{{ n.chunk_count }}</td>
                   <td class="text-muted">{{ U.relTime(n.last_seen, true) }}</td>
                   <td>
-                    <button v-if="n.state !== 1 && n.state !== 2 && n.state !== 4" class="btn btn-sm btn-danger" @click="askDecommission(n)">Decommission</button>
-                    <span v-else class="text-muted" style="font-size:.75rem">draining</span>
+                    <button v-if="n.state !== 1 && n.state !== 2 && n.state !== 4" class="btn btn-sm btn-danger" @click="askDecommission(n)">{{ t('nd.decommission') }}</button>
+                    <span v-else class="text-muted" style="font-size:.75rem">{{ t('nd.draining_lbl') }}</span>
                   </td>
                 </tr>
-                <tr v-if="!nodes.length"><td colspan="11" class="empty">No nodes registered</td></tr>
+                <tr v-if="!nodes.length"><td colspan="11" class="empty">{{ t('nd.no_nodes') }}</td></tr>
               </tbody>
             </table>
           </div>
         </div>
 
-        <Modal :show="!!confirm" title="Decommission node" @close="cancelConfirm">
-          <p style="font-size:.9rem">Drain and decommission <strong>node {{ confirm ? confirm.id : '' }}</strong> ({{ confirm ? confirm.addr : '' }})?<br>
-          <span class="text-muted">Its replicas will migrate to surviving peers before it goes offline.</span></p>
+        <Modal :show="!!confirm" :title="t('nd.modal_title')" @close="cancelConfirm">
+          <p style="font-size:.9rem" v-html="t('nd.modal_body', { id: confirm ? confirm.id : '', addr: confirm ? confirm.addr : '' })"></p>
           <template #footer>
-            <button class="btn" @click="cancelConfirm" :disabled="busy">Cancel</button>
-            <button class="btn btn-danger" @click="confirmDecommission" :disabled="busy">{{ busy ? 'Draining…' : 'Decommission' }}</button>
+            <button class="btn" @click="cancelConfirm" :disabled="busy">{{ t('common.cancel') }}</button>
+            <button class="btn btn-danger" @click="confirmDecommission" :disabled="busy">{{ busy ? t('nd.draining_btn') : t('nd.decommission') }}</button>
           </template>
         </Modal>
         <ToastRoot/>

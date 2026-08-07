@@ -6,6 +6,7 @@
   var U = window.NUFS.Util;
   var A = window.NUFS.API;
   var C = window.NUFS.Components;
+  var I = window.NUFS.I18n;
   var P = window.NUFS.Pages;
 
   function asArray(l) { return (l || []).slice().sort(function (a, b) { return (b.created_at || '').localeCompare(a.created_at || ''); }); }
@@ -16,7 +17,7 @@
       return {
         list: null, status: null, loading: true, unavailable: false,
         busyCreate: false, busyId: null, pruneBusy: false, pruneResult: null,
-        pollTimer: null
+        pollTimer: null, t: I.t
       };
     },
     computed: {
@@ -25,6 +26,10 @@
         if (this.list && this.list.catalog && this.list.catalog.backups) return asArray(this.list.catalog.backups);
         if (this.status && this.status.catalog && this.status.catalog.backups) return asArray(this.status.catalog.backups);
         return [];
+      },
+      subText: function () {
+        if (!this.status) return '';
+        return this.status.Active ? this.t('bk.sub_active', { ret: this.status.Retention }) : this.t('bk.sub_idle', { ret: this.status.Retention });
       }
     },
     mounted: function () {
@@ -50,18 +55,18 @@
         var self = this;
         this.busyCreate = true;
         A.createBackup().then(function () {
-          C.toast.ok('Backup started');
+          C.toast.ok(this.t('bk.toast_started'));
           self.busyCreate = false;
           self.load();
-        }).catch(function (e) { self.busyCreate = false; C.toast.err(e.message); });
+        }.bind(this)).catch(function (e) { self.busyCreate = false; C.toast.err(e.message); });
       },
       verify: function (id) {
         var self = this;
         this.busyId = id;
         A.verifyBackup(id).then(function (r) {
-          C.toast.ok('Backup ' + id + (r && r.verified ? ' verified OK' : ' verified'));
+          C.toast.ok(this.t(r && r.verified ? 'bk.toast_verified' : 'bk.toast_verified2', { id: id }));
           self.busyId = null;
-        }).catch(function (e) { self.busyId = null; C.toast.err(e.message); });
+        }.bind(this)).catch(function (e) { self.busyId = null; C.toast.err(e.message); });
       },
       previewPrune: function () {
         var self = this;
@@ -77,47 +82,48 @@
         if (s === 'failed' || s === 'error') return 'badge-danger';
         if (s === 'creating' || s === 'uploading' || s === 'verifying') return 'badge-warning';
         return 'badge-secondary';
-      }
+      },
+      stateLabel: function (s) { return U.stateLabel(s); }
     },
     template: `
       <div>
         <div class="page-head">
-          <h2 class="page-title">Backups</h2>
-          <div class="page-sub" v-if="status">Retention {{ status.Retention }} &middot; {{ status.Active ? 'backup in progress' : 'idle' }}</div>
+          <h2 class="page-title">{{ t('bk.title') }}</h2>
+          <div class="page-sub" v-if="status">{{ subText }}</div>
           <div class="actions-row">
-            <button class="btn" @click="load()">Refresh</button>
-            <button class="btn btn-primary" :disabled="busyCreate || (status && status.Active)" @click="createBackup">{{ busyCreate ? 'Starting…' : 'Run backup' }}</button>
+            <button class="btn" @click="load()">{{ t('bk.refresh') }}</button>
+            <button class="btn btn-primary" :disabled="busyCreate || (status && status.Active)" @click="createBackup">{{ busyCreate ? t('bk.starting') : t('bk.run') }}</button>
           </div>
         </div>
 
-        <div v-if="loading" class="loading">Loading backup status…</div>
+        <div v-if="loading" class="loading">{{ t('bk.loading') }}</div>
 
         <div v-else-if="unavailable" class="empty-state">
-          <div class="ops-empty-title">Backup coordinator not configured</div>
-          <div class="empty-desc">Backups are disabled on this cluster. Configure the backup coordinator to enable catalog + backups.</div>
+          <div class="ops-empty-title">{{ t('bk.unconfigured') }}</div>
+          <div class="empty-desc">{{ t('bk.unconfigured_hint') }}</div>
         </div>
 
         <template v-else>
           <div v-if="status" class="card">
-            <div class="card-header"><h3>Coordinator status</h3></div>
+            <div class="card-header"><h3>{{ t('bk.coordinator') }}</h3></div>
             <div class="card-body">
               <div class="kv-grid">
-                <div class="kv"><div class="k">Last backup</div><div class="v mono">{{ status.LastBackupID || '—' }}</div></div>
-                <div class="kv"><div class="k">Scheduled</div><div class="v">{{ rel(status.NextRunAt) }}</div></div>
-                <div class="kv"><div class="k">Last started</div><div class="v">{{ fmt(status.LastStartedAt) }}</div></div>
-                <div class="kv"><div class="k">Last error</div><div class="v" style="color:var(--red)">{{ status.LastError || '—' }}</div></div>
+                <div class="kv"><div class="k">{{ t('bk.k_last') }}</div><div class="v mono">{{ status.LastBackupID || '—' }}</div></div>
+                <div class="kv"><div class="k">{{ t('bk.k_scheduled') }}</div><div class="v">{{ rel(status.NextRunAt) }}</div></div>
+                <div class="kv"><div class="k">{{ t('bk.k_started') }}</div><div class="v">{{ fmt(status.LastStartedAt) }}</div></div>
+                <div class="kv"><div class="k">{{ t('bk.k_error') }}</div><div class="v" style="color:var(--red)">{{ status.LastError || '—' }}</div></div>
               </div>
             </div>
           </div>
 
           <div v-if="pruneResult" class="card">
-            <div class="card-header"><h3>Prune preview (dry run)</h3>
-              <span class="badge badge-info">{{ pruneResult.committed_backups }} committed, retention {{ pruneResult.retention }}</span>
+            <div class="card-header"><h3>{{ t('bk.prune_preview') }}</h3>
+              <span class="badge badge-info">{{ t('bk.prune_badge', { committed: pruneResult.committed_backups, ret: pruneResult.retention }) }}</span>
             </div>
             <div class="card-body">
-              <p v-if="!(pruneResult.deletion_candidates || []).length" class="empty">Nothing to prune — within retention.</p>
+              <p v-if="!(pruneResult.deletion_candidates || []).length" class="empty">{{ t('bk.prune_none') }}</p>
               <table v-else class="table">
-                <thead><tr><th>ID</th><th>Created</th><th>Bytes</th></tr></thead>
+                <thead><tr><th>{{ t('bk.th_pid') }}</th><th>{{ t('bk.th_created') }}</th><th>{{ t('bk.th_bytes') }}</th></tr></thead>
                 <tbody>
                   <tr v-for="b in pruneResult.deletion_candidates" :key="b.id">
                     <td class="mono">{{ b.id }}</td>
@@ -130,12 +136,12 @@
           </div>
 
           <div class="card">
-            <div class="card-header"><h3>Committed catalog ({{ catalogBackups.length }})</h3>
-              <button class="btn btn-sm" :disabled="pruneBusy" @click="previewPrune">{{ pruneBusy ? '…' : 'Preview prune' }}</button>
+            <div class="card-header"><h3>{{ t('bk.catalog', { n: catalogBackups.length }) }}</h3>
+              <button class="btn btn-sm" :disabled="pruneBusy" @click="previewPrune">{{ pruneBusy ? '…' : t('bk.preview_prune') }}</button>
             </div>
             <div class="card-body p-0">
               <table class="table">
-                <thead><tr><th>ID</th><th>Created</th><th>Bytes</th><th>Term</th><th></th></tr></thead>
+                <thead><tr><th>{{ t('bk.th_pid') }}</th><th>{{ t('bk.th_created') }}</th><th>{{ t('bk.th_bytes') }}</th><th>{{ t('bk.th_term') }}</th><th></th></tr></thead>
                 <tbody>
                   <tr v-for="b in catalogBackups" :key="b.id">
                     <td class="mono">{{ b.id }}</td>
@@ -143,29 +149,29 @@
                     <td>{{ U.humanBytes(b.total_bytes) }}</td>
                     <td>{{ b.raft_term }}</td>
                     <td style="text-align:right">
-                      <button class="btn btn-sm" :disabled="busyId === b.id" @click="verify(b.id)">{{ busyId === b.id ? 'Verifying…' : 'Verify' }}</button>
+                      <button class="btn btn-sm" :disabled="busyId === b.id" @click="verify(b.id)">{{ busyId === b.id ? t('bk.verifying') : t('bk.verify') }}</button>
                     </td>
                   </tr>
-                  <tr v-if="!catalogBackups.length"><td colspan="5" class="empty">No committed backups yet</td></tr>
+                  <tr v-if="!catalogBackups.length"><td colspan="5" class="empty">{{ t('bk.no_catalog') }}</td></tr>
                 </tbody>
               </table>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-header"><h3>Runs ({{ tasks.length }})</h3></div>
+            <div class="card-header"><h3>{{ t('bk.runs', { n: tasks.length }) }}</h3></div>
             <div class="card-body p-0">
               <table class="table">
-                <thead><tr><th>ID</th><th>State</th><th>Started</th><th>Bytes</th><th>Files</th></tr></thead>
+                <thead><tr><th>{{ t('bk.th_pid') }}</th><th>{{ t('bk.th_state') }}</th><th>{{ t('bk.th_started') }}</th><th>{{ t('bk.th_bytes') }}</th><th>{{ t('bk.th_files') }}</th></tr></thead>
                 <tbody>
                   <tr v-for="t in tasks" :key="t.id">
                     <td class="mono">{{ t.id }}</td>
-                    <td><span class="badge" :class="stateBadge(t.state)">{{ t.state }}</span></td>
+                    <td><span class="badge" :class="stateBadge(t.state)">{{ stateLabel(t.state) }}</span></td>
                     <td>{{ fmt(t.started_at) }}</td>
                     <td>{{ U.humanBytes(t.bytes_uploaded) }}</td>
                     <td>{{ t.files_uploaded || 0 }}</td>
                   </tr>
-                  <tr v-if="!tasks.length"><td colspan="5" class="empty">No backup runs yet</td></tr>
+                  <tr v-if="!tasks.length"><td colspan="5" class="empty">{{ t('bk.no_runs') }}</td></tr>
                 </tbody>
               </table>
             </div>

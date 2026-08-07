@@ -6,6 +6,7 @@
   'use strict';
   var Vue = window.Vue;
   var U = window.NUFS.Util;
+  var I = window.NUFS.I18n;
   var C = window.NUFS.Components = {};
 
   // ---- Toast system (lightweight global store + component) ----
@@ -39,7 +40,8 @@
 
   // ---- Loading placeholder ----
   C.Loading = {
-    template: '<div class="loading">Loading…</div>'
+    data: function () { return { t: I.t }; },
+    template: '<div class="loading">{{ t("common.loading") }}</div>'
   };
 
   // ---- Empty / placeholder ----
@@ -98,7 +100,7 @@
         var data = (this.series || []).slice();
         if (data.length < 2) {
           ctx.fillStyle = '#94a3b8'; ctx.font = '13px Inter, sans-serif';
-          ctx.textAlign = 'center'; ctx.fillText('Waiting for data…', w / 2, h / 2 + 4);
+          ctx.textAlign = 'center'; ctx.fillText(I.t('chart.waiting'), w / 2, h / 2 + 4);
           return;
         }
 
@@ -166,13 +168,14 @@
   C.Modal = {
     props: { show: Boolean, title: String, width: { type: String, default: '440px' } },
     emits: ['close'],
+    data: function () { return { t: I.t }; },
     template:
       '<teleport to="body">' +
       '<transition name="modal">' +
       '<div v-if="show" class="modal-overlay" @click.self="$emit(\'close\')">' +
       '<div class="modal" :style="{ width: width }" role="dialog" aria-modal="true">' +
       '<div class="modal-header"><h3>{{ title }}</h3>' +
-      '<button class="modal-close" aria-label="Close" @click="$emit(\'close\')">&times;</button></div>' +
+      '<button class="modal-close" :aria-label="t(\'common.close\')" @click="$emit(\'close\')">&times;</button></div>' +
       '<div class="modal-body"><slot></slot></div>' +
       '<div class="modal-footer"><slot name="footer"></slot></div>' +
       '</div></div></transition></teleport>'
@@ -197,9 +200,9 @@
         return out;
       },
       verdict: function () {
-        if (this.total === 0) return { cls: 'down', label: 'No nodes', pct: 0 };
-        if (this.offline > 0) return { cls: 'degraded', label: 'Degraded', pct: Math.round(this.online / this.total * 100) };
-        return { cls: 'ok', label: 'Cluster healthy', pct: Math.round(this.online / this.total * 100) };
+        if (this.total === 0) return { cls: 'down', label: I.t('ring.no_nodes'), pct: 0 };
+        if (this.offline > 0) return { cls: 'degraded', label: I.t('ring.degraded'), pct: Math.round(this.online / this.total * 100) };
+        return { cls: 'ok', label: I.t('ring.healthy'), pct: Math.round(this.online / this.total * 100) };
       }
     },
     template:

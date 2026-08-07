@@ -329,11 +329,11 @@
       </div>
     </div>
     <nav class="nav" id="nav">
-      <a class="nav-item active" data-view="overview" href="#overview"><span class="nav-key">01</span>Overview</a>
-      <a class="nav-item" data-view="disks" href="#disks"><span class="nav-key">02</span>Disks</a>
-      <a class="nav-item" data-view="alerts" href="#alerts"><span class="nav-key">03</span>Alerts</a>
-      <a class="nav-item" data-view="repair" href="#repair"><span class="nav-key">04</span>Repair</a>
-      <a class="nav-item" data-view="engine" href="#engine"><span class="nav-key">05</span>Engine</a>
+      <a class="nav-item active" data-view="overview" href="#overview"><span class="nav-key">01</span><span data-i18n="nav.overview">Overview</span></a>
+      <a class="nav-item" data-view="disks" href="#disks"><span class="nav-key">02</span><span data-i18n="nav.disks">Disks</span></a>
+      <a class="nav-item" data-view="alerts" href="#alerts"><span class="nav-key">03</span><span data-i18n="nav.alerts">Alerts</span></a>
+      <a class="nav-item" data-view="repair" href="#repair"><span class="nav-key">04</span><span data-i18n="nav.repair">Repair</span></a>
+      <a class="nav-item" data-view="engine" href="#engine"><span class="nav-key">05</span><span data-i18n="nav.engine">Engine</span></a>
     </nav>
     <div class="foot">
       <div id="footNode">node —</div>
@@ -348,6 +348,7 @@
       <div class="spacer"></div>
       <span class="pill off" id="healthPill"><span class="led off"></span><span id="healthText">…</span></span>
       <span class="ver" id="verText"></span>
+      <button class="opbtn" id="langToggle" style="font-size:11px">中 / EN</button>
     </div>
 
     <!-- ============ OVERVIEW ============ -->
@@ -366,37 +367,37 @@
           </svg>
           <div class="ring-detail">
             <span id="ringCap" class="mono dim">—</span>
-            <span id="ringCapSub" class="mono faint">of node capacity</span>
+            <span id="ringCapSub" class="mono faint" data-i18n="ring.capsub">of node capacity</span>
           </div>
         </div>
 
         <div class="ratestrip" id="rateStrip">
           <div class="rs-cell">
-            <span class="rs-label"><span class="dot read"></span>Read <span class="live-tag"><span class="pl"></span>live</span></span>
+            <span class="rs-label"><span class="dot read"></span><span data-i18n="lbl.read">Read</span> <span class="live-tag"><span class="pl"></span><span data-i18n="lbl.live">live</span></span></span>
             <span class="rs-value read" id="rsRead">—</span>
-            <span class="rs-foot" id="rsReadChunk">0 chunks/s</span>
+            <span class="rs-foot" id="rsReadChunk" data-i18n="unit.chunks_p_s" data-i18n-p='{"n":0}'>0 chunks/s</span>
           </div>
           <div class="rs-cell">
-            <span class="rs-label"><span class="dot write"></span>Write <span class="live-tag"><span class="pl"></span>live</span></span>
+            <span class="rs-label"><span class="dot write"></span><span data-i18n="lbl.write">Write</span> <span class="live-tag"><span class="pl"></span><span data-i18n="lbl.live">live</span></span></span>
             <span class="rs-value write" id="rsWrite">—</span>
-            <span class="rs-foot" id="rsWriteChunk">0 chunks/s</span>
+            <span class="rs-foot" id="rsWriteChunk" data-i18n="unit.chunks_p_s" data-i18n-p='{"n":0}'>0 chunks/s</span>
           </div>
           <div class="rs-cell">
-            <span class="rs-label"><span class="dot"></span>Throughput</span>
+            <span class="rs-label"><span class="dot"></span><span data-i18n="lbl.throughput">Throughput</span></span>
             <span class="rs-value" id="rsThroughput">—</span>
             <span class="rs-foot" id="rsActive">0 active</span>
           </div>
           <div class="rs-spark">
-            <span class="spark-title">I/O activity · last 30s</span>
+            <span class="spark-title"><span data-i18n="lbl.spark">I/O activity · last 30s</span></span>
             <canvas id="spark" width="360" height="56"></canvas>
-            <span class="spark-legend"><span class="lg"><span class="sw" style="background:var(--brand)"></span>read</span><span class="lg"><span class="sw" style="background:var(--ok)"></span>write</span></span>
+            <span class="spark-legend"><span class="lg"><span class="sw" style="background:var(--brand)"></span><span data-i18n="lbl.read_s">read</span></span><span class="lg"><span class="sw" style="background:var(--ok)"></span><span data-i18n="lbl.write_s">write</span></span></span>
           </div>
         </div>
       </div>
 
       <!-- LAYER 2 — cluster topology (fault-domain roster) -->
       <div class="panel">
-        <div class="band-title"><span class="bt-key">FM</span><h3>Fault domain</h3>
+        <div class="band-title"><span class="bt-key">FM</span><h3 data-i18n="fm.title">Fault domain</h3>
           <span class="bt-sub" id="topoSub">loading members…</span></div>
         <div class="topo" id="topo">…</div>
       </div>
@@ -404,36 +405,36 @@
       <!-- LAYER 3 — system detail: capacity KPIs + drive bay + engine -->
       <div class="kpis">
         <div class="kpi">
-          <div class="k-label">Capacity used</div>
+          <div class="k-label" data-i18n="k.capacity_used">Capacity used</div>
           <div class="k-value accent" id="kUsed">—</div>
           <div class="k-sub" id="kUsedSub"></div>
         </div>
         <div class="kpi">
-          <div class="k-label">On disk</div>
+          <div class="k-label" data-i18n="k.on_disk">On disk</div>
           <div class="k-value ondisk" id="kOnDisk">—</div>
           <div class="k-sub" id="kOnDiskSub"></div>
         </div>
         <div class="kpi">
-          <div class="k-label">Capacity total</div>
+          <div class="k-label" data-i18n="k.capacity_total">Capacity total</div>
           <div class="k-value" id="kTotal">—</div>
-          <div class="k-sub">aggregate across disks</div>
+          <div class="k-sub" data-i18n="k.total_sub">aggregate across disks</div>
         </div>
         <div class="kpi">
-          <div class="k-label">Usage</div>
+          <div class="k-label" data-i18n="k.usage">Usage</div>
           <div class="k-value" id="kUsage">—</div>
           <div class="k-bar"><span id="kUsageBar"></span></div>
         </div>
         <div class="kpi">
-          <div class="k-label">Chunks</div>
+          <div class="k-label" data-i18n="k.chunks">Chunks</div>
           <div class="k-value" id="kChunks">—</div>
-          <div class="k-sub">stored on this node</div>
+          <div class="k-sub" data-i18n="k.chunks_sub">stored on this node</div>
         </div>
       </div>
 
-      <div class="baywrap" id="baywrap"><div class="bay-empty">No disks</div></div>
+      <div class="baywrap" id="baywrap"><div class="bay-empty" data-i18n="bay.none">No disks</div></div>
 
       <div class="panel">
-        <h3><span class="h-key">LIVE</span> Engine</h3>
+        <h3><span class="h-key">LIVE</span> <span data-i18n="engine.title">Engine</span></h3>
         <div class="sys-badges" id="sysBadges"></div>
         <div class="row" id="teleRow" style="margin-top:12px"></div>
       </div>
@@ -442,16 +443,16 @@
     <!-- ============ DISKS ============ -->
     <section class="view" id="view-disks" hidden>
       <div class="panel">
-        <h3><span class="h-key">02</span> Disks lifecycle</h3>
+        <h3><span class="h-key">02</span> <span data-i18n="d.title">Disks lifecycle</span></h3>
         <table>
-          <thead><tr><th>Bay</th><th>Dir</th><th>State</th><th>Chunks</th><th>Used</th><th></th></tr></thead>
-          <tbody id="diskRows"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+          <thead><tr><th data-i18n="d.th_bay">Bay</th><th data-i18n="d.th_dir">Dir</th><th data-i18n="d.th_state">State</th><th data-i18n="d.th_chunks">Chunks</th><th data-i18n="d.th_used">Used</th><th></th></tr></thead>
+          <tbody id="diskRows"><tr><td colspan="6" class="empty" data-i18n="e.loading">Loading…</td></tr></tbody>
         </table>
         <div class="disk-ops">
-          <input id="adoptDir" placeholder="/mnt/disk3   (path to mount as a new disk)" spellcheck="false"/>
-          <button class="opbtn" id="btnAdopt">Adopt</button>
+          <input id="adoptDir" data-i18n-ph="d.adopt_ph" placeholder="/mnt/disk3   (path to mount as a new disk)" spellcheck="false"/>
+          <button class="opbtn" id="btnAdopt"><span data-i18n="d.adopt">Adopt</span></button>
           <span class="spacer" style="flex:1"></span>
-          <button class="opbtn warnb" id="btnDrain">Drain writes (pre-restart)</button>
+          <button class="opbtn warnb" id="btnDrain"><span data-i18n="d.drain">Drain writes (pre-restart)</span></button>
         </div>
       </div>
     </section>
@@ -459,7 +460,7 @@
     <!-- ============ ALERTS ============ -->
     <section class="view" id="view-alerts" hidden>
       <div class="panel">
-        <h3><span class="h-key">03</span> Capacity alerts</h3>
+        <h3><span class="h-key">03</span> <span data-i18n="a.title">Capacity alerts</span></h3>
         <div id="alertList"></div>
       </div>
     </section>
@@ -467,7 +468,7 @@
     <!-- ============ REPAIR ============ -->
     <section class="view" id="view-repair" hidden>
       <div class="panel">
-        <h3><span class="h-key">04</span> Repair queue</h3>
+        <h3><span class="h-key">04</span> <span data-i18n="r.title">Repair queue</span></h3>
         <ul class="repair-list" id="repairList"></ul>
       </div>
     </section>
@@ -475,8 +476,8 @@
     <!-- ============ ENGINE ============ -->
     <section class="view" id="view-engine" hidden>
       <div class="panel">
-        <h3><span class="h-key">05</span> Metrics stream</h3>
-        <pre class="json" id="metricsInfo">Loading…</pre>
+        <h3><span class="h-key">05</span> <span data-i18n="e.title">Metrics stream</span></h3>
+        <pre class="json" id="metricsInfo" data-i18n="e.loading">Loading…</pre>
       </div>
     </section>
 
@@ -487,13 +488,162 @@
 
 <script>
 "use strict";
+
+/* ============================================================
+   i18n — self-contained zh/en (independent copy; default zh).
+   Shared localStorage key `nufs.locale` keeps metad console and
+   this panel in the same language.
+   ============================================================ */
+const __I18N = {
+  zh: {
+    'nav.overview': '总览', 'nav.disks': '磁盘', 'nav.alerts': '告警',
+    'nav.repair': '修复', 'nav.engine': '引擎',
+    'foot.node': '节点：{n}',
+    'top.node': 'node {n}', 'top.self': '本节点',
+    'top.chunks': '分块', 'top.shards': '分片', 'top.rack': '机架', 'top.zone': '可用区',
+    'lbl.read': '读', 'lbl.write': '写', 'lbl.throughput': '吞吐',
+    'lbl.live': '实时', 'lbl.spark': 'I/O 活动 · 最近 30s',
+    'lbl.read_s': '读', 'lbl.write_s': '写',
+    'ring.capsub': '占节点容量',
+    'ring.verdict_ok': '健康', 'ring.verdict_degraded': '降级', 'ring.verdict_offline': '离线',
+    'ring.pct_cap': '{pct}% 占节点容量',
+    'ring.node': 'node {id}',
+    'k.capacity_used': '已用容量', 'k.on_disk': '物理占用',
+    'k.capacity_total': '总容量', 'k.usage': '使用率', 'k.chunks': '分块',
+    'k.used_sub': '{pct} 占节点', 'k.ondisk_pct': '{pct}% 占逻辑容量', 'k.ondisk_phys': '物理 .seg',
+    'k.total_sub': '各磁盘合计', 'k.chunks_sub': '存储于本节点',
+    'fm.title': '故障域', 'fm.sub_loading': '加载成员…',
+    'fm.sub_multi': '{n} 个成员 · {m}/{n} 在线', 'fm.single': '单机 · 无对端',
+    'fm.none': '无成员', 'fm.empty': '尚未注册集群成员',
+    'fm.topo_unavail': '拓扑不可用',
+    'engine.title': '引擎',
+    'sys.replication': '复制', 'sys.anti_entropy': '反熵', 'sys.repair': '修复',
+    'sys.active': '活跃', 'sys.idle_single': '空闲 · 单节点', 'sys.idle': '空闲',
+    'sys.scanned': '{n} 已扫描', 'sys.errors': '{n} 个错误', 'sys.insync': '已同步',
+    'bay.node': 'bay {i}', 'bay.chunks': '{n} 个分块', 'bay.ondisk': '磁盘 {b}',
+    'bay.none': '无磁盘',
+    'd.title': '磁盘生命周期', 'd.th_bay': '槽位', 'd.th_dir': '目录', 'd.th_state': '状态',
+    'd.th_chunks': '分块', 'd.th_used': '已用', 'd.none': '无磁盘',
+    'd.adopt_ph': '/mnt/disk3   （将挂载为新磁盘的路径）', 'd.adopt': '采纳',
+    'd.drain': '排空写入（重启前）',
+    'a.title': '容量告警', 'a.empty': '无容量告警 —— 本节点远低于限制',
+    'r.title': '修复队列', 'r.chunk': 'chunk {id}', 'r.empty': '无进行中的修复 —— 节点健康',
+    'r.unavail': '修复队列不可用',
+    'e.title': '指标流', 'e.loading': '加载中…', 'e.unavail': '指标不可用',
+    'btn.verify': '校验', 'btn.migrate': '迁移', 'btn.decomm': '下线', 'btn.retire': '报废',
+    'op.verify_started': '已在 {dir} 上开始校验',
+    'op.migrate': '迁移 {dir}：{n} 个分块已移动',
+    'op.decomm': '已下线 {dir}：{n} 个分块已移动并移除',
+    'op.retire': '已报废 {dir}',
+    'op.adopt_needs_dir': '请输入要采纳的目录路径', 'op.adopted': '已采纳 {dir} 为 bay {i}',
+    'op.drained': '写入已排空 —— 可安全重启',
+    'op.failed': '磁盘操作失败',
+    'cf.decommission': '下线会将该磁盘的分块迁移至其他磁盘后移除。是否继续？',
+    'cf.retire': '报废将立即从节点移除该磁盘且不迁移分块（仅用于故障盘 —— 存在数据丢失风险）。是否继续？',
+    'st.online': '在线', 'st.draining': '排空中', 'st.maint': '维护', 'st.offline': '离线', 'st.failed': '故障',
+    'st.degraded': '降级', 'st.pending': '等待中', 'st.ready': '就绪', 'st.syncing': '同步中', 'st.stale': '过期',
+    'u.b': 'B', 'u.kb': 'KB', 'u.mb': 'MB', 'u.gb': 'GB', 'u.tb': 'TB',
+    'r.bps': 'B/s', 'r.kbps': 'KB/s', 'r.mbps': 'MB/s', 'r.gbps': 'GB/s',
+    'unit.chunks_p_s': '{n} 个分块/秒', 'unit.active': '{n} 个活跃',
+    'tele.life_read': '累计读取', 'tele.life_written': '累计写入',
+    'tele.read_amp': '读放大', 'tele.fsync': 'Fsync',
+    'tele.cumulative': '累计', 'tele.since_start': '自启动', 'tele.req_read': '请求/读取',
+    'ts.utc': '{ts} UTC',
+  },
+  en: {
+    'nav.overview': 'Overview', 'nav.disks': 'Disks', 'nav.alerts': 'Alerts',
+    'nav.repair': 'Repair', 'nav.engine': 'Engine',
+    'foot.node': 'node: {n}',
+    'top.node': 'node {n}', 'top.self': 'this node',
+    'top.chunks': 'chunks', 'top.shards': 'shards', 'top.rack': 'rack', 'top.zone': 'zone',
+    'lbl.read': 'Read', 'lbl.write': 'Write', 'lbl.throughput': 'Throughput',
+    'lbl.live': 'live', 'lbl.spark': 'I/O activity · last 30s',
+    'lbl.read_s': 'read', 'lbl.write_s': 'write',
+    'ring.capsub': 'of node capacity',
+    'ring.verdict_ok': 'HEALTH OK', 'ring.verdict_degraded': 'DEGRADED', 'ring.verdict_offline': 'OFFLINE',
+    'ring.pct_cap': '{pct}% of node capacity',
+    'ring.node': 'node {id}',
+    'k.capacity_used': 'Capacity used', 'k.on_disk': 'On disk',
+    'k.capacity_total': 'Capacity total', 'k.usage': 'Usage', 'k.chunks': 'Chunks',
+    'k.used_sub': '{pct} of node', 'k.ondisk_pct': '{pct}% of logical', 'k.ondisk_phys': 'physical .seg',
+    'k.total_sub': 'aggregate across disks', 'k.chunks_sub': 'stored on this node',
+    'fm.title': 'Fault domain', 'fm.sub_loading': 'loading members…',
+    'fm.sub_multi': '{n} member(s) · {m}/{n} online', 'fm.single': 'standalone · no peers',
+    'fm.none': 'no members', 'fm.empty': 'No cluster members registered.',
+    'fm.topo_unavail': 'Topology unavailable.',
+    'engine.title': 'Engine',
+    'sys.replication': 'Replication', 'sys.anti_entropy': 'Anti-entropy', 'sys.repair': 'Repair',
+    'sys.active': 'active', 'sys.idle_single': 'idle · single node', 'sys.idle': 'idle',
+    'sys.scanned': '{n} scanned', 'sys.errors': '{n} errors', 'sys.insync': 'in sync',
+    'bay.node': 'bay {i}', 'bay.chunks': '{n} chunks', 'bay.ondisk': 'on disk {b}',
+    'bay.none': 'No disks',
+    'd.title': 'Disks lifecycle', 'd.th_bay': 'Bay', 'd.th_dir': 'Dir', 'd.th_state': 'State',
+    'd.th_chunks': 'Chunks', 'd.th_used': 'Used', 'd.none': 'No disks',
+    'd.adopt_ph': '/mnt/disk3   (path to mount as a new disk)', 'd.adopt': 'Adopt',
+    'd.drain': 'Drain writes (pre-restart)',
+    'a.title': 'Capacity alerts', 'a.empty': 'No capacity alerts — this node is well within limits.',
+    'r.title': 'Repair queue', 'r.chunk': 'chunk {id}', 'r.empty': 'No repairs in flight — the node is healthy.',
+    'r.unavail': 'Repair queue unavailable.',
+    'e.title': 'Metrics stream', 'e.loading': 'Loading…', 'e.unavail': 'Metrics unavailable.',
+    'btn.verify': 'Verify', 'btn.migrate': 'Migrate', 'btn.decomm': 'Decomm', 'btn.retire': 'Retire',
+    'op.verify_started': 'Verify started on {dir}',
+    'op.migrate': 'Migrate {dir}: {n} chunks moved',
+    'op.decomm': 'Decommissioned {dir}: {n} chunks moved, removed',
+    'op.retire': 'Retired {dir}',
+    'op.adopt_needs_dir': 'Enter a directory path to adopt', 'op.adopted': 'Adopted {dir} as bay {i}',
+    'op.drained': 'Writes drained — safe to restart',
+    'op.failed': 'Disk action failed',
+    'cf.decommission': "Decommissioning drains this disk's chunks onto others, then removes it. Continue?",
+    'cf.retire': "Retiring removes this disk from the node immediately without migrating chunks (for failed disks only — data loss risk). Continue?",
+    'st.online': 'online', 'st.draining': 'draining', 'st.maint': 'maint', 'st.offline': 'offline', 'st.failed': 'failed',
+    'st.degraded': 'degraded', 'st.pending': 'pending', 'st.ready': 'ready', 'st.syncing': 'syncing', 'st.stale': 'stale',
+    'u.b': 'B', 'u.kb': 'KB', 'u.mb': 'MB', 'u.gb': 'GB', 'u.tb': 'TB',
+    'r.bps': 'B/s', 'r.kbps': 'KB/s', 'r.mbps': 'MB/s', 'r.gbps': 'GB/s',
+    'unit.chunks_p_s': '{n} chunks/s', 'unit.active': '{n} active',
+    'tele.life_read': 'Lifetime read', 'tele.life_written': 'Lifetime written',
+    'tele.read_amp': 'Read amplification', 'tele.fsync': 'Fsync',
+    'tele.cumulative': 'cumulative', 'tele.since_start': 'since start', 'tele.req_read': 'requested / read',
+    'ts.utc': '{ts} UTC',
+  }
+};
+function __loc(){ try{ const v = localStorage.getItem("nufs.locale"); return (v==="zh"||v==="en")?v:"zh"; }catch(e){ return "zh"; } }
+let __cur = __loc();
+const T = (k, p) => {
+  const dict = __I18N[__cur] || __I18N.zh;
+  let s = dict[k];
+  if(s == null) s = (__I18N.en[k] != null) ? __I18N.en[k] : k;
+  if(p){ for(const key in p){ s = String(s).split("{"+key+"}").join(String(p[key])); } }
+  return s;
+};
+/* localize a display state label, falling back to the raw value */
+const stateLabel = s => {
+  const raw = String(s==null?"":s).toLowerCase();
+  const k = "st."+raw;
+  if(__I18N.zh[k] != null) return T(k);
+  return String(s==null?"":s);
+};
+const setLocale = l => { __cur = l; try{ localStorage.setItem("nufs.locale", l); }catch(e){} document.documentElement.lang = l==="zh"?"zh-CN":"en"; applyStatic(); };
+/* swap static data-i18n labels */
+function applyStatic(){
+  document.querySelectorAll("[data-i18n]").forEach(el=>{
+    const k = el.getAttribute("data-i18n");
+    const p = el.getAttribute("data-i18n-p");
+    const html = el.getAttribute("data-i18n-html");
+    let v = T(k, p ? JSON.parse(p) : undefined);
+    if(html != null) el.innerHTML = v; else el.textContent = v;
+  });
+  document.querySelectorAll("[data-i18n-ph]").forEach(el=>{
+    el.placeholder = T(el.getAttribute("data-i18n-ph"));
+  });
+}
+
 const $ = id => document.getElementById(id);
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /* ---------- formatting ---------- */
 const fmtBytes = b => {
   if (b == null || isNaN(b)) return "—";
-  const u = ["B","KB","MB","GB","TB"];
+  const u = [T("u.b"),T("u.kb"),T("u.mb"),T("u.gb"),T("u.tb")];
   let i = 0, v = +b;
   while (v >= 1024 && i < u.length-1){ v/=1024; i++; }
   return v.toFixed(i?1:0)+" "+u[i];
@@ -505,13 +655,13 @@ const esc = s => String(s==null?"":s).replace(/[&<>"']/g,
 
 /* ---------- view routing (hash-based) ---------- */
 const views = ["overview","disks","alerts","repair","engine"];
-const titles = {overview:"Overview",disks:"Disks",alerts:"Alerts",repair:"Repair",engine:"Engine"};
+const titles = {overview:"nav.overview",disks:"nav.disks",alerts:"nav.alerts",repair:"nav.repair",engine:"nav.engine"};
 function showView(name){
   if(!views.includes(name)) name = "overview";
   views.forEach(v => $("view-"+v).hidden = (v!==name));
   document.querySelectorAll(".nav-item").forEach(a =>
     a.classList.toggle("active", a.dataset.view===name));
-  $("pageTitle").textContent = titles[name];
+  $("pageTitle").textContent = T(titles[name]);
 }
 window.addEventListener("hashchange", ()=>showView(location.hash.slice(1)||"overview"));
 showView(location.hash.slice(1)||"overview");
@@ -527,16 +677,16 @@ async function loadAlerts(){
     pill.querySelector(".led").className = "led "+(level==="critical"?"crit":level==="warn"?"warn":"ok");
     $("healthText").textContent = level;
     if(d.version && d.version.version) $("verText").textContent = "v"+d.version.version;
-    if(d.node_id != null) $("nodeCrumb").textContent = "node "+d.node_id;
-    $("footNode").textContent = "node "+(d.node_id!=null?d.node_id:"—");
+    if(d.node_id != null){ __nodeId = ""+d.node_id; $("nodeCrumb").textContent = T("top.node",{n:d.node_id}); }
+    $("footNode").textContent = T("foot.node",{n: d.node_id!=null?d.node_id:"—"});
 
     const o = d.overview || {};
     const used = o.used_bytes, total = o.total_bytes, p = o.usage_pct||0;
     const onDisk = o.on_disk_bytes||0;
     $("kUsed").textContent = fmtBytes(used);
-    $("kUsedSub").textContent = fmtPct(p)+" of node";
+    $("kUsedSub").textContent = T("k.used_sub",{pct:fmtPct(p)});
     $("kOnDisk").textContent = fmtBytes(onDisk);
-    $("kOnDiskSub").textContent = onDisk>0 ? (used>0?Math.round(onDisk/used*100)+"% of logical":"physical .seg") : "physical .seg";
+    $("kOnDiskSub").textContent = onDisk>0 ? (used>0?T("k.ondisk_pct",{pct:Math.round(onDisk/used*100)}):T("k.ondisk_phys")) : T("k.ondisk_phys");
     $("kTotal").textContent = fmtBytes(total);
     $("kUsage").textContent = fmtPct(p);
     const bar = $("kUsageBar");
@@ -552,10 +702,10 @@ async function loadAlerts(){
             <span class="amt">${fmtBytes(a.used_bytes)} / ${fmtBytes(a.total_bytes)} · ${fmtPct(a.usage_pct)}</span>
             <span class="when">${esc(safeTs(a.ts))}</span>
           </div>`).join("")
-      : `<div class="empty">No capacity alerts — this node is well within limits.</div>`;
+      : `<div class="empty">${T("a.empty")}</div>`;
   }catch(e){
-    $("kUsed").textContent = "offline";
-    $("healthText").textContent = "offline";
+    $("kUsed").textContent = T("st.offline");
+    $("healthText").textContent = T("st.offline");
   }
 }
 function safeTs(ts){
@@ -563,7 +713,7 @@ function safeTs(ts){
   const iso = String(ts).includes("T")?ts:String(ts).replace(" ","T")+"Z";
   const dt = new Date(iso);
   if(isNaN(dt)) return String(ts);
-  return dt.toISOString().replace("T"," ").slice(0,19)+" UTC";
+  return dt.toISOString().replace("T"," ").slice(0,19)+" "+T("ts.utc");
 }
 
 /* ---------- LAYER 1 · health verdict ring ---------- */
@@ -571,6 +721,7 @@ function safeTs(ts){
 const NODE_STATE = { online:"ok", draining:"warn", maint:"warn", offline:"crit", failed:"crit" };
 function nodeStateKey(n){ return NODE_STATE[(n||"online").toLowerCase()]||"warn"; }
 const CIRC = 2*Math.PI*56; // r=56
+let __nodeId = "";
 
 function setRing(okClass, verdict, pct, nodes, capBytes, capTotal){
   const fill = $("ringFill");
@@ -582,7 +733,7 @@ function setRing(okClass, verdict, pct, nodes, capBytes, capTotal){
   $("ringPct").textContent = (pct*100).toFixed(1)+"%";
   $("ringNodes").textContent = nodes;
   $("ringCap").textContent = fmtBytes(capBytes||0);
-  $("ringCapSub").textContent = (capTotal>0 ? (capBytes/capTotal*100).toFixed(2) : "0.00")+"% of node capacity";
+  $("ringCapSub").textContent = T("ring.pct_cap",{pct:(capTotal>0 ? (capBytes/capTotal*100).toFixed(2) : "0.00")});
 }
 
 async function loadHealth(){
@@ -595,9 +746,9 @@ async function loadHealth(){
     const pct = ds.usage_pct||0;
     const healthy = h.status==="healthy";
     const ok = healthy ? "ok":"crit";
-    setRing(ok, healthy?"HEALTH OK":"DEGRADED", pct, "node "+($("nodeCrumb").textContent.replace("node ","")||"—"),
-      ds.used_bytes, ds.total_bytes);
-  }catch(e){ setRing("crit","OFFLINE",0,"node —",0,0); }
+    setRing(ok, healthy?T("ring.verdict_ok"):T("ring.verdict_degraded"), pct,
+      T("top.node",{n:__nodeId||"—"}), ds.used_bytes, ds.total_bytes);
+  }catch(e){ setRing("crit",T("ring.verdict_offline"),0,T("top.node",{n:"—"}),0,0); }
 }
 
 /* ---------- LAYER 2 · cluster topology ---------- */
@@ -614,14 +765,14 @@ function topoCard(n, isSelf){
   const key = nodeStateKey(st);
   return `<div class="tnode${isSelf?" self":""}">
     <div class="tn-head">
-      <span class="tn-id">node <span class="nid">${esc(n.id)}</span>${isSelf?`<span class="tn-self">this node</span>`:""}</span>
-      <span class="tn-state ${key}"><span class="led ${key}"></span>${esc(st)}</span>
+      <span class="tn-id">${T("top.node",{n:""})}<span class="nid">${esc(n.id)}</span>${isSelf?`<span class="tn-self"> · ${T("top.self")}</span>`:""}</span>
+      <span class="tn-state ${key}"><span class="led ${key}"></span>${esc(stateLabel(st))}</span>
     </div>
     <div class="tn-meta">
-      <span>chunks <b>${fmtNum(n.chunk_count)}</b></span>
-      <span>shards <b>${fmtNum(n.shard_disk_count)}</b></span>
-      ${n.rack?`<span>rack <b>${esc(n.rack)}</b></span>`:""}
-      ${n.zone?`<span>zone <b>${esc(n.zone)}</b></span>`:""}
+      <span>${T("top.chunks")} <b>${fmtNum(n.chunk_count)}</b></span>
+      <span>${T("top.shards")} <b>${fmtNum(n.shard_disk_count)}</b></span>
+      ${n.rack?`<span>${T("top.rack")} <b>${esc(n.rack)}</b></span>`:""}
+      ${n.zone?`<span>${T("top.zone")} <b>${esc(n.zone)}</b></span>`:""}
     </div>
     <div class="tn-addr">${esc(n.addr||n.Addr||"—")}</div>
   </div>`;
@@ -639,28 +790,28 @@ async function loadTopo(){
 
     const selfId = ($("nodeCrumb").textContent.match(/\d+/)||[])[0];
     const online = list.filter(n=>nodeStateName(n)==="online").length;
-    $("topoSub").textContent = list.length
-      ? (list.length+" member"+(list.length>1?"s":"")+" · "+online+"/"+list.length+" online"+(list.length===1?" · standalone, no peers":""))
-      : "no members";
+    $("topoSub").textContent = !list.length
+      ? T("fm.none")
+      : (list.length===1 ? T("fm.single") : T("fm.sub_multi",{n:list.length,m:online}));
     $("topo").innerHTML = list.length
       ? list.map(n=>topoCard(n, String(n.id)===String(selfId))).join("")
-      : `<div class="topo-empty">No cluster members registered.</div>`;
+      : `<div class="topo-empty">${T("fm.empty")}</div>`;
 
     // honest replication / anti-entropy state
     const cs = await fetch("/api/v1/cluster/status").then(r=>r.json()).catch(()=>({}));
     const repl = cs.replication||{}, ae = cs.anti_entropy||{};
     const replBadge = (repl.writes>0)
-      ? `<span class="sys-badge"><span class="sb-l">Replication</span><span class="sb-v ok">active</span></span>`
-      : `<span class="sys-badge"><span class="sb-l">Replication</span><span class="sb-v idle">idle · single node</span></span>`;
+      ? `<span class="sys-badge"><span class="sb-l">${T("sys.replication")}</span><span class="sb-v ok">${T("sys.active")}</span></span>`
+      : `<span class="sys-badge"><span class="sb-l">${T("sys.replication")}</span><span class="sb-v idle">${T("sys.idle_single")}</span></span>`;
     const aeBadge = (ae.scanned>0)
-      ? `<span class="sys-badge"><span class="sb-l">Anti-entropy</span><span class="sb-v ok">${fmtNum(ae.scanned)} scanned</span></span>`
-      : `<span class="sys-badge"><span class="sb-l">Anti-entropy</span><span class="sb-v idle">idle</span></span>`;
+      ? `<span class="sys-badge"><span class="sb-l">${T("sys.anti_entropy")}</span><span class="sb-v ok">${fmtNum(ae.scanned)} ${T("sys.scanned")}</span></span>`
+      : `<span class="sys-badge"><span class="sb-l">${T("sys.anti_entropy")}</span><span class="sb-v idle">${T("sys.idle")}</span></span>`;
     const errBadge = (repl.errors>0)
-      ? `<span class="sys-badge"><span class="sb-l">Repair</span><span class="sb-v crit">${fmtNum(repl.errors)} errors</span></span>`
-      : `<span class="sys-badge"><span class="sb-l">Repair</span><span class="sb-v idle">in sync</span></span>`;
+      ? `<span class="sys-badge"><span class="sb-l">${T("sys.repair")}</span><span class="sb-v crit">${fmtNum(repl.errors)} ${T("sys.errors")}</span></span>`
+      : `<span class="sys-badge"><span class="sb-l">${T("sys.repair")}</span><span class="sb-v idle">${T("sys.insync")}</span></span>`;
     $("sysBadges").innerHTML = replBadge+aeBadge+errBadge;
   }catch(e){
-    $("topo").innerHTML = `<div class="topo-empty">Topology unavailable.</div>`;
+    $("topo").innerHTML = `<div class="topo-empty">${T("fm.topo_unavail")}</div>`;
     $("sysBadges").innerHTML = "";
   }
 }
@@ -677,19 +828,19 @@ async function loadDisks(){
     // table
     $("diskRows").innerHTML = disks.length
       ? disks.map(disk=>`<tr>
-            <td class="mono">bay ${esc(disk.index)}</td>
+            <td class="mono">${T("bay.node",{i:esc(disk.index)})}</td>
             <td class="mono">${esc(disk.dir)}</td>
-            <td><span class="pill ${esc(pillFor(disk.state))}"><span class="led ${esc(ledFor(disk.state))}"></span>${esc(disk.state||"—")}</span></td>
+            <td><span class="pill ${esc(pillFor(disk.state))}"><span class="led ${esc(ledFor(disk.state))}"></span>${esc(stateLabel(disk.state))}</span></td>
             <td class="mono">${fmtNum(disk.chunks)}</td>
             <td class="mono">${fmtBytes(disk.bytes)}</td>
             <td class="mono" style="text-align:right">
-              <button class="dbtn drift" data-act="verify" data-dir="${esc(disk.dir)}">Verify</button>
-              <button class="dbtn drift" data-act="migrate" data-dir="${esc(disk.dir)}">Migrate</button>
-              <button class="dbtn danger" data-act="decommission" data-dir="${esc(disk.dir)}">Decomm</button>
-              <button class="dbtn danger" data-act="retire" data-dir="${esc(disk.dir)}">Retire</button>
+              <button class="dbtn drift" data-act="verify" data-dir="${esc(disk.dir)}">${T("btn.verify")}</button>
+              <button class="dbtn drift" data-act="migrate" data-dir="${esc(disk.dir)}">${T("btn.migrate")}</button>
+              <button class="dbtn danger" data-act="decommission" data-dir="${esc(disk.dir)}">${T("btn.decomm")}</button>
+              <button class="dbtn danger" data-act="retire" data-dir="${esc(disk.dir)}">${T("btn.retire")}</button>
             </td>
           </tr>`).join("")
-      : `<tr><td colspan="6" class="empty">No disks</td></tr>`;
+      : `<tr><td colspan="6" class="empty">${T("d.none")}</td></tr>`;
 
     // drive bay hero
     $("baywrap").innerHTML = disks.length
@@ -697,8 +848,8 @@ async function loadDisks(){
           const mb = ledFor(disk.state); // "ok" | "warn" | "crit"
           return `<div class="bay bay-${esc(mb)}" data-dir="${esc(disk.dir)}" data-state="${esc(disk.state||"online")}">
             <div class="bay-top">
-              <span class="bay-idx">bay ${esc(disk.index)}</span>
-              <span class="bay-state">${esc(disk.state||"online")}</span>
+              <span class="bay-idx">${T("bay.node",{i:esc(disk.index)})}</span>
+              <span class="bay-state">${esc(stateLabel(disk.state||"online"))}</span>
             </div>
             <div class="fill-wrap">
               <span class="capmark w75"></span>
@@ -709,18 +860,18 @@ async function loadDisks(){
               <div class="bay-used">${fmtBytes(disk.bytes)}</div>
               <div class="bay-pct">${(pctOf(disk)*100).toFixed(1)}%</div>
             </div>
-            <div class="bay-sub">${fmtNum(disk.chunks)} chunks</div>
-            <div class="bay-ondisk">on disk ${fmtBytes(disk.on_disk_bytes||0)}</div>
+            <div class="bay-sub">${T("bay.chunks",{n:fmtNum(disk.chunks)})}</div>
+            <div class="bay-ondisk">${T("bay.ondisk",{b:fmtBytes(disk.on_disk_bytes||0)})}</div>
             <div class="bay-rate" data-bay="${esc(disk.index)}"><span class="up">▲</span> <span class="bw">—</span></div>
             <div class="bay-actions" data-dir="${esc(disk.dir)}">
-              <button class="dbtn drift" data-act="verify">Verify</button>
-              <button class="dbtn drift" data-act="migrate">Migrate</button>
-              <button class="dbtn danger" data-act="decommission">Decommission</button>
-              <button class="dbtn danger" data-act="retire">Retire</button>
+              <button class="dbtn drift" data-act="verify">${T("btn.verify")}</button>
+              <button class="dbtn drift" data-act="migrate">${T("btn.migrate")}</button>
+              <button class="dbtn danger" data-act="decommission">${T("btn.decomm")}</button>
+              <button class="dbtn danger" data-act="retire">${T("btn.retire")}</button>
             </div>
           </div>`;
         }).join("")
-      : `<div class="bay-empty">No disks mounted.</div>`;
+      : `<div class="bay-empty">${T("bay.none")}</div>`;
 
     // animate fills once (skip under reduced motion)
     if(!reduceMotion){
@@ -772,21 +923,21 @@ async function postDisk(action, dir){
   return d;
 }
 const DISK_CONFIRM = {
-  decommission:"Decommissioning drains this disk's chunks onto others, then removes it. Continue?",
-  retire:"Retiring removes this disk from the node immediately without migrating chunks (for failed disks only — data loss risk). Continue?",
+  decommission:T("cf.decommission"),
+  retire:T("cf.retire"),
 };
 async function runDiskAction(act, dir, btn){
   btn.disabled = true;
   try{
     if(DISK_CONFIRM[act] && !confirm(DISK_CONFIRM[act])) return;
     const d = await postDisk(act, dir);
-    toast(act==="verify" ? `Verify started on ${dir}`
-        : act==="migrate" ? `Migrate ${dir}: ${d.migrated||0} chunks moved`
-        : act==="decommission" ? `Decommissioned ${dir}: ${d.migrated||0} chunks moved, removed`
-        : `Retired ${dir}`, "ok");
+    toast(act==="verify" ? T("op.verify_started",{dir})
+        : act==="migrate" ? T("op.migrate",{dir, n:d.migrated||0})
+        : act==="decommission" ? T("op.decomm",{dir, n:d.migrated||0})
+        : T("op.retire",{dir}), "ok");
     loadDisks();
   }catch(e){
-    toast(e.message || "Disk action failed", "err");
+    toast(e.message || T("op.failed"), "err");
   }finally{
     btn.disabled = false;
   }
@@ -800,19 +951,19 @@ document.addEventListener("click", ev => {
 });
 async function adoptDisk(){
   const dir = $("adoptDir").value.trim();
-  if(!dir){ toast("Enter a directory path to adopt", "err"); return; }
+  if(!dir){ toast(T("op.adopt_needs_dir"), "err"); return; }
   try{
     const d = await postDisk("adopt", dir);
-    toast(`Adopted ${d.dir} as bay ${d.index}`, "ok");
+    toast(T("op.adopted",{dir:d.dir, i:d.index}), "ok");
     $("adoptDir").value = "";
     loadDisks();
-  }catch(e){ toast(e.message || "Adopt failed", "err"); }
+  }catch(e){ toast(e.message || T("op.failed"), "err"); }
 }
 async function drainNode(){
   try{
     const d = await postDisk("drain", null);
-    toast("Writes drained — safe to restart", "ok");
-  }catch(e){ toast(e.message || "Drain failed", "err"); }
+    toast(T("op.drained"), "ok");
+  }catch(e){ toast(e.message || T("op.failed"), "err"); }
 }
 document.addEventListener("DOMContentLoaded", ()=>{
   const adopt = $("btnAdopt"), drain = $("btnDrain");
@@ -830,12 +981,12 @@ async function loadRepair(){
     $("repairList").innerHTML = Array.isArray(q) && q.length
       ? q.slice(0,50).map(t=>`<li>
             <span class="led ${esc(ledFor(t.status||t.state))}"></span>
-            <span class="cid">chunk ${esc(t.chunk_id||t.chunk||"?")}</span>
-            <span class="st" style="color:var(--warn)">${esc(t.status||t.state||"pending")}</span>
+            <span class="cid">${T("r.chunk",{id:esc(t.chunk_id||t.chunk||"?")})}</span>
+            <span class="st" style="color:var(--warn)">${esc(stateLabel(t.status||t.state||"pending"))}</span>
           </li>`).join("")
-      : `<li class="empty" style="border:none;font-style:normal">No repairs in flight — the node is healthy.</li>`;
+      : `<li class="empty" style="border:none;font-style:normal">${T("r.empty")}</li>`;
   }catch(e){
-    $("repairList").innerHTML = `<li class="empty" style="border:none;font-style:normal">Repair queue unavailable.</li>`;
+    $("repairList").innerHTML = `<li class="empty" style="border:none;font-style:normal">${T("r.unavail")}</li>`;
   }
 }
 
@@ -847,7 +998,7 @@ let lastDisks = null;
 
 function fmtRate(bps){
   if(bps == null || isNaN(bps)) return "—";
-  const u = ["B/s","KB/s","MB/s","GB/s"];
+  const u = [T("r.bps"),T("r.kbps"),T("r.mbps"),T("r.gbps")];
   let i = 0, v = bps;
   while (v >= 1024 && i < u.length-1){ v/=1024; i++; }
   return v.toFixed(i?1:0)+" "+u[i];
@@ -894,7 +1045,7 @@ async function loadRates(){
       $("rsThroughput").firstChild.nodeValue = fmtRate(readRate+writeRate);
 
       // write rate chunk/sec: derive from writeRate / avg chunk write size (64KiB when known)
-      $("rsWriteChunk").textContent = fmtNum(Math.round(writeRate / 65536))+" chunks/s";
+      $("rsWriteChunk").textContent = T("unit.chunks_p_s",{n:fmtNum(Math.round(writeRate / 65536))});
 
       // distribute aggregate write rate across bays by their bytes share
       if(lastDisks && lastDisks.length){
@@ -932,16 +1083,24 @@ async function loadMetrics(){
     const readL = disk.read_bytes||0, writeL = disk.write_bytes||0;
     const readAmp = perf.read_requested_bytes ? (perf.read_requested_bytes/(readL||1)) : null;
     $("teleRow").innerHTML =
-      teleCard("Lifetime read", fmtBytes(readL), "", "cumulative") +
-      teleCard("Lifetime written", fmtBytes(writeL), "", "cumulative") +
-      teleCard("Read amplification", readAmp!=null?readAmp.toFixed(2)+"×":"—", "", "requested / read") +
-      teleCard("Fsync", fmtNum(perf.fsync_count||0), "", "since start");
+      teleCard(T("tele.life_read"), fmtBytes(readL), "", T("tele.cumulative")) +
+      teleCard(T("tele.life_written"), fmtBytes(writeL), "", T("tele.cumulative")) +
+      teleCard(T("tele.read_amp"), readAmp!=null?readAmp.toFixed(2)+"×":"—", "", T("tele.req_read")) +
+      teleCard(T("tele.fsync"), fmtNum(perf.fsync_count||0), "", T("tele.since_start"));
   }catch(e){
-    $("metricsInfo").textContent = "Metrics unavailable.";
+    $("metricsInfo").textContent = T("e.unavail");
   }
 }
 
 /* ---------- boot ---------- */
+document.documentElement.lang = __cur==="zh"?"zh-CN":"en";
+applyStatic();
+const __langBtn = $("langToggle");
+if(__langBtn) __langBtn.addEventListener("click", ()=>{
+  setLocale(__cur==="zh"?"en":"zh");
+  showView(location.hash.slice(1)||"overview");
+  loadAlerts(); loadDisks(); loadRepair(); loadMetrics(); loadRates(); loadHealth(); loadTopo();
+});
 loadAlerts(); loadDisks(); loadRepair(); loadMetrics(); loadRates(); loadHealth(); loadTopo();
 setInterval(loadAlerts, 4000);
 setInterval(loadDisks, 10000);

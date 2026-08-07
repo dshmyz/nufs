@@ -5,19 +5,19 @@
   'use strict';
   var R = window.NUFS.Router = {};
 
-  // route: key → { key, label } ; params: { id? }
-  R.current = { key: 'overview', label: 'Overview', params: {} };
+  // route: key → { key, labelKey } ; params: { id? }
+  R.current = { key: 'overview', labelKey: 'page.overview', params: {} };
 
   R.PAGES = [
-    { key: 'overview', label: 'Overview', href: '#/overview' },
-    { key: 'nodes', label: 'Nodes', href: '#/nodes' },
-    { key: 'repair', label: 'Repair', href: '#/repair' },
-    { key: 'rebalance', label: 'Rebalance', href: '#/rebalance' },
-    { key: 'namespace', label: 'Namespace', href: '#/namespace' },
-    { key: 'chunks', label: 'Chunks', href: '#/chunks' },
-    { key: 'quota', label: 'Quota', href: '#/quota' },
-    { key: 'ops', label: 'Ops', href: '#/ops' },
-    { key: 'backups', label: 'Backups', href: '#/backups' }
+    { key: 'overview', labelKey: 'page.overview', href: '#/overview' },
+    { key: 'nodes', labelKey: 'page.nodes', href: '#/nodes' },
+    { key: 'repair', labelKey: 'page.repair', href: '#/repair' },
+    { key: 'rebalance', labelKey: 'page.rebalance', href: '#/rebalance' },
+    { key: 'namespace', labelKey: 'page.namespace', href: '#/namespace' },
+    { key: 'chunks', labelKey: 'page.chunks', href: '#/chunks' },
+    { key: 'quota', labelKey: 'page.quota', href: '#/quota' },
+    { key: 'ops', labelKey: 'page.ops', href: '#/ops' },
+    { key: 'backups', labelKey: 'page.backups', href: '#/backups' }
   ];
 
   function parse(hash) {
@@ -56,20 +56,21 @@
     apply();
   };
 
-  // titleFor(page key) → human label for topbar
+  // titleFor(page key) → i18n key for the topbar title. The app layer renders
+  // it with t(); localizing here in the router keeps the map near the labels.
   R.titleFor = function (pageKey) {
     var map = {
-      overview: 'Cluster Overview',
-      nodes: 'Nodes',
-      node_detail: 'Node Detail',
-      repair: 'Repair Queue',
-      rebalance: 'Rebalance',
-      namespace: 'Namespace Browser',
-      chunks: 'Chunk Operations',
-      quota: 'Bucket Quota',
-      ops: 'Data Ops Observability',
-      backups: 'Backups'
+      overview: 'page.overview',
+      nodes: 'page.nodes',
+      node_detail: 'page.node_detail',
+      repair: 'page.repair',
+      rebalance: 'page.rebalance',
+      namespace: 'page.namespace',
+      chunks: 'page.chunks',
+      quota: 'page.quota',
+      ops: 'page.ops',
+      backups: 'page.backups'
     };
-    return map[pageKey] || 'NUFS';
+    return map[pageKey] || 'app.metad';
   };
 })();

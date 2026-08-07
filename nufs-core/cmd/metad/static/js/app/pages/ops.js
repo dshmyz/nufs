@@ -8,6 +8,7 @@
   var U = window.NUFS.Util;
   var A = window.NUFS.API;
   var C = window.NUFS.Components;
+  var I = window.NUFS.I18n;
   var P = window.NUFS.Pages;
 
   var STATES = ['pending', 'chunks_allocated', 'chunks_durable', 'committed', 'failed', 'recovery_needed'];
@@ -34,7 +35,8 @@
         // audit
         audit: null, auditLoading: true, auditUnavailable: false,
         // locks
-        locks: null, locksLoading: false, lockInode: ''
+        locks: null, locksLoading: false, lockInode: '',
+        t: I.t
       };
     },
     computed: {
@@ -79,10 +81,10 @@
         var self = this;
         this.scrubBusy = true;
         A.scrub().then(function (r) {
-          C.toast.ok('Scrub completed');
+          C.toast.ok(this.t('ops.toast_scrub'));
           self.scrub = r;
           self.scrubBusy = false;
-        }).catch(function (e) { self.scrubBusy = false; C.toast.err(e.message); });
+        }.bind(this)).catch(function (e) { self.scrubBusy = false; C.toast.err(e.message); });
       },
 
       // ---- write-ops ----
@@ -101,7 +103,7 @@
         var self = this;
         this.attemptsLoading = true; this.attempts = null;
         A.writeAttempts(this.attemptsState).then(function (r) { self.attempts = r || []; })
-          .catch(function (e) { console.error(e); self.attempts = []; C.toast.err('Failed to load attempts'); })
+          .catch(function (e) { console.error(e); self.attempts = []; C.toast.err(self.t('ops.toast_load_attempts')); })
           .finally(function () { self.attemptsLoading = false; });
       },
 
@@ -121,7 +123,7 @@
       loadLocks: function () {
         var self = this;
         var inode = String(this.lockInode || '').trim();
-        if (!inode) { C.toast.err('Enter an inode to inspect locks'); return; }
+        if (!inode) { C.toast.err(self.t('ops.toast_inode')); return; }
         this.locksLoading = true; this.locks = null;
         A.locks(inode).then(function (r) { self.locks = r || []; })
           .catch(function (e) { self.locks = []; C.toast.err(e.message); })
@@ -131,29 +133,29 @@
     template: `
       <div>
         <div class="page-head">
-          <h2 class="page-title">Data Ops Observability</h2>
-          <div class="page-sub">Scrub, write pipeline health, write attempts, audit log, and advisory locks</div>
+          <h2 class="page-title">{{ t('ops.title') }}</h2>
+          <div class="page-sub">{{ t('ops.sub') }}</div>
           <div class="actions-row">
-            <button class="btn" @click="loadScrub; loadOpsStatus; loadAudit; loadAttempts">Refresh all</button>
+            <button class="btn" @click="loadScrub; loadOpsStatus; loadAudit; loadAttempts">{{ t('ops.refresh_all') }}</button>
           </div>
         </div>
 
         <!-- Scrub -->
         <div class="card">
-          <div class="card-header"><h3>Scrub</h3>
-            <button class="btn btn-sm" :disabled="scrubBusy" @click="runScrub">{{ scrubBusy ? 'Scrubbing…' : 'Run scrub' }}</button>
+          <div class="card-header"><h3>{{ t('ops.scrub') }}</h3>
+            <button class="btn btn-sm" :disabled="scrubBusy" @click="runScrub">{{ scrubBusy ? t('ops.scrubbing') : t('ops.run_scrub') }}</button>
           </div>
           <div class="card-body">
-            <div v-if="scrubLoading" class="loading">Loading…</div>
-            <div v-else-if="!scrub" class="empty">No scrub result yet — run a scrub.</div>
+            <div v-if="scrubLoading" class="loading">{{ t('ops.scrub_loading') }}</div>
+            <div v-else-if="!scrub" class="empty">{{ t('ops.scrub_none') }}</div>
             <div v-else class="kv-grid">
-              <div class="kv"><div class="k">Scanned</div><div class="v mono">{{ scrub.scanned }}</div></div>
-              <div class="kv"><div class="k">Healthy</div><div class="v mono" style="color:var(--green)">{{ scrub.healthy }}</div></div>
-              <div class="kv"><div class="k">Unhealthy</div><div class="v mono" style="color:var(--red)">{{ scrub.unhealthy }}</div></div>
-              <div class="kv"><div class="k">Duration</div><div class="v mono">{{ scrub.duration }}</div></div>
-              <div class="kv"><div class="k">Ran at</div><div class="v mono">{{ fmtStamp(scrub.timestamp) }}</div></div>
-              <div class="kv"><div class="k">Health</div><div class="v">
-                <span class="badge" :class="(scrub.unhealthy||0)>0 ? 'badge-danger' : 'badge-success'">{{ (scrub.unhealthy||0)>0 ? 'degraded' : 'all healthy' }}</span>
+              <div class="kv"><div class="k">{{ t('ops.k_scanned') }}</div><div class="v mono">{{ scrub.scanned }}</div></div>
+              <div class="kv"><div class="k">{{ t('ops.k_healthy') }}</div><div class="v mono" style="color:var(--green)">{{ scrub.healthy }}</div></div>
+              <div class="kv"><div class="k">{{ t('ops.k_unhealthy') }}</div><div class="v mono" style="color:var(--red)">{{ scrub.unhealthy }}</div></div>
+              <div class="kv"><div class="k">{{ t('ops.k_duration') }}</div><div class="v mono">{{ scrub.duration }}</div></div>
+              <div class="kv"><div class="k">{{ t('ops.k_ran') }}</div><div class="v mono">{{ fmtStamp(scrub.timestamp) }}</div></div>
+              <div class="kv"><div class="k">{{ t('ops.k_health') }}</div><div class="v">
+                <span class="badge" :class="(scrub.unhealthy||0)>0 ? 'badge-danger' : 'badge-success'">{{ (scrub.unhealthy||0)>0 ? t('ops.badge_degraded') : t('ops.badge_healthy') }}</span>
               </div></div>
             </div>
           </div>
@@ -161,12 +163,12 @@
 
         <!-- Write ops status -->
         <div class="card">
-          <div class="card-header"><h3>Write pipeline</h3>
-            <button class="btn btn-sm" @click="loadOpsStatus">Refresh</button>
+          <div class="card-header"><h3>{{ t('ops.wr_pipeline') }}</h3>
+            <button class="btn btn-sm" @click="loadOpsStatus">{{ t('ops.refresh') }}</button>
           </div>
           <div class="card-body">
-            <div v-if="osLoading" class="loading">Loading…</div>
-            <div v-else-if="osUnavailable || !os" class="empty">Write-ops status unavailable on this process.</div>
+            <div v-if="osLoading" class="loading">{{ t('common.loading') }}</div>
+            <div v-else-if="osUnavailable || !os" class="empty">{{ t('ops.wr_unavailable') }}</div>
             <template v-else>
               <div class="stat-chips">
                 <div v-for="c in osCounts" :key="c.state" class="stat-chip">
@@ -176,29 +178,29 @@
               </div>
 
               <div class="card" style="margin-top:12px">
-                <div class="card-header"><h3 style="font-size:.9rem">Background tasks</h3></div>
+                <div class="card-header"><h3 style="font-size:.9rem">{{ t('ops.bg_tasks') }}</h3></div>
                 <div class="card-body">
                   <div v-if="recoveryTask || gcTask" class="kv-grid">
                     <div v-if="recoveryTask" class="kv" style="grid-column:span 1">
-                      <div class="k">Recovery ({{ recoveryTask.type }})</div>
+                      <div class="k">{{ t('ops.recovery') }} ({{ recoveryTask.type }})</div>
                       <div class="v">
-                        <span class="badge" :class="stateBadge(recoveryTask.state)">{{ recoveryTask.state }}</span>
-                        <div class="muted small">attempts {{ recoveryTask.attempt_count }} &middot; updated {{ fmt(recoveryTask.updated_at) }}</div>
-                        <div v-if="recoveryTask.target" class="muted small mono">target {{ recoveryTask.target }}</div>
+                        <span class="badge" :class="stateBadge(recoveryTask.state)">{{ U.stateLabel(recoveryTask.state) }}</span>
+                        <div class="muted small">{{ t('ops.task_meta', { a: recoveryTask.attempt_count, t: fmt(recoveryTask.updated_at) }) }}</div>
+                        <div v-if="recoveryTask.target" class="muted small mono">{{ t('ops.target_lbl') }} {{ recoveryTask.target }}</div>
                         <div v-if="recoveryTask.last_error" class="small" style="color:var(--red)">{{ recoveryTask.last_error }}</div>
                       </div>
                     </div>
                     <div v-if="gcTask" class="kv" style="grid-column:span 1">
-                      <div class="k">GC ({{ gcTask.type }})</div>
+                      <div class="k">{{ t('ops.gc') }} ({{ gcTask.type }})</div>
                       <div class="v">
-                        <span class="badge" :class="stateBadge(gcTask.state)">{{ gcTask.state }}</span>
-                        <div class="muted small">attempts {{ gcTask.attempt_count }} &middot; updated {{ fmt(gcTask.updated_at) }}</div>
-                        <div v-if="gcTask.target" class="muted small mono">target {{ gcTask.target }}</div>
+                        <span class="badge" :class="stateBadge(gcTask.state)">{{ U.stateLabel(gcTask.state) }}</span>
+                        <div class="muted small">{{ t('ops.task_meta', { a: gcTask.attempt_count, t: fmt(gcTask.updated_at) }) }}</div>
+                        <div v-if="gcTask.target" class="muted small mono">{{ t('ops.target_lbl') }} {{ gcTask.target }}</div>
                         <div v-if="gcTask.last_error" class="small" style="color:var(--red)">{{ gcTask.last_error }}</div>
                       </div>
                     </div>
                   </div>
-                  <div v-else class="empty">No background tasks registered.</div>
+                  <div v-else class="empty">{{ t('ops.no_bg') }}</div>
                 </div>
               </div>
             </template>
@@ -207,18 +209,18 @@
 
         <!-- Write attempts -->
         <div class="card">
-          <div class="card-header"><h3>Write attempts</h3>
+          <div class="card-header"><h3>{{ t('ops.wr_attempts') }}</h3>
             <div style="display:flex;gap:8px;align-items:center">
               <select class="input" style="width:auto" v-model="attemptsState" @change="loadAttempts">
                 <option v-for="s in attemptStates" :key="s" :value="s">{{ s }}</option>
               </select>
-              <button class="btn btn-sm" @click="loadAttempts">{{ attemptsLoading ? '…' : 'Refresh' }}</button>
+              <button class="btn btn-sm" @click="loadAttempts">{{ attemptsLoading ? '…' : t('ops.refresh') }}</button>
             </div>
           </div>
           <div class="card-body p-0">
-            <div v-if="attemptsLoading" class="loading">Loading…</div>
+            <div v-if="attemptsLoading" class="loading">{{ t('common.loading') }}</div>
             <table v-else class="table">
-              <thead><tr><th>ID</th><th>Bucket / Key</th><th>Inode</th><th>State</th><th>Last error</th><th>Created</th></tr></thead>
+              <thead><tr><th>{{ t('ops.th_id') }}</th><th>{{ t('ops.th_bucket') }}</th><th>{{ t('ops.th_inode') }}</th><th>{{ t('ops.th_state') }}</th><th>{{ t('ops.th_err') }}</th><th>{{ t('ops.th_created') }}</th></tr></thead>
               <tbody>
                 <tr v-for="a in attempts" :key="a.ID || a.id">
                   <td class="mono">{{ a.ID }}</td>
@@ -228,7 +230,7 @@
                   <td class="muted small">{{ a.LastError || a.last_error || '—' }}</td>
                   <td class="mono small">{{ fmt(a.CreatedAt || a.created_at) }}</td>
                 </tr>
-                <tr v-if="!attemptsLoading && (!attempts || !attempts.length)"><td colspan="6" class="empty">No attempts in state "{{ attemptsState }}".</td></tr>
+                <tr v-if="!attemptsLoading && (!attempts || !attempts.length)"><td colspan="6" class="empty">{{ t('ops.attempts_empty', { state: attemptsState }) }}</td></tr>
               </tbody>
             </table>
           </div>
@@ -236,17 +238,17 @@
 
         <!-- Audit -->
         <div class="card">
-          <div class="card-header"><h3>Audit log ({{ audit ? audit.length : 0 }})</h3>
-            <button class="btn btn-sm" @click="loadAudit">Refresh</button>
+          <div class="card-header"><h3>{{ t('ops.audit', { n: audit ? audit.length : 0 }) }}</h3>
+            <button class="btn btn-sm" @click="loadAudit">{{ t('ops.refresh') }}</button>
           </div>
           <div class="card-body p-0">
-            <div v-if="auditLoading" class="loading">Loading…</div>
+            <div v-if="auditLoading" class="loading">{{ t('common.loading') }}</div>
             <div v-else-if="auditUnavailable" class="empty-state">
-              <div class="ops-empty-title">Audit logger not enabled</div>
-              <div class="empty-desc">The audit endpoint returned 503. Enable the audit logger on the metad process to record access events.</div>
+              <div class="ops-empty-title">{{ t('ops.audit_not_enabled') }}</div>
+              <div class="empty-desc">{{ t('ops.audit_not_enabled_hint') }}</div>
             </div>
             <table v-else class="table">
-              <thead><tr><th>Time</th><th>Action</th><th>Actor</th><th>Resource</th><th>Result</th></tr></thead>
+              <thead><tr><th>{{ t('ops.th_time') }}</th><th>{{ t('ops.th_action') }}</th><th>{{ t('ops.th_actor') }}</th><th>{{ t('ops.th_resource') }}</th><th>{{ t('ops.th_result') }}</th></tr></thead>
               <tbody>
                 <tr v-for="r in audit" :key="r.id || r.ts">
                   <td class="mono small">{{ fmt(r.ts) }}</td>
@@ -255,7 +257,7 @@
                   <td class="mono">{{ r.resource }}</td>
                   <td><span class="badge" :class="r.result === 'ok' ? 'badge-success' : 'badge-danger'">{{ r.result }}</span></td>
                 </tr>
-                <tr v-if="!audit || !audit.length"><td colspan="5" class="empty">No audit records yet.</td></tr>
+                <tr v-if="!audit || !audit.length"><td colspan="5" class="empty">{{ t('ops.audit_empty') }}</td></tr>
               </tbody>
             </table>
           </div>
@@ -263,16 +265,16 @@
 
         <!-- Locks -->
         <div class="card">
-          <div class="card-header"><h3>Advisory locks</h3>
+          <div class="card-header"><h3>{{ t('ops.locks') }}</h3>
             <div style="display:flex;gap:8px;align-items:center">
-              <input class="input" style="width:140px" v-model="lockInode" placeholder="inode" @keyup.enter="loadLocks"/>
-              <button class="btn btn-sm" :disabled="locksLoading" @click="loadLocks">{{ locksLoading ? '…' : 'Inspect' }}</button>
+              <input class="input" style="width:140px" v-model="lockInode" :placeholder="t('ops.ph_inode')" @keyup.enter="loadLocks"/>
+              <button class="btn btn-sm" :disabled="locksLoading" @click="loadLocks">{{ locksLoading ? '…' : t('ops.inspect') }}</button>
             </div>
           </div>
           <div class="card-body p-0">
-            <p class="muted small" style="padding:8px 12px;margin:0">Enter an inode to list current lock holders on it.</p>
+            <p class="muted small" style="padding:8px 12px;margin:0">{{ t('ops.locks_hint') }}</p>
             <table class="table">
-              <thead><tr><th>Inode</th><th>Owner</th><th>Mode</th><th>Since</th></tr></thead>
+              <thead><tr><th>{{ t('ops.th_l_inode') }}</th><th>{{ t('ops.th_owner') }}</th><th>{{ t('ops.th_mode') }}</th><th>{{ t('ops.th_since') }}</th></tr></thead>
               <tbody>
                 <tr v-for="(l, i) in locks || []" :key="i">
                   <td class="mono">{{ l.inode }}</td>
@@ -280,7 +282,7 @@
                   <td><span class="badge" :class="l.mode === 'exclusive' ? 'badge-warning' : 'badge-info'">{{ l.mode }}</span></td>
                   <td class="mono small">{{ fmt(l.since_unix_nano) }}</td>
                 </tr>
-                <tr v-if="locks && !locks.length"><td colspan="4" class="empty">No locks held on this inode.</td></tr>
+                <tr v-if="locks && !locks.length"><td colspan="4" class="empty">{{ t('ops.locks_empty') }}</td></tr>
               </tbody>
             </table>
           </div>

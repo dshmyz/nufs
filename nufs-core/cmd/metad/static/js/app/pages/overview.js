@@ -6,6 +6,7 @@
   var U = window.NUFS.Util;
   var A = window.NUFS.API;
   var C = window.NUFS.Components;
+  var I = window.NUFS.I18n;
   var P = window.NUFS.Pages = window.NUFS.Pages || {};
 
   P.overview = {
@@ -40,9 +41,9 @@
         return 'ok';
       },
       verdictLabel: function () {
-        if (this.nodes.length === 0) return 'No nodes registered';
-        if (this.offline > 0) return 'Degraded';
-        return 'Cluster healthy';
+        if (this.nodes.length === 0) return I.t('ov.no_nodes');
+        if (this.offline > 0) return I.t('ov.hero_degraded');
+        return I.t('ring.healthy');
       },
       topo: function () {
         var groups = [], byName = {};
@@ -138,17 +139,17 @@
     template: `
       <div>
         <template v-if="loading && nodes.length === 0 && buckets.length === 0">
-          <div class="loading">Loading cluster…</div>
+          <div class="loading">{{ t('ov.loading') }}</div>
         </template>
 
         <template v-else-if="empty">
           <div class="empty-state">
             <div class="empty-icon"><svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></div>
-            <h2>Welcome to NUFS</h2>
-            <p class="empty-desc">Your cluster is empty. Create demo data to explore the console.</p>
-            <button class="btn btn-primary btn-lg" :disabled="seeding" @click="runSeed">{{ seeding ? 'Creating…' : 'Create Demo Data' }}</button>
+            <h2>{{ t('ov.welcome') }}</h2>
+            <p class="empty-desc">{{ t('ov.empty_desc') }}</p>
+            <button class="btn btn-primary btn-lg" :disabled="seeding" @click="runSeed">{{ seeding ? t('ov.creating') : t('ov.create_demo') }}</button>
             <p v-if="seedError" class="empty-hint" style="color:#dc2626">{{ seedError }}</p>
-            <p class="empty-hint">This will create 3 nodes, 2 buckets, and sample chunks + namespace entries.</p>
+            <p class="empty-hint">{{ t('ov.empty_hint') }}</p>
           </div>
         </template>
 
@@ -157,25 +158,23 @@
           <div class="cluster-hero">
             <HeroRing :online="online" :draining="draining" :offline="offline" :total="nodes.length"/>
             <div class="hero-body">
-              <div class="hero-eyebrow"><span class="eyebrow-dot"></span> NUFS cluster &middot; {{ nodes.length }} node{{ nodes.length !== 1 ? 's' : '' }}</div>
-              <div class="hero-title">{{ verdict === 'ok' ? 'Data plane nominal' : (verdict === 'degraded' ? 'Attention required' : 'No live nodes') }}</div>
+              <div class="hero-eyebrow"><span class="eyebrow-dot"></span> {{ t('ov.hero_eyebrow', { n: nodes.length }) }}</div>
+              <div class="hero-title">{{ verdict === 'ok' ? t('ov.hero_ok') : (verdict === 'degraded' ? t('ov.hero_degraded') : t('ov.hero_down')) }}</div>
               <div class="hero-desc">
-                {{ nodes.length }} node{{ nodes.length !== 1 ? 's' : '' }} across {{ topo.length }} fault domain{{ topo.length !== 1 ? 's' : '' }}.
-                {{ online }} online, {{ draining }} draining{{ offline ? ', ' + offline + ' offline' : '' }}.
-                {{ repairs.length }} repair{{ repairs.length !== 1 ? 's' : '' }} pending.
+                {{ t('ov.hero_desc', { nodes: nodes.length, doms: topo.length, online: online, draining: draining, offline: offline ? ', ' + offline + ' offline' : '', repairs: repairs.length }) }}
               </div>
               <div class="hero-gauge-row">
-                <div class="hero-gauge"><span class="g-k">Capacity waterline</span><span class="g-v" :class="capacityPct >= 75 ? 'heat' : 'cool'">{{ capacityPct.toFixed(1) }}%</span><div class="g-meter"><i :style="{ width: capacityPct + '%' }"></i></div></div>
-                <div class="hero-gauge"><span class="g-k">Physical / logical</span><span class="g-v" :class="onDiskPct > 100 ? 'heat' : 'cool'">{{ onDiskPct.toFixed(0) }}%</span><div class="g-meter"><i :style="{ width: Math.min(onDiskPct, 100) + '%' }"></i></div></div>
-                <div class="hero-gauge"><span class="g-k">Live bytes</span><span class="g-v">{{ U.humanBytes(totals.used) }}</span></div>
-                <div class="hero-gauge"><span class="g-k">Physical on disk</span><span class="g-v heat">{{ U.humanBytes(totals.ondisk) }}</span></div>
+                <div class="hero-gauge"><span class="g-k">{{ t('ov.g_capacity') }}</span><span class="g-v" :class="capacityPct >= 75 ? 'heat' : 'cool'">{{ capacityPct.toFixed(1) }}%</span><div class="g-meter"><i :style="{ width: capacityPct + '%' }"></i></div></div>
+                <div class="hero-gauge"><span class="g-k">{{ t('ov.g_phys_logic') }}</span><span class="g-v" :class="onDiskPct > 100 ? 'heat' : 'cool'">{{ onDiskPct.toFixed(0) }}%</span><div class="g-meter"><i :style="{ width: Math.min(onDiskPct, 100) + '%' }"></i></div></div>
+                <div class="hero-gauge"><span class="g-k">{{ t('ov.g_live_bytes') }}</span><span class="g-v">{{ U.humanBytes(totals.used) }}</span></div>
+                <div class="hero-gauge"><span class="g-k">{{ t('ov.g_phys_disk') }}</span><span class="g-v heat">{{ U.humanBytes(totals.ondisk) }}</span></div>
               </div>
               <div class="hero-chips">
-                <span class="hero-chip ok">{{ online }} online</span>
-                <span v-if="draining" class="hero-chip warn">{{ draining }} draining</span>
-                <span v-if="offline" class="hero-chip bad">{{ offline }} offline</span>
-                <span class="hero-chip neutral">{{ buckets.length }} bucket{{ buckets.length !== 1 ? 's' : '' }}</span>
-                <span class="hero-chip neutral">{{ totals.chunks }} chunks</span>
+                <span class="hero-chip ok">{{ t('ov.chip_online', { n: online }) }}</span>
+                <span v-if="draining" class="hero-chip warn">{{ t('ov.chip_draining', { n: draining }) }}</span>
+                <span v-if="offline" class="hero-chip bad">{{ t('ov.chip_offline', { n: offline }) }}</span>
+                <span class="hero-chip neutral">{{ t('ov.chip_buckets', { n: buckets.length }) }}</span>
+                <span class="hero-chip neutral">{{ t('ov.chip_chunks', { n: totals.chunks }) }}</span>
               </div>
             </div>
           </div>
@@ -185,15 +184,15 @@
 
           <!-- Balance / readiness strip -->
           <div v-if="balance" class="card">
-            <div class="card-header"><h3>Rebalance posture</h3>
-              <span class="badge" :class="'badge-' + balanceBadge">{{ (balance.imbalance * 100).toFixed(1) }}% spread</span>
+            <div class="card-header"><h3>{{ t('ov.rebalance_posture') }}</h3>
+              <span class="badge" :class="'badge-' + balanceBadge">{{ t('ov.spread', { n: (balance.imbalance * 100).toFixed(1) }) }}</span>
             </div>
             <div class="card-body" style="display:flex;flex-wrap:wrap;gap:22px;align-items:center">
-              <span class="text-muted" style="font-size:.85rem">Imbalance</span>
-              <strong v-if="balance.nodes">{{ balance.nodes.length }} node{{ balance.nodes.length !== 1 ? 's' : '' }}</strong>
+              <span class="text-muted" style="font-size:.85rem">{{ t('ov.imbalance') }}</span>
+              <strong v-if="balance.nodes">{{ balance.nodes.length }} {{ t('ov.stat_nodes') }}</strong>
               <span class="text-muted">{{ balance.recommendation }}</span>
               <span class="badge" :class="'badge-' + (balance.total_used_pct > 0.8 ? 'warning' : 'info')" style="margin-left:auto">
-                {{ (balance.total_used_pct * 100).toFixed(1) }}% used cluster-wide
+                {{ t('ov.used_cluster_wide', { n: (balance.total_used_pct * 100).toFixed(1) }) }}
               </span>
             </div>
           </div>
@@ -201,32 +200,32 @@
           <div class="stats-grid">
             <div class="stat-card stat-blue">
               <div class="stat-value">{{ nodes.length }}</div>
-              <div class="stat-label">Total Nodes</div>
-              <div class="stat-sub"><span class="stat-green">{{ online }} online</span><span v-if="draining"> &middot; <span class="stat-yellow">{{ draining }} draining</span></span><span v-if="offline"> &middot; <span class="stat-red">{{ offline }} offline</span></span></div>
+              <div class="stat-label">{{ t('ov.stat_nodes') }}</div>
+              <div class="stat-sub"><span class="stat-green">{{ online }} {{ t('ov.chip_online_lbl') }}</span><span v-if="draining"> &middot; <span class="stat-yellow">{{ draining }} {{ t('ov.chip_draining_lbl') }}</span></span><span v-if="offline"> &middot; <span class="stat-red">{{ offline }} {{ t('ov.chip_offline_lbl') }}</span></span></div>
             </div>
-            <div class="stat-card stat-green"><div class="stat-value">{{ buckets.length }}</div><div class="stat-label">Buckets</div></div>
-            <div class="stat-card stat-purple"><div class="stat-value">{{ totals.chunks }}</div><div class="stat-label">Total Chunks</div></div>
-            <div class="stat-card stat-orange"><div class="stat-value">{{ repairs.length }}</div><div class="stat-label">Pending Repairs</div></div>
+            <div class="stat-card stat-green"><div class="stat-value">{{ buckets.length }}</div><div class="stat-label">{{ t('ov.stat_buckets') }}</div></div>
+            <div class="stat-card stat-purple"><div class="stat-value">{{ totals.chunks }}</div><div class="stat-label">{{ t('ov.stat_chunks') }}</div></div>
+            <div class="stat-card stat-orange"><div class="stat-value">{{ repairs.length }}</div><div class="stat-label">{{ t('ov.stat_repairs') }}</div></div>
             <div class="stat-card">
               <div class="stat-value" style="color:var(--primary);font-size:1.6rem">{{ lastEvt ? lastEvt.ops_rate.toFixed(1) : '…' }}</div>
-              <div class="stat-label">Ops / sec</div>
+              <div class="stat-label">{{ t('ov.stat_ops_sec') }}</div>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-header"><h3>Cluster Capacity</h3></div>
+            <div class="card-header"><h3>{{ t('ov.capacity') }}</h3></div>
             <div class="card-body">
               <CapacityBar :pct="capacityPct"/>
               <div class="capacity-labels">
-                <span>{{ U.humanBytes(totals.used) }} used <span class="lbl">(logical)</span></span>
-                <span class="capacity-ondisk">{{ U.humanBytes(totals.ondisk) }} on disk</span>
-                <span>/ {{ U.humanBytes(totals.cap) }} total ({{ capacityPct.toFixed(1) }}%)</span>
+                <span>{{ t('ov.capacity_used', { used: U.humanBytes(totals.used) }) }}</span>
+                <span class="capacity-ondisk">{{ t('ov.ondisk', { n: U.humanBytes(totals.ondisk) }) }}</span>
+                <span>{{ t('ov.capacity_total', { total: U.humanBytes(totals.cap), pct: capacityPct.toFixed(1) }) }}</span>
               </div>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-header"><h3>Operations Rate <span class="live-badge">LIVE</span></h3></div>
+            <div class="card-header"><h3>{{ t('ov.ops_rate') }} <span class="live-badge">{{ t('ov.live') }}</span></h3></div>
             <div class="card-body">
               <TrendChart :series="opsSeries"/>
             </div>
@@ -234,8 +233,8 @@
 
           <div class="card topo-card">
             <div class="card-header">
-              <h3>Node Topology</h3>
-              <span class="badge" :class="nodes.length > 1 ? 'badge-info' : 'badge-secondary'">{{ nodes.length }} node{{ nodes.length !== 1 ? 's' : '' }} &middot; {{ topo.length }} fault domain{{ topo.length !== 1 ? 's' : '' }}</span>
+              <h3>{{ t('ov.topo') }}</h3>
+              <span class="badge" :class="nodes.length > 1 ? 'badge-info' : 'badge-secondary'">{{ t('ov.topo_badge', { n: nodes.length, d: topo.length }) }}</span>
             </div>
             <div class="card-body">
               <template v-for="(g, gi) in topo" :key="g.name">
@@ -245,41 +244,41 @@
                     <div v-for="n in g.nodes" :key="n.id" class="tnode" :class="'tnode-' + n.stateCls">
                       <div class="tnode-head">
                         <span class="tnode-led" :class="'tnode-led-' + n.stateCls"></span>
-                        <span class="tnode-id"><a href="javascript:void(0)" @click="goNode(n.id)">node {{ n.id }}</a></span>
-                        <span class="tnode-state badge" :class="'badge-' + n.stateCls">{{ n.stateName }}</span>
+                        <span class="tnode-id"><a href="javascript:void(0)" @click="goNode(n.id)">{{ t('ov.node_n', { n: n.id }) }}</a></span>
+                        <span class="tnode-state badge" :class="'badge-' + n.stateCls">{{ U.stateLabel(n.state) }}</span>
                       </div>
                       <div v-if="n.hasCap" class="tnode-metric">
                         <RingGauge :pct="n.usagePct" :size="44" :color="n.stateCls === 'danger' ? 'danger' : (n.stateCls === 'warning' ? 'warning' : 'primary')"/>
                         <div class="tnode-ring-label">
                           <span class="tnode-pct">{{ n.usagePct.toFixed(1) }}%</span>
-                          <span class="tnode-sub">{{ U.humanBytes(n.usedBytes) }} used</span>
-                          <span class="tnode-sub tnode-ondisk">{{ U.humanBytes(n.onDiskBytes) }} on disk</span>
-                          <span class="tnode-sub">{{ U.humanBytes(n.capBytes) }} total</span>
+                          <span class="tnode-sub">{{ t('ov.used', { n: U.humanBytes(n.usedBytes) }) }}</span>
+                          <span class="tnode-sub tnode-ondisk">{{ t('ov.ondisk_short', { n: U.humanBytes(n.onDiskBytes) }) }}</span>
+                          <span class="tnode-sub">{{ t('ov.total_short', { n: U.humanBytes(n.capBytes) }) }}</span>
                         </div>
                       </div>
-                      <div v-else class="tnode-metric"><span class="tnode-no-cap">capacity unknown</span></div>
+                      <div v-else class="tnode-metric"><span class="tnode-no-cap">{{ t('ov.cap_unknown') }}</span></div>
                       <div class="tnode-detail">
-                        <div class="tnode-row"><span class="tnode-k">chunks</span><span>{{ n.chunks }}</span></div>
-                        <div v-if="n.machine" class="tnode-row"><span class="tnode-k">machine</span><span class="mono">{{ n.machine }}</span></div>
-                        <div v-if="n.zone" class="tnode-row"><span class="tnode-k">zone</span><span>{{ n.zone }}</span></div>
-                        <div class="tnode-row"><span class="tnode-k">addr</span><span class="mono">{{ n.addr }}</span></div>
+                        <div class="tnode-row"><span class="tnode-k">{{ t('ov.row_chunks') }}</span><span>{{ n.chunks }}</span></div>
+                        <div v-if="n.machine" class="tnode-row"><span class="tnode-k">{{ t('ov.row_machine') }}</span><span class="mono">{{ n.machine }}</span></div>
+                        <div v-if="n.zone" class="tnode-row"><span class="tnode-k">{{ t('ov.row_zone') }}</span><span>{{ n.zone }}</span></div>
+                        <div class="tnode-row"><span class="tnode-k">{{ t('ov.row_addr') }}</span><span class="mono">{{ n.addr }}</span></div>
                       </div>
                     </div>
                   </div>
                 </div>
               </template>
-              <p v-if="!topo.length" class="empty">No nodes registered</p>
+              <p v-if="!topo.length" class="empty">{{ t('ov.no_nodes') }}</p>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-header"><h3>Buckets</h3><a href="javascript:void(0)" class="btn btn-sm" @click="goBuckets">View All</a></div>
+            <div class="card-header"><h3>{{ t('ov.buckets') }}</h3><a href="javascript:void(0)" class="btn btn-sm" @click="goBuckets">{{ t('ov.view_all') }}</a></div>
             <div class="card-body p-0">
               <table class="table">
-                <thead><tr><th>Name</th><th>Policy</th><th>Replicas</th></tr></thead>
+                <thead><tr><th>{{ t('ov.th_name') }}</th><th>{{ t('ov.th_policy') }}</th><th>{{ t('ov.th_replicas') }}</th></tr></thead>
                 <tbody>
                   <tr v-for="b in buckets" :key="b.name"><td>{{ b.name }}</td><td>{{ b.policy ? b.policy.id : '-' }}</td><td>{{ b.policy ? b.policy.replication_factor : '-' }}</td></tr>
-                  <tr v-if="!buckets.length"><td colspan="3" class="empty">No buckets</td></tr>
+                  <tr v-if="!buckets.length"><td colspan="3" class="empty">{{ t('ov.th_nobuckets') }}</td></tr>
                 </tbody>
               </table>
             </div>
