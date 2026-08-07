@@ -2999,6 +2999,45 @@ func (s *PebbleStore) DecommissionNode(ctx context.Context, nodeID NodeID) error
 	return nil
 }
 
+// RestoreNode brings a node that was explicitly taken out of service back to
+// online. It inverts DecommissionNode, EnterMaintenance, and the transient
+// NodeOffline/NodeFailed states, making decommission reversible — the missing
+// half of the sticky-decommission change (commit 346c884): heartbeats only
+// promote NodeOffline → NodeOnline and never touch an operator-set
+// NodeDraining, so the ONLY way back online is this explicit call.
+//
+// It is a deliberate, operator-authenticated control-plane action, so it does
+// not weaken decommission stickiness: an idle heartbeat still cannot silently
+// resurrect a drained node. Placement immediately considers the node a target
+// again on return, matching what DecommissionNode revoked.
+//
+// No-op if the node is already online. Fails if the node does not exist.
+func (s *PebbleStore) RestoreNode(ctx context.Context, nodeID NodeID) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	key := prefixNode + fmt.Sprintf("%d", nodeID)
+	var info NodeInfo
+	exists, err := s.getJSON(key, &info)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNodeNotFound
+	}
+	if info.State == NodeOnline {
+		return nil // already online
+	}
+	info.State = NodeOnline
+	info.LastSeen = time.Now().UnixNano()
+	if err := s.putMsgpack(key, &info); err != nil {
+		return err
+	}
+	s.placement.UpdateNode(&info)
+	slog.Info("node restored to online", "nodeID", nodeID)
+	return nil
+}
+
 // EnterMaintenance transitions a node to maintenance mode for rolling upgrades.
 // The node stops receiving new chunk allocations but continues serving reads.
 // Existing chunks are migrated off before the node is taken down.

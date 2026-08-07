@@ -176,6 +176,9 @@
       'nd.modal_body': '排空并下线 <strong>节点 {id}</strong>（{addr}）？<br><span class="text-muted">其副本将在离线前迁移到存活的节点。</span>',
       'nd.toast_draining': '节点 {id} 正在排空',
       'nd.draining_btn': '排空中…',
+      'nd.restore': '恢复上线',
+      'nd.restoring_btn': '恢复中…',
+      'nd.toast_restored': '节点 {id} 已恢复上线',
 
       // ---- node detail ----
       'nod.title': '节点 {id}',
@@ -679,6 +682,9 @@
       'nd.modal_body': 'Drain and decommission <strong>node {id}</strong> ({addr})?<br><span class="text-muted">Its replicas will migrate to surviving peers before it goes offline.</span>',
       'nd.toast_draining': 'Node {id} is draining',
       'nd.draining_btn': 'Draining…',
+      'nd.restore': 'Restore online',
+      'nd.restoring_btn': 'Restoring…',
+      'nd.toast_restored': 'Node {id} restored to online',
 
       // ---- node detail ----
       'nod.title': 'Node {id}',

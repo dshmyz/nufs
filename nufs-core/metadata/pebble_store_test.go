@@ -461,6 +461,66 @@ func TestPebbleStore_DecommissionExcludesFromPlacement(t *testing.T) {
 	}
 }
 
+// TestPebbleStore_RestoreNode is the inverse of decommission: an operator
+// explicitly brings a drained (or otherwise non-online) node back online, and
+// placement immediately picks it again — the missing reversible half of the
+// sticky-decommission feature. It also confirms RestoreNode is a no-op on an
+// already-online node and errors on an unknown one, and that it never depends
+// on a heartbeat to recover (heartbeats only promote offline→online).
+func TestPebbleStore_RestoreNode(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	rfc := func(rf int) PlacementPolicy {
+		return PlacementPolicy{
+			ID:                "t",
+			ReplicationFactor: rf,
+			TopologySpread:    SpreadNode,
+		}
+	}
+	for _, id := range []NodeID{160, 161} {
+		if err := store.RegisterNode(ctx, &NodeInfo{ID: id, Addr: fmt.Sprintf("node%d:9001", id), CapacityGB: 100}); err != nil {
+			t.Fatalf("RegisterNode %d: %v", id, err)
+		}
+	}
+
+	// Drain 160, then restore it. RF=1 placement must bounce back onto it.
+	if err := store.DecommissionNode(ctx, 160); err != nil {
+		t.Fatalf("DecommissionNode: %v", err)
+	}
+	if ids, _ := store.placement.PlaceChunk(rfc(1), nil); len(ids) != 1 || ids[0] == 160 {
+		t.Fatalf("post-decommission RF=1 placement = %v, want exactly [161]", ids)
+	}
+	if err := store.RestoreNode(ctx, 160); err != nil {
+		t.Fatalf("RestoreNode: %v", err)
+	}
+	n, err := store.GetNode(ctx, 160)
+	if err != nil {
+		t.Fatalf("GetNode after restore: %v", err)
+	}
+	if n.State != NodeOnline {
+		t.Fatalf("node state after restore=%v, want NodeOnline", n.State)
+	}
+	// With 161 drained, 160 (restored) is the sole candidate — this proves
+	// RestoreNode flipped it back to placement-eligible.
+	if err := store.DecommissionNode(ctx, 161); err != nil {
+		t.Fatalf("DecommissionNode 161: %v", err)
+	}
+	if ids, _ := store.placement.PlaceChunk(rfc(1), nil); len(ids) != 1 || ids[0] != 160 {
+		t.Fatalf("post-restore RF=1 placement = %v, want exactly [160] (restored node eligible)", ids)
+	}
+
+	// Idempotent: restoring an already-online node is a harmless no-op.
+	if err := store.RestoreNode(ctx, 160); err != nil {
+		t.Fatalf("RestoreNode on online node should be no-op, got %v", err)
+	}
+
+	// Restoring a never-registered node is an error.
+	if err := store.RestoreNode(ctx, 999); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("RestoreNode unknown = %v, want ErrNodeNotFound", err)
+	}
+}
+
 // TestPebbleStore_ShardDiskCountRoundTrip proves the EC candidate-topology
 // contract (Program 9): ShardDiskCount reported at registration persists and
 // round-trips through ListNodes/GetNode, and re-registration (ErrNodeAlreadyExists

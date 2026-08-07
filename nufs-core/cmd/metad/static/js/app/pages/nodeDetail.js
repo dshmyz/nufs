@@ -47,6 +47,15 @@
           self.load();
         }.bind(this)).catch(function (e) { self.busy = false; C.toast.err(e.message); });
       },
+      restore: function () {
+        var self = this;
+        this.busy = true;
+        A.restoreNode(this.id).then(function () {
+          C.toast.ok(this.t('nd.toast_restored', { id: self.id }));
+          self.busy = false;
+          self.load();
+        }.bind(this)).catch(function (e) { self.busy = false; C.toast.err(e.message); });
+      },
       back: function () { window.NUFS.Router.navigate('nodes'); }
     },
     template: `
@@ -68,6 +77,7 @@
             <div class="card-header"><h3>{{ t('nod.health') }}</h3>
               <div class="actions-row">
                 <button v-if="node.state === 0" class="btn btn-sm btn-danger" @click="confirm = true">{{ t('nd.decommission') }}</button>
+                <button v-if="node.state !== 0" class="btn btn-sm btn-primary" @click="restore" :disabled="busy">{{ busy ? t('nd.restoring_btn') : t('nd.restore') }}</button>
               </div>
             </div>
             <div class="card-body">

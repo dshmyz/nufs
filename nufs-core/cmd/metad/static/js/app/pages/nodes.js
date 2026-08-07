@@ -41,6 +41,15 @@
         }).catch(function (e) { self.busy = false; C.toast.err(e.message); });
       },
       go: function (id) { window.NUFS.Router.navigate('node_detail', { id: id }); },
+      restore: function (n) {
+        var self = this;
+        this.busy = true;
+        A.restoreNode(n.id).then(function () {
+          C.toast.ok(self.t('nd.toast_restored', { id: n.id }));
+          self.busy = false;
+          self.load();
+        }).catch(function (e) { self.busy = false; C.toast.err(e.message); });
+      },
       usagePct: function (n) { return n.capacity_gb > 0 ? ((n.used_gb / n.capacity_gb) * 100) : 0; }
     },
     template: `
@@ -76,6 +85,7 @@
                   <td>
                     <button v-if="n.state !== 1 && n.state !== 2 && n.state !== 4" class="btn btn-sm btn-danger" @click="askDecommission(n)">{{ t('nd.decommission') }}</button>
                     <span v-else class="text-muted" style="font-size:.75rem">{{ t('nd.draining_lbl') }}</span>
+                    <button v-if="n.state !== 0" class="btn btn-sm btn-primary" style="margin-left:6px" @click="restore(n)">{{ t('nd.restore') }}</button>
                   </td>
                 </tr>
                 <tr v-if="!nodes.length"><td colspan="11" class="empty">{{ t('nd.no_nodes') }}</td></tr>

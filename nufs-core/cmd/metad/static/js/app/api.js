@@ -58,6 +58,7 @@
   A.triggerRepair = function (chunkId) { return A.post('/api/v1/repair/trigger', chunkId ? { chunk_id: chunkId } : undefined); };
   A.triggerRebalance = function () { return A.post('/api/v1/rebalance/trigger'); };
   A.decommissionNode = function (id) { return A.post('/api/v1/nodes/' + id + '/decommission'); };
+  A.restoreNode = function (id) { return A.post('/api/v1/nodes/' + id + '/restore'); };
 
   // ---- namespace (parent-inode based) ----
   // ReadDir returns []DirEntry { inode, type, name } for a parent inode id.

@@ -807,6 +807,17 @@ func (c *HTTPClient) DecommissionNode(ctx context.Context, nodeID NodeID) error 
 	return c.readResponse(resp, nil)
 }
 
+// RestoreNode brings a decommissioned (draining), maintenance, offline, or
+// failed node back to online via the control plane — the explicit inverse of
+// DecommissionNode. See PebbleStore.RestoreNode.
+func (c *HTTPClient) RestoreNode(ctx context.Context, nodeID NodeID) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, fmt.Sprintf("/api/v1/nodes/%d/restore", nodeID), nil)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
 func (c *HTTPClient) EnterMaintenance(ctx context.Context, nodeID NodeID) error {
 	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, fmt.Sprintf("/api/v1/nodes/%d/maintenance", nodeID), nil)
 	if err != nil {
