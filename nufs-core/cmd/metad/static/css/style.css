@@ -1859,3 +1859,62 @@ html[data-theme="light"] .table tr.row-active { background: rgba(8,145,178,0.09)
 html[data-theme="light"] ::-webkit-scrollbar-thumb { background: #c3cad6; border: 2px solid var(--bg); }
 html[data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #a9b3c3; }
 
+/* -- Sidebar (brand anchor) flips light too, so the whole console is one
+   surface. The cyan/amber logo gradient and the active accent stay — those
+   are identity, not surface. -- */
+html[data-theme="light"] {
+  --sidebar-bg: #eef1f6;
+  --sidebar-hover: rgba(8,145,178,0.09);
+  --sidebar-text: #5b6b82;
+  --sidebar-active: #0891b2;
+}
+
+html[data-theme="light"] .sidebar {
+  background:
+    linear-gradient(180deg, rgba(8,145,178,0.05), transparent 34%),
+    repeating-linear-gradient(0deg, rgba(15,23,42,0.016) 0 1px, transparent 1px 46px),
+    var(--sidebar-bg);
+}
+
+html[data-theme="light"] .sidebar-nav a:hover { color: #263044; }
+
+/* -- Cluster hero becomes a light instrument panel (same precision
+   announcing, pale ground). -- */
+html[data-theme="light"] .cluster-hero {
+  background:
+    radial-gradient(120% 140% at 8% 0%, rgba(8,145,178,0.10), transparent 46%),
+    linear-gradient(180deg, #ffffff, #eef1f6);
+  color: #1a2333;
+  border: 1px solid rgba(8,145,178,0.18);
+  box-shadow: var(--shadow-md), 0 0 24px rgba(8,145,178,0.06);
+}
+
+/* data-plane glow mesh: hairline seams stay, but read dark-on-light. */
+html[data-theme="light"] .cluster-hero::before {
+  background:
+    repeating-linear-gradient(90deg, transparent 0 46px, rgba(8,145,178,0.06) 46px 47px, transparent 47px 92px),
+    repeating-linear-gradient(0deg, transparent 0 40px, rgba(8,145,178,0.05) 40px 41px, transparent 41px 80px);
+}
+
+html[data-theme="light"] .hero-eyebrow,
+html[data-theme="light"] .hero-verdict-sub,
+html[data-theme="light"] .hero-gauge .g-k { color: #5b6b82; }
+
+html[data-theme="light"] .hero-desc { color: #40506a; }
+
+html[data-theme="light"] .hero-gauge .g-v { color: #1a2333; text-shadow: 0 0 12px rgba(8,145,178,0.30); }
+html[data-theme="light"] .hero-gauge .g-v.heat { color: #d97706; text-shadow: 0 0 12px rgba(217,119,6,0.35); }
+html[data-theme="light"] .hero-gauge .g-v.cool { color: #0f9d6e; text-shadow: 0 0 12px rgba(15,157,110,0.30); }
+html[data-theme="light"] .hero-gauge .g-meter { background: rgba(15,23,42,0.08); }
+
+html[data-theme="light"] .hero-verdict.ok { color: #0f9d6e; text-shadow: 0 0 16px rgba(15,157,110,0.35); }
+html[data-theme="light"] .hero-verdict.degraded { color: #d97706; text-shadow: 0 0 16px rgba(217,119,6,0.35); }
+html[data-theme="light"] .hero-verdict.down { color: #d64545; text-shadow: 0 0 16px rgba(214,69,69,0.35); }
+
+html[data-theme="light"] .hero-chip {
+  background: rgba(8,145,178,0.06);
+  color: #40506a;
+  border: 1px solid rgba(15,23,42,0.10);
+}
+
+
