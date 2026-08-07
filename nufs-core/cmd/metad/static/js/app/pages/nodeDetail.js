@@ -18,6 +18,20 @@
       usagePct: function () {
         if (!this.node) return 0;
         return this.node.capacity_gb > 0 ? ((this.node.used_gb / this.node.capacity_gb) * 100) : 0;
+      },
+      // An operator-set state (decommission/maintenance/failed) excludes the
+      // node from placement and is sticky across heartbeats. Surface it as a
+      // prominent banner so the action clearly took effect and is reversible —
+      // the restore button lives in the actions row beside it.
+      decoStatus: function () {
+        if (!this.node) return null;
+        switch (this.node.state) {
+          case 1: return 'draining';
+          case 2: return 'maintenance';
+          case 3: return 'offline';
+          case 4: return 'failed';
+          default: return null;
+        }
       }
     },
     watch: { id: function () { this.load(); } },
@@ -73,13 +87,20 @@
         </div>
 
         <template v-else-if="node">
+          <div v-if="decoStatus" class="notice notice-warning">
+            {{ t('nod.banner_' + decoStatus, { id: id }) }}
+          </div>
           <div class="card">
-            <div class="card-header"><h3>{{ t('nod.health') }}</h3>
-              <div class="actions-row">
-                <button v-if="node.state === 0" class="btn btn-sm btn-danger" @click="confirm = true">{{ t('nd.decommission') }}</button>
-                <button v-if="node.state !== 0" class="btn btn-sm btn-primary" @click="restore" :disabled="busy">{{ busy ? t('nd.restoring_btn') : t('nd.restore') }}</button>
+            <div class="card-body" style="padding-top:16px"><div class="kv">
+                <div class="k">{{ t('nod.k_state') }}</div>
+                <div class="v"><StateBadge :state="node.state"/>
+                  <button v-if="node.state === 0" class="btn btn-sm btn-danger" style="margin-left:12px" @click="confirm = true">{{ t('nd.decommission') }}</button>
+                  <button v-if="node.state !== 0" class="btn btn-sm btn-primary" style="margin-left:12px" @click="restore" :disabled="busy">{{ busy ? t('nd.restoring_btn') : t('nd.restore') }}</button>
+                </div>
               </div>
             </div>
+          </div>
+          <div class="card">
             <div class="card-body">
               <div style="display:flex;align-items:center;gap:16px;margin-bottom:18px">
                 <RingGauge :pct="usagePct" :size="56" :color="usagePct > 85 ? 'danger' : (usagePct > 70 ? 'warning' : 'primary')"/>

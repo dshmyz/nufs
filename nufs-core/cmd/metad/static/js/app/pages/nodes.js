@@ -83,9 +83,9 @@
                   <td>{{ n.chunk_count }}</td>
                   <td class="text-muted">{{ U.relTime(n.last_seen, true) }}</td>
                   <td>
-                    <button v-if="n.state !== 1 && n.state !== 2 && n.state !== 4" class="btn btn-sm btn-danger" @click="askDecommission(n)">{{ t('nd.decommission') }}</button>
-                    <span v-else class="text-muted" style="font-size:.75rem">{{ t('nd.draining_lbl') }}</span>
-                    <button v-if="n.state !== 0" class="btn btn-sm btn-primary" style="margin-left:6px" @click="restore(n)">{{ t('nd.restore') }}</button>
+                    <button v-if="n.state === 0" class="btn btn-sm btn-danger" @click.stop="askDecommission(n)">{{ t('nd.decommission') }}</button>
+                    <span v-else-if="n.state === 1 || n.state === 2" class="text-muted" style="font-size:.75rem">{{ t('nd.draining_lbl') }}</span>
+                    <button v-if="n.state !== 0" class="btn btn-sm btn-primary" style="margin-left:6px" @click.stop="restore(n)">{{ t('nd.restore') }}</button>
                   </td>
                 </tr>
                 <tr v-if="!nodes.length"><td colspan="11" class="empty">{{ t('nd.no_nodes') }}</td></tr>
