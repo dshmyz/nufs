@@ -380,6 +380,85 @@ func TestPebbleStore_NodeManagement(t *testing.T) {
 	if n2.State != NodeDraining {
 		t.Fatalf("expected Draining, got %d", n2.State)
 	}
+
+	// A decommissioned node keeps heartbeating while its data drains away.
+	// That heartbeat must refresh liveness WITHOUT undoing the operator's
+	// drain decision: if it flipped the node back to NodeOnline, placement
+	// (which filters n.State != NodeOnline) would start sending it new chunks
+	// again and decommission would be a silent no-op. Regression for the live
+	// multi-node drill that exposed exactly this clobber.
+	if err := store.Heartbeat(ctx, 1, &NodeReport{UsedGB: 99, ChunkCount: 49}); err != nil {
+		t.Fatalf("Heartbeat after decommission: %v", err)
+	}
+	n3, _ := store.GetNode(ctx, 1)
+	if n3.State != NodeDraining {
+		t.Fatalf("decommissioned node flipped to %d on heartbeat, want NodeDraining (sticky)", n3.State)
+	}
+	if n3.UsedGB != 99 {
+		t.Fatalf("heartbeat liveness fields not refreshed: UsedGB=%d, want 99", n3.UsedGB)
+	}
+
+	// An explicitly-decommissioned node must not be eligible for placement.
+	nodesAfter, err := store.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	if len(nodesAfter) != 1 || nodesAfter[0].State != NodeDraining {
+		t.Fatalf("unexpected node state after decommission: %+v", nodesAfter)
+	}
+}
+
+// TestPebbleStore_DecommissionExcludesFromPlacement proves a decommissioned
+// (NodeDraining) node is excluded from new chunk placement even while it keeps
+// heartbeating. Placement filters candidates by State == NodeOnline; the bug
+// this guards was HeartbeatLiveness clobbering NodeDraining back to NodeOnline
+// on every heartbeat, silently re-enabling placement onto the very node being
+// decommissioned. With two nodes (150, 151), an RF=2 plan fits before
+// decommission; after draining 150 only 151 remains eligible, so the same
+// plan must now fail with ErrInsufficientNodes.
+func TestPebbleStore_DecommissionExcludesFromPlacement(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	rfc := func(rf int) PlacementPolicy {
+		return PlacementPolicy{
+			ID:                "t",
+			ReplicationFactor: rf,
+			TopologySpread:    SpreadNode,
+		}
+	}
+	pol := rfc(2)
+	for _, id := range []NodeID{150, 151} {
+		if err := store.RegisterNode(ctx, &NodeInfo{ID: id, Addr: fmt.Sprintf("node%d:9001", id), CapacityGB: 100}); err != nil {
+			t.Fatalf("RegisterNode %d: %v", id, err)
+		}
+	}
+	// RF=2 across the two online nodes fits before decommission.
+	if ids, err := store.placement.PlaceChunk(pol, nil); err != nil || len(ids) != 2 {
+		t.Fatalf("pre-decommission placement err=%v ids=%v, want 2 eligible", err, ids)
+	}
+
+	// Drain 150 — it keeps heartbeating, but placement must no longer pick it.
+	if err := store.DecommissionNode(ctx, 150); err != nil {
+		t.Fatalf("DecommissionNode: %v", err)
+	}
+	if err := store.Heartbeat(ctx, 150, &NodeReport{UsedGB: 10, ChunkCount: 5}); err != nil {
+		t.Fatalf("heartbeat while draining: %v", err)
+	}
+	if _, err := store.placement.PlaceChunk(pol, nil); !errors.Is(err, ErrInsufficientNodes) {
+		t.Fatalf("after decommission RF=2 placement err=%v, want ErrInsufficientNodes (only 1 eligible)", err)
+	}
+	// RF=1 still places on the surviving online node 151, never the drained 150.
+	ids, err := store.placement.PlaceChunk(rfc(1), nil)
+	if err != nil {
+		t.Fatalf("RF=1 placement after decommission: %v", err)
+	}
+	if len(ids) != 1 || ids[0] == 150 {
+		t.Fatalf("RF=1 placement after decommission = %v, want exactly [151] (drained 150 excluded)", ids)
+	}
+	if ids[0] != 151 {
+		t.Fatalf("RF=1 placement = %v, want [151]", ids)
+	}
 }
 
 // TestPebbleStore_ShardDiskCountRoundTrip proves the EC candidate-topology
@@ -2176,4 +2255,32 @@ func TestRaftE2E_LeaderFailover(t *testing.T) {
 		t.Fatalf("data lost: got %q", got2)
 	}
 	t.Log("leader commit and local persistence verified")
+}
+
+// TestPebbleStore_HeartbeatPromotesOfflineToOnline locks in the other half of
+// the liveness state machine: a node the lease manager marked NodeOffline
+// (heartbeat loss) must be promoted back to NodeOnline by its next heartbeat,
+// while the sticky states (NodeDraining/NodeMaint/NodeFailed) set by an
+// operator are left untouched. This guards the exact branch the decommission
+// fix keeps.
+func TestPebbleStore_HeartbeatPromotesOfflineToOnline(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+	if err := store.RegisterNode(ctx, &NodeInfo{ID: 40, Addr: "node40:9001", CapacityGB: 100}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	// Simulate the lease manager expiring the node: force State to offline.
+	off := &NodeInfo{ID: 40, Addr: "node40:9001", CapacityGB: 100,
+		State: NodeOffline, LastSeen: time.Now().Add(-2 * time.Minute).UnixNano()}
+	if err := store.putJSON(prefixNode+"40", off); err != nil {
+		t.Fatalf("force offline: %v", err)
+	}
+	// A resumed heartbeat must promote offline -> online.
+	if err := store.Heartbeat(ctx, 40, &NodeReport{UsedGB: 5, ChunkCount: 1}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	n, _ := store.GetNode(ctx, 40)
+	if n.State != NodeOnline {
+		t.Fatalf("offline node not promoted on heartbeat: got state %d, want NodeOnline", n.State)
+	}
 }

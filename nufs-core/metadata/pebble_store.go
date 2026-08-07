@@ -2933,7 +2933,17 @@ func (s *PebbleStore) HeartbeatLiveness(ctx context.Context, nodeID NodeID, repo
 		return ErrNodeNotFound
 	}
 	info.LastSeen = time.Now().UnixNano()
-	info.State = NodeOnline
+	// A heartbeat proves the node is alive but must not undo an explicit
+	// operator/admin state change on the same path that keeps it alive.
+	// Decommission (NodeDraining) and maintenance (NodeMaint) are sticky:
+	// decommissioning a node must keep excluding it from new placements
+	// (PlaceChunk filters n.State != NodeOnline) even while the node keeps
+	// heartbeating as its data drains away. Only promote a node that the
+	// lease manager previously marked NodeOffline (heartbeat loss) back to
+	// online when liveness resumes; leave draining/maintenance/failed as-is.
+	if info.State == NodeOffline {
+		info.State = NodeOnline
+	}
 	if report != nil {
 		info.UsedGB = report.UsedGB
 		info.UsedBytes = report.UsedBytes
