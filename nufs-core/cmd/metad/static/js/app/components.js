@@ -71,7 +71,7 @@
 
   // ---- TrendChart: canvas line/area chart (ops-rate live) ----
   C.TrendChart = {
-    props: { series: { type: Array, default: function () { return []; } }, height: { type: Number, default: 220 }, color: { type: String, default: '#0891b2' }, ylabel: { type: String, default: 'ops/s' } },
+    props: { series: { type: Array, default: function () { return []; } }, height: { type: Number, default: 220 }, color: { type: String, default: '#22d3ee' }, ylabel: { type: String, default: 'ops/s' } },
     template: '<div class="trend-wrap"><canvas class="trend-canvas" :height="height"></canvas></div>',
     mounted: function () {
       var self = this;
@@ -99,7 +99,7 @@
 
         var data = (this.series || []).slice();
         if (data.length < 2) {
-          ctx.fillStyle = '#94a3b8'; ctx.font = '13px Inter, sans-serif';
+          ctx.fillStyle = '#6b7690'; ctx.font = '13px Inter, sans-serif';
           ctx.textAlign = 'center'; ctx.fillText(I.t('chart.waiting'), w / 2, h / 2 + 4);
           return;
         }
@@ -108,9 +108,9 @@
         var mag = Math.pow(10, Math.floor(Math.log10(max)));
         var nice = Math.ceil(max / mag) * mag; if (nice <= 0) nice = 1; max = nice;
 
-        // grid
-        ctx.strokeStyle = '#e5eaf0'; ctx.lineWidth = 1;
-        ctx.font = '11px Inter, sans-serif'; ctx.fillStyle = '#8b95a3'; ctx.textAlign = 'right';
+        // grid (dark-panel instrument gridlines)
+        ctx.strokeStyle = 'rgba(148,163,184,0.12)'; ctx.lineWidth = 1;
+        ctx.font = '11px ui-monospace, Menlo, monospace'; ctx.fillStyle = '#6b7690'; ctx.textAlign = 'right';
         var gl = 4;
         for (var i = 0; i <= gl; i++) {
           var y = pad.top + (plotH / gl) * i;
@@ -119,7 +119,7 @@
           ctx.fillText(val.toFixed(val < 1 ? 2 : 1), pad.left - 8, y + 4);
         }
         ctx.save();
-        ctx.fillStyle = '#94a3b8'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = '#6b7690'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
         ctx.translate(12, pad.top + plotH / 2); ctx.rotate(-Math.PI / 2);
         ctx.fillText(this.ylabel, 0, 0); ctx.restore();
 

@@ -148,7 +148,7 @@
             <h2>{{ t('ov.welcome') }}</h2>
             <p class="empty-desc">{{ t('ov.empty_desc') }}</p>
             <button class="btn btn-primary btn-lg" :disabled="seeding" @click="runSeed">{{ seeding ? t('ov.creating') : t('ov.create_demo') }}</button>
-            <p v-if="seedError" class="empty-hint" style="color:#dc2626">{{ seedError }}</p>
+            <p v-if="seedError" class="empty-hint" style="color:var(--red)">{{ seedError }}</p>
             <p class="empty-hint">{{ t('ov.empty_hint') }}</p>
           </div>
         </template>
