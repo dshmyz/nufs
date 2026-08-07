@@ -300,6 +300,26 @@ body {
   box-shadow: inset 0 0 0 1px rgba(34,211,238,0.4);
 }
 
+/* Theme toggle — a single-glyph switch sitting beside the language toggle. */
+.theme-toggle {
+  border: 1px solid var(--seam);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--text-secondary);
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.theme-toggle:hover {
+  border-color: var(--seam-strong);
+  color: var(--primary);
+}
+
 /* ===== Notice ===== */
 .notice {
   padding: 10px 32px;
@@ -1748,3 +1768,94 @@ table.table tbody tr.clickable-row:hover td { background: rgba(34,211,238,0.06);
 /* Chunks page: highlighted row for the inspected chunk */
 .table tr.row-active { background: rgba(34,211,238,0.08); }
 .table tr.row-active td { font-weight: 500; }
+
+/* ===== Light theme =====================================================
+   Same anodized-instrument grammar, but the content surface becomes brushed
+   light aluminum while the sidebar and the cluster hero stay dark (the brand
+   anchors — the precision front panel and the optical readout survive the
+   theme flip). Toggled via html[data-theme="light"], set by AppLayout and
+   persisted to localStorage; applies instantly to honor reduced-motion.   */
+html[data-theme="light"] {
+  /* Content substrate flips to a cool light graphite; sidebar vars untouched. */
+  --bg: #eef1f6;
+  --bg-2: #e5e9f0;
+  --panel: #ffffff;
+  --panel-2: #f6f8fb;
+  --panel-3: #eef2f7;
+  --seam: rgba(15,23,42,0.10);
+  --seam-strong: rgba(15,23,42,0.18);
+  --card-bg: var(--panel);
+  --card-hover: var(--panel-2);
+  --text: #1a2333;
+  --text-secondary: #40506a;
+  --text-muted: #74809a;
+  --border: var(--seam);
+  --border-light: var(--seam);
+  /* Primary/status hues darken a step for contrast on white, hues unchanged. */
+  --primary: #0891b2;
+  --primary-hover: #0e7490;
+  --primary-glow: rgba(8,145,178,0.18);
+  --green: #0f9d6e;
+  --green-bg: rgba(15,157,110,0.10);
+  --red: #d64545;
+  --red-bg: rgba(214,69,69,0.10);
+  --orange: #c87c1a;
+  --orange-bg: rgba(200,124,26,0.10);
+  --purple: #7c5cd6;
+  --purple-bg: rgba(124,92,214,0.10);
+  --blue: #2b6fd0;
+  --blue-bg: rgba(43,111,208,0.10);
+  --gray: #5b6b82;
+  --gray-bg: #e9edf3;
+  /* Softer, lower-trust shadows on a pale ground. */
+  --shadow: 0 1px 2px rgba(15,23,42,0.10), 0 1px 0 rgba(255,255,255,0.6) inset;
+  --shadow-md: 0 8px 22px rgba(15,23,42,0.14), 0 0 0 1px var(--seam);
+  --shadow-lg: 0 20px 52px rgba(15,23,42,0.20), 0 0 0 1px var(--seam);
+}
+
+/* -- hardcoded light-on-dark values that must flip when the surface is pale -- */
+html[data-theme="light"] body {
+  background:
+    radial-gradient(120% 90% at 50% -10%, rgba(8,145,178,0.06), transparent 55%),
+    var(--bg);
+}
+
+html[data-theme="light"] .topbar {
+  background: rgba(238,241,246,0.78);
+}
+
+/* Inputs regain a white well on focus instead of the dark well. */
+html[data-theme="light"] .input:focus { background: #ffffff; }
+
+/* Status notifications: bright amber-on-dark becomes a readable deep amber. */
+html[data-theme="light"] .notice-warning {
+  color: #9a5b0d;
+  border-bottom: 1px solid var(--seam);
+}
+
+/* Badges: bright LED text on translucent dark tints needs darker light-theme
+   text to stay legible on white. */
+html[data-theme="light"] .badge-success { color: #0f7a56; }
+html[data-theme="light"] .badge-danger  { color: #c03939; }
+html[data-theme="light"] .badge-warning { color: #9a5b0d; }
+html[data-theme="light"] .badge-info    { color: #24588f; }
+html[data-theme="light"] .badge-primary { color: #6543a8; }
+
+/* Leader pill in the topbar. */
+html[data-theme="light"] .leader-yes { color: #0f9d6e; }
+html[data-theme="light"] .leader-no  { color: #c87c1a; }
+
+/* Card top hairline highlight reads as light-on-dark; flip to white. */
+html[data-theme="light"] .card {
+  background: linear-gradient(180deg, rgba(255,255,255,0.9), transparent 3px), var(--card-bg);
+}
+
+/* Row hover tins and active rows: slightly deeper cyan so they read on white. */
+html[data-theme="light"] .table tbody tr:hover td,
+html[data-theme="light"] table.table tbody tr.clickable-row:hover td { background: rgba(8,145,178,0.06); }
+html[data-theme="light"] .table tr.row-active { background: rgba(8,145,178,0.09); }
+
+/* Scrollbar thumb — dark indigo to neutral slate. */
+html[data-theme="light"] ::-webkit-scrollbar-thumb { background: #c3cad6; border: 2px solid var(--bg); }
+html[data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #a9b3c3; }
+

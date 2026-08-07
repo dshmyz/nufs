@@ -26,7 +26,7 @@
   var ICONS = { overview: '◆', nodes: '◫', repair: '↻', rebalance: '⇄', namespace: '◈', chunks: '▣', quota: '◻', ops: '⌁', backups: '▣' };
   var AppLayout = {
     data: function () {
-      return { state: R.state, nav: R.PAGES };
+      return { state: R.state, nav: R.PAGES, light: false };
     },
     computed: {
       title: function () { return I.t(R.titleFor(this.state.key)); },
@@ -51,7 +51,25 @@
       // reactive locale; page templates use the global `t` from globalProperties.
       t: I.t,
       lang: function () { return I.current(); },
-      setLang: function (l) { I.setLocale(l); }
+      setLang: function (l) { I.setLocale(l); },
+      toggleTheme: function () {
+        this.light = !this.light;
+        this.applyTheme();
+      },
+      applyTheme: function () {
+        var root = document.documentElement;
+        if (this.light) { root.setAttribute('data-theme', 'light'); }
+        else { root.removeAttribute('data-theme'); }
+        try { localStorage.setItem('nufs-theme', this.light ? 'light' : 'dark'); } catch (e) {}
+      }
+    },
+    mounted: function () {
+      // Restore the persisted theme on load (default dark). No animated switch —
+      // the theme flips instantly so prefers-reduced-motion is honored.
+      var saved = 'dark';
+      try { saved = localStorage.getItem('nufs-theme') || 'dark'; } catch (e) {}
+      this.light = saved === 'light';
+      this.applyTheme();
     },
     template: `
       <div class="layout">
@@ -72,6 +90,9 @@
           <header class="topbar">
             <h2>{{ title }}</h2>
             <div class="topbar-right">
+              <button class="theme-toggle" :title="light ? t('app.theme_dark') : t('app.theme_light')"
+                      :aria-label="light ? t('app.theme_dark') : t('app.theme_light')"
+                      @click="toggleTheme">{{ light ? '☀' : '◐' }}</button>
               <div class="lang-toggle" role="group" aria-label="Language / 语言">
                 <button class="lang-btn" :class="{ 'active': lang() === 'zh' }" @click="setLang('zh')">中</button>
                 <button class="lang-btn" :class="{ 'active': lang() === 'en' }" @click="setLang('en')">EN</button>

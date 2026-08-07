@@ -21,6 +21,8 @@
       'app.control_plane': '控制平面',
       'app.metad': '元数据节点',
       'app.lang': '中 / EN',
+      'app.theme_light': '切换到浅色主题',
+      'app.theme_dark': '切换到深色主题',
       'chart.waiting': '等待数据…',
       // nav labels + topbar titles share these keys
       'page.overview': '总览',
@@ -541,6 +543,8 @@
       'app.control_plane': 'control plane',
       'app.metad': 'metad',
       'app.lang': '中 / EN',
+      'app.theme_light': 'Switch to light theme',
+      'app.theme_dark': 'Switch to dark theme',
       'chart.waiting': 'Waiting for data…',
       'page.overview': 'Overview',
       'page.nodes': 'Nodes',
