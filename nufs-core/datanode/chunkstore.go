@@ -220,7 +220,8 @@ func (cs *ChunkStore) diskOf(chunkID metadata.ChunkID) *diskShard {
 
 // Write stores chunk data to local disk.
 // If WAL is configured, the write is logged before and committed after for crash recovery.
-func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) (writeErr error) {	cs.perf.writeOps.Add(1)
+func (cs *ChunkStore) Write(chunkID metadata.ChunkID, data []byte) (writeErr error) {
+	cs.perf.writeOps.Add(1)
 	defer func() {
 		if writeErr != nil {
 			cs.perf.writeFailOps.Add(1)
@@ -1070,16 +1071,46 @@ func (cs *ChunkStore) scanExisting() error {
 // DiskInfo is a read-only snapshot of one disk shard's metadata, returned
 // by DiskInfos for the management interface.
 type DiskInfo struct {
-	Index      int
-	Dir        string
-	UsedBytes  int64
+	Index       int
+	Dir         string
+	UsedBytes   int64
 	OnDiskBytes int64
-	ChunkCount int64
-	Failed     bool
+	ChunkCount  int64
+	Failed      bool
 	// State is the derived 3-tier health (DiskOnline/DiskDegraded/DiskFailed).
 	// The legacy ChunkStore derives its own DiskManager state; V2.1 V2Store
 	// fills this from its failCount thresholds. Zero value = DiskOnline.
 	State DiskState
+}
+
+// diskIndexByDir resolves a directory to its disk index, preferring the first
+// HEALTHY (non-Failed) entry that claims that dir and falling back to a Failed
+// entry only when no healthy one matches.
+//
+// Both engines can hold two disk slots for the same dir after a retire +
+// re-adopt round-trip: RemoveDisk preserves the retired slot (Failed, lower
+// index) and AddDisk appends a fresh healthy slot. The ops/mgmt commands that
+// address disks by dir (retire/migrate/decommission/verify) must target the
+// healthy re-adopted disk, not the preserved failed one — matching the first
+// entry would hit the failed slot and report "already retired" (or verify the
+// closed backend) forever. Preferring healthy keeps the single-entry case
+// identical (that entry is healthy), and only when every entry for the dir is
+// failed does it select the failed one, preserving the "use retire / unreadable
+// disk" behavior for a genuinely-only-failed disk.
+func DiskIndexByDir(infos []DiskInfo, dir string) int {
+	firstAny := -1
+	for _, d := range infos {
+		if d.Dir != dir {
+			continue
+		}
+		if firstAny < 0 {
+			firstAny = d.Index
+		}
+		if !d.Failed {
+			return d.Index
+		}
+	}
+	return firstAny
 }
 
 // DiskInfos returns a snapshot of all disk shards' metadata.

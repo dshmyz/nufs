@@ -244,3 +244,102 @@ func TestOpsServer_V2StoreDiskLifecycleWithoutFactoryDegrades(t *testing.T) {
 		t.Fatalf("adopt-no-factory body=%q, want 'not configured'", rec.Body.String())
 	}
 }
+
+// TestDiskIndexByDirRegression is the pure-function regression for the
+// retire + re-adopt same-dir bug: the ops/mgmt commands that address disks by
+// dir must resolve to the HEALTHY re-adopted entry, not the preserved failed
+// slot (which would report "already retired" / verify the closed backend).
+func TestDiskIndexByDirRegression(t *testing.T) {
+	// Two entries claim the same dir: preserved failed slot at lower index,
+	// healthy re-adopted slot at higher index (the post-retire+re-adopt shape).
+	infos := []DiskInfo{
+		{Index: 2, Dir: "/data", Failed: true},
+		{Index: 3, Dir: "/data", Failed: false},
+		{Index: 0, Dir: "/other", Failed: false},
+	}
+	if got := DiskIndexByDir(infos, "/data"); got != 3 {
+		t.Fatalf("DiskIndexByDir(same-dir) = %d, want 3 (healthy re-adopted, not failed slot 2)", got)
+	}
+	// Single healthy entry → itself.
+	if got := DiskIndexByDir(infos, "/other"); got != 0 {
+		t.Fatalf("DiskIndexByDir(healthy-only) = %d, want 0", got)
+	}
+	// Only failed entries for the dir → falls back to the failed one, preserving
+	// the "genuinely-only-failed" behavior (use retire / unreadable).
+	if got := DiskIndexByDir(infos, "/gone"); got != -1 {
+		t.Fatalf("DiskIndexByDir(unknown) = %d, want -1", got)
+	}
+	onlyFailed := []DiskInfo{{Index: 5, Dir: "/dead", Failed: true}}
+	if got := DiskIndexByDir(onlyFailed, "/dead"); got != 5 {
+		t.Fatalf("DiskIndexByDir(only-failed) = %d, want 5", got)
+	}
+}
+
+// TestOpsServer_SameDirReAdoptPrefersHealthy commands a retire + re-adopt of
+// the same dir through the REAL ops HTTP handlers and asserts migrate /
+// decommission target the healthy re-adopted disk — the end-to-end regression
+// for the bug, exercising DiskIndexByDir inside the ops dispatcher rather than
+// the raw store.
+func TestOpsServer_SameDirReAdoptPrefersHealthy(t *testing.T) {
+	s, dispatch := newV2OpsServer(t)
+	s.store.(*V2Store).SetDiskFactory(func(dir string) (storage.Store, storage.Store, error) {
+		data, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 1})
+		if err != nil {
+			return nil, nil, err
+		}
+		shard, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 2})
+		if err != nil {
+			_ = data.Close()
+			return nil, nil, err
+		}
+		return data, shard, nil
+	})
+
+	dir := t.TempDir()
+	// Adopt → retire → re-adopt the SAME dir. This leaves two DiskInfo entries
+	// for dir: the preserved failed slot (index 2) and the healthy re-adopted
+	// one (index 3).
+	adopt := func() int {
+		rec := dispatch(http.MethodPost, "/api/v1/disks/adopt?dir="+dir)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("adopt code=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var r struct {
+			Index int `json:"index"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &r)
+		return r.Index
+	}
+	a1 := adopt()
+	if rec := dispatch(http.MethodPost, "/api/v1/disks/retire?dir="+dir); rec.Code != http.StatusOK {
+		t.Fatalf("retire code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	a2 := adopt()
+	if a2 <= a1 {
+		t.Fatalf("re-adopt must append a fresh slot (adopt1=%d adopt2=%d)", a1, a2)
+	}
+
+	// Sanity: exactly two entries claim dir, first is failed, second healthy.
+	infos := s.store.DiskInfos()
+	var dirInfos []DiskInfo
+	for _, d := range infos {
+		if d.Dir == dir {
+			dirInfos = append(dirInfos, d)
+		}
+	}
+	if len(dirInfos) != 2 || !dirInfos[0].Failed || dirInfos[1].Failed {
+		t.Fatalf("expected [failed, healthy] same-dir entries, got %+v", dirInfos)
+	}
+
+	// migrate?dir= MUST act on the healthy re-adopted disk (200, ok), not the
+	// failed preserved slot. Before the fix it was a coin-flip on first-match.
+	if rec := dispatch(http.MethodPost, "/api/v1/disks/migrate?dir="+dir); rec.Code != http.StatusOK {
+		t.Fatalf("migrate same-dir post-re-adopt code=%d body=%s (want 200 on healthy slot)", rec.Code, rec.Body.String())
+	}
+
+	// decommission?dir= must also succeed (not "already retired") and retire the
+	// healthy re-adopted disk, leaving the same-dir case fully drained.
+	if rec := dispatch(http.MethodPost, "/api/v1/disks/decommission?dir="+dir); rec.Code != http.StatusOK {
+		t.Fatalf("decommission same-dir post-re-adopt code=%d body=%s (want 200, not 'already retired')", rec.Code, rec.Body.String())
+	}
+}

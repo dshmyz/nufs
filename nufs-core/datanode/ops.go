@@ -815,19 +815,25 @@ func (s *OpsServer) handleHTTPRetire(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotImplemented, "disk lifecycle unsupported by this engine")
 		return
 	}
+	idx := DiskIndexByDir(s.store.DiskInfos(), dir)
+	if idx < 0 {
+		writeJSONError(w, http.StatusNotFound, "dir not found")
+		return
+	}
 	for _, di := range s.store.DiskInfos() {
-		if di.Dir == dir {
-			if di.Failed {
-				writeJSONError(w, http.StatusConflict, "disk already retired")
-				return
-			}
-			if err := lc.RemoveDisk(di.Index); err != nil {
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			writeJSON(w, map[string]interface{}{"dir": dir})
+		if di.Index != idx {
+			continue
+		}
+		if di.Failed {
+			writeJSONError(w, http.StatusConflict, "disk already retired")
 			return
 		}
+		if err := lc.RemoveDisk(di.Index); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]interface{}{"dir": dir})
+		return
 	}
 	writeJSONError(w, http.StatusNotFound, "dir not found")
 }
@@ -847,25 +853,31 @@ func (s *OpsServer) handleHTTPDecommission(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusNotImplemented, "disk lifecycle unsupported by this engine")
 		return
 	}
+	idx := DiskIndexByDir(s.store.DiskInfos(), dir)
+	if idx < 0 {
+		writeJSONError(w, http.StatusNotFound, "dir not found")
+		return
+	}
 	for _, di := range s.store.DiskInfos() {
-		if di.Dir == dir {
-			if di.Failed {
-				writeJSONError(w, http.StatusConflict, "disk already retired")
-				return
-			}
-			migrated, migErr := lc.MigrateDisk(di.Index)
-			if migErr != nil {
-				writeJSONError(w, http.StatusInternalServerError,
-					fmt.Sprintf("disk may be unreadable; use retire instead (migrated %d, error: %v)", migrated, migErr))
-				return
-			}
-			if err := lc.RemoveDisk(di.Index); err != nil {
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			writeJSON(w, map[string]interface{}{"dir": dir, "migrated": migrated})
+		if di.Index != idx {
+			continue
+		}
+		if di.Failed {
+			writeJSONError(w, http.StatusConflict, "disk already retired")
 			return
 		}
+		migrated, migErr := lc.MigrateDisk(di.Index)
+		if migErr != nil {
+			writeJSONError(w, http.StatusInternalServerError,
+				fmt.Sprintf("disk may be unreadable; use retire instead (migrated %d, error: %v)", migrated, migErr))
+			return
+		}
+		if err := lc.RemoveDisk(di.Index); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]interface{}{"dir": dir, "migrated": migrated})
+		return
 	}
 	writeJSONError(w, http.StatusNotFound, "dir not found")
 }
@@ -885,17 +897,23 @@ func (s *OpsServer) handleHTTPMigrate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotImplemented, "disk lifecycle unsupported by this engine")
 		return
 	}
+	idx := DiskIndexByDir(s.store.DiskInfos(), dir)
+	if idx < 0 {
+		writeJSONError(w, http.StatusNotFound, "dir not found")
+		return
+	}
 	for _, di := range s.store.DiskInfos() {
-		if di.Dir == dir {
-			migrated, err := lc.MigrateDisk(di.Index)
-			if err != nil {
-				writeJSONError(w, http.StatusInternalServerError,
-					fmt.Sprintf("error: %v (migrated %d)", err, migrated))
-				return
-			}
-			writeJSON(w, map[string]interface{}{"dir": dir, "migrated": migrated})
+		if di.Index != idx {
+			continue
+		}
+		migrated, err := lc.MigrateDisk(di.Index)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError,
+				fmt.Sprintf("error: %v (migrated %d)", err, migrated))
 			return
 		}
+		writeJSON(w, map[string]interface{}{"dir": dir, "migrated": migrated})
+		return
 	}
 	writeJSONError(w, http.StatusNotFound, "dir not found")
 }
@@ -1001,13 +1019,7 @@ func (s *OpsServer) handleHTTPVerifyDisk(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusBadRequest, "path required")
 		return
 	}
-	targetIdx := -1
-	for _, di := range s.store.DiskInfos() {
-		if di.Dir == dir {
-			targetIdx = di.Index
-			break
-		}
-	}
+	targetIdx := DiskIndexByDir(s.store.DiskInfos(), dir)
 	if targetIdx < 0 {
 		writeJSONError(w, http.StatusNotFound, "dir not found")
 		return

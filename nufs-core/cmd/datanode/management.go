@@ -197,21 +197,27 @@ func (ms *managementServer) handleRetire(conn net.Conn, dir string) {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk lifecycle unsupported by this engine"})
 		return
 	}
+	idx := datanode.DiskIndexByDir(ms.store.DiskInfos(), dir)
+	if idx < 0 {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
+		return
+	}
 	for _, di := range ms.store.DiskInfos() {
-		if di.Dir == dir {
-			if di.Failed {
-				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk already retired"})
-				return
-			}
-			if err := lc.RemoveDisk(di.Index); err != nil {
-				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
-				return
-			}
-			json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{
-				"dir": dir,
-			}})
+		if di.Index != idx {
+			continue
+		}
+		if di.Failed {
+			json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk already retired"})
 			return
 		}
+		if err := lc.RemoveDisk(di.Index); err != nil {
+			json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
+			return
+		}
+		json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{
+			"dir": dir,
+		}})
+		return
 	}
 	json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
 }
@@ -228,32 +234,38 @@ func (ms *managementServer) handleDecommission(conn net.Conn, dir string) {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk lifecycle unsupported by this engine"})
 		return
 	}
+	idx := datanode.DiskIndexByDir(ms.store.DiskInfos(), dir)
+	if idx < 0 {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
+		return
+	}
 	for _, di := range ms.store.DiskInfos() {
-		if di.Dir == dir {
-			if di.Failed {
-				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk already retired"})
-				return
-			}
-			// Phase 1: migrate data to other disks.
-			migrated, migErr := lc.MigrateDisk(di.Index)
-			if migErr != nil {
-				json.NewEncoder(conn).Encode(sockResp{
-					Status: "error",
-					Error:  fmt.Sprintf("disk may be unreadable; use retire instead (migrated %d, error: %v)", migrated, migErr),
-				})
-				return
-			}
-			// Phase 2: mark failed after successful migration.
-			if err := lc.RemoveDisk(di.Index); err != nil {
-				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
-				return
-			}
-			json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{
-				"dir":      dir,
-				"migrated": migrated,
-			}})
+		if di.Index != idx {
+			continue
+		}
+		if di.Failed {
+			json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk already retired"})
 			return
 		}
+		// Phase 1: migrate data to other disks.
+		migrated, migErr := lc.MigrateDisk(di.Index)
+		if migErr != nil {
+			json.NewEncoder(conn).Encode(sockResp{
+				Status: "error",
+				Error:  fmt.Sprintf("disk may be unreadable; use retire instead (migrated %d, error: %v)", migrated, migErr),
+			})
+			return
+		}
+		// Phase 2: mark failed after successful migration.
+		if err := lc.RemoveDisk(di.Index); err != nil {
+			json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
+			return
+		}
+		json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{
+			"dir":      dir,
+			"migrated": migrated,
+		}})
+		return
 	}
 	json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
 }
@@ -269,16 +281,22 @@ func (ms *managementServer) handleMigrate(conn net.Conn, dir string) {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk lifecycle unsupported by this engine"})
 		return
 	}
+	idx := datanode.DiskIndexByDir(ms.store.DiskInfos(), dir)
+	if idx < 0 {
+		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
+		return
+	}
 	for _, di := range ms.store.DiskInfos() {
-		if di.Dir == dir {
-			migrated, err := lc.MigrateDisk(di.Index)
-			if err != nil {
-				json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: fmt.Sprintf("migration error: %v (migrated %d)", err, migrated)})
-				return
-			}
-			json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{"dir": dir, "migrated": migrated}})
+		if di.Index != idx {
+			continue
+		}
+		migrated, err := lc.MigrateDisk(di.Index)
+		if err != nil {
+			json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: fmt.Sprintf("migration error: %v (migrated %d)", err, migrated)})
 			return
 		}
+		json.NewEncoder(conn).Encode(sockResp{Status: "ok", Data: map[string]interface{}{"dir": dir, "migrated": migrated}})
+		return
 	}
 	json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
 }
@@ -311,13 +329,7 @@ func (ms *managementServer) handleVerify(conn net.Conn, dir string) {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "path required"})
 		return
 	}
-	targetIdx := -1
-	for _, di := range ms.store.DiskInfos() {
-		if di.Dir == dir {
-			targetIdx = di.Index
-			break
-		}
-	}
+	targetIdx := datanode.DiskIndexByDir(ms.store.DiskInfos(), dir)
 	if targetIdx < 0 {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "dir not found"})
 		return
