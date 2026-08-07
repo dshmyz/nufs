@@ -172,8 +172,17 @@ func (v *V2Store) ECShardChunks() (map[metadata.ChunkID]bool, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	seen := make(map[metadata.ChunkID]bool)
-	for _, b := range v.shards {
+	for i, b := range v.shards {
 		if b.lister == nil {
+			continue
+		}
+		// Skip a retired/failed shard store. RemoveDisk marks the shard backend
+		// at the disk's index as FAILED (read-only, closed on re-adopt), and
+		// ListExtents on a closed store errors. A retired store contributes no
+		// reachable shards, so skipping it is correct — and one retired store
+		// must not abort self-heal discovery for the whole node, or the EC
+		// reaper would skip every sweep until the disk is re-adopted.
+		if v.diskFailed(i) {
 			continue
 		}
 		extents, err := b.lister.ListExtents()

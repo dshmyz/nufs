@@ -1077,6 +1077,18 @@ func (v *V2Store) AddDisk(dir string, maxWrites, maxReads int, wal *WriteAheadLo
 	if v.diskFactory == nil {
 		return 0, fmt.Errorf("add disk: not configured (no disk factory); disk lifecycle unsupported by this engine")
 	}
+	// Re-adopting the same dir a previous retire already claimed? The retired
+	// backend is still holding its on-disk index lock (the slot is preserved),
+	// so a fresh engine store for the same dir would fail to acquire it. Tear
+	// that engine down first to release the lock (and to forget the tombstoned
+	// extents), then rebuild below. This makes retire → re-adopt the same dir a
+	// reversible round-trip.
+	if idx := v.retiredDiskIndexFor(dir); idx >= 0 {
+		closeStore(v.disks[idx].store)
+		if idx < len(v.shards) {
+			closeStore(v.shards[idx].store)
+		}
+	}
 	data, shard, err := v.diskFactory(dir)
 	if err != nil {
 		return 0, fmt.Errorf("add disk: build engine store for %s: %w", dir, err)
@@ -1151,6 +1163,21 @@ func closeStore(s storage.Store) {
 	if c, ok := s.(interface{ Close() error }); ok {
 		_ = c.Close()
 	}
+}
+
+// retiredDiskIndexFor returns the index of a FAILED (retired) data backend
+// whose dir matches, or -1. Used by AddDisk to release a previously-retired
+// disk's on-disk lock before re-adopting the same dir. Reads v.disks under the
+// reader lock so a concurrent lifecycle operation can't race the slot scan.
+func (v *V2Store) retiredDiskIndexFor(dir string) int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	for i, b := range v.disks {
+		if b.dir == dir && v.diskFailed(i) {
+			return i
+		}
+	}
+	return -1
 }
 
 // loc returns the location of a chunk, defaulting to the first disk at

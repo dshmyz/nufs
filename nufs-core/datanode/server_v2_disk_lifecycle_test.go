@@ -230,6 +230,173 @@ func TestV2StoreAddDiskWithoutFactoryDegrades(t *testing.T) {
 	}
 }
 
+// TestV2StoreECShardChunksSkipsRetiredShardStore guards the EC self-heal
+// discovery path against a retired shard store: after RemoveDisk retires a disk
+// whose shard backend is subsequently closed (re-adopt tears the old backend
+// down to release its index flock), ListExtents on that closed store errors.
+// ECShardChunks must SKIP the retired shard store — not abort discovery for the
+// whole node — or the EC reaper logs "discovery failed" every sweep and never
+// self-heals the healthy disks until the disk is re-adopted.
+func TestV2StoreECShardChunksSkipsRetiredShardStore(t *testing.T) {
+	v, _ := newTestShardMultiStore(t, 2)
+
+	// A shard each on disk 0 (chunk 1) and disk 1 (chunk 2).
+	if err := v.WriteShard(metadata.ChunkID(1), 0, []byte("s0")); err != nil {
+		t.Fatalf("WriteShard(1): %v", err)
+	}
+	if err := v.WriteShard(metadata.ChunkID(2), 0, []byte("s1")); err != nil {
+		t.Fatalf("WriteShard(2): %v", err)
+	}
+
+	// Both chunks discovered while both disks are healthy.
+	all, err := v.ECShardChunks()
+	if err != nil {
+		t.Fatalf("ECShardChunks before retire: %v", err)
+	}
+	if !all[1] || !all[2] {
+		t.Fatalf("ECShardChunks before retire = %v, want chunks 1 and 2", all)
+	}
+
+	// Retire disk 1, then close its (now unneeded) shard backend — the exact
+	// state re-adopt of the same dir leaves behind (AddDisk closes the retired
+	// data+shard backends to release their index flocks).
+	if err := v.RemoveDisk(1); err != nil {
+		t.Fatalf("RemoveDisk(1): %v", err)
+	}
+	closeStore(v.shards[1].store)
+
+	// Discovery must still succeed and report only the healthy disk's shard.
+	after, err := v.ECShardChunks()
+	if err != nil {
+		t.Fatalf("ECShardChunks with retired shard store errored (discovery aborts): %v", err)
+	}
+	if !after[1] {
+		t.Fatal("healthy disk 0 shard (chunk 1) not discovered after retining disk 1")
+	}
+	if after[2] {
+		t.Fatal("retired disk 1 shard (chunk 2) should be excluded from discovery")
+	}
+}
+
+// TestV2StoreReAdoptSameDirAfterRetire proves retire → re-adopt the SAME dir is
+// a reversible round-trip on the V2.1 engine. This uses on-disk (Pebble) segment
+// stores so the retired backend actually holds its index flock — the exact
+// failure the E2E hit ("open index: lock held by current process") — and the
+// fix (AddDisk tearing down the retired backend before reopening) must clear it.
+func TestV2StoreReAdoptSameDirAfterRetire(t *testing.T) {
+	target := t.TempDir()
+	// A factory that builds real on-disk segment stores (StreamID 1 data,
+	// StreamID 2 shard) so each holds a real index flock. The shard index is
+	// placed under dir/index-ecshard (mirroring runDataNodeV21.newDiskStores)
+	// so the data and shard stores of the same dir don't collide on one lock.
+	factory := func(dir string) (storage.Store, storage.Store, error) {
+		data, err := segment.New(segment.Config{Dir: dir, UseMemIndex: false, StreamID: 1})
+		if err != nil {
+			return nil, nil, err
+		}
+		shard, err := segment.New(segment.Config{Dir: dir, IndexDir: dir + "/index-ecshard", UseMemIndex: false, StreamID: 2})
+		if err != nil {
+			_ = data.Close()
+			return nil, nil, err
+		}
+		return data, shard, nil
+	}
+
+	// Seed TWO real on-disk disks so RemoveDisk on a third (adopted) disk isn't
+	// rejected as "the only disk".
+	seed := func(dir string) (*segment.Store, *segment.Store) {
+		data, err := segment.New(segment.Config{Dir: dir, UseMemIndex: false, StreamID: 1})
+		if err != nil {
+			t.Fatalf("seed data store %s: %v", dir, err)
+		}
+		shard, err := segment.New(segment.Config{Dir: dir, IndexDir: dir + "/index-ecshard", UseMemIndex: false, StreamID: 2})
+		if err != nil {
+			t.Fatalf("seed shard store %s: %v", dir, err)
+		}
+		return data, shard
+	}
+	seed1, seed1s := seed(t.TempDir())
+	seed2, seed2s := seed(t.TempDir())
+	t.Cleanup(func() { seed1.Close(); seed1s.Close(); seed2.Close(); seed2s.Close() })
+	v := NewMultiV2Store([]storage.Store{seed1, seed2}, "" /* dirs omitted */)
+	// Attach the seeds' EC-shard stores so the shard slice stays index-aligned
+	// with the data disks, exactly as runDataNodeV21's AttachShardStores does.
+	if err := v.AttachShardStores([]storage.Store{seed1s, seed2s}); err != nil {
+		t.Fatalf("attach shard stores: %v", err)
+	}
+	v.SetDiskFactory(factory)
+	// Close every store V2Store adopts (including the re-adopted one) so their
+	// segment background goroutines (compactor/WAL) stop before the t.TempDir()
+	// cleanup removes the index dirs — otherwise a leaked goroutine races temp
+	// cleanup and crashes a LATER test with "001/index: no such file or
+	// directory". Close is idempotent, so this is safe alongside the seed
+	// t.Cleanup above.
+	t.Cleanup(func() {
+		for _, b := range v.disks {
+			closeStore(b.store)
+		}
+		for _, b := range v.shards {
+			closeStore(b.store)
+		}
+	})
+
+	// Give the seed disks some bytes so the freshly re-adopted (empty) disk is
+	// the strict least-used placement target.
+	if err := v.Write(metadata.ChunkID(1), []byte("seed-1")); err != nil {
+		t.Fatalf("seed write 1: %v", err)
+	}
+	if err := v.Write(metadata.ChunkID(2), []byte("seed-2")); err != nil {
+		t.Fatalf("seed write 2: %v", err)
+	}
+
+	// Adopt a temp dir → disk 2, then retire it, then re-adopt the SAME dir.
+	// RemoveDisk preserves the slot and leaves the retired backend's flock on
+	// the dir; the re-adopt must tear that backend down first (the fix) so it
+	// can reopen the same dir instead of failing with "lock held by current
+	// process".
+	idx, err := v.AddDisk(target, 8, 8, nil)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if idx != 2 {
+		t.Fatalf("adopt index = %d, want 2", idx)
+	}
+	if err := v.RemoveDisk(idx); err != nil {
+		t.Fatalf("retire: %v", err)
+	}
+	if !v.diskFailed(idx) {
+		t.Fatalf("retired disk %d should be FAILED", idx)
+	}
+	// The retired backend for the target dir must be locatable so the re-adopt
+	// can tear it down; if not, its flock is never released and re-adopt fails.
+	if got := v.retiredDiskIndexFor(target); got != idx {
+		t.Fatalf("retiredDiskIndexFor(%s) = %d, want %d", target, got, idx)
+	}
+	reIdx, err := v.AddDisk(target, 8, 8, nil)
+	if err != nil {
+		t.Fatalf("re-adopt same dir after retire: %v", err)
+	}
+	if reIdx != 3 {
+		t.Fatalf("re-adopted disk index = %d, want 3 (appended after preserved slot)", reIdx)
+	}
+	if v.diskFailed(reIdx) {
+		t.Fatalf("re-adopted disk %d should be healthy, not failed", reIdx)
+	}
+
+	// A fresh chunk must land on the healthy re-adopted disk (disk 3 is the
+	// strictly least-used non-failed one) and read back.
+	base := metadata.ChunkID(900)
+	if err := v.Write(base, []byte("post-readopt")); err != nil {
+		t.Fatalf("write post re-adopt: %v", err)
+	}
+	if loc := v.loc(base); loc.disk != reIdx {
+		t.Fatalf("post-re-adopt chunk placed on disk %d, want %d", loc.disk, reIdx)
+	}
+	if got, _, err := v.Read(base, 0, 1<<20); err != nil || string(got) != "post-readopt" {
+		t.Fatalf("read post-re-adopt: got=%q err=%v", got, err)
+	}
+}
+
 // TestV2StoreDecommissionComposite exercises the ops-server decommission path:
 // migrate the disk's data onto the remaining healthy disk, then retire it.
 func TestV2StoreDecommissionComposite(t *testing.T) {
