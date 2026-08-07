@@ -37,6 +37,9 @@
         }).catch(function (e) { self.busy = false; C.toast.err(e.message); });
       },
       relTime: function (ts) { return U.relTime(ts, false); },
+      // task row drill → the chunk's detail page (the repair queue is flat, but
+      // the chunk detail shows the replicas/state/EC layout responsible here)
+      goChunk: function (chunkId) { window.NUFS.Router.navigate('chunk_detail', { id: chunkId }); },
       priorityLabel: function (p) {
         if (p >= 3) return 'high';
         if (p === 2) return 'med';
@@ -68,7 +71,7 @@
             <table class="table">
               <thead><tr><th>{{ t('rp.th_chunk') }}</th><th>{{ t('rp.th_reason') }}</th><th>{{ t('rp.th_priority') }}</th><th>{{ t('rp.th_queued') }}</th></tr></thead>
               <tbody>
-                <tr v-for="t in tasks" :key="t.chunk_id">
+                <tr v-for="t in tasks" :key="t.chunk_id" class="clickable-row" @click="goChunk(t.chunk_id)">
                   <td class="mono">{{ t.chunk_id }}</td>
                   <td>{{ t.reason || '—' }}</td>
                   <td><span class="badge" :class="priorityLabel(t.priority) === 'high' ? 'badge-danger' : (priorityLabel(t.priority) === 'med' ? 'badge-warning' : 'badge-secondary')">{{ priorityTxt(t.priority) }}</span></td>

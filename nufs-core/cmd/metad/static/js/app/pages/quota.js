@@ -112,7 +112,8 @@
         });
       },
       bytePct: function (b) { return b.ratios ? Math.round((b.ratios.bytes || 0) * 100) : 0; },
-      fmt: function (ts) { return U.fmtTime(ts, false); }
+      fmt: function (ts) { return U.fmtTime(ts, false); },
+      goBucket: function (name) { window.NUFS.Router.navigate('bucket_detail', { id: name }); }
     },
     template: `
       <div>
@@ -137,7 +138,7 @@
             <table class="table">
               <thead><tr><th>{{ t('qu.th_bucket') }}</th><th>{{ t('qu.th_usage') }}</th><th>{{ t('qu.th_quota') }}</th><th>{{ t('qu.th_objects') }}</th><th></th></tr></thead>
               <tbody>
-                <tr v-for="b in buckets" :key="b.name">
+                <tr v-for="b in buckets" :key="b.name" class="clickable-row" @click="goBucket(b.name)">
                   <td>
                     <div class="mono">{{ b.name }}</div>
                     <div class="muted small">{{ t('qu.inode_policy', { inode: b.root_inode, pol: (b.policy && (b.policy.id || b.policy.name)) || t('qu.policy') }) }}</div>
@@ -150,7 +151,7 @@
                   <td class="mono">{{ quotaLabel(b) }}</td>
                   <td>{{ b.usage.objects }}</td>
                   <td style="text-align:right">
-                    <button class="btn btn-sm" @click="openEdit(b)">{{ t('qu.edit') }}</button>
+                    <button class="btn btn-sm" @click.stop="openEdit(b)">{{ t('qu.edit') }}</button>
                   </td>
                 </tr>
                 <tr v-if="!buckets.length"><td colspan="5" class="empty">{{ t('qu.th_nobucket') }}</td></tr>

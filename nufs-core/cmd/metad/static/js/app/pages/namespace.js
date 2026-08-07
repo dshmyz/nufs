@@ -35,7 +35,13 @@
         t: I.t
       };
     },
-    mounted: function () { this.open(ROOT); },
+    mounted: function () {
+      // Optional #/namespace?root=<inode> lets a bucket detail deep-link
+      // straight to that bucket's root directory instead of global ROOT=1.
+      var m = window.location.hash.match(/[?&]root=(\d+)/);
+      if (m) { this.open(Number(m[1])); return; }
+      this.open(ROOT);
+    },
     computed: {
       // which modal is open (for v-if/chained template brevity)
       showMkdir: function () { return this.dlg === 'mkdir'; },

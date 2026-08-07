@@ -22,17 +22,23 @@
 
   function parse(hash) {
     hash = hash || '';
-    var path = hash.replace(/^#\/?/, '').replace(/\/+$/, '');
+    // Strip any ?query so #/namespace?root=N still routes to 'namespace'; the
+    // page (namespace) reads the query itself for extra params like root inode.
+    var noQuery = hash.split('?')[0];
+    var path = noQuery.replace(/^#\/?/, '').replace(/\/+$/, '');
     var parts = path.split('/').filter(Boolean);
     var params = {};
     var key = 'overview';
 
     if (parts.length >= 1) key = parts[0];
 
-    // Nested detail routes: #/nodes/<id> → node_detail (there is no
-    // P.chunkDetail, so #/chunks/<id> stays a list; handled for forward-compat).
+    // Nested detail routes:
+    //   #/nodes/<id>    → node_detail
+    //   #/chunks/<id>   → chunk_detail (single chunk's metadata / replicas)
+    //   #/buckets/<name> → bucket_detail
     if (parts.length >= 2 && parts[0] === 'nodes') { key = 'node_detail'; params.id = parts[1]; }
-    else if (parts.length >= 2 && parts[0] === 'chunks') params.id = parts[1];
+    else if (parts.length >= 2 && parts[0] === 'chunks') { key = 'chunk_detail'; params.id = parts[1]; }
+    else if (parts.length >= 2 && parts[0] === 'buckets') { key = 'bucket_detail'; params.id = decodeURIComponent(parts[1]); }
 
     return { key: key, params: params };
   }
@@ -49,6 +55,7 @@
     var target;
     if (key === 'node_detail' && p.id) target = '#/nodes/' + p.id;
     else if (key === 'chunk_detail' && p.id) target = '#/chunks/' + p.id;
+    else if (key === 'bucket_detail' && p.id) target = '#/buckets/' + encodeURIComponent(p.id);
     else if (key === 'overview') target = '#/overview';
     else target = '#' + key; // '#/nodes', '#/repair', ...
     if (window.location.hash === target) { apply(); } else { window.location.hash = target; }
@@ -66,6 +73,8 @@
       overview: 'page.overview',
       nodes: 'page.nodes',
       node_detail: 'page.node_detail',
+      chunk_detail: 'page.chunk_detail',
+      bucket_detail: 'page.bucket_detail',
       repair: 'page.repair',
       rebalance: 'page.rebalance',
       namespace: 'page.namespace',

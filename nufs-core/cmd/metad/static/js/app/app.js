@@ -36,13 +36,15 @@
         // (overview, nodes, ...) already share their key with the page name.
         var k = this.state.key;
         if (k === 'node_detail') return P.nodeDetail;
+        if (k === 'chunk_detail') return P.chunkDetail;
+        if (k === 'bucket_detail') return P.bucketDetail;
         return P[k];
       }
     },
     methods: {
       isActive: function (k) {
         var pk = this.state.key;
-        return pk === k || (k === 'nodes' && pk === 'node_detail') || (k === 'chunks' && pk === 'chunk_detail');
+        return pk === k || (k === 'nodes' && pk === 'node_detail') || (k === 'chunks' && pk === 'chunk_detail') || (k === 'quota' && pk === 'bucket_detail');
       },
       icon: function (k) { return ICONS[k] || '•'; },
       // i18n helpers — exposed on the layout so the topbar toggle can flip the

@@ -38,7 +38,8 @@
         if (b.imbalance < 0.25) return 'info';
         if (b.imbalance < 0.50) return 'warning';
         return 'danger';
-      }
+      },
+      goNode: function (id) { window.NUFS.Router.navigate('node_detail', { id: id }); }
     },
     template: `
       <div>
@@ -74,7 +75,7 @@
               <table class="table">
                 <thead><tr><th>{{ t('rb.th_node') }}</th><th>{{ t('rb.th_capacity') }}</th><th>{{ t('rb.th_used') }}</th><th>{{ t('rb.th_usedpct') }}</th></tr></thead>
                 <tbody>
-                  <tr v-for="n in (balance.nodes || [])" :key="n.id">
+                  <tr v-for="n in (balance.nodes || [])" :key="n.id" class="clickable-row" @click="goNode(n.id)">
                     <td class="mono">{{ n.id }}</td>
                     <td>{{ U.humanBytes(n.capacity_gb * 1073741824) }}</td>
                     <td>{{ U.humanBytes(n.used_gb * 1073741824) }}</td>
