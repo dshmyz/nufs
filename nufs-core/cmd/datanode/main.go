@@ -135,23 +135,23 @@ func main() {
 			SkipVerify:        *tlsSkipVerify,
 			RequireClientCert: *tlsRequireClientCert,
 		},
-		MetadataAuthToken: *metadataAuthToken,
-		OpsAuthToken:      *opsAuthToken,
-		EnablePprof:       *enablePprof,
-		TraceEnabled:      *traceEnabled,
-		TraceEndpoint:     *traceEndpoint,
-		TraceInsecure:     *traceInsecure,
-		EncryptAtRest:     *encryptAtRest,
-		AllowLocalKMS:     *allowLocalKMS,
-		KMSKeyFile:        *kmsKeyFile,
-		KMSKeyEnv:         *kmsKeyEnv,
-		KMSKeyHex:         *kmsKeyHex,
-		AllowInsecureDev:  *allowInsecureDev,
-		AlertWebhook:      *alertWebhook,
-		StorageVersion:    *storageVersion,
-		SegmentSize:       *segmentSize,
+		MetadataAuthToken:  *metadataAuthToken,
+		OpsAuthToken:       *opsAuthToken,
+		EnablePprof:        *enablePprof,
+		TraceEnabled:       *traceEnabled,
+		TraceEndpoint:      *traceEndpoint,
+		TraceInsecure:      *traceInsecure,
+		EncryptAtRest:      *encryptAtRest,
+		AllowLocalKMS:      *allowLocalKMS,
+		KMSKeyFile:         *kmsKeyFile,
+		KMSKeyEnv:          *kmsKeyEnv,
+		KMSKeyHex:          *kmsKeyHex,
+		AllowInsecureDev:   *allowInsecureDev,
+		AlertWebhook:       *alertWebhook,
+		StorageVersion:     *storageVersion,
+		SegmentSize:        *segmentSize,
 		CompactionInterval: *compactInterval,
-		LogLevel:          *logLevel,
+		LogLevel:           *logLevel,
 	})
 }
 
@@ -260,16 +260,37 @@ func readMachineID() string {
 	return h
 }
 
+// productionGateError returns a non-nil error when cfg would start a datanode
+// with an open control plane in a production (non-dev) setting. With the
+// explicit --allow-insecure-dev opt-out, no error is returned.
+//
+// Besides requiring TLS (the historical gate), a production datanode must also
+// carry an ops auth token: without it the HTTP ops API (disk adopt/retire/
+// migrate, decommission, EC convert, repair …) is completely unauthenticated,
+// a full control-plane take-over. Mirrors metad's ValidateProductionConfig.
+func productionGateError(cfg datanode.Config) error {
+	if cfg.AllowInsecureDev {
+		return nil
+	}
+	if cfg.TLS.CertFile == "" || cfg.TLS.KeyFile == "" {
+		return fmt.Errorf("production datanode requires TLS; refusing to start in plaintext (set --tls-cert/--tls-key)")
+	}
+	if cfg.OpsAuthToken == "" {
+		return fmt.Errorf("production datanode requires ops authentication; refusing to start with an open ops API (set --ops-auth-token)")
+	}
+	return nil
+}
+
 func runDataNode(cfg datanode.Config) {
 	log := logging.Named("datanode")
 	log.Info("starting data node", "node_id", cfg.NodeID, "addr", cfg.ListenAddr, "data", cfg.DataDir, "machine", cfg.MachineID)
 
 	// Production safety gate (mirrors metad's ValidateProductionConfig):
-	// without the explicit dev opt-out, a datanode must not listen in
-	// plaintext. Refuse to start so a TLS-less node cannot silently accept
-	// chunk/ops traffic in a production setting.
-	if !cfg.AllowInsecureDev && (cfg.TLS.CertFile == "" || cfg.TLS.KeyFile == "") {
-		log.Error("production datanode requires TLS; refusing to start in plaintext", "hint", "set --tls-cert/--tls-key, or pass --allow-insecure-dev for development only")
+	// without the explicit dev opt-out, a datanode must not run an open
+	// control plane. Refuse to start so a TLS-less or unauthenticated node
+	// cannot silently accept chunk/ops traffic in a production setting.
+	if err := productionGateError(cfg); err != nil {
+		log.Error(err.Error(), "hint", "pass --allow-insecure-dev for development only")
 		os.Exit(1)
 	}
 

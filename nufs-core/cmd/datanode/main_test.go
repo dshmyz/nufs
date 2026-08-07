@@ -4,7 +4,64 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/example/dfs/datanode"
+	"github.com/example/dfs/internal/tlsutil"
 )
+
+// productionGateError must not accept a TLS-less or unauthenticated datanode
+// in production: an open control plane is a full ops-API take-over.
+func TestProductionGateRejectsOpenControlPlane(t *testing.T) {
+	cases := []struct {
+		name          string
+		cfg           datanode.Config
+		allowInsecure bool
+		wantErr       bool
+	}{
+		{
+			name:          "dev opt-out always allowed",
+			cfg:           datanode.Config{},
+			allowInsecure: true,
+			wantErr:       false,
+		},
+		{
+			name:    "production requires TLS",
+			cfg:     datanode.Config{},
+			wantErr: true,
+		},
+		{
+			name: "production requires ops auth",
+			cfg: datanode.Config{
+				TLS: tlsutil.Config{CertFile: "/certs/server.crt", KeyFile: "/certs/server.key"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "production TLS + auth is allowed",
+			cfg: datanode.Config{
+				TLS:          tlsutil.Config{CertFile: "/certs/server.crt", KeyFile: "/certs/server.key"},
+				OpsAuthToken: "s3cr3t",
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			if tc.allowInsecure {
+				cfg.AllowInsecureDev = true
+			}
+			err := productionGateError(cfg)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected production gate to reject, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected production gate to allow, got: %v", err)
+			}
+		})
+	}
+}
 
 func TestLoadOrAllocateNodeID(t *testing.T) {
 	tmpDir := t.TempDir()
