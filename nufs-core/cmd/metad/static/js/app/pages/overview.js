@@ -128,8 +128,11 @@
           .catch(function (e) { self.seedError = e.message; self.seeding = false; });
       },
       goNode: function (id) { window.NUFS.Router.navigate('node_detail', { id: id }); },
-      goBuckets: function () { window.NUFS.Router.navigate('buckets'); },
-      goRepair: function () { window.NUFS.Router.navigate('repair'); }
+      goNodes: function () { window.NUFS.Router.navigate('nodes'); },
+      goQuota: function () { window.NUFS.Router.navigate('quota'); },
+      goChunks: function () { window.NUFS.Router.navigate('chunks'); },
+      goRepair: function () { window.NUFS.Router.navigate('repair'); },
+      goRebalance: function () { window.NUFS.Router.navigate('rebalance'); }
     },
     mounted: function () {
       this.load();
@@ -183,7 +186,7 @@
           <FaultDomainStrip :domains="faultDomains"/>
 
           <!-- Balance / readiness strip -->
-          <div v-if="balance" class="card">
+          <div v-if="balance" class="card clickable-card" @click="goRebalance">
             <div class="card-header"><h3>{{ t('ov.rebalance_posture') }}</h3>
               <span class="badge" :class="'badge-' + balanceBadge">{{ t('ov.spread', { n: (balance.imbalance * 100).toFixed(1) }) }}</span>
             </div>
@@ -198,15 +201,15 @@
           </div>
 
           <div class="stats-grid">
-            <div class="stat-card stat-blue">
+            <div class="stat-card stat-blue" @click="goNodes">
               <div class="stat-value">{{ nodes.length }}</div>
               <div class="stat-label">{{ t('ov.stat_nodes') }}</div>
               <div class="stat-sub"><span class="stat-green">{{ online }} {{ t('ov.chip_online_lbl') }}</span><span v-if="draining"> &middot; <span class="stat-yellow">{{ draining }} {{ t('ov.chip_draining_lbl') }}</span></span><span v-if="offline"> &middot; <span class="stat-red">{{ offline }} {{ t('ov.chip_offline_lbl') }}</span></span></div>
             </div>
-            <div class="stat-card stat-green"><div class="stat-value">{{ buckets.length }}</div><div class="stat-label">{{ t('ov.stat_buckets') }}</div></div>
-            <div class="stat-card stat-purple"><div class="stat-value">{{ totals.chunks }}</div><div class="stat-label">{{ t('ov.stat_chunks') }}</div></div>
-            <div class="stat-card stat-orange"><div class="stat-value">{{ repairs.length }}</div><div class="stat-label">{{ t('ov.stat_repairs') }}</div></div>
-            <div class="stat-card">
+            <div class="stat-card stat-green" @click="goQuota"><div class="stat-value">{{ buckets.length }}</div><div class="stat-label">{{ t('ov.stat_buckets') }}</div></div>
+            <div class="stat-card stat-purple" @click="goChunks"><div class="stat-value">{{ totals.chunks }}</div><div class="stat-label">{{ t('ov.stat_chunks') }}</div></div>
+            <div class="stat-card stat-orange" @click="goRepair"><div class="stat-value">{{ repairs.length }}</div><div class="stat-label">{{ t('ov.stat_repairs') }}</div></div>
+            <div class="stat-card" style="cursor:default">
               <div class="stat-value" style="color:var(--primary);font-size:1.6rem">{{ lastEvt ? lastEvt.ops_rate.toFixed(1) : '…' }}</div>
               <div class="stat-label">{{ t('ov.stat_ops_sec') }}</div>
             </div>
@@ -241,7 +244,7 @@
                 <div class="topo-group">
                   <div class="topo-group-name">{{ g.name }}</div>
                   <div class="topo-grid">
-                    <div v-for="n in g.nodes" :key="n.id" class="tnode" :class="'tnode-' + n.stateCls">
+                    <div v-for="n in g.nodes" :key="n.id" class="tnode" :class="'tnode-' + n.stateCls" @click="goNode(n.id)">
                       <div class="tnode-head">
                         <span class="tnode-led" :class="'tnode-led-' + n.stateCls"></span>
                         <span class="tnode-id"><a href="javascript:void(0)" @click="goNode(n.id)">{{ t('ov.node_n', { n: n.id }) }}</a></span>
@@ -272,7 +275,7 @@
           </div>
 
           <div class="card">
-            <div class="card-header"><h3>{{ t('ov.buckets') }}</h3><a href="javascript:void(0)" class="btn btn-sm" @click="goBuckets">{{ t('ov.view_all') }}</a></div>
+            <div class="card-header"><h3>{{ t('ov.buckets') }}</h3><a href="javascript:void(0)" class="btn btn-sm" @click="goQuota">{{ t('ov.view_all') }}</a></div>
             <div class="card-body p-0">
               <table class="table">
                 <thead><tr><th>{{ t('ov.th_name') }}</th><th>{{ t('ov.th_policy') }}</th><th>{{ t('ov.th_replicas') }}</th></tr></thead>

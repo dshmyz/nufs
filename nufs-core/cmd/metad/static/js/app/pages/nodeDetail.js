@@ -12,7 +12,7 @@
     props: ['id'],
     components: { StateBadge: C.StateBadge, Modal: C.Modal, RingGauge: C.RingGauge },
     data: function () {
-      return { node: null, chunks: [], loading: true, notFound: false, busy: false, confirm: false, t: I.t };
+      return { node: null, chunks: [], loading: true, notFound: false, busy: false, confirm: false, chunksUnavailable: false, t: I.t };
     },
     computed: {
       usagePct: function () {
@@ -29,11 +29,12 @@
         A.node(this.id).then(function (n) {
           if (!n) { self.notFound = true; return; }
           self.node = n;
-          return A.chunks().then(function (ch) {
-            self.chunks = (ch || []).filter(function (c) {
-              return (c.replicas || []).some(function (r) { return r.node_id === n.id || r.node_id === Number(self.id); });
-            });
-          });
+          // The control plane enumerates chunks by inode only — there is no
+          // node-scoped "chunks hosted here" listing, so the bare /api/v1/chunks
+          // call 400s. Show the hosted count from the node summary and mark the
+          // per-chunk breakdown unavailable instead of firing a bad request.
+          self.chunks = [];
+          self.chunksUnavailable = true;
         }).catch(function (e) { console.error(e); C.toast.err(e.message); })
           .finally(function () { self.loading = false; });
       },
@@ -91,9 +92,10 @@
           </div>
 
           <div class="card">
-            <div class="card-header"><h3>{{ t('nod.chunks_hosted', { n: chunks.length }) }}</h3></div>
+            <div class="card-header"><h3>{{ t('nod.chunks_hosted', { n: node ? node.chunk_count || 0 : 0 }) }}</h3></div>
             <div class="card-body p-0">
-              <table class="table">
+              <div v-if="chunksUnavailable" class="empty ops-empty">{{ t('nod.chunks_unavailable') }}</div>
+              <table v-else class="table">
                 <thead><tr><th>{{ t('nod.th_chunk') }}</th><th>{{ t('nod.th_size') }}</th><th>{{ t('nod.th_state') }}</th><th>{{ t('nod.th_replicas') }}</th></tr></thead>
                 <tbody>
                   <tr v-for="c in chunks" :key="c.id">

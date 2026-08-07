@@ -31,9 +31,12 @@
     computed: {
       title: function () { return I.t(R.titleFor(this.state.key)); },
       routedComponent: function () {
+        // Return the component object (not a name string) so detail pages map
+        // cleanly: route key 'node_detail' → P.nodeDetail. Top-level routes
+        // (overview, nodes, ...) already share their key with the page name.
         var k = this.state.key;
-        if (k === 'node_detail' || k === 'chunk_detail') return k;
-        return k;
+        if (k === 'node_detail') return P.nodeDetail;
+        return P[k];
       }
     },
     methods: {

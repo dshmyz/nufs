@@ -62,7 +62,7 @@
                 <th data-sort="int">{{ t('nd.th_chunks') }}</th><th data-sort="string">{{ t('nd.th_lastseen') }}</th><th></th>
               </tr></thead>
               <tbody>
-                <tr v-for="n in nodes" :key="n.id">
+                <tr v-for="n in nodes" :key="n.id" class="clickable-row" @click="go(n.id)">
                   <td><a href="javascript:void(0)" @click="go(n.id)">{{ n.id }}</a></td>
                   <td class="mono">{{ n.addr }}</td>
                   <td><StateBadge :state="n.state"/></td>

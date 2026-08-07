@@ -386,11 +386,13 @@ body {
   border: 1px solid var(--border);
   position: relative;
   overflow: hidden;
-  transition: box-shadow var(--transition), transform var(--transition);
+  cursor: pointer;
+  transition: box-shadow var(--transition), transform var(--transition), border-color var(--transition);
 }
 
 .stat-card:hover {
   box-shadow: var(--shadow-md);
+  border-color: var(--primary);
   transform: translateY(-1px);
 }
 
@@ -1107,6 +1109,7 @@ td.on-disk {
   border-radius: var(--radius);
   padding: 14px 14px 12px;
   box-shadow: var(--shadow);
+  cursor: pointer;
   transition: box-shadow var(--transition), border-color var(--transition), transform var(--transition);
 }
 
@@ -1115,6 +1118,13 @@ td.on-disk {
   border-color: var(--primary);
   transform: translateY(-1px);
 }
+
+/* Clickable whole-card / row affordances (overview rebalance card, table rows) */
+.clickable-card { cursor: pointer; }
+.clickable-card:hover { box-shadow: var(--shadow-md); border-color: var(--primary); }
+
+table.table tbody tr.clickable-row { cursor: pointer; }
+table.table tbody tr.clickable-row:hover td { background: rgba(34,211,238,0.06); }
 
 .tnode-head {
   display: flex;

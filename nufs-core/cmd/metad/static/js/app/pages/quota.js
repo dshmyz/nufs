@@ -140,7 +140,7 @@
                 <tr v-for="b in buckets" :key="b.name">
                   <td>
                     <div class="mono">{{ b.name }}</div>
-                    <div class="muted small">{{ t('qu.inode_policy', { inode: b.root_inode, pol: b.policy || t('qu.policy') }) }}</div>
+                    <div class="muted small">{{ t('qu.inode_policy', { inode: b.root_inode, pol: (b.policy && (b.policy.id || b.policy.name)) || t('qu.policy') }) }}</div>
                   </td>
                   <td>
                     <div>{{ U.humanBytes(b.usage.used_bytes) }}</div>
