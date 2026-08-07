@@ -3001,10 +3001,12 @@ func (s *PebbleStore) DecommissionNode(ctx context.Context, nodeID NodeID) error
 
 // RestoreNode brings a node that was explicitly taken out of service back to
 // online. It inverts DecommissionNode, EnterMaintenance, and the transient
-// NodeOffline/NodeFailed states, making decommission reversible — the missing
-// half of the sticky-decommission change (commit 346c884): heartbeats only
-// promote NodeOffline → NodeOnline and never touch an operator-set
-// NodeDraining, so the ONLY way back online is this explicit call.
+// NodeOffline/NodeFailed states — including the terminal NodeDecommissioned
+// state reached once a drained node holds zero replicas — making decommission
+// reversible. This is the missing half of the sticky-decommission change
+// (commit 346c884): heartbeats only promote NodeOffline → NodeOnline and never
+// touch an operator-set NodeDraining, so the ONLY way a decommissioned node
+// returns to service is this explicit call.
 //
 // It is a deliberate, operator-authenticated control-plane action, so it does
 // not weaken decommission stickiness: an idle heartbeat still cannot silently
@@ -3396,6 +3398,35 @@ func (s *PebbleStore) ScanAllChunks(ctx context.Context, fn func(*ChunkMeta) err
 		}
 		return fn(&chunk)
 	})
+}
+
+// CountNodeReplicas scans every chunk and counts how many replicas (in any
+// sync state) the given node currently hosts. The decommission drain-completion
+// check uses this: a draining node is only "fully drained" once it holds zero
+// replicas, at which point it may safely advance to the terminal
+// NodeDecommissioned state.
+func (s *PebbleStore) CountNodeReplicas(ctx context.Context, nodeID NodeID) (int, error) {
+	if s.closed.Load() {
+		return 0, ErrServiceClosed
+	}
+	count := 0
+	err := s.scanPrefix(prefixChunk, func(key, val []byte) error {
+		var chunk ChunkMeta
+		if err := unmarshalValue(val, &chunk); err != nil {
+			slog.Warn("pebble store: corrupted chunk entry", "key", string(key), "error", err)
+			return nil
+		}
+		for _, r := range chunk.Replicas {
+			if r.NodeID == nodeID {
+				count++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // DB returns the underlying Pebble instance (for Raft snapshot/restore).

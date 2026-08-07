@@ -459,8 +459,23 @@ func (lm *LeaseManager) checkExpiredNodes() {
 			var cur NodeInfo
 			if err := unmarshalValue(raw, &cur); err == nil {
 				switch cur.State {
-				case NodeDraining, NodeMaint, NodeFailed:
+				case NodeMaint, NodeFailed:
+					// Never touch maintenance/failed; only an explicit operator
+					// action brings them back to service.
 					sticky = true
+				case NodeDraining:
+					// Draining is sticky too, but it also advances: once the
+					// node holds zero replicas it is fully drained and reaches
+					// the terminal NodeDecommissioned state. This runs in the
+					// lease sweep because the drain worker (rebalance_exec)
+					// migrates chunks independently of heartbeats and there is
+					// no other guaranteed signal of when the last replica left.
+					sticky = true
+					if n, err := lm.store.CountNodeReplicas(context.Background(), oldest.nodeID); err == nil && n == 0 {
+						if !lm.markDecommissioned(oldest.key, oldest.nodeID, now) {
+							continue
+						}
+					}
 				}
 			}
 		}
@@ -512,6 +527,32 @@ func (lm *LeaseManager) checkExpiredNodes() {
 			})
 		}
 	}
+}
+
+// markDecommissioned advances a fully-drained draining node to the terminal
+// NodeDecommissioned state. Returns true on success (or if the concurrent
+// state changed under us), false if the write should be retried/abandoned.
+func (lm *LeaseManager) markDecommissioned(key string, nodeID NodeID, now int64) bool {
+	info := &NodeInfo{ID: nodeID, State: NodeDecommissioned, LastSeen: now}
+	data, err := marshalValue(info, codecMsgpack)
+	if err != nil {
+		slog.Error("lease: marshal decommissioned node", "node_id", nodeID, "error", err)
+		return false
+	}
+	if err := lm.store.applyViaRaft(OpSet, key, data); err != nil {
+		slog.Error("lease: failed to mark node decommissioned", "node_id", nodeID, "error", err)
+		return false
+	}
+	slog.Info("lease: fully-drained decommissioning node reached terminal state",
+		"node_id", nodeID, "state", NodeDecommissioned.String())
+	if lm.events != nil {
+		eventData, _ := marshalValue(map[string]interface{}{
+			"node_id": nodeID,
+			"state":   NodeDecommissioned.String(),
+		}, codecMsgpack)
+		lm.events.PublishOrBlock(Event{Type: EventSet, Key: key, Value: eventData})
+	}
+	return true
 }
 
 // popMin removes and returns the minimum element from the heap.

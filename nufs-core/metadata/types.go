@@ -353,6 +353,7 @@ const (
 	NodeMaint              // Under maintenance (rolling upgrade)
 	NodeOffline
 	NodeFailed
+	NodeDecommissioned // Fully drained (zero replicas left); terminal unless explicitly restored
 )
 
 func (s NodeState) String() string {
@@ -367,6 +368,8 @@ func (s NodeState) String() string {
 		return "offline"
 	case NodeFailed:
 		return "failed"
+	case NodeDecommissioned:
+		return "decommissioned"
 	default:
 		return fmt.Sprintf("unknown(%d)", s)
 	}

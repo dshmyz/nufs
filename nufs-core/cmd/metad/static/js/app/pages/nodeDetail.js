@@ -30,6 +30,7 @@
           case 2: return 'maintenance';
           case 3: return 'offline';
           case 4: return 'failed';
+          case 5: return 'decommissioned';
           default: return null;
         }
       }

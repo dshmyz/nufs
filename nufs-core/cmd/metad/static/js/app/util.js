@@ -20,8 +20,9 @@
 
   // state → CSS class + label, mirroring the Go helpers the console used to
   // share. NodeInfo.state arrives as a numeric enum (0=online,1=draining,
-  // 2=maint,3=offline,4=failed); accept both numbers and strings for safety.
-  var STATE_NUM = ['online', 'draining', 'maintenance', 'offline', 'failed'];
+  // 2=maint,3=offline,4=failed,5=decommissioned); accept both numbers and
+  // strings for safety.
+  var STATE_NUM = ['online', 'draining', 'maintenance', 'offline', 'failed', 'decommissioned'];
   U.stateName = function (s) {
     if (typeof s === 'number') return STATE_NUM[s] || 'unknown';
     if (!s) return 'unknown';

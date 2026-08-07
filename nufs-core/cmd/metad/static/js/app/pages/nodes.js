@@ -85,6 +85,7 @@
                   <td>
                     <button v-if="n.state === 0" class="btn btn-sm btn-danger" @click.stop="askDecommission(n)">{{ t('nd.decommission') }}</button>
                     <span v-else-if="n.state === 1 || n.state === 2" class="text-muted" style="font-size:.75rem">{{ t('nd.draining_lbl') }}</span>
+                    <span v-else-if="n.state === 5" class="text-muted" style="font-size:.75rem">{{ t('nd.decommissioned_lbl') }}</span>
                     <button v-if="n.state !== 0" class="btn btn-sm btn-primary" style="margin-left:6px" @click.stop="restore(n)">{{ t('nd.restore') }}</button>
                   </td>
                 </tr>

@@ -150,9 +150,14 @@ func TestLeaseManager_PreservesOperatorStates(t *testing.T) {
 		want NodeState
 	}{
 		{
+			// Decommissioned node with no replicas left advances to the terminal
+			// NodeDecommissioned state via the lease-sweep drain-completion check
+			// (see TestLeaseManager_DrainingTerminalState). This is still sticky —
+			// the sweep never demotes it to NodeOffline, which is the property
+			// under test here.
 			name: "decommissioned",
 			prep: func(store *PebbleStore, id NodeID) error { return store.DecommissionNode(ctx, id) },
-			want: NodeDraining,
+			want: NodeDecommissioned,
 		},
 		{
 			name: "maintenance",
@@ -222,6 +227,87 @@ func TestLeaseManager_PreservesOperatorStates(t *testing.T) {
 				t.Fatalf("state after lease expiry = %d, want %d (operator state must survive)", n.State, tc.want)
 			}
 		})
+	}
+}
+
+// TestLeaseManager_DrainingTerminalState locks the "draining terminal state"
+// semantics the operator chose: a decommissioned (draining) node advances to
+// the terminal NodeDecommissioned state automatically once it holds zero
+// replicas, but stays draining while it still hosts data. Combined with
+// PreservesOperatorStates, this makes decommission a true lifecycle:
+//
+//	decommission → draining → (data fully migrated away) → decommissioned
+//
+// The transition is driven here in the lease sweep because the drain worker
+// (rebalance_exec) migrates chunks independently of heartbeats, and only the
+// metadata authority can observe "last replica left". It is still sticky (the
+// sweep never marks a draining node NodeOffline), so a heartbeat lapse can not
+// resurrect a node mid-drain, and only RestoreNode brings a decommissioned
+// node back to service.
+func TestLeaseManager_DrainingTerminalState(t *testing.T) {
+	ctx := context.Background()
+	bus := NewEventBus(4)
+
+	// Two nodes. Both hold operator-set states whose records we will advance.
+	// Node 1 additionally hosts a live replica (so it must STAY draining); node
+	// 2 is empty (so it must reach the terminal decommissioned state).
+	store := newTestPebbleStore(t)
+	for _, id := range []NodeID{1, 2} {
+		if err := store.RegisterNode(ctx, &NodeInfo{
+			ID: id, Addr: fmt.Sprintf("n%d:9001", id),
+			CapacityGB: 100, State: NodeOnline, LastSeen: time.Now().UnixNano(),
+		}); err != nil {
+			t.Fatalf("RegisterNode %d: %v", id, err)
+		}
+	}
+	// Node 1 hosts one live replica.
+	n1 := ChunkID(1001)
+	if err := store.putJSON(prefixChunk+fmt.Sprint(n1), &ChunkMeta{
+		ID: n1, Size: 64, State: ChunkReady,
+		Replicas: []ReplicaInfo{{NodeID: 1, Addr: "n1:9001", State: ReplicaReady}},
+	}); err != nil {
+		t.Fatalf("seed chunk on node 1: %v", err)
+	}
+
+	lm := NewLeaseManager(store, bus, 2*time.Second)
+	lm.Start()
+	defer lm.Stop()
+
+	// Decommission both nodes, then stop heartbeats so LastSeen goes stale and
+	// the next expiry sweep runs the drain-completion check.
+	for _, id := range []NodeID{1, 2} {
+		if err := store.DecommissionNode(ctx, id); err != nil {
+			t.Fatalf("DecommissionNode %d: %v", id, err)
+		}
+	}
+
+	time.Sleep(2500 * time.Millisecond)
+
+	// Node 1 still hosts a replica → must remain draining (not decommissioned).
+	n1n, err := store.GetNode(ctx, 1)
+	if err != nil {
+		t.Fatalf("GetNode 1: %v", err)
+	}
+	if n1n.State != NodeDraining {
+		t.Fatalf("node 1 (still hosting a replica) state = %d, want NodeDraining", n1n.State)
+	}
+
+	// Node 2 holds no replicas → must advance to the terminal NodeDecommissioned.
+	n2n, err := store.GetNode(ctx, 2)
+	if err != nil {
+		t.Fatalf("GetNode 2: %v", err)
+	}
+	if n2n.State != NodeDecommissioned {
+		t.Fatalf("node 2 (fully drained) state = %d, want NodeDecommissioned", n2n.State)
+	}
+
+	// Restore brings a decommissioned node back to service.
+	if err := store.RestoreNode(ctx, 2); err != nil {
+		t.Fatalf("RestoreNode 2: %v", err)
+	}
+	n2n, _ = store.GetNode(ctx, 2)
+	if n2n.State != NodeOnline {
+		t.Fatalf("node 2 after restore = %d, want NodeOnline", n2n.State)
 	}
 }
 

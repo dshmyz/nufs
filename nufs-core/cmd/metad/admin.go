@@ -80,6 +80,8 @@ func stateClass(s metadata.NodeState) string {
 		return "secondary"
 	case metadata.NodeFailed:
 		return "danger"
+	case metadata.NodeDecommissioned:
+		return "secondary"
 	default:
 		return "secondary"
 	}
@@ -96,6 +98,8 @@ func stateLabel(s metadata.NodeState) string {
 		return "Offline"
 	case metadata.NodeFailed:
 		return "Failed"
+	case metadata.NodeDecommissioned:
+		return "Decommissioned"
 	default:
 		return "Unknown"
 	}
