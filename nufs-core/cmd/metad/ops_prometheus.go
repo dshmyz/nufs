@@ -46,6 +46,7 @@ func prometheusMetricsHandler(store *metadata.PebbleStore, metrics *metadata.Met
 		writePrometheusBucketQuota(r.Context(), w, newPebbleBucketQuotaMetricsSource(store))
 		writePrometheusBackup(r.Context(), w, backupSource, time.Now().UTC())
 		writePrometheusNodeMetrics(w, store)
+		writePrometheusEventBus(w, store)
 		writePrometheusClusterReadiness(w, store)
 	})
 }
@@ -433,6 +434,28 @@ func writePrometheusNodeMetrics(w io.Writer, store *metadata.PebbleStore) {
 		fmt.Fprintf(w, "nufs_node_capacity_bytes{node_id=\"%s\"} %d\n", nodeID, nm.CapacityGB*1024*1024*1024)
 		fmt.Fprintf(w, "nufs_node_used_bytes{node_id=\"%s\"} %d\n", nodeID, nm.UsedGB*1024*1024*1024)
 	}
+}
+
+// writePrometheusEventBus surfaces the metadata change-notification bus
+// diagnostics. Dropped events mean a watcher's buffer filled up and a change
+// notification was silently lost — a slow-consumer signal worth alerting on,
+// especially since node-liveness uses PublishOrBlock (never dropped) but the
+// ordinary change notifications use Publish (may drop).
+func writePrometheusEventBus(w io.Writer, store *metadata.PebbleStore) {
+	eb := store.Events()
+	if eb == nil {
+		return
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP nufs_events_dropped_total Metadata change events dropped due to full watcher buffer")
+	fmt.Fprintln(w, "# TYPE nufs_events_dropped_total counter")
+	fmt.Fprintf(w, "nufs_events_dropped_total %d\n", eb.DroppedEvents())
+	fmt.Fprintln(w, "# HELP nufs_events_published_total Metadata change event publish attempts (including dropped)")
+	fmt.Fprintln(w, "# TYPE nufs_events_published_total counter")
+	fmt.Fprintf(w, "nufs_events_published_total %d\n", eb.PublishedTotal())
+	fmt.Fprintln(w, "# HELP nufs_events_watcher_count Active metadata change notification watchers")
+	fmt.Fprintln(w, "# TYPE nufs_events_watcher_count gauge")
+	fmt.Fprintf(w, "nufs_events_watcher_count %d\n", eb.WatcherCount())
 }
 
 func writePrometheusClusterReadiness(w io.Writer, store *metadata.PebbleStore) {

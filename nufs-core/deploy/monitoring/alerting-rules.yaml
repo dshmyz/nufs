@@ -304,6 +304,17 @@ groups:
           summary: "Chunk tombstones are waiting beyond the purge safety window"
           runbook: "docs/runbooks/metadata-disaster-recovery.md"
 
+      - alert: NUFSEventsDropped
+        expr: increase(nufs_events_dropped_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Metadata change events are being dropped — a watcher's buffer is full and notifications are being lost"
+          runbook: "docs/runbooks/metadata-disaster-recovery.md"
+
   - name: nufs.info
     rules:
       - alert: NUFSDiskDegraded
