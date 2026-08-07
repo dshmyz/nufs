@@ -446,6 +446,28 @@ func (lm *LeaseManager) checkExpiredNodes() {
 		// Pop from heap
 		lm.popMin()
 
+		// An operator-set state (decommission/maintenance/failed) is sticky and
+		// must survive heartbeat lapses: it is an explicit human action, not a
+		// transient liveness blip. The lease manager's job is to flag nodes that
+		// stopped heartbeating, so it must never clobber an operator decision
+		// with NodeOffline — doing so would let a later heartbeat revive a node
+		// that was deliberately taken out of service (see HeartbeatLiveness,
+		// which promotes only NodeOffline → NodeOnline). Read the current record
+		// and preserve any sticky state instead of overwriting it.
+		sticky := false
+		if raw, ok, err := lm.store.getRawBytes(oldest.key); err == nil && ok {
+			var cur NodeInfo
+			if err := unmarshalValue(raw, &cur); err == nil {
+				switch cur.State {
+				case NodeDraining, NodeMaint, NodeFailed:
+					sticky = true
+				}
+			}
+		}
+		if sticky {
+			continue
+		}
+
 		// Mark node offline
 		info := &NodeInfo{ID: oldest.nodeID, State: NodeOffline, LastSeen: now}
 		data, err := marshalValue(info, codecMsgpack)

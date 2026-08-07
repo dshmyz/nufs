@@ -133,6 +133,98 @@ func TestLeaseManager_ExpiresOfflineNodes(t *testing.T) {
 	}
 }
 
+// TestLeaseManager_PreservesOperatorStates proves that lease expiry never
+// clobbers an operator-set state with NodeOffline. Decommission, maintenance,
+// and failed are sticky human actions: if the lease manager overwrote a
+// draining node with NodeOffline, a later heartbeat (HeartbeatLiveness, which
+// promotes only offline → online) would silently resurrect a node the operator
+// deliberately took out of service. This is the regression that made
+// "decommission then restore" fail on a live cluster whose datanode heartbeat
+// lapsed momentarily.
+func TestLeaseManager_PreservesOperatorStates(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		prep func(store *PebbleStore, id NodeID) error
+		want NodeState
+	}{
+		{
+			name: "decommissioned",
+			prep: func(store *PebbleStore, id NodeID) error { return store.DecommissionNode(ctx, id) },
+			want: NodeDraining,
+		},
+		{
+			name: "maintenance",
+			prep: func(store *PebbleStore, id NodeID) error { return store.EnterMaintenance(ctx, id) },
+			want: NodeMaint,
+		},
+		{
+			name: "failed",
+			prep: func(store *PebbleStore, id NodeID) error {
+				// No public "mark failed" surface; a failed state arises from the
+				// disaster drill path, so write it directly like the lease test.
+				var cur NodeInfo
+				key := prefixNode + fmt.Sprintf("%d", id)
+				if _, err := store.getJSON(key, &cur); err != nil {
+					return err
+				}
+				cur.State = NodeFailed
+				return store.putJSON(key, &cur)
+			},
+			want: NodeFailed,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestPebbleStore(t)
+			bus := NewEventBus(4)
+
+			const id = NodeID(77)
+			if err := store.RegisterNode(ctx, &NodeInfo{
+				ID: id, Addr: "n77:9001", CapacityGB: 100,
+				State: NodeOnline, LastSeen: time.Now().UnixNano(),
+			}); err != nil {
+				t.Fatalf("RegisterNode: %v", err)
+			}
+
+			// 1. Lease manager with a short TTL, started first.
+			lm := NewLeaseManager(store, bus, 2*time.Second)
+			lm.Start()
+			defer lm.Stop()
+
+			// 2. The node heartbeats normally — this keeps it in the lease
+			//    expiry heap with a fresh LastSeen (mirrors live: a draining node
+			//    still heartbeats while its data drains away).
+			hb := func() {
+				if err := store.HeartbeatLiveness(ctx, id, nil); err != nil {
+					t.Fatalf("HeartbeatLiveness: %v", err)
+				}
+			}
+			hb()
+			hb()
+
+			// 3. Operator action mid-run, then the heartbeat stops so LastSeen
+			//    goes stale and the next expiry sweep would try to mark it
+			//    offline — the exact condition that used to clobber NodeDraining.
+			if err := tc.prep(store, id); err != nil {
+				t.Fatalf("prep: %v", err)
+			}
+
+			time.Sleep(2500 * time.Millisecond)
+
+			n, err := store.GetNode(ctx, id)
+			if err != nil {
+				t.Fatalf("GetNode: %v", err)
+			}
+			if n.State != tc.want {
+				t.Fatalf("state after lease expiry = %d, want %d (operator state must survive)", n.State, tc.want)
+			}
+		})
+	}
+}
+
 // ========== Chunk GC Tests ==========
 
 func TestChunkGC_FindsOrphans(t *testing.T) {
