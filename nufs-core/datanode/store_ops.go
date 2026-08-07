@@ -29,9 +29,11 @@ type OpsStore interface {
 }
 
 // DiskLifecycleOps is the optional hot-add/remove/migrate capability of a
-// storage backend (V1 ChunkStore has it; V2.1 V2Store does not yet). The
-// management servers advertise these commands only when the backend
-// implements the capability.
+// storage backend. Both the V1 ChunkStore and the V2.1 V2Store implement it;
+// the management servers advertise these commands only when the backend
+// implements the capability. V2Store.AddDisk additionally requires a disk
+// factory (SetDiskFactory) to have been injected by the datanode main —
+// without one it degrades to an "unsupported" error.
 type DiskLifecycleOps interface {
 	AddDisk(dir string, maxWrites, maxReads int, wal *WriteAheadLog) (int, error)
 	RemoveDisk(idx int) error
@@ -52,7 +54,12 @@ type DrainOps interface {
 var _ OpsStore = (*ChunkStore)(nil)
 var _ OpsStore = (*V2Store)(nil)
 
-// Compile-time: only the legacy ChunkStore exposes the disk-lifecycle and
-// drain capabilities. V2.1 gates both out of the management/ops channel.
+// Compile-time: both storage engines expose the disk-lifecycle capability so
+// the management/ops channel can advertise adopt/retire/decommission/migrate
+// for either engine. Only the legacy ChunkStore exposes the drain capability:
+// V2.1's internal shutdown barrier is named QuiesceWrites (not DrainWrites),
+// so it does not structurally satisfy DrainOps and the management/ops channel
+// keeps returning "drain unsupported by this engine" for V2.1 (option A).
 var _ DiskLifecycleOps = (*ChunkStore)(nil)
+var _ DiskLifecycleOps = (*V2Store)(nil)
 var _ DrainOps = (*ChunkStore)(nil)

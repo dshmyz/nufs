@@ -129,6 +129,23 @@ type V2Store struct {
 	diskMu       sync.Mutex
 	diskRun      bool
 	diskInterval time.Duration // probe cadence; <=0 falls back to diskHealthDefaultInterval
+
+	// diskFactory, when set, builds the paired data-stream and EC-shard
+	// segment stores for a newly adopted disk dir (streams 1 and 2, sharing
+	// the dir and change journal — the AddDisk analogue of the startup store
+	// construction in runDataNodeV21). It is injected by the datanode main
+	// because segment store construction needs the engine config (change
+	// journal, index dir, KMS, segment size, stream IDs) that lives there,
+	// not on the V2Store. nil means DiskLifecycleOps.AddDisk is unsupported.
+	diskFactory func(dir string) (data, shard storage.Store, err error)
+}
+
+// SetDiskFactory installs the disk-construction callback used by
+// DiskLifecycleOps.AddDisk. The datanode main wires it after building the
+// startup stores so a runtime-adopted disk is constructed exactly like its
+// siblings.
+func (v *V2Store) SetDiskFactory(fn func(dir string) (data, shard storage.Store, err error)) {
+	v.diskFactory = fn
 }
 
 // NewV2Store wraps a single backend (legacy/plain single-disk use). An
@@ -764,6 +781,15 @@ func (v *V2Store) nextLoc(chunkID metadata.ChunkID) (int, storage.Generation) {
 // toDisk==fromDisk, an unknown chunk, a missing source, or a move onto a
 // failed disk returns an error without changing state.
 func (v *V2Store) RebalanceOne(chunkID metadata.ChunkID, fromDisk, toDisk int) error {
+	return v.rebalanceOne(chunkID, fromDisk, toDisk, false)
+}
+
+// rebalanceOne is the shared move primitive behind RebalanceOne (live load
+// balancing, keep the source copy) and MigrateDisk (decommission pre-step,
+// remove the source copy). removeSource tombstones the source extent once the
+// move is committed so migrate truly drains the disk instead of leaving a
+// byte-for-byte duplicate behind.
+func (v *V2Store) rebalanceOne(chunkID metadata.ChunkID, fromDisk, toDisk int, removeSource bool) error {
 	// Rebalance issues a write to the target disk, so hold the write barrier
 	// for the whole move: a DrainWrites running concurrently must not observe
 	// a half-moved extent. Reads (which take only mu.RLock) are unaffected.
@@ -824,6 +850,20 @@ func (v *V2Store) RebalanceOne(chunkID metadata.ChunkID, fromDisk, toDisk int) e
 	}
 	v.locOf[chunkID] = chunkLoc{disk: toDisk, gen: gen}
 	v.mu.Unlock()
+
+	// For a migrate (removeSource), tombstone the source extent now that locOf
+	// is authoritative at the target, so the source disk is physically drained
+	// (decommission pre-step). The delete is at the store level — not v.Delete,
+	// which would follow locOf to the target — and defers to the accounting
+	// below (src loses the extent, dst gains it) so the counters move, not
+	// double-count. A failed tombstone is best-effort: the chunk already reads
+	// authoritatively from the target, and compaction reclaims the residue.
+	if removeSource {
+		_ = src.store.Delete(context.Background(), &storage.DeleteRequest{
+			ExtentID:   storage.ExtentID(chunkID),
+			Generation: gen,
+		})
+	}
 
 	src.usedByts.Add(-int64(len(res.Data)))
 	src.extCount.Add(-1)
@@ -944,6 +984,173 @@ func (v *V2Store) leastUsedDisk(exclude int) int {
 		}
 	}
 	return best
+}
+
+// ============ Disk lifecycle (DiskLifecycleOps — V2.1 parity) ============
+//
+// V2.1 advertising, retiring, decommissioning, and migrating a disk, the
+// V2Store analogue of the legacy ChunkStore's DiskLifecycleOps. The V2Store
+// builds its migration on the existing RebalanceOne primitive and marks a
+// removed disk failed (preserving its index slot, like V1), so reads to a
+// chunk that still claims the old slot keep routing and the disk is excluded
+// from all further placement.
+
+// MigrateDisk moves every chunk extent on disk srcIdx onto a healthy target
+// disk at the same generation, removing the source copy (PUT-at-target +
+// tombstone the source, via rebalanceOne with removeSource), returning the
+// number of extents migrated. It is the decommission pre-step: drain the
+// source disk's data before retiring it. Chunks that cannot move (e.g. the
+// target is full/failed — guarded inside rebalanceOne) are skipped and
+// counted nowhere; the caller decides whether to proceed with retire on top
+// of the residual. On success the source disk is physically emptied.
+func (v *V2Store) MigrateDisk(srcIdx int) (int, error) {
+	if srcIdx < 0 || srcIdx >= len(v.disks) {
+		return 0, fmt.Errorf("migrate disk: index %d out of range (have %d)", srcIdx, len(v.disks))
+	}
+	if len(v.disks) <= 1 {
+		return 0, fmt.Errorf("migrate disk: cannot migrate the only disk")
+	}
+	// Snapshot the source disk's extents before moving; a concurrent write to a
+	// chunk here is a non-issue — RebalanceOne CAS-guards the locOf re-point, so
+	// whichever wins the race is authoritative.
+	var ids []metadata.ChunkID
+	if l := v.disks[srcIdx].lister; l != nil {
+		extents, err := l.ListExtents()
+		if err != nil {
+			return 0, fmt.Errorf("migrate disk: enumerate disk %d: %w", srcIdx, err)
+		}
+		for _, e := range extents {
+			if e.Generation == 0 {
+				continue
+			}
+			ids = append(ids, metadata.ChunkID(e.ExtentID))
+		}
+	}
+	migrated := 0
+	for _, id := range ids {
+		dst := v.leastUsedDisk(srcIdx)
+		if dst < 0 {
+			break // no healthy target remains; stop the drain
+		}
+		if err := v.rebalanceOne(id, srcIdx, dst, true); err == nil {
+			migrated++
+		}
+	}
+	return migrated, nil
+}
+
+// RemoveDisk retires disk idx: it marks the disk and its paired shard backend
+// FAILED (consecutive-failure counter pinned at the failure threshold) while
+// preserving its index slot, so no new chunk or shard is placed on it and the
+// existing helper guards (diskFailed, leastUsedDisk, nextLoc, RebalanceOne)
+// all skip it. The disk's already-stored data is left in place — call
+// MigrateDisk first to drain it, or accept it as a lost replica (survivor
+// repair / anti-entropy will rebuild from healthy peers).
+//
+// Parity with ChunkStore.RemoveDisk: the slot is never removed from the
+// slices, so location maps and reads that reference it keep resolving.
+func (v *V2Store) RemoveDisk(idx int) error {
+	if idx < 0 || idx >= len(v.disks) {
+		return fmt.Errorf("remove disk: index %d out of range (have %d)", idx, len(v.disks))
+	}
+	if len(v.disks) <= 1 {
+		return fmt.Errorf("remove disk: cannot remove the only disk")
+	}
+	v.disks[idx].failCount.Store(diskHealthFailedThreshold)
+	if idx < len(v.shards) {
+		v.shards[idx].failCount.Store(diskHealthFailedThreshold)
+	}
+	v.stateVersion.Add(1)
+	return nil
+}
+
+// AddDisk adopts a new data dir by asking the injected disk factory to build
+// its paired data-stream and EC-shard segment stores, then appends both (plus
+// a capacity guard) to the V2Store and enumerates the new data/shards into
+// the location maps. Returns the new disk's index. maxWrites/maxReads/wal are
+// legacy-ChunkStore disk constraints with no V2.1 analogue and are ignored.
+//
+// Without a configured diskFactory (SetDiskFactory never called) AddDisk is
+// unsupported and returns an error — the single-disk/test construction path
+// has no way to build an engine backend for an arbitrary new dir.
+func (v *V2Store) AddDisk(dir string, maxWrites, maxReads int, wal *WriteAheadLog) (int, error) {
+	if v.diskFactory == nil {
+		return 0, fmt.Errorf("add disk: not configured (no disk factory); disk lifecycle unsupported by this engine")
+	}
+	data, shard, err := v.diskFactory(dir)
+	if err != nil {
+		return 0, fmt.Errorf("add disk: build engine store for %s: %w", dir, err)
+	}
+	// Enumerate the new stores off-lock so a partially-built disk never leaks
+	// into the serving slices; append everything under one lock at the end.
+	n := len(v.disks)
+	dataB := &diskBackend{store: data, index: n, dir: dir}
+	var newLocs map[metadata.ChunkID]chunkLoc
+	if l, ok := data.(extentLister); ok {
+		dataB.lister = l
+		if extents, err := l.ListExtents(); err != nil {
+			closeStore(data)
+			closeStore(shard)
+			return 0, fmt.Errorf("add disk: enumerate data store for %s: %w", dir, err)
+		} else {
+			newLocs = make(map[metadata.ChunkID]chunkLoc, len(extents))
+			for _, e := range extents {
+				id := metadata.ChunkID(e.ExtentID)
+				dataB.usedByts.Add(int64(e.Value.LogicalLen))
+				dataB.extCount.Add(1)
+				newLocs[id] = chunkLoc{disk: n, gen: e.Generation}
+			}
+		}
+	}
+	shardB := &diskBackend{store: shard, index: n}
+	var newShards map[metadata.ChunkID]map[int]int
+	if l, ok := shard.(extentLister); ok {
+		shardB.lister = l
+		if extents, err := l.ListExtents(); err != nil {
+			closeStore(data)
+			closeStore(shard)
+			return 0, fmt.Errorf("add disk: enumerate shard store for %s: %w", dir, err)
+		} else {
+			newShards = make(map[metadata.ChunkID]map[int]int, len(extents))
+			for _, e := range extents {
+				idx := int(e.Generation) - 1
+				cid := metadata.ChunkID(e.ExtentID)
+				if newShards[cid] == nil {
+					newShards[cid] = make(map[int]int)
+				}
+				newShards[cid][idx] = n
+				shardB.usedByts.Add(int64(e.Value.LogicalLen))
+				shardB.extCount.Add(1)
+			}
+		}
+	}
+
+	v.mu.Lock()
+	v.disks = append(v.disks, dataB)
+	v.shards = append(v.shards, shardB)
+	v.caps = append(v.caps, capacityForDisk(dir))
+	for id, loc := range newLocs {
+		v.locOf[id] = loc
+	}
+	for cid, m := range newShards {
+		if v.shardDiskOf[cid] == nil {
+			v.shardDiskOf[cid] = make(map[int]int)
+		}
+		for idx, d := range m {
+			v.shardDiskOf[cid][idx] = d
+		}
+	}
+	v.mu.Unlock()
+	v.stateVersion.Add(1)
+	return n, nil
+}
+
+// closeStore best-effort closes a newly-created engine store on AddDisk
+// rollback. Most V2.1 stores expose Close.
+func closeStore(s storage.Store) {
+	if c, ok := s.(interface{ Close() error }); ok {
+		_ = c.Close()
+	}
 }
 
 // loc returns the location of a chunk, defaulting to the first disk at
@@ -1159,6 +1366,13 @@ func (v *V2Store) diskFailed(i int) bool {
 // data backend. It is behind StartDiskMonitor, so an operator can leave it
 // off; when on, a responsive disk is never penalized (see probeDisk).
 const diskHealthDefaultInterval = 30 * time.Second
+
+// diskHealthFailedThreshold is the consecutive write-failure count at which a
+// backend is considered FAILED (read-only, excluded from placement) per the
+// disk health state machine. RemoveDisk pins a retired disk's counter here.
+// This is the same value the drive-failure state (probeDisk, diskState) uses;
+// it is a named constant here so the retire path reads its intent.
+const diskHealthFailedThreshold int64 = 5
 
 // StartDiskMonitor begins the proactive per-disk I/O health probe loop
 // (§4 V1-c). On each tick it probes every DATA backend (v.disks; EC shard

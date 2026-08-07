@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/example/dfs/datanode/storage"
+	"github.com/example/dfs/datanode/storage/segment"
 	"github.com/example/dfs/metadata"
 )
 
@@ -163,21 +165,86 @@ func TestOpsServer_V2StoreDrain(t *testing.T) {
 	}
 }
 
-func TestOpsServer_V2StoreDiskLifecycleUnsupported(t *testing.T) {
-	_, dispatch := newV2OpsServer(t)
+func TestOpsServer_V2StoreDiskLifecycleAdoptRetire(t *testing.T) {
+	s, dispatch := newV2OpsServer(t)
+	// The datanode main wires this factory; a configured store advertises and
+	// serves the full disk-lifecycle surface (task #183).
+	s.store.(*V2Store).SetDiskFactory(func(dir string) (storage.Store, storage.Store, error) {
+		data, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 1})
+		if err != nil {
+			return nil, nil, err
+		}
+		shard, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 2})
+		if err != nil {
+			_ = data.Close()
+			return nil, nil, err
+		}
+		return data, shard, nil
+	})
 
-	for _, tc := range []struct{ method, path string }{
-		{http.MethodPost, "/api/v1/disks/adopt?dir=/tmp/x"},
-		{http.MethodPost, "/api/v1/disks/retire?dir=/tmp/x"},
-		{http.MethodPost, "/api/v1/disks/decommission?dir=/tmp/x"},
-		{http.MethodPost, "/api/v1/disks/migrate?dir=/tmp/x"},
+	dir := t.TempDir()
+	rec := dispatch(http.MethodPost, "/api/v1/disks/adopt?dir="+dir)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("adopt code=%d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var res struct {
+		Dir   string `json:"dir"`
+		Index int    `json:"index"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal adopt: %v", err)
+	}
+	if res.Index != 2 {
+		t.Fatalf("adopt index=%d, want 2", res.Index)
+	}
+
+	// The adopted disk now appears in the disk list.
+	rec = dispatch(http.MethodGet, "/api/v1/disks")
+	var d struct {
+		Disks []struct {
+			Index int    `json:"index"`
+			Dir   string `json:"dir"`
+		} `json:"disks"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &d)
+	found := false
+	for _, disk := range d.Disks {
+		if disk.Index == 2 && disk.Dir == dir {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("adopted disk (index 2, dir %s) missing from /api/v1/disks: %+v", dir, d.Disks)
+	}
+
+	// Retire it back — reversible, proving lifecycle round-trips on V2.1.
+	rec = dispatch(http.MethodPost, "/api/v1/disks/retire?dir="+dir)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("retire code=%d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// Unknown dir → 404 for the dir-based lifecycle verbs.
+	for _, path := range []string{
+		"/api/v1/disks/retire?dir=/nope",
+		"/api/v1/disks/decommission?dir=/nope",
+		"/api/v1/disks/migrate?dir=/nope",
 	} {
-		rec := dispatch(tc.method, tc.path)
-		if rec.Code != http.StatusNotImplemented {
-			t.Fatalf("%s code=%d, want 501 (body: %s)", tc.path, rec.Code, rec.Body.String())
+		if c := dispatch(http.MethodPost, path).Code; c != http.StatusNotFound {
+			t.Fatalf("%s code=%d, want 404", path, c)
 		}
-		if !strings.Contains(rec.Body.String(), "unsupported by this engine") {
-			t.Fatalf("%s body=%q, want 'unsupported by this engine'", tc.path, rec.Body.String())
-		}
+	}
+}
+
+func TestOpsServer_V2StoreDiskLifecycleWithoutFactoryDegrades(t *testing.T) {
+	_, dispatch := newV2OpsServer(t)
+	// Without SetDiskFactory the V2Store cannot build an engine backend for an
+	// arbitrary new dir, so adopt degrades to an unsupported error (TASK #183
+	// keeps the degrade path; production main always wires the factory).
+	rec := dispatch(http.MethodPost, "/api/v1/disks/adopt?dir=/tmp/x")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("adopt-no-factory code=%d, want 500 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not configured") {
+		t.Fatalf("adopt-no-factory body=%q, want 'not configured'", rec.Body.String())
 	}
 }

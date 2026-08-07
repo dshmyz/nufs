@@ -574,41 +574,38 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	if cfg.SegmentSize > 0 {
 		segSize = cfg.SegmentSize
 	}
-	for _, dir := range dataDirs {
+	// Configure at-rest encryption once; the same registry is shared by the
+	// data stream, the EC-shard stream, and any disk adopted later via AddDisk.
+	var enc *encryption.KeyRegistry
+	if cfg.EncryptAtRest {
+		kms, err := buildAtRestKMS(cfg)
+		if err != nil {
+			log.Error("failed to configure at-rest encryption", "error", err)
+			closeStores()
+			os.Exit(1)
+		}
+		enc = encryption.NewKeyRegistry(kms)
+	}
+
+	// newDiskStores builds the paired data-stream (StreamID 1) and EC-shard
+	// (StreamID 2) segment stores for one disk dir. It is the single factory
+	// for every disk: the startup loop below builds the configured data dirs
+	// through it, and the V2Store's DiskLifecycleOps.AddDisk reuses it to
+	// adopt a runtime-added dir with exactly the same engine config (change
+	// journal, segment size, stream IDs, encryption) as its siblings.
+	newDiskStores := func(dir string) (storage.Store, storage.Store, error) {
 		segCfg := segment.Config{
 			Dir:           dir,
 			SegmentSize:   segSize,
 			UseMemIndex:   false,
 			StreamID:      1, // data stream (0 = small)
 			ChangeJournal: changeJournal,
-		}
-		// Configure at-rest encryption if enabled.
-		if cfg.EncryptAtRest {
-			kms, err := buildAtRestKMS(cfg)
-			if err != nil {
-				log.Error("failed to configure at-rest encryption", "error", err)
-				closeStores()
-				os.Exit(1)
-			}
-			segCfg.Enc = encryption.NewKeyRegistry(kms)
+			Enc:           enc,
 		}
 		s, err := segment.New(segCfg)
 		if err != nil {
-			log.Error("failed to init V2.1 store", "disk", dir, "error", err)
-			closeStores()
-			os.Exit(1)
+			return nil, nil, fmt.Errorf("init V2.1 data store: %w", err)
 		}
-		stores = append(stores, s)
-
-		// EC shard store for this disk (StreamID 2, class dir "ecshard").
-		// One per disk, sharing the dir and change journal with the data
-		// stream; the V2Store attaches these so EC conversions (Program A)
-		// can place 6+3 shards across the node's shard stores (§14). The
-		// same encryption registry is reused so shard extents are encrypted
-		// at rest exactly like data extents. It needs its own on-disk index
-		// directory: both streams would otherwise open Pebble in Dir/index,
-		// and Pebble's exclusive per-directory lock would make the second
-		// open fail ("lock held by current process").
 		shardCfg := segment.Config{
 			Dir:           dir,
 			IndexDir:      filepath.Join(dir, "index-ecshard"),
@@ -616,16 +613,25 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 			UseMemIndex:   false,
 			StreamID:      2, // EC shard stream
 			ChangeJournal: changeJournal,
-		}
-		if segCfg.Enc != nil {
-			shardCfg.Enc = segCfg.Enc
+			Enc:           enc,
 		}
 		ss, err := segment.New(shardCfg)
 		if err != nil {
-			log.Error("failed to init V2.1 shard store", "disk", dir, "error", err)
+			// Unwind the already-opened data store for this dir.
+			_ = s.Close()
+			return nil, nil, fmt.Errorf("init V2.1 shard store: %w", err)
+		}
+		return s, ss, nil
+	}
+
+	for _, dir := range dataDirs {
+		s, ss, err := newDiskStores(dir)
+		if err != nil {
+			log.Error("failed to init V2.1 store", "disk", dir, "error", err)
 			closeStores()
 			os.Exit(1)
 		}
+		stores = append(stores, s)
 		shardStores = append(shardStores, ss)
 	}
 	log.Info("V2.1 storage engine ready", "disks", len(dataDirs))
@@ -676,6 +682,10 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		closeStores()
 		os.Exit(1)
 	}
+	// Let DiskLifecycleOps.AddDisk adopt a runtime-added disk dir using the
+	// same engine factory that built the configured data dirs above, so an
+	// adopted disk is constructed (and enumerated) exactly like its siblings.
+	v2Store.SetDiskFactory(newDiskStores)
 	log.Info("V2.1 EC shard stores attached", "shard_stores", len(shardStores))
 
 	srvCfg := cfg

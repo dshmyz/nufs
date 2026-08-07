@@ -76,8 +76,18 @@ func TestManagementServer_V2StoreStatus(t *testing.T) {
 }
 
 // TestManagementServer_V2StoreLifecycleUnsupported proves disk-lifecycle
-// socket commands answer "unsupported by this engine" for V2.1 (no disk
-// lifecycle) rather than panicking on the missing capability.
+// socket commands degrade cleanly for a factory-less V2Store (the operational
+// degrade path when the datanode main has NOT injected a disk factory via
+// SetDiskFactory). V2Store now satisfies DiskLifecycleOps, so:
+//   - adopt degrades to "add disk: not configured (no disk factory)…" because
+//     the engine cannot construct a segment store for an arbitrary new dir;
+//   - retire/decommission/migrate route through DiskInfos() and answer
+//     "dir not found" for an unknown path;
+//   - drain still answers "drain unsupported by this engine" (V2.1 exposes no
+//     DrainOps).
+//
+// None of these panic on the missing capability; production main always wires
+// the factory, which is exercised end-to-end in datanode/ops_v2store_test.go.
 func TestManagementServer_V2StoreLifecycleUnsupported(t *testing.T) {
 	v, dir := newV2StoreForTest(t)
 	stop, err := startManagementServer(v, nil, []string{dir})
@@ -94,10 +104,10 @@ func TestManagementServer_V2StoreLifecycleUnsupported(t *testing.T) {
 	defer conn.Close()
 
 	for _, tc := range []struct{ cmd, wantErr string }{
-		{cmd: "adopt", wantErr: "disk lifecycle unsupported by this engine"},
-		{cmd: "retire", wantErr: "disk lifecycle unsupported by this engine"},
-		{cmd: "decommission", wantErr: "disk lifecycle unsupported by this engine"},
-		{cmd: "migrate", wantErr: "disk lifecycle unsupported by this engine"},
+		{cmd: "adopt", wantErr: "add disk: not configured (no disk factory); disk lifecycle unsupported by this engine"},
+		{cmd: "retire", wantErr: "dir not found"},
+		{cmd: "decommission", wantErr: "dir not found"},
+		{cmd: "migrate", wantErr: "dir not found"},
 		{cmd: "drain", wantErr: "drain unsupported by this engine"},
 	} {
 		c, err := net.Dial("unix", sockPath)
