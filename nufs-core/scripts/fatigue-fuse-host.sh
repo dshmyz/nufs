@@ -2,7 +2,7 @@
 #
 # NUFS V2.1 挂载访问（真实 FUSE mount）疲劳 / 可靠性测试 —— 裸机（无 Docker）版
 #
-# 与 tests/fatigue-fuse.sh（Docker 版）等价，但完全在宿主机上运行：用
+# 与 scripts/fatigue-fuse.sh（Docker 版）等价，但完全在宿主机上运行：用
 # deploy/host/mount-helpers.sh 以裸机进程方式拉起 metad + datanode(v2.1 JBOD)
 # + nufs-s3，用 nufs-fuse 真实挂载 DFS，然后对挂载点持续注入 POSIX 负载
 # （写/读/追加/truncate/mkdir/symlink/删除 + 超过 64MiB 的多 chunk 文件），
@@ -21,7 +21,7 @@
 #   * 可执行 nufs-fuse（裸机 BIN_DIR 内），用于真实挂载。
 #
 # 用法:
-#   ./tests/fatigue-fuse-host.sh --duration 600 [--rounds N] [--crash-after 120]
+#   ./scripts/fatigue-fuse-host.sh --duration 600 [--rounds N] [--crash-after 120]
 #       [--no-cleanup] [--keep-alive] [--mountpoint /mnt/nufs-fuse]
 #
 # 环境变量（继承 deploy/host/mount-helpers.sh）：NUFS_BIN_DIR/NUFS_DATA_ROOT/

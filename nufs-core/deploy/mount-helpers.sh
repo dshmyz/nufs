@@ -4,7 +4,7 @@
 #
 # 提供一套"开箱即用"的命令原语，把"编译 → 启集群 → 打通网络 → 挂载 FUSE →
 # 卸载 → 清集群"的零散命令收敛成可复用的函数，供 dfs-cluster.sh / mount.sh /
-# 以及 tests/fatigue-fuse.sh、tests/smallfile-fuse.sh 引用。
+# 以及 scripts/fatigue-fuse.sh、scripts/smallfile-fuse.sh 引用。
 #
 # 全部路径/主机名默认值与 deploy/docker-compose.yml 对齐：
 #   metad  :8091 ; s3 :8081 ; datanode-v21-multi :9103（JBOD /d0,/d1, multidisk profile）

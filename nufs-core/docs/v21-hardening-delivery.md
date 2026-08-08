@@ -6,7 +6,7 @@
 > 见仓库根 `MULTI_DISK_GAP.md`。
 >
 > 门禁：全包 `-race -count=1` 绿（metadata / gateway/s3 / chunkstore / gateway/fuse /
-> datanode + datanode/storage/* 子包 / cmd/metad）；`tests/run-v21-multidisk.sh`
+> datanode + datanode/storage/* 子包 / cmd/metad）；`scripts/run-v21-multidisk.sh`
 > Docker-compose 全栈 e2e PASSED；`go build ./... && go vet ./...` 干净；
 > `git diff HEAD -- gateway/s3/auth.go` 恒为 0（从未触碰，standing 安全约束）。
 

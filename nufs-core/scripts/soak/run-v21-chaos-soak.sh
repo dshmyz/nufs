@@ -22,7 +22,7 @@
 #           默认关闭（--net-fault 显式开启，仅追加时长）。
 #
 # 用法:
-#   ./tests/soak/run-v21-chaos-soak.sh [--nodes N] [--duration S] [--crash-after S]
+#   ./scripts/soak/run-v21-chaos-soak.sh [--nodes N] [--duration S] [--crash-after S]
 #       [--net-fault S] [--no-cleanup] [--keep-alive] [--results /path]
 #
 #   退出码: 0 = PASS；非 0 = FAIL（打印失败阶段）。

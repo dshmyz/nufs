@@ -22,7 +22,7 @@
 `Stats`/`ChunkStateSnapshot`/`StateVersion`/`DiskStats`/`WriteErrorRate` 全部真实；
 `DiskIO` 由 `ReadWriteBytes()` 产出实时值（**V1 恒为 0**，V2.1 超出，用户批准的差异）。
 
-**验证**：`tests/run-v21-multidisk.sh`（多盘放置 + 字节精确读写 e2e 门禁）通过。
+**验证**：`scripts/run-v21-multidisk.sh`（多盘放置 + 字节精确读写 e2e 门禁）通过。
 
 ## 2. 行为差异（非缺口，引擎机制不同）⚠️
 
@@ -75,7 +75,7 @@ placement-group/epoch/change-journal EC 服务强相关，不是单纯"把 V1 �
   metrics 子集。磁盘生命周期命令 V2.1 报 "unsupported"。验证：
   - `TestOpsServer_V2Store*`（health/disks/metrics/verify/501-unsupported）
   - `TestManagementServer_V2Store*`（unix status + unsupported）
-  - `tests/run-v21-multidisk.sh` e2e 门禁绿（重建镜像后重启 datanode-v21-multi，
+  - `scripts/run-v21-multidisk.sh` e2e 门禁绿（重建镜像后重启 datanode-v21-multi，
     字节精确读写 + 双盘落地）
 - **磁盘健康状态机 `DiskManager`**：V2.1 用 `diskFailed`（连续写失败）兜底，无
   完整 bad-disk 状态机。要补需泛化 `DiskManager` 对 `*ChunkStore` 的依赖。

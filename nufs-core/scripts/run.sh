@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # NUFS 测试脚本集
-# 用法: ./tests/run.sh <test-name> [options]
+# 用法: ./scripts/run.sh <test-name> [options]
 #
 # 可用测试:
 #   smoke        - 快速冒烟测试（S3 PUT/GET + kill datanode + JBOD，~30s）
@@ -143,8 +143,8 @@ case "${1:-help}" in
         echo "  full         全部测试 (~180s)"
         echo ""
         echo "示例:"
-        echo "  ./tests/run.sh smoke"
-        echo "  NUFS_LOAD_WORKERS=4 NUFS_LOAD_DURATION=120s ./tests/run.sh load"
-        echo "  NUFS_LOAD_WORKERS=16 ./tests/run.sh benchmark"
+        echo "  ./scripts/run.sh smoke"
+        echo "  NUFS_LOAD_WORKERS=4 NUFS_LOAD_DURATION=120s ./scripts/run.sh load"
+        echo "  NUFS_LOAD_WORKERS=16 ./scripts/run.sh benchmark"
         ;;
 esac

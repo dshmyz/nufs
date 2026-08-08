@@ -142,7 +142,7 @@ var SLIDefinitions = []SLI{
 	{
 		Name:        "metad_leader_failover_rto",
 		Category:    "availability",
-		Description: "Time from raft leader loss (SIGKILL/failure) until a new leader successfully serves a metadata write. Budget is a hard RTO gate for a 5-9 tier; measured by the failover drill (tests/soak/run-v21-leader-failover.sh) and surfaced here as a machine-checked SLO rather than a run-rate ratio.",
+		Description: "Time from raft leader loss (SIGKILL/failure) until a new leader successfully serves a metadata write. Budget is a hard RTO gate for a 5-9 tier; measured by the failover drill (scripts/soak/run-v21-leader-failover.sh) and surfaced here as a machine-checked SLO rather than a run-rate ratio.",
 		Metric:      `metad_leader_failover_rto_seconds`,
 		Unit:        "seconds",
 		Source:      "metad",

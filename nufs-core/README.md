@@ -97,11 +97,11 @@ umount /mnt/nufs-fuse
 `/var/log/nufs-tests`，带 `latest` 软链）：
 
 ```bash
-tests/fatigue-fuse-host.sh        # 长时可靠性：写/读/杀 datanode / 重启等
-tests/smallfile-fuse-host.sh      # 小文件批量测试
+scripts/fatigue-fuse-host.sh        # 长时可靠性：写/读/杀 datanode / 重启等
+scripts/smallfile-fuse-host.sh      # 小文件批量测试
 ```
 
-对应 Docker 版（`tests/fatigue-fuse.sh` / `tests/smallfile-fuse.sh`）走 compose 集群。
+对应 Docker 版（`scripts/fatigue-fuse.sh` / `scripts/smallfile-fuse.sh`）走 compose 集群。
 
 ---
 

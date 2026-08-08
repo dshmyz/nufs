@@ -7,8 +7,8 @@ time objective (RTO) and graceful degradation. It is the machine-checked
 implementation of the "定期故障注入演练" requirement for the 5-9 availability
 tier, and the evidence source for the `metad_leader_failover_rto` SLO.
 
-- Harness: `tests/soak/run-v21-leader-failover.sh`
-- Gate: `tests/soak/run-v21-leader-failover.sh` PASS/FAIL
+- Harness: `scripts/soak/run-v21-leader-failover.sh`
+- Gate: `scripts/soak/run-v21-leader-failover.sh` PASS/FAIL
 - SLO: `internal/slo/slo.go` — `metad_leader_failover_rto` (budget 15 s),
   alert `NUFSLeaderFailoverRTOExceeded`
 - Unscheduled automation: `deploy/systemd/nufs-leader-failover-drill.{service,timer}`
@@ -35,7 +35,7 @@ production cluster.
 Run from `nufs-core/` (Go build rules apply):
 
 ```sh
-./tests/soak/run-v21-leader-failover.sh \
+./scripts/soak/run-v21-leader-failover.sh \
   --duration 300 \
   --failover-after 120 \
   --rto-budget 15 \

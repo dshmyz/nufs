@@ -8,7 +8,7 @@
 #   2. 端到端读写字节精确。
 #
 # 前置条件: docker compose, python3
-# 用法: ./tests/run-v21-multidisk.sh [--cleanup]
+# 用法: ./scripts/run-v21-multidisk.sh [--cleanup]
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

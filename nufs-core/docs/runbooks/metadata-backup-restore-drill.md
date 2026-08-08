@@ -11,8 +11,8 @@ archives auditable evidence for each.
   production backup → restore chain (source → backup → destroy → restore to a
   new cluster ID → readiness gate → RTO).
 
-- Harness: `tests/soak/run-v21-metadata-restore.sh`
-- Gate: `tests/soak/run-v21-metadata-restore.sh` PASS/FAIL
+- Harness: `scripts/soak/run-v21-metadata-restore.sh`
+- Gate: `scripts/soak/run-v21-metadata-restore.sh` PASS/FAIL
 - Complementary coverage: `leader-failover-drill.md` (the RTO/graceful-degradation
   drill); `metadata-disaster-recovery.md` (the design).
 
@@ -37,7 +37,7 @@ Run from `nufs-core/` (Go build rules apply). No Docker, no Minio required —
 the only prerequisites are a Go toolchain and spare host ports.
 
 ```sh
-./tests/soak/run-v21-metadata-restore.sh --results /var/log/nufs-tests
+./scripts/soak/run-v21-metadata-restore.sh --results /var/log/nufs-tests
 ```
 
 | Flag | Default | Meaning |

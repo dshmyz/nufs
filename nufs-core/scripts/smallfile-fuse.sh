@@ -11,7 +11,7 @@
 #   3. 崩溃（SIGKILL）后先前的 durable 小文件仍字节精确可读；
 #   4. 批量删除（rm -rf）能把这百万条清干净，目录项回收正常。
 #
-# 与 tests/fatigue-fuse.sh（持续负载 + 随机大小 + 覆盖/删除腾挪）互补：
+# 与 scripts/fatigue-fuse.sh（持续负载 + 随机大小 + 覆盖/删除腾挪）互补：
 # 本脚本专注"数量极大、单文件极小"的形态，暴露小文件路径的元数据/
 # 内存压力，而非吞吐型负载。
 #
@@ -29,7 +29,7 @@
 #   * docker compose, python3；可 root 改 /etc/hosts。
 #
 # 用法:
-#   ./tests/smallfile-fuse.sh [--scale 1000000] [--shards 8] [--filesize 2048]
+#   ./scripts/smallfile-fuse.sh [--scale 1000000] [--shards 8] [--filesize 2048]
 #       [--crash-after 120] [--full-verify] [--no-cleanup] [--keep-alive]
 #       [--mountpoint /mnt/nufs-fuse] [--fuse-bin nufs-fuse]
 #

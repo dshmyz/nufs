@@ -2,7 +2,7 @@
 #
 # NUFS V2.1 海量小文件挂载访问测试（真实 FUSE mount，默认百万级）—— 裸机（无 Docker）版
 #
-# 与 tests/smallfile-fuse.sh（Docker 版）等价，但完全在宿主机上运行：用
+# 与 scripts/smallfile-fuse.sh（Docker 版）等价，但完全在宿主机上运行：用
 # deploy/host/mount-helpers.sh 以裸机进程方式拉起 metad + datanode(v2.1 JBOD)
 # + nufs-s3，用 nufs-fuse 真实挂载 DFS，然后一次性创建海量小文件（默认
 # 1,000,000 个，每文件几百字节 ~ 几 KB），分层校验 + 崩溃恢复 + 删除风暴，
@@ -28,7 +28,7 @@
 #   * python3；可 root（fusermount）。
 #
 # 用法:
-#   ./tests/smallfile-fuse-host.sh [--scale 1000000] [--shards 8] [--filesize 2048]
+#   ./scripts/smallfile-fuse-host.sh [--scale 1000000] [--shards 8] [--filesize 2048]
 #       [--crash-after 120] [--full-verify] [--no-cleanup] [--keep-alive]
 #       [--mountpoint /mnt/nufs-fuse]
 #

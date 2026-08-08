@@ -17,7 +17,7 @@ Type=oneshot
 User=nufs
 Group=nufs
 WorkingDirectory=/opt/nufs/nufs-core
-ExecStart=/opt/nufs/nufs-core/tests/soak/run-v21-leader-failover.sh \
+ExecStart=/opt/nufs/nufs-core/scripts/soak/run-v21-leader-failover.sh \
     --duration 300 \
     --failover-after 120 \
     --rto-budget 15 \

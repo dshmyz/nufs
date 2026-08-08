@@ -21,7 +21,7 @@
 # 前置条件: 本机可编译 Go。无需 Docker。数据/进程清理同 soak。
 #
 # 用法:
-#   ./tests/soak/run-v21-leader-failover.sh [--metad NODES] [--nodes NODES]
+#   ./scripts/soak/run-v21-leader-failover.sh [--metad NODES] [--nodes NODES]
 #       [--duration S] [--failover-after S] [--rto-budget S] [--window S]
 #       [--no-cleanup] [--keep-alive] [--results /path]
 #

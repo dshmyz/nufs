@@ -16,7 +16,7 @@
 - Startup work is bounded by at most 100,000 committed mutations, 256 MiB of unindexed committed bytes, and 128 MiB of uncommitted tail per disk.
 - Process-crash `DataReady` remains at most 30 seconds on the reference hardware defined by the V2.1 design.
 - Range reads read, authenticate, decrypt, and decompress only intersecting 64 KiB frames.
-- Do not modify the current unrelated worktree changes in `nufs-core/deploy/docker-compose.yml` or `nufs-core/tests/run-v21-integration.sh`.
+- Do not modify the current unrelated worktree changes in `nufs-core/deploy/docker-compose.yml` or `nufs-core/scripts/run-v21-integration.sh`.
 - Do not begin multi-disk production wiring, V2 metadata cutover, EC completion, or billion-scale qualification until this plan's exit gate passes.
 
 ---

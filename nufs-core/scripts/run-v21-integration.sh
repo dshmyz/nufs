@@ -9,7 +9,7 @@
 # V1 datanode 通过 profile 隔离（--profile v1 才启用），默认不干扰。
 #
 # 前置条件: docker compose, python3
-# 用法: ./tests/run-v21-integration.sh [--cleanup]
+# 用法: ./scripts/run-v21-integration.sh [--cleanup]
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

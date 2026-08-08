@@ -69,7 +69,7 @@
 - [x] **命名空间一致性加固**：create/delete 双路径 `ConditionalBatch` CAS，消除并发同名 RMW 竞态
 - [x] **V2.1 存储引擎可靠性（P0 gate）**：group commit 无死锁、恢复 checkpoint 硬化、崩溃验收等
 
-**门禁**：全包 `-race -count=1` 绿；`tests/run-v21-multidisk.sh` e2e PASSED；
+**门禁**：全包 `-race -count=1` 绿；`scripts/run-v21-multidisk.sh` e2e PASSED；
 `git diff HEAD -- gateway/s3/auth.go` 恒为 0。
 
 ---

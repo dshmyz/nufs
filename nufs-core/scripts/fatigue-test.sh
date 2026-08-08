@@ -16,7 +16,7 @@
 #
 # 前置条件: docker compose, python3
 # 用法:
-#   ./tests/fatigue-test.sh --duration 600 [--rounds N] [--crash-after 120]
+#   ./scripts/fatigue-test.sh --duration 600 [--rounds N] [--crash-after 120]
 #       [--no-cleanup] [--keep-alive]
 #
 # 退出码: 0 = PASS；非 0 = FAIL（含具体失败阶段）

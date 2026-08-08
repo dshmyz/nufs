@@ -24,7 +24,7 @@
 # 前置条件: 本机可编译 Go。无需 Docker。
 #
 # 用法:
-#   ./tests/soak/run-v21-metadata-restore.sh [--metad NODES] [--nodes NODES]
+#   ./scripts/soak/run-v21-metadata-restore.sh [--metad NODES] [--nodes NODES]
 #       [--results /path] [--no-cleanup] [--keep-alive]
 #
 #   退出码: 0 = PASS；非 0 = FAIL（打印失败阶段）。
