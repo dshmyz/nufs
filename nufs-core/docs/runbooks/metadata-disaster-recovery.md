@@ -145,3 +145,13 @@ If traffic was already enabled, stop writers first, preserve the failed
 restore's data directory for investigation, and perform another new-cluster
 restore from the last known-good backup. Keep old and new cluster endpoints
 separated until operators explicitly cut traffic back over.
+
+---
+
+## Related
+
+- **Leader failover drill** (`leader-failover-drill.md`) — recurring raft
+  leader-kill drill asserting recovery-time objective (RTO), graceful
+  degradation, and byte-exact durability. Backups cover *recovery from data
+  loss*; the drill covers *availability during leadership change*; run both for
+  the 5-9 tier.
