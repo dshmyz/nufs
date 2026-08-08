@@ -219,6 +219,15 @@ type PebbleStore struct {
 	pgStore  *PlacementGroupStore
 	chunkGen *ChunkIDGenerator
 	inodeSeq atomic.Uint64
+
+	// chunkIDMax / chunkIDMaxInit bound chunk-ID minting to stay strictly above
+	// the largest chunk ID already committed to this store (the cold-cache scan
+	// in ensureChunkIDMax, kept current by advanceChunkIDMax). This closes the
+	// cross-leader-failover and process-restart chunk-ID-reuse hole; see
+	// buildAllocatedChunks.
+	chunkIDMax     atomic.Uint64
+	chunkIDMaxInit atomic.Bool
+
 	closed   atomic.Bool
 	mu       sync.RWMutex
 	cfg      PebbleStoreConfig
@@ -2179,6 +2188,20 @@ func (s *PebbleStore) buildAllocatedChunks(ctx context.Context, offsets []int64,
 	}
 	ecPolicy := policy
 	ecPolicy.ReplicationFactor = replicaCount
+
+	// ---- Chunk-ID uniqueness across leader failover ----
+	// Chunk IDs are minted here, on whichever process is leader at request time,
+	// from a per-process snowflake generator (chunkGen) *before* the raft
+	// conditional apply. The generator is in-memory and uncoordinated, so a
+	// newly elected leader or restarted process could otherwise re-issue an
+	// ID another leader already committed — and since the datanode keys chunks
+	// by their 64-bit ID, reuse silently overwrites another object's bytes (a
+	// byte-exact durability break, reproduced by the multi-metad leader-
+	// failover drill). Closing this: bump the generator strictly above the
+	// largest chunk ID already committed to this store, so issuance is globally
+	// monotonic across leadership changes and restarts.
+	s.chunkGen.BumpAbove(s.ensureChunkIDMax())
+
 	ids := make([]ChunkID, len(offsets))
 	seenIDs := make(map[ChunkID]struct{}, len(offsets))
 	for i := range ids {
@@ -2191,6 +2214,15 @@ func (s *PebbleStore) buildAllocatedChunks(ctx context.Context, offsets []int64,
 		}
 		seenIDs[ids[i]] = struct{}{}
 	}
+	// The largest minted ID is the new in-process high mark, so later batches
+	// stay monotonic without rescanning committed keys.
+	var newHW ChunkID
+	for _, id := range ids {
+		if id > newHW {
+			newHW = id
+		}
+	}
+	s.advanceChunkIDMax(newHW)
 	groupID := ""
 	if policy.ECConfig != nil && policy.ECConfig.DataShards > 0 {
 		groupID = fmt.Sprintf("ec-%d", ids[0])
@@ -2215,7 +2247,15 @@ func (s *PebbleStore) buildAllocatedChunks(ctx context.Context, offsets []int64,
 		} else {
 			nodeIDs, err := s.placement.PlaceChunk(ecPolicy, nil)
 			if err != nil {
-				return nil, err
+				if errors.Is(err, ErrInsufficientNodes) {
+					if herr := s.hydratePlacement(); herr != nil {
+						return nil, herr
+					}
+					nodeIDs, err = s.placement.PlaceChunk(ecPolicy, nil)
+				}
+				if err != nil {
+					return nil, err
+				}
 			}
 			replicas, err = s.buildReplicas(ctx, nodeIDs, groupID)
 			if err != nil {
@@ -2235,6 +2275,67 @@ func (s *PebbleStore) buildAllocatedChunks(ctx context.Context, offsets []int64,
 		chunks[i] = chunk
 	}
 	return chunks, nil
+}
+
+// ensureChunkIDMax returns a floor strictly above which the next chunk ID may
+// safely be minted, derived from the true maximum chunk ID already committed to
+// this store. The durable source of truth is the raft-replicated set of chunk-
+// metadata keys, so this is authoritative across leader failover and process
+// restart. The first call scans the committed chunk keys (cold cache); later
+// calls are served from an in-memory high mark that advanceChunkIDMax keeps
+// current, so steady-state allocation is O(1).
+func (s *PebbleStore) ensureChunkIDMax() uint64 {
+	if s.chunkIDMaxInit.Load() {
+		return s.chunkIDMax.Load()
+	}
+	// Cold cache: this process (or this raft epoch) has not yet minted; scan the
+	// committed chunk metadata for the largest existing chunk ID. Handles a
+	// freshly elected leader that must not re-issue IDs a previous leader
+	// already committed, and a restarted process that must not reuse its own
+	// prior IDs.
+	var max uint64
+	_ = s.scanPrefix(prefixChunk, func(key, _ []byte) error {
+		id, err := parseChunkTombstoneKey(string(key), prefixChunk)
+		if err == nil && uint64(id) > max {
+			max = uint64(id)
+		}
+		return nil
+	})
+	s.chunkIDMax.Store(max)
+	s.chunkIDMaxInit.Store(true)
+	return max
+}
+
+// advanceChunkIDMax raises the in-memory high mark when a batch mints IDs
+// beyond what the cold-cache scan observed, so subsequent allocations stay
+// monotonic without rescanning.
+func (s *PebbleStore) advanceChunkIDMax(newMax ChunkID) {
+	for {
+		cur := s.chunkIDMax.Load()
+		if uint64(newMax) <= cur {
+			return
+		}
+		if s.chunkIDMax.CompareAndSwap(cur, uint64(newMax)) {
+			return
+		}
+	}
+}
+
+// hydratePlacement syncs the in-memory PlacementEngine from the
+// raft-replicated node store. A metad raft member that did not directly
+// receive a datanode's RegisterNode/Heartbeat RPC (e.g. a newly elected
+// leader right after a failover) has an empty placement view; rebuilding it
+// from ListNodes lets allocation proceed immediately instead of failing
+// until the datanodes happen to re-heartbeat to it.
+func (s *PebbleStore) hydratePlacement() error {
+	nodes, err := s.ListNodes(context.Background())
+	if err != nil {
+		return err
+	}
+	for i := range nodes {
+		s.placement.UpdateNode(&nodes[i])
+	}
+	return nil
 }
 
 // buildReplicas resolves node IDs (from PlacementEngine.PlaceChunk) into

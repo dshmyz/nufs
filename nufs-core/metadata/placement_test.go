@@ -3,6 +3,7 @@ package metadata
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 func makeTestNode(id NodeID, rack, zone string, tier StorageTier, capGB, usedGB int64, state NodeState) *NodeInfo {
@@ -357,6 +358,41 @@ func TestChunkIDGenerator_Monotonic(t *testing.T) {
 		prev = id
 	}
 }
+
+// TestChunkIDGenerator_BumpAbove verifies the floor-raising contract that
+// closes chunk-ID reuse across leader failover / process restart: after
+// BumpAbove(F), every subsequent Next() returns an ID strictly greater than F
+// — for floors in the past AND floors in the future relative to wall clock.
+// The future-floor case is the dangerous one: a freshly restarted generator
+// must not re-issue an ID whose committed predecessor is ahead of wall time.
+func TestChunkIDGenerator_BumpAbove(t *testing.T) {
+	// Past floor (the common case, single-node restart).
+	past := NewChunkIDGenerator(1)
+	pre := past.Next() // an ID from this generator
+	if pre == 0 {
+		t.Fatal("unexpected zero ID")
+	}
+	past.BumpAbove(uint64(pre))
+	after := past.Next()
+	if after <= pre {
+		t.Fatalf("BumpAbove(past) should yield strictly greater ID: after=%d pre=%d", after, pre)
+	}
+
+	// Future floor (the cross-leader/restart hazard): a committed ID whose
+	// millisecond field is 60s ahead of now.
+	futureMS := uint64(time.Now().UnixMilli()+60000) & 0x1FFFFFFFFFF
+	futureFloor := ChunkID(futureMS<<23 | 1<<13) // node=1, seq=0
+
+	gen := NewChunkIDGenerator(1)
+	gen.BumpAbove(uint64(futureFloor))
+	for i := 0; i < 100; i++ {
+		id := gen.Next()
+		if id <= futureFloor {
+			t.Fatalf("BumpAbove(future) yielded ID %d not strictly greater than floor %d at iteration %d", id, futureFloor, i)
+		}
+	}
+}
+
 
 func makeTestNodeWithMachine(id NodeID, rack, zone, machineID string, capGB, usedGB int64, state NodeState) *NodeInfo {
 	n := makeTestNode(id, rack, zone, TierHot, capGB, usedGB, state)

@@ -201,6 +201,14 @@ func (p *PlacementEngine) PlaceChunk(
 		candidates = append(candidates, n)
 	}
 
+	// A placement engine with no candidate nodes in its view (e.g. a follower
+	// that has not yet synced node membership) must fail cleanly rather than
+	// panic. This guard runs before the EC divisor below, which would otherwise
+	// divide by zero when len(candidates)==0.
+	if len(candidates) == 0 {
+		return nil, ErrInsufficientNodes
+	}
+
 	// For EC or high-RF where RF > node count, allow multiple shards
 	// per node (up to maxPerNode). Each shard lands on a different disk
 	// via the datanode's PickDisk (least-used selection).
@@ -400,18 +408,54 @@ func (g *ChunkIDGenerator) Next() ChunkID {
 	defer g.mu.Unlock()
 
 	ts := time.Now().UnixMilli()
-	if ts == g.lastTS {
+	switch {
+	case ts < g.lastTS:
+		// The generator's clock is pinned ahead of wall time by a prior
+		// BumpAbove (e.g. this process freshly elected as raft leader, or a
+		// restarted process resuming past a committed high-water). Never rewind
+		// below the pinned region: stay in g.lastTS and keep emitting
+		// monotonically, so we cannot re-issue a chunk ID that is already
+		// committed to the cluster. On 13-bit sequence rollover within the
+		// pinned region, step the region forward by one (safe: a one-region
+		// step exceeds the entire 23-bit node|sequence field).
+		if g.sequence < 0x1FFF {
+			g.sequence++
+		} else {
+			g.lastTS++
+			g.sequence = 0
+		}
+	case ts == g.lastTS:
 		g.sequence++
-	} else {
+	default:
 		g.sequence = 0
 		g.lastTS = ts
 	}
 
-	id := uint64(ts&0x1FFFFFFFFFF)<<23 |
+	id := uint64(g.lastTS&0x1FFFFFFFFFF)<<23 |
 		g.nodeID<<13 |
 		(g.sequence & 0x1FFF)
 
 	return ChunkID(id)
+}
+
+// BumpAbove raises the generator so the very next Next() returns a chunk ID
+// strictly greater than floor. It is used to re-seed a generator — a freshly
+// elected raft leader, or a restarted process — so it never re-issues a chunk
+// ID that is already committed to the cluster (where the datanode keys chunks
+// by their 64-bit ID, an ID reuse would silently overwrite another object's
+// bytes). Because a one-unit advance of the 41-bit millisecond field (1<<23)
+// exceeds the entire 23-bit node|sequence field, bumping the clock region one
+// above floor's region is sufficient to exceed any floor regardless of its
+// node/sequence bits. Monotonic and idempotent: a floor at or below the
+// generator's current position is a no-op.
+func (g *ChunkIDGenerator) BumpAbove(floor uint64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	region := int64(floor >> 23)
+	if region+1 > g.lastTS {
+		g.lastTS = region + 1
+		g.sequence = 0
+	}
 }
 
 // SubscribeEvents registers the placement engine to automatically receive
