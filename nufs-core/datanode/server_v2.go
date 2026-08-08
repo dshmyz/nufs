@@ -432,6 +432,27 @@ func (v *V2Store) WriteShardAtDisk(chunkID metadata.ChunkID, shardIndex int, dis
 	return v.writeShardAt(chunkID, shardIndex, disk, data)
 }
 
+// WriteShardAtDiskPref durably writes one EC shard extent preferring the given
+// (authoritative landing) disk, but falls back to a healthy accepting shard
+// disk when the preferred one is tombstoned for that shard's generation. This
+// is the cross-node counterpart to cleanShardDiskPref/RepairChunkECWithLanding:
+// a repair push must not re-write a shard onto a disk whose (extent, gen) was
+// tombstoned (§14 generation fence would reject it), routing instead to a
+// least-used healthy disk on this node. It is the server side of the
+// self-healer's cross-node restore push (handleReplicateECShard).
+func (v *V2Store) WriteShardAtDiskPref(chunkID metadata.ChunkID, shardIndex, prefer int, data []byte) error {
+	gen := shardGen(shardIndex)
+	// Prefer the authoritative landing disk when it accepts a fresh write.
+	if prefer >= 0 && prefer < len(v.shards) && v.shardAccepting(prefer, chunkID, gen) {
+		return v.writeShardAt(chunkID, shardIndex, prefer, data)
+	}
+	// Landing disk tombstoned (or out of range): fall back to the least-used
+	// healthy shard disk that accepts this generation, mirroring node-local
+	// repair fallback. -1 means no disk accepted, which writeShardAt rejects.
+	disk := v.cleanShardDiskPref(chunkID, shardIndex, -1)
+	return v.writeShardAt(chunkID, shardIndex, disk, data)
+}
+
 // writeShardAt is the shared impl: write a shard extent on a given disk,
 // record the per-shard owning disk, and update the disk's usage accounting.
 func (v *V2Store) writeShardAt(chunkID metadata.ChunkID, shardIndex, disk int, data []byte) error {
@@ -632,6 +653,14 @@ func (v *V2Store) RepairChunkECWithLanding(chunkID metadata.ChunkID, originalLen
 	}
 	if len(missing) == 0 {
 		return 0, nil // nothing to repair
+	}
+	// originalLen is advisory for reconstruction: a directly-written EC chunk's
+	// ChunkMeta.Size (MaxChunkSize) exceeds the true padded length, so clamp to
+	// the shard-derived length — which also happens to be the byte-exact result
+	// the rebuilt shards decode to (§14). A legitimate length (converted chunk,
+	// tests) <= paddedLen is kept.
+	if originalLen <= 0 || originalLen > ec63PaddedLen(shards) {
+		originalLen = ec63PaddedLen(shards)
 	}
 	rebuilt, _, err := reconstructEC63(shards, originalLen)
 	if err != nil {

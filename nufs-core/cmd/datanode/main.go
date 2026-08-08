@@ -904,6 +904,19 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// production multi-node topology, replacing the F3/F4 local-Pebble stand-in.
 	healer.SetLandingResolver(metaStore)
 	healer.SetOrphanResolver(metaStore, datanode.EcOrphanDefaultAge)
+	// Program 13 / soak: cross-node EC shard rebuild. The self-healer otherwise
+	// only sees this node's ~3 shards, so on a multi-node cluster every stripe
+	// looks "loss > §14 tolerance" and a node crash that skirts a shard is never
+	// auto-repaired (the soak caught this: GET truncates until an operator
+	// intervenes). Wiring a peer dialer lets the healer take the cluster-wide
+	// view — read every shard from its owning node and push lost shards back to
+	// their authoritative landing node/disk. The dialer reuses the same lazily
+	// loaded ListNodes → addr topology the EC conversion coordinator uses above;
+	// datanode.NewClient connects lazily, so an unreachable peer just fails that
+	// one shard (it is counted missing and retried next sweep).
+	healer.SetPeerDialer(func(addr string) *datanode.Client {
+		return datanode.NewClient(addr)
+	})
 	healer.Start(ctx)
 
 	// Program 8 / §4 V1-c: proactive per-disk I/O health monitor. Start it

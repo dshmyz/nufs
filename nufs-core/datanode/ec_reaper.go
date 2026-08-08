@@ -2,6 +2,7 @@ package datanode
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -80,6 +81,13 @@ type ECSelfHealer struct {
 	orphanAge time.Duration
 	interval time.Duration
 
+	// peerDial makes repair cross-node (Program 13 / soak evidence): when set,
+	// a degraded stripe is repaired from the cluster-wide shard view — reading
+	// every shard from its owning node and pushing lost shards back to their
+	// authoritative landing node — instead of the node-local view that can only
+	// ever see this node's ~3 shards. nil keeps today's single-node behavior.
+	peerDial func(addr string) *Client
+
 	mu      sync.Mutex
 	running bool
 	stopCh  chan struct{}
@@ -129,6 +137,17 @@ func (h *ECSelfHealer) SetOrphanResolver(src ECOrphanResolver, olderThan time.Du
 	if olderThan > 0 {
 		h.orphanAge = olderThan
 	}
+}
+
+// SetPeerDialer wires a cross-node datanode transport (Program 13 / soak) so the
+// self-healer can rebuild shards that live on other nodes of the cluster. dial
+// returns a client for addr (typically a lazily-connecting *Client derived from
+// the metadata ListNodes topology, as ECService.SetCrossNode wires). Without it
+// the healer keeps the single-node behavior: it only sees the ~3 shards this
+// node holds locally, so on a multi-node cluster it cannot distinguish "my 3
+// shards lost" from "other nodes' shards I never held" and never auto-repairs.
+func (h *ECSelfHealer) SetPeerDialer(dial func(addr string) *Client) {
+	h.peerDial = dial
 }
 
 // Start begins the periodic sweep loop.
@@ -290,18 +309,37 @@ func (h *ECSelfHealer) reclaimChunkShards(ctx context.Context, cid metadata.Chun
 }
 
 // repairChunk counts the shard loss for one chunk and repairs it if the loss
-// is within tolerance and the original length is resolvable.
+// is within tolerance and the original length is resolvable. On a multi-node
+// cluster (peerDial wired) it uses the cluster-wide shard view so shards lost
+// on *other* nodes are rebuilt; otherwise it stays node-local (single node).
 func (h *ECSelfHealer) repairChunk(ctx context.Context, cid metadata.ChunkID) {
-	// readChunkECShards probes all nine shard indices across the node's shard
-	// stores and reports which are missing (a present shard needs no repair; a
-	// full stripe short-circuits here as a no-op).
+	chunk, ok := h.chunkMeta(ctx, cid)
+	if !ok {
+		// No authoritative original length (chunk metadata unreachable or gone):
+		// we cannot safely decode/reconstruct, so skip rather than write garbage.
+		h.skipped.Add(1)
+		h.scanned.Add(1)
+		slog.Warn("ec self-heal: no original length, skipping repair",
+			"chunk", cid)
+		return
+	}
+	h.scanned.Add(1)
+	landing := h.landingFor(chunk)
+
+	if h.peerDial != nil {
+		h.repairChunkCrossNode(ctx, cid, chunk, landing)
+		return
+	}
+
+	// Node-local path (single node): probe the nine shard indices across this
+	// node's shard stores and report which are missing. A full stripe
+	// short-circuits as a no-op.
 	_, missing, err := h.v.readChunkECShards(cid)
 	if err != nil {
 		slog.Warn("ec self-heal: reading shard occupancy", "chunk", cid, "error", err)
 		h.failed.Add(1)
 		return
 	}
-	h.scanned.Add(1)
 	loss := len(missing)
 	if loss == 0 {
 		return // fully replicated, nothing to do
@@ -315,18 +353,8 @@ func (h *ECSelfHealer) repairChunk(ctx context.Context, cid metadata.ChunkID) {
 			"chunk", cid, "missing", loss)
 		return
 	}
-	chunk, ok := h.chunkMeta(ctx, cid)
-	if !ok {
-		// No authoritative original length (chunk metadata unreachable or gone):
-		// we cannot safely decode/reconstruct, so skip rather than write garbage.
-		h.skipped.Add(1)
-		slog.Warn("ec self-heal: no original length, skipping repair",
-			"chunk", cid, "missing", loss)
-		return
-	}
 	// Prefer rebuilding each lost shard back onto its authoritative landing
 	// disk (F3, §14) when the durable stripe is resolvable; else least-used.
-	landing := h.landingFor(chunk)
 	rebuilt, err := h.v.RepairChunkECWithLanding(cid, int(chunk.Size), landing)
 	if err != nil {
 		h.failed.Add(1)
@@ -338,6 +366,149 @@ func (h *ECSelfHealer) repairChunk(ctx context.Context, cid metadata.ChunkID) {
 		slog.Info("ec self-heal: repaired degraded stripe",
 			"chunk", cid, "rebuilt", rebuilt)
 	}
+}
+
+// repairChunkCrossNode rebuilds a degraded 6+3 stripe whose shards are spread
+// across multiple datanodes (Program 13 / soak evidence). A single node's
+// node-local probe only ever sees the ~3 shards it holds locally, so on a
+// multi-node cluster it cannot tell "my shards lost" from "other nodes' shards
+// I never held" and would misreport loss > §14 tolerance forever. Here we take
+// the cluster-wide view: read every shard from its owning node, and when the
+// true loss is within tolerance, reconstruct the missing shards from the
+// survivors and push each back to its authoritative landing node/disk.
+//
+// The owner of shard i is resolved from chunk.Replicas by ShardIndex (the
+// authority kept the plan aligned, cf. PlanECWrite/RecordDirect), so the
+// stripe's own metadata names every peer — no separate peer registry needed.
+func (h *ECSelfHealer) repairChunkCrossNode(ctx context.Context, cid metadata.ChunkID, chunk *metadata.ChunkMeta, landing []metadata.ECShard) {
+	// owner[i] = the ReplicaInfo that serves shard i (by ShardIndex).
+	owner := make([]*metadata.ReplicaInfo, ec63Shards)
+	for i := range chunk.Replicas {
+		r := &chunk.Replicas[i]
+		if r.ShardIndex >= 0 && r.ShardIndex < ec63Shards && owner[r.ShardIndex] == nil {
+			owner[r.ShardIndex] = r
+		}
+	}
+
+	// Read every shard from its owning node (cluster-wide view).
+	shards := make([][]byte, ec63Shards)
+	present := make([]bool, ec63Shards)
+	var missing []int
+	for i := 0; i < ec63Shards; i++ {
+		ownerRep := owner[i]
+		if ownerRep == nil || ownerRep.Addr == "" {
+			missing = append(missing, i)
+			continue
+		}
+		data, err := h.readShardFrom(ownerRep.Addr, cid, i)
+		if err != nil {
+			missing = append(missing, i)
+			continue
+		}
+		shards[i] = data
+		present[i] = true
+	}
+	loss := len(missing)
+	if loss == 0 {
+		return // fully replicated, nothing to do
+	}
+	if loss > ec63Parity {
+		// Fewer than six surviving shards cluster-wide: cannot reconstruct.
+		h.skipped.Add(1)
+		slog.Warn("ec self-heal: stripe loss beyond §14 tolerance, skipping",
+			"chunk", cid, "missing", loss)
+		return
+	}
+	// Reconstruct the full nine-shard set (missing shards repopulated) from
+	// the survivors, verifying the original payload against the shard checksums.
+	// originalLen is clamped to the shard-derived padded length: a direct-EC
+	// chunk's ChunkMeta.Size (MaxChunkSize) exceeds the true padded length and
+	// would otherwise fail the reconstruction length check.
+	originalLen := int(chunk.Size)
+	if originalLen <= 0 || originalLen > ec63PaddedLen(shards) {
+		originalLen = ec63PaddedLen(shards)
+	}
+	rebuilt, _, err := reconstructEC63(shards, originalLen)
+	if err != nil {
+		h.failed.Add(1)
+		slog.Warn("ec self-heal: cross-node reconstruct failed", "chunk", cid, "missing", loss, "error", err)
+		return
+	}
+	n := 0
+	for _, idx := range missing {
+		ownerRep := owner[idx]
+		disk := -1
+		if idx < len(landing) {
+			disk = int(landing[idx].DiskID % 1000) // node-local shard-store index on the owner
+		}
+		if ownerRep == nil || ownerRep.Addr == "" {
+			slog.Warn("ec self-heal: cannot restore shard, no owner addr",
+				"chunk", cid, "shard", idx)
+			continue
+		}
+		if err := h.pushShardTo(ownerRep.Addr, cid, idx, disk, rebuilt[idx]); err != nil {
+			slog.Warn("ec self-heal: restore shard failed", "chunk", cid, "shard", idx, "error", err)
+			continue
+		}
+		n++
+	}
+	if n > 0 {
+		h.repaired.Add(int64(n))
+		slog.Info("ec self-heal: cross-node repaired degraded stripe",
+			"chunk", cid, "rebuilt", n)
+	}
+}
+
+// readShardFrom reads one EC shard extent from addr (the node that owns it),
+// using the same ReadECShard the serving read path uses for V2.1 converted
+// stripes. Any error — unreachable node, absent extent, transient fault — is
+// treated as "that shard is unavailable" so the caller counts it as missing.
+func (h *ECSelfHealer) readShardFrom(addr string, cid metadata.ChunkID, idx int) ([]byte, error) {
+	client, err := h.dial(addr)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.ReadECShard(cid, idx)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Status != StatusOK {
+		return nil, fmt.Errorf("status=%d: %s", resp.Status, resp.Error)
+	}
+	return resp.Data, nil
+}
+
+// pushShardTo durably lands one rebuilt EC shard back onto its owning node's
+// shard store (the authoritative landing disk when disk >= 0, else the peer's
+// own routing). Matches the coordinator->peer push the direct EC write path
+// uses (ReplicateECShard), so the peer's server writes it into its shard store.
+func (h *ECSelfHealer) pushShardTo(addr string, cid metadata.ChunkID, idx, disk int, data []byte) error {
+	client, err := h.dial(addr)
+	if err != nil {
+		return err
+	}
+	resp, err := client.ReplicateECShard(cid, idx, disk, data)
+	if err != nil {
+		return err
+	}
+	if resp.Status != StatusOK {
+		return fmt.Errorf("status=%d: %s", resp.Status, resp.Error)
+	}
+	return nil
+}
+
+// dial returns a client for addr via the injected peer dialer (nil-safe: with
+// no dialer wired the healer never reaches the cross-node path, so this is only
+// called when h.peerDial != nil).
+func (h *ECSelfHealer) dial(addr string) (*Client, error) {
+	if h.peerDial == nil {
+		return nil, fmt.Errorf("no peer dialer wired")
+	}
+	c := h.peerDial(addr)
+	if c == nil {
+		return nil, fmt.Errorf("dial %s: no client", addr)
+	}
+	return c, nil
 }
 
 // chunkMeta fetches the chunk's authoritative metadata (its Size is the

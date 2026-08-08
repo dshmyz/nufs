@@ -396,7 +396,22 @@ func (s *Server) handleReplicateECShard(header *Header, data []byte) *Response {
 	}
 	// The coordinator may name the exact target disk (planned §14 placement). An
 	// absent/zero disk falls back to the store's own shard routing (WriteShard).
+	// When the store exposes the landing-preference write, a tombstoned landing
+	// disk (a self-heal/repair push re-writing a deleted shard's generation)
+	// falls back to a healthy shard disk instead of failing the §14 fence.
 	if d, err := strconv.Atoi(header.Extra["disk"]); err == nil && d > 0 {
+		if wsd, ok2 := s.store.(interface {
+			WriteShardAtDiskPref(metadata.ChunkID, int, int, []byte) error
+		}); ok2 {
+			if err := wsd.WriteShardAtDiskPref(header.ChunkID, header.ShardIndex, d, data); err != nil {
+				return &Response{
+					RequestID: header.RequestID,
+					Status:    StatusError,
+					Error:     err.Error(),
+				}
+			}
+			return &Response{RequestID: header.RequestID, Status: StatusOK, Length: int32(len(data))}
+		}
 		if wsd, ok2 := s.store.(interface {
 			WriteShardAtDisk(metadata.ChunkID, int, int, []byte) error
 		}); ok2 {

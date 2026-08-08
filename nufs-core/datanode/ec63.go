@@ -169,3 +169,25 @@ func reconstructEC63(shards [][]byte, originalLen int) ([][]byte, []byte, error)
 	}
 	return rebuilt, result[:originalLen], nil
 }
+
+// ec63PaddedLen returns the stripe's padded original length implied by the shard
+// payloads: the six data shards each hold shardSize bytes of (padded) payload, so
+// the padded original length is K*shardSize. It is derived from the shards
+// themselves because a directly-written EC chunk's ChunkMeta.Size holds the
+// allocation cap (MaxChunkSize), not the literal length — the same lever the
+// serving read path uses (chunkstore readECChunk computes paddedLen from shard
+// sizes and treats Size as unreliable). reconstructEC63 needs originalLen only to
+// truncate the decoded payload and pass its length sanity check; the rebuilt
+// shards it returns are byte-exact regardless. The healer/repair paths therefore
+// pass paddedLen as originalLen so a legitimate (<= paddedLen) length like a
+// converted chunk's literal Size is kept, and the broken MaxChunkSize cap
+// (which exceeds paddedLen) is corrected to the true padded length.
+func ec63PaddedLen(shards [][]byte) int {
+	maxShard := 0
+	for _, s := range shards {
+		if len(s) > maxShard {
+			maxShard = len(s)
+		}
+	}
+	return maxShard * ec63Data
+}
