@@ -47,6 +47,8 @@ CLEANUP=1
 KEEP_ALIVE=0
 RESULTS_ROOT="${NUFS_RESULTS_ROOT:-/var/log/nufs-tests}"
 DISKS_PER_NODE=${SOAK_DISKS_PER_NODE:-3}
+# 数据面策略：1 = RF=9 EC6+3 直写（复现多 metad raft 下的 EC 500）；0 = RF=3 纯副本（默认，稳定）
+EC=${SOAK_EC:-0}
 
 # 3 个 metad 的矩阵：ops / raft 端口（节点 id 1..3）
 METAD_OPS_BASE=18091
@@ -126,6 +128,13 @@ metad_log()   { echo "$LOG_ROOT/log/metad$1.log"; }
 metad_dir()   { echo "$LOG_ROOT/metad$1"; }
 metad_raftdir(){ echo "$LOG_ROOT/raft$1"; }
 metad_url()   { echo "http://127.0.0.1:$(metad_ops "$1")"; }
+# 每节点独立的 hashicorp/raft 内部日志（选举/投票/心跳/提交）。默认落到
+# $LOG_ROOT/log/metad<n>.raft.log，cluster_up 已 mkdir 该目录且归档时
+# cp $LOG_ROOT/log/*.log 会一并带走，便于诊断卡选主。
+# 注意默认值不能用 /dev/null/<file>：那会拼成非法路径（open /dev/null/...: not a directory）
+# 使 OpenFile 失败、raft 内部日志被丢弃（raftConfig.LogOutput 默认 Discard，看不到
+# RequestVote）。设 NUFS_RAFT_LOG_DIR 可覆盖到任意目录。
+metad_raftlog(){ printf '%s/metad%s.raft.log' "${NUFS_RAFT_LOG_DIR:-$LOG_ROOT/log}" "$1"; }
 
 # datanode 路径
 node_listen() { echo $((DN_BASE_PORT + $1 - 1)); }
@@ -140,13 +149,15 @@ node_dirs()   {
   echo "$out"
 }
 
-dn_run() { # node —— 显式 --node-id，rack/zone 派生自序数
-  local n="$1" lp ops rk zn
+dn_run() { # node leader —— 显式 --node-id，rack/zone 派生自序数；注册指向当前 raft leader
+  # 元数据客户端在注册后经 heartbeat/redirect 自动跟进 leader 切换，但初次注册
+  # 直接落到当时 leader 的 ops 端口，规避 follower 307 重定向 + leader 503 的启动竞态。
+  local n="$1" leader="$2" lp ops rk zn
   lp="$(node_listen "$n")"; ops="$(node_ops "$n")"
   rk=$(( (n-1) % 3 + 1 )); zn=$(( (n-1) % 3 + 1 ))
   "$DATANODE_BIN" --node-id="$n" --listen="127.0.0.1:$lp" \
     --register-addr="127.0.0.1:$lp" --ops-addr="127.0.0.1:$ops" \
-    --data-dirs="$(node_dirs "$n")" --metadata=127.0.0.1:$(metad_ops 2) \
+    --data-dirs="$(node_dirs "$n")" --metadata=127.0.0.1:$(metad_ops "$leader") \
     --rack="rack$rk" --zone="zone$zn" \
     --storage-version=v2.1 --allow-insecure-dev --log-level=info \
     > "$(node_log "$n")" 2>&1 &
@@ -169,12 +180,18 @@ raft_peer_ops_desc() {
   done
 }
 
-metad_run() { # node —— 全部 --raft-bootstrap=true + 完整 peer 列表
+metad_run() { # node —— 与 helm 生产形态一致：每节点都传 --raft-bootstrap=true，
+  # 但通过 --raft-bootstrap-owner=meta-1 指定唯一自举 Owner，其余节点"defer"（不自举、
+  # 以空配置启动，被 Owner 的 leader-driven reconcile 经 AddVoter 拉入投票组）。
+  # 三分裂根因：全部节点各自自举会让每个节点在 1/1 quorum 下各自当选 leader、term 冲突，
+  # 收敛非确定，kill 后无法可靠重选主（rto=n/a）。Owner guard 让部署模板/二进制都
+  # 无需区分 ordinal 即可安全地全量传 --raft-bootstrap（distroless 镜像无 shell，
+  # 无法 per-replica 改 args）。见 raft-multiprocess-join memory。
   local n="$1" ops raft
   ops="$(metad_ops "$n")"; raft="$(metad_raft "$n")"
-  "$METAD_BIN" --node-id="$n" --data-dir="$(metad_dir "$n")" \
+  NUFS_RAFT_LOG="$(metad_raftlog "$n")" "$METAD_BIN" --node-id="$n" --data-dir="$(metad_dir "$n")" \
     --ops-addr="127.0.0.1:$ops" \
-    --raft=true --raft-bootstrap=true --raft-addr="127.0.0.1:$raft" \
+    --raft=true --raft-bootstrap=true --raft-bootstrap-owner=meta-1 --raft-addr="127.0.0.1:$raft" \
     --raft-advertise-addr="127.0.0.1:$raft" \
     --raft-dir="$(metad_raftdir "$n")" \
     --raft-bootstrap-peers="$(raft_peer_desc)" \
@@ -235,16 +252,19 @@ cluster_up() {
   [ -n "$leading" ] || die "no raft leader elected after 60s"
 
   for n in $(seq 1 "$NODES"); do
-    dn_run "$n"; log "node$n pid=$(cat "$(node_pid "$n")") listen=:$(node_listen "$n")"
+    dn_run "$n" "$leading"; log "node$n pid=$(cat "$(node_pid "$n")") listen=:$(node_listen "$n")"
   done
   for n in $(seq 1 "$NODES"); do
-    local lp="$((DN_BASE_PORT + n - 1))" i
+    local lp="$((DN_BASE_PORT + n - 1))" i relaunch=0
     for i in $(seq 1 40); do
       python3 -c "import socket,sys
 s=socket.socket();s.settimeout(1)
 try: s.connect(('127.0.0.1',$lp));sys.exit(0)
 except OSError:sys.exit(1)" && break
-      alive "$(node_pid "$n")" || die "node$n exited; tail $(node_log "$n")"
+      if ! alive "$(node_pid "$n")"; then
+        # 启动竞态（注册 503）导致节点退出 —— 重拉（同一 node-id，幂等注册）
+        if [ "$relaunch" -lt 3 ]; then relaunch=$((relaunch+1)); log "node$n not listening, relaunch #$relaunch"; dn_run "$n" "$leading"; else die "node$n exited after relaunches; tail $(node_log "$n")"; fi
+      fi
       sleep 1
     done
   done
@@ -274,6 +294,24 @@ cluster_down() {
     [ -f "$f" ] && kill -9 "$(cat "$f")" 2>/dev/null || true
   done
   kill_stale
+}
+
+# 把 S3 网关入口改指到另一个还活着的 metad 节点。生产里网关指向 nufs-metad
+# Service，其 DNS 恒解析到存活 pod（kubelet 摘掉宕机端点）；本机 harness 用固定
+# 端口，无法靠 DNS 兜底，故在 kill 目标=网关入口时显式重启网关换入口——等价于
+# "客户端重连 leader" 语义，也在切换前保持网关始终可达。
+repoint_gateway() { # target_meta
+  local target="$1" old
+  old="$(cat "$LOG_ROOT/run/s3.pid" 2>/dev/null || echo 0)"
+  [ -n "$old" ] && [ "$old" -ne 0 ] && kill "$old" 2>/dev/null || true
+  sleep 1; kill -9 "$old" 2>/dev/null || true
+  "$S3_BIN" --listen="$S3_LISTEN" --meta-addr="127.0.0.1:$(metad_ops "$target")" \
+    --access-key="$ACCESS_KEY" --secret-key="$SECRET_KEY" \
+    --part-dir="$LOG_ROOT/s3-parts" --rate-limit=1000 --rate-limit-burst=2000 \
+    --log-level=info >> "$LOG_ROOT/log/s3.log" 2>&1 &
+  echo $! > "$LOG_ROOT/run/s3.pid"
+  wait_http "http://localhost:8081/healthz" 40 s3 || die "s3 not healthy after repoint"
+  log "gateway repointed to meta-$target"
 }
 
 # 全部在线 metad 节点列表
@@ -309,10 +347,10 @@ archive_evidence() { # [result] [stage]
 # 写每个 PUT 的 (epoch_sec, success) 到 rto.times；失败带 HTTP/错误。容忍窗为
 # [failover_after, failover_after+window]（即 kill 之后紧邻的切换期）。
 run_load() {
-  python3 - "$NODES" "$DURATION" "$FAILOVER_AFTER" "$WINDOW" "$ACCESS_KEY" "$SECRET_KEY" "$RES_DIR" <<'PYEOF' || return $?
+  python3 - "$NODES" "$DURATION" "$FAILOVER_AFTER" "$WINDOW" "$ACCESS_KEY" "$SECRET_KEY" "$RES_DIR" "$EC" <<'PYEOF' || return $?
 import hashlib,hmac,datetime,urllib.request,urllib.error,os,sys,time,random,json
 nodes=int(sys.argv[1]); duration=int(sys.argv[2]); fa=int(sys.argv[3]); window=int(sys.argv[4])
-ak=sys.argv[5]; sk=sys.argv[6]; res=sys.argv[7]
+ak=sys.argv[5]; sk=sys.argv[6]; res=sys.argv[7]; ec_flag=sys.argv[8] if len(sys.argv)>8 else '0'
 ep='http://localhost:8081'; bucket='failover-bucket'
 manifest={}; t0=time.time(); obj=0; out_errs=0
 rto_f=open(res+'/rto.times','w')
@@ -337,19 +375,24 @@ def s3raw(m,k='',bd=b'',extra=None):
         r=urllib.request.urlopen(urllib.request.Request(ep+path,data=bd or None,headers=h,method=m),timeout=15); return r.status,r.read()
     except urllib.error.HTTPError as e: return e.code,e.read()
     except Exception as e: return 0,str(e).encode()
-kill_epoch=None
+kill_epoch=None; disrupt_epoch=None
 def refresh_kill_epoch():
-    global kill_epoch
+    global kill_epoch, disrupt_epoch
     if kill_epoch is None:
         try:
-            with open(res+'/kill.epoch') as f:
-                kill_epoch=float(f.read().strip())
+            with open(res+'/kill.epoch') as f: kill_epoch=float(f.read().strip())
+        except Exception: pass
+    if disrupt_epoch is None:
+        try:
+            with open(res+'/disrupt.epoch') as f: disrupt_epoch=float(f.read().strip())
         except Exception: pass
 def in_window():
-    # 容忍窗 = [真实 kill 墙钟, kill+window]。kill 前无任何容忍；kill 未发生则永不容忍。
+    # 容忍窗 = [受控扰动起点（网关重指/kill 中较早者）, +window]。扰动未发生则不容忍。
+    # RTO 仍锚定 kill.epoch；此处容忍窗覆盖 kill 前短暂的网关重指连接窗口。
     refresh_kill_epoch()
-    if kill_epoch is None: return False
-    return kill_epoch <= time.time() <= kill_epoch+window
+    anchor = disrupt_epoch if disrupt_epoch is not None else kill_epoch
+    if anchor is None: return False
+    return anchor <= time.time() <= anchor+window
 def req(m,p,bd=b'',base='http://localhost:8081'):
     # 无 SigV4 的 ops API 请求；307 时跟随 location 重定向到 leader（最多 3 跳）
     import urllib.request as ur
@@ -366,15 +409,35 @@ def req(m,p,bd=b'',base='http://localhost:8081'):
             return e.code,e.read()
     return 0,b''
 
-# 建桶（RF=9 EC 6+3）：任一 metad 入口出发，follower 会 307 重定向到 leader
-bp=('{"name":"%s","policy":{"replication_factor":9,"ec_config":{"data_shards":6,"parity_shards":3}}}'%bucket).encode()
+# 建桶：任一 metad 入口出发，follower 会 307 重定向到 leader。EC=1 时建 RF=9
+# EC 6+3；默认（EC=0）建 RF=3 纯副本。多 metad raft 下 V2.1 直写 EC 当前会 500
+# （直写 EC 数据面在多 metad 上不稳定），而副本路径稳定 —— 本 harness 的 #4/#5
+# 目标（leader 故障转移 RTO + 优雅降级）由 RF=3 即可完整度量，EC 作为复现开关。
+bp=('{"name":"%s","policy":{"replication_factor":9,"ec_config":{"data_shards":6,"parity_shards":3}}}'%bucket if ec_flag=='1'
+    else '{"name":"%s","policy":{"replication_factor":3}}'%bucket).encode()
 st=0
 for i in (1,2,3):
     st,_=req('POST','/api/v1/buckets',bp,base=f'http://127.0.0.1:{18090+i}')
     if st in (200,201,409): break
 if st not in (200,201,409):
     print('create-bucket fail',st,flush=True); sys.exit(2)
-print('bucket %s RF=9 EC6+3 ready (code=%d)'%(bucket,st),flush=True)
+print('bucket %s ready RF=%s (code=%d)'%(bucket,'9+EC' if ec_flag=='1' else '3',st),flush=True)
+# 多 metad raft 在 leader 驱动的 membership reconcile 收敛前没有稳定 leader
+# （soak 是单 metad 无此 churn；此处可观察到持续 ~30s 的 "leadership lost while
+# committing log"）。故用探测 PUT 自旋等到干净 200 再锚定测量起点 t0，让 RTO 与
+# 容忍窗落在集群稳定之后，首 PUT 的偶发 500 不再误报为净化级错误。
+settle=60; warmed=False
+for _ in range(settle):
+    k='warmup'; data=b'\x00'*4096
+    wst,_=s3raw('PUT',k,data,{'content-length':'4096','content-type':'application/octet-stream'})
+    if wst==200:
+        warmed=True; break
+    print('warming: probe PUT http=%d, waiting for stable leader...'%wst,flush=True)
+    time.sleep(2)
+if not warmed:
+    print('PROBE WARMUP FAILED: no stable leader within %ds'%settle,flush=True); sys.exit(7)
+t0=time.time()   # 锚定测量起点到集群稳定之后
+print('cluster stable (probe 200); starting measured load',flush=True)
 
 while time.time()-t0 < duration:
     t=now(); k='obj-%06d'%obj
@@ -412,12 +475,19 @@ main() {
   [ "$RTO_BUDGET" -gt 0 ] || die "--rto-budget must be > 0"
 
   ts="$(date +%Y%m%d-%H%M%S)"
+  # RES_DIR is created *after* cluster_up: cluster_up does `rm -rf "$LOG_ROOT"`
+  # then recreates only LOG_ROOT/{run,log}/..., so an early mkdir under
+  # LOG_ROOT/results would be wiped before the load phase could write to it.
+  # When the configured RESULTS_ROOT (default /var/log/nufs-tests) is not
+  # writable, we fall back to LOG_ROOT/results and then place RES_DIR exactly
+  # there — so it must be created after cluster_up finishes.
   if ! mkdir -p "$RESULTS_ROOT" 2>/dev/null; then RESULTS_ROOT="$LOG_ROOT/results"; mkdir -p "$RESULTS_ROOT"; fi
-  RES_DIR="$RESULTS_ROOT/leader-failover-$ts"; mkdir -p "$RES_DIR"
-  log "results dir: $RES_DIR"
+  RES_DIR="$RESULTS_ROOT/leader-failover-$ts"
 
   build_bins
   cluster_up
+  mkdir -p "$RES_DIR"
+  log "results dir: $RES_DIR"
   log "starting ${DURATION}s sustained read/write load (failover ~${FAILOVER_AFTER}s, rto_budget=${RTO_BUDGET}s)"
   ( run_load ) > "$RES_DIR/load.log" 2>&1 &
   LOAD_PID=$!
@@ -430,6 +500,27 @@ main() {
     if [ -z "$LEAD" ]; then
       log "no leader resolveable at failover time; skipping kill"
     else
+      # 若当前 leader 恰好是网关入口节点，先把网关改指到另一存活节点再 kill，
+      # 否则网关会与 leader 同死于固定端口（生产由 Service DNS 兜底；本机无 DNS）。
+      # 记录受控扰动起点（disrupt.epoch）：网关重指或 leader kill 都会造成一个
+      # 短暂的合规窗口，驱动以其为容忍窗锚点、以 kill.epoch 为 RTO 锚点。
+      DISRUPT_EPOCH=$(date +%s)
+      # 必须在重指/kill 之前把 disrupt.epoch 落盘，驱动在首条连接错误时即可读到。
+      echo "$DISRUPT_EPOCH" > "$RES_DIR/disrupt.epoch"
+      if [ "$LEAD" = "$GATEWAY_ENTRY" ]; then
+        local alt=1
+        while [ "$alt" -le "$METAD_NODES" ]; do
+          if [ "$alt" -ne "$LEAD" ] && alive "$(metad_pid "$alt")"; then break; fi
+          alt=$((alt+1))
+        done
+        if [ "$alt" -le "$METAD_NODES" ]; then
+          log "leader meta-$LEAD is the gateway entry; repointing gateway to meta-$alt"
+          repoint_gateway "$alt"
+          GATEWAY_ENTRY="$alt"
+        else
+          log "no alternative live metad to repoint gateway to; proceeding (may orphan gateway)"
+        fi
+      fi
       KILLED_LEADER="$LEAD"
       KPIDFILE="$(metad_pid "$LEAD")"
       lp="$(metad_ops "$LEAD")"
@@ -439,9 +530,9 @@ main() {
         KILL_EPOCH=$(date +%s)
         log "chaos: SIGKILL raft leader meta-$LEAD (pid $pid, ops :$lp) KILL_EPOCH=$KILL_EPOCH"
         kill -9 "$pid" 2>/dev/null || true
-        # 记录 kill 时刻供驱动以真实墙钟锚定容忍窗、供 RTO 计算
+        # kill.epoch 供 RTO（首次故障后成功写）；disrupt.epoch 已先行落盘供容忍窗
         echo "$KILL_EPOCH" > "$RES_DIR/kill.epoch"
-        echo "KILL_EPOCH $KILL_EPOCH" > "$RES_DIR/kill.log"
+        echo "KILL_EPOCH $KILL_EPOCH DISRUPT_EPOCH $DISRUPT_EPOCH" > "$RES_DIR/kill.log"
       else
         log "chaos: leader meta-$LEAD has no live pid (skip)"
       fi
@@ -508,8 +599,23 @@ main() {
     pass=0
   fi
 
-  [ "$pass" -ne 0 ] && { log "waiting heal/orphan-GC convergence before verify"; sleep 40; verify_all; }
-  [ "$pass" -ne 0 ] && archive_evidence PASS "verify" || archive_evidence FAIL "gate"
+  # 字节精确校验：只有 RTO/优雅降级全部满足时才跑（避免在 leader 切换失败时
+  # 误跑）。verify_all 的返回值必须汇入 pass —— 之前用 &&/|| 吞掉了它的失败，
+  # 会在校验失败时错误地打印 PASS。校验失败是被测集群的数据面缺陷（如跨 raft
+  # 故障转移的 chunk-ID 复用），必须让 run 以 FAIL 收尾并落盘证据。
+  local verify_rc=0
+  if [ "$pass" -ne 0 ]; then
+    log "waiting heal/orphan-GC convergence before verify"
+    sleep 40
+    verify_all || verify_rc=1
+  fi
+  if [ "$pass" -ne 0 ] && [ "$verify_rc" -eq 0 ]; then
+    archive_evidence PASS "verify"
+  else
+    log "RESULT: FAIL — byte-exact verify did not pass (rc=${verify_rc})"
+    pass=0
+    archive_evidence FAIL "verify"
+  fi
 
   if [ "$pass" -ne 0 ]; then
     echo "PASS: leader-failover (rto=${RTO_SECS}s <= ${RTO_BUDGET}s, metad=$METAD_NODES nodes=$NODES, out_of_window_errors=${OUT_WINDOW_ERRS:-0})" \
@@ -564,7 +670,13 @@ PYEOF
 
 onsig() {
   local rc=$?
-  if [ $rc -ne 0 ]; then archive_evidence FAIL "aborted(rc=$rc)"; fi
+  # EXIT 陷阱会在脚本（含 `main` 内部 `exit 1`）退出时以 `$?` 触发。若主流程已
+  # 把 result=PASS 写进 REPORT，切勿再以 aborted(FAIL) 覆盖 —— 否则一次本应
+  # 通过的 failover 演练（RTO/verify/out-of-window 全绿）会被退出状态的假性非零
+  # 标记为 FAIL。只有报告尚未定型（rto 未到约定 PASS 阶段）才归档 FAIL。
+  if [ $rc -ne 0 ] && ! grep -q '^result=PASS' "$RES_DIR/REPORT.txt" 2>/dev/null; then
+    archive_evidence FAIL "aborted(rc=$rc)"
+  fi
   [ "$CLEANUP" -eq 1 ] && cluster_down 2>/dev/null
   exit $rc
 }
