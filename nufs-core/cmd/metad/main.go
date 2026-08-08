@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -44,6 +45,7 @@ func main() {
 		raftAdvertiseAddr    = flag.String("raft-advertise-addr", "", "Advertised Raft address for peers (default: raft-addr)")
 		raftDir              = flag.String("raft-dir", "/var/lib/dfs/raft", "Raft data directory")
 		raftBootstrap        = flag.Bool("raft-bootstrap", false, "Bootstrap a new Raft cluster")
+		raftBootstrapOwner   = flag.String("raft-bootstrap-owner", "", "Node ID of the single node allowed to seed the Raft cluster. When set, nodes with --raft-bootstrap=true whose --node-id differs defer to it (start as follower and are added by the owner's reconcile), preventing the all-nodes-bootstrap leadership split in multi-process deploys.")
 		raftBootstrapPeers   = flag.String("raft-bootstrap-peers", "", "Comma-separated Raft bootstrap peers as id=host:port")
 		raftPeerOps          = flag.String("raft-peer-ops", "", "Comma-separated Raft peer ops URLs as id=http://host:port")
 		opsAddr              = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
@@ -137,6 +139,21 @@ func main() {
 	raftNodeCount := 1
 	if *enableRaft && *raftBootstrapPeers != "" {
 		raftNodeCount = len(parsePeerOpsURLsForValidation(*raftBootstrapPeers)) + 1
+	}
+	// Multi-process bootstrap owner hardening: in a >1-node production
+	// deployment, every replica may legitimately carry --raft-bootstrap=true
+	// (a distroless image has no shell, so per-ordinal args aren't possible;
+	// the helm chart passes it to all + a --raft-bootstrap-owner). But if
+	// bootstrap is on for a multi-node set with NO owner designated, every
+	// node seeds its own 1-voter singleton, all win independent elections with
+	// conflicting terms, and the leader-driven reconcile races a rival leader
+	// so membership never converges (three-way leadership split). Reject that
+	// shape outright in production instead of letting the cluster silently fail
+	// to elect after any leader kill. Dev mode (--allow-insecure-dev) keeps the
+	// permissive legacy self-seed so the in-process harness is unaffected.
+	if *enableRaft && raftNodeCount > 1 && *raftBootstrap && *raftBootstrapOwner == "" && !*allowInsecureDev {
+		fmt.Fprintf(os.Stderr, "invalid configuration: --raft-bootstrap=true with %d raft nodes requires --raft-bootstrap-owner, otherwise every node seeds its own 1-voter cluster and re-election never converges (three-way leadership split)\n", raftNodeCount)
+		os.Exit(1)
 	}
 	if err := metadata.ValidateProductionConfig(metadata.ProductionValidationConfig{
 		Mode:             runtimeMode(*allowInsecureDev),
@@ -235,12 +252,26 @@ func main() {
 		raftNodeID := fmt.Sprintf("meta-%d", nodeIDValue)
 		peerOps[raftNodeID] = advertiseOpsURL
 
+		// Optional raft-internal log sink (election/vote/heartbeat/commit)
+		// for diagnosing re-election behavior. Off by default.
+		raftLogOut := io.Writer(nil)
+		if p := os.Getenv("NUFS_RAFT_LOG"); p != "" {
+			f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				log.Error("NUFS_RAFT_LOG open failed", "error", err, "path", p)
+			} else {
+				raftLogOut = f
+				log.Info("raft internal log enabled", "path", p)
+			}
+		}
+
 		raftCfg := metadata.RaftNodeConfig{
 			NodeID:             raftNodeID,
 			BindAddr:           *raftAddr,
 			AdvertiseAddr:      *raftAdvertiseAddr,
 			RaftDir:            *raftDir,
 			Bootstrap:          *raftBootstrap,
+			BootstrapOwnerID:   *raftBootstrapOwner,
 			BootstrapPeers:     bootstrapPeers,
 			HeartbeatTimeout:   *raftHbTimeout,
 			ElectionTimeout:    *raftElection,
@@ -250,6 +281,7 @@ func main() {
 			TrailingLogs:       10240,
 			AdvertiseOpsAddr:   advertiseOpsURL,
 			PeerOpsURLs:        peerOps,
+			LogOutput:          raftLogOut,
 		}
 
 		raftNode, err = metadata.NewRaftNode(store, raftCfg)
@@ -838,8 +870,14 @@ func runtimeMode(allowInsecureDev bool) metadata.RuntimeMode {
 //
 //   - no-ops entirely when this node owns no peers (nothing to reconcile);
 //   - only acts while this node is leader (AddVoter is leader-only);
-//   - reruns periodically so a peer that was not listening yet (or restarted)
-//     is absorbed, and so a newly elected leader re-confirms the voting set;
+//   - runs once immediately at startup, so a node that is already the leader (or
+//     elected soon after process start) pulls peers in without waiting for the
+//     first 5s tick — this is what keeps the post-election window small;
+//   - re-triggers whenever this node gains leadership (LeaderChanges), so a newly
+//     elected leader re-confirms the voting set immediately rather than on the
+//     next tick;
+//   - reruns on the periodic tick so a peer that was not listening yet (or
+//     restarted) is absorbed, and as a fallback if an immediate pass failed;
 //   - stops when stop is closed (process shutdown).
 //
 // It is intentionally non-fatal: an unreachable peer is retried, never treated
@@ -856,27 +894,45 @@ func reconcileMetadPeers(log *slog.Logger, raftNode *metadata.RaftNode, peers []
 	if !hasPeer {
 		return
 	}
+	reconcileOnce := func(why string) {
+		if !raftNode.IsLeader() {
+			return
+		}
+		log.Debug("raft reconcile", "trigger", why, "configured_peers", len(peers), "members", raftNode.Peers())
+		added, already, err := raftNode.EnsurePeers(peers)
+		if err != nil {
+			log.Warn("raft membership reconcile failed", "error", err)
+			return
+		}
+		if added > 0 {
+			log.Info("raft membership reconciled: added peers as voters", "trigger", why, "added", added)
+		} else if already > 0 {
+			log.Debug("raft membership confirmed: peers already voters", "trigger", why, "already", already)
+		}
+	}
+
+	// Immediate first pass: the cluster may have already formed a leader by the
+	// time this goroutine starts (the owner seeds synchronously in NewRaftNode,
+	// and election can win in the same second). Pull peers in now instead of
+	// waiting up to 5s for the first tick.
+	reconcileOnce("startup")
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	leaderCh := raftNode.LeaderChanges()
 	for {
 		select {
 		case <-stop:
 			return
+		case won := <-leaderCh:
+			// Fire on every leadership *gain*. falses (step-downs) are skipped —
+			// only the new leader should re-confirm the voting set.
+			if !won {
+				continue
+			}
+			reconcileOnce("leader-gained")
 		case <-ticker.C:
-		}
-		if !raftNode.IsLeader() {
-			continue
-		}
-		log.Debug("raft reconcile tick", "configured_peers", len(peers), "members", raftNode.Peers())
-		added, already, err := raftNode.EnsurePeers(peers)
-		if err != nil {
-			log.Warn("raft membership reconcile failed", "error", err)
-			continue
-		}
-		if added > 0 {
-			log.Info("raft membership reconciled: added peers as voters", "added", added)
-		} else if already > 0 {
-			log.Debug("raft membership confirmed: peers already voters", "already", already)
+			reconcileOnce("tick")
 		}
 	}
 }

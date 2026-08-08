@@ -1188,8 +1188,21 @@ type RaftNodeConfig struct {
 	AdvertiseAddr string
 	RaftDir       string
 	Bootstrap     bool
-	JoinAddr      string
-	Peers         []string
+	// BootstrapOwnerID designates the single node responsible for calling
+	// BootstrapCluster in a multi-process (baremetal/helm) deployment. Unlike
+	// the in-process harness, peers come up at different times, so only ONE
+	// node may seed the initial config; if every node sets Bootstrap=true each
+	// seeds its own 1-voter singleton, all win independent elections with
+	// conflicting terms, and the leader-driven reconcile races a rival leader
+	// ("leadership lost while committing log") so membership never converges.
+	// When set, a node whose NodeID != BootstrapOwnerID skips BootstrapCluster
+	// entirely, starts as a follower with an empty config, and is pulled into
+	// the voting set by the owner's reconcile (RaftNode.EnsurePeers). Empty
+	// (default) preserves legacy behavior: every Bootstrap node self-seeds
+	// (used by the in-process test harness).
+	BootstrapOwnerID string
+	JoinAddr         string
+	Peers            []string
 	// BootstrapPeers defines the initial Raft voter set as explicit
 	// server ID/address pairs. Prefer this over Peers for production
 	// deployments where server IDs differ from network addresses.
@@ -1237,6 +1250,13 @@ type RaftNodeConfig struct {
 	// tiebreaker: higher-priority nodes use shorter election timeouts,
 	// making them more likely to win elections. Set to 0 (default) for no preference.
 	ElectionPriority uint8
+
+	// LogOutput routes hashicorp/raft's internal logs (election, vote,
+	// heartbeat, append-commit activity). Defaults to io.Discard (silent).
+	// Set this to a file/logger in diagnostics to inspect re-election
+	// behavior that is otherwise invisible (see run-v21-leader-failover.sh
+	// NUFS_RAFT_LOG).
+	LogOutput io.Writer
 }
 
 // RaftPeer is an explicit server ID/address pair for Raft membership.
@@ -1249,7 +1269,10 @@ type RaftPeer struct {
 func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 	raftConfig := raft.DefaultConfig()
 	raftConfig.LocalID = raft.ServerID(cfg.NodeID)
-	raftConfig.LogOutput = io.Discard
+	raftConfig.LogOutput = cfg.LogOutput
+	if raftConfig.LogOutput == nil {
+		raftConfig.LogOutput = io.Discard
+	}
 
 	// Apply Raft timing configuration
 	if cfg.HeartbeatTimeout > 0 {
@@ -1347,38 +1370,52 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 
 	// Bootstrap
 	if cfg.Bootstrap {
-		servers := []raft.Server{
-			{ID: raft.ServerID(cfg.NodeID), Address: raft.ServerAddress(advertiseAddr)},
-		}
-		// cfg.Peers (legacy) is always seeded: it is used by the in-process test
-		// harness where all nodes share one process and can form a quorum at boot.
-		for _, peer := range cfg.Peers {
-			servers = append(servers, raft.Server{
-				ID:      raft.ServerID(peer),
-				Address: raft.ServerAddress(peer),
-			})
-		}
-		// cfg.BootstrapPeers (multi-process baremetal/helm) is seeded only when
-		// PreSeedBootstrapPeers is true (in-process harness). For multi-process it
-		// stays empty: peer processes may not be up yet, so pre-seeding them as
-		// voters would leave the seed unable to reach a quorum and stall election.
-		// Instead the seed starts with only itself as a voter, becomes leader, and
-		// the leader-driven reconcile loop (cmd/metad reconcileMetadPeers) brings
-		// each BootstrapPeer into the voting set with AddVoter as it comes up.
-		if cfg.PreSeedBootstrapPeers {
-			for _, peer := range cfg.BootstrapPeers {
-				if peer.ID == cfg.NodeID {
-					continue
-				}
+		// In a multi-process deployment only the designated bootstrap owner may
+		// seed the cluster. A non-owner that also started with Bootstrap=true
+		// (e.g. a chart that passes --raft-bootstrap to every replica) must NOT
+		// self-seed: doing so would race the owner for leadership and split the
+		// membership. It instead starts with an empty config and is added as a
+		// voter by the owner's reconcile loop once it is up.
+		if cfg.BootstrapOwnerID == "" || cfg.NodeID == cfg.BootstrapOwnerID {
+			servers := []raft.Server{
+				{ID: raft.ServerID(cfg.NodeID), Address: raft.ServerAddress(advertiseAddr)},
+			}
+			// cfg.Peers (legacy) is always seeded: it is used by the in-process test
+			// harness where all nodes share one process and can form a quorum at boot.
+			for _, peer := range cfg.Peers {
 				servers = append(servers, raft.Server{
-					ID:      raft.ServerID(peer.ID),
-					Address: raft.ServerAddress(peer.Address),
+					ID:      raft.ServerID(peer),
+					Address: raft.ServerAddress(peer),
 				})
 			}
-		}
-		f := r.BootstrapCluster(raft.Configuration{Servers: servers})
-		if err := f.Error(); err != nil && err != raft.ErrCantBootstrap {
-			slog.Warn("raft bootstrap warning", "error", err)
+			// cfg.BootstrapPeers (multi-process baremetal/helm) is seeded only when
+			// PreSeedBootstrapPeers is true (in-process harness). For multi-process it
+			// stays empty: peer processes may not be up yet, so pre-seeding them as
+			// voters would leave the seed unable to reach a quorum and stall election.
+			// Instead the seed starts with only itself as a voter, becomes leader, and
+			// the leader-driven reconcile loop (cmd/metad reconcileMetadPeers) brings
+			// each BootstrapPeer into the voting set with AddVoter as it comes up.
+			if cfg.PreSeedBootstrapPeers {
+				for _, peer := range cfg.BootstrapPeers {
+					if peer.ID == cfg.NodeID {
+						continue
+					}
+					servers = append(servers, raft.Server{
+						ID:      raft.ServerID(peer.ID),
+						Address: raft.ServerAddress(peer.Address),
+					})
+				}
+			}
+			f := r.BootstrapCluster(raft.Configuration{Servers: servers})
+			if err := f.Error(); err != nil && err != raft.ErrCantBootstrap {
+				slog.Warn("raft bootstrap warning", "error", err)
+			}
+		} else {
+			// Non-owner started with Bootstrap=true: do not seed. Start as a
+			// follower with an empty config; the owner's reconcile will AddVoter
+			// this node once the owner is elected.
+			slog.Info("raft bootstrap deferred to owner",
+				"node_id", cfg.NodeID, "owner_id", cfg.BootstrapOwnerID)
 		}
 	}
 
@@ -1404,6 +1441,21 @@ func (n *RaftNode) IsLeader() bool {
 		return n.publicLeaderHook()
 	}
 	return n.raft.State() == raft.Leader
+}
+
+// LeaderChanges returns a channel that receives true whenever this node
+// becomes the Raft leader (and false when it loses leadership). It wraps
+// hashicorp/raft's LeaderCh, which is buffered (cap 1) and non-blocking, so
+// a leadership gain is never lost even if the caller is busy. Consumers use
+// it to react to leadership *transitions* rather than polling, e.g. running
+// the membership reconcile immediately on election instead of waiting for
+// the next periodic tick.
+//
+// Closing the returned channel is the caller's responsibility if it needs a
+// terminal signal; keeping it open for the process lifetime is fine for the
+// metad reconcile loop (which has its own stop channel).
+func (n *RaftNode) LeaderChanges() <-chan bool {
+	return n.raft.LeaderCh()
 }
 
 // TransferLeadership transfers leadership to another node. If targetID
