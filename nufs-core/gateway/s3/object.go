@@ -352,7 +352,17 @@ func (gw *Gateway) handleCopyObject(w http.ResponseWriter, r *http.Request, buck
 	}
 
 	reader, writer := io.Pipe()
+	// streamCopySource reads source chunks and feeds them into the pipe; it runs
+	// on a background goroutine so the destination Put can stream from the pipe.
+	// It MUST be awaited (and the pipe reader closed) before this handler returns:
+	// otherwise a copy whose destination Put fails before draining the body leaves
+	// the producer running, and when the metadata store is later closed (app
+	// shutdown, or the test teardown) the still-running GetChunk panics with
+	// "pebble: closed". Closing the reader unblocks a producer stuck on the pipe
+	// write; draining copyErr then joins it so it cannot outlive this handler.
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		writer.CloseWithError(gw.streamCopySource(ctx, writer, lockedSource))
 	}()
 	result, err := gw.committer.Put(ctx, PutObjectRequest{
@@ -364,6 +374,7 @@ func (gw *Gateway) handleCopyObject(w http.ResponseWriter, r *http.Request, buck
 		RequestID:     requestID,
 	})
 	_ = reader.Close()
+	<-done
 	if err != nil {
 		gw.writePutObjectCommitterError(w, err, bucket, key, requestID)
 		return
