@@ -54,6 +54,68 @@ func TestHTTPClientSendsAuthTokenOnRedirect(t *testing.T) {
 	}
 }
 
+// TestHTTPClientFollowsMultiHopRedirect verifies the client chases a leader
+// through more than one 307 redirect (follower -> second follower -> leader),
+// re-sending the original method, body and auth headers on each hop.
+func TestHTTPClientFollowsMultiHopRedirect(t *testing.T) {
+	leader := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("expected redirected Authorization header, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name":"b1"}]`))
+	}))
+	defer leader.Close()
+
+	hop2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, leader.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer hop2.Close()
+
+	follower := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// First hop points at another follower rather than the leader directly.
+		http.Redirect(w, r, hop2.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer follower.Close()
+
+	c := NewHTTPClient(follower.URL, time.Second)
+	c.SetAuthToken("secret")
+	buckets, err := c.ListBuckets(context.Background())
+	if err != nil {
+		t.Fatalf("ListBuckets via multi-hop redirect: %v", err)
+	}
+	if len(buckets) != 1 || buckets[0].Name != "b1" {
+		t.Fatalf("unexpected buckets: %+v", buckets)
+	}
+}
+
+// TestHTTPClientRetriesThroughLeaderTransition verifies the client keeps
+// retrying transient 5xx responses (a follower answering "no leader available"
+// while the Raft cluster re-elects) for a bounded transition budget instead of
+// surfacing an immediate 503 to the caller.
+func TestHTTPClientRetriesThroughLeaderTransition(t *testing.T) {
+	var fails atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fails.Add(1) <= 3 {
+			http.Error(w, "no leader available", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name":"b1"}]`))
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, 2*time.Second)
+	c.SetRetryConfig(3, time.Millisecond)
+	buckets, err := c.ListBuckets(context.Background())
+	if err != nil {
+		t.Fatalf("ListBuckets through 503 transition: %v", err)
+	}
+	if len(buckets) != 1 {
+		t.Fatalf("unexpected buckets: %+v", buckets)
+	}
+}
+
 func TestHTTPClientXAttrRoundTripOverJSON(t *testing.T) {
 	var stored []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

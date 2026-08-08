@@ -91,25 +91,70 @@ func (c *HTTPClient) EnableTLS(cfg tlsutil.Config) error {
 	return nil
 }
 
+// leaderRedirectMaxHops bounds how many 307/301 leader redirects we follow
+// before giving up. A follower redirects to the leader; in a multi-node Raft
+// cluster a freshly-elected leader may in turn have an outdated view and
+// redirect once more, so we chase a few hops (mirroring the admin cluster
+// client) instead of stopping at the first redirect target.
+const leaderRedirectMaxHops = 5
+
+// leaderTransitionBudget bounds how long a single metadata request keeps
+// retrying through a leader reconfiguration. A hashicorp/raft election can take
+// several seconds (the V2.1 failover drill measures ~8s RTO), far longer than
+// the default maxRetries backoff window (~700ms), so we keep retrying transient
+// 5xx / "no leader" responses for up to this budget before giving up. It is
+// comfortably under the per-attempt HTTP timeout (30s) and bounded so a truly
+// wedged node does not block callers indefinitely.
+const leaderTransitionBudget = 10 * time.Second
+
 // doRequestWithRetry executes an HTTP request with exponential backoff retry
-// and automatic leader redirect following.
+// and automatic leader redirect following. It is resilient to a Raft leader
+// transition: it follows multiple redirect hops toward the leader and keeps
+// retrying transient 5xx responses (e.g. "no leader available" on a follower)
+// for up to leaderTransitionBudget so an in-flight election does not surface a
+// spurious 503 to the caller.
 func (c *HTTPClient) doRequestWithRetry(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
 	var lastErr error
 
-	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: 100ms, 200ms, 400ms, ...
-			wait := c.retryBaseWait * time.Duration(1<<uint(attempt-1))
+	// started tracks wall-clock elapsed since the request began so we can bound
+	// total reconfiguration retries beyond the fixed maxRetries count. While the
+	// Raft cluster is reconfiguring, a follower may keep answering 503 ("no
+	// leader available") for several seconds; we stay in the loop until the
+	// election settles or the budget is exhausted.
+	started := time.Now()
+
+	// waitRetry<== sleeps the exponential backoff for the given attempt index,
+	// returning false if the context was cancelled.
+	waitBackoff := func(attempt int) bool {
+		wait := c.retryBaseWait * time.Duration(1<<uint(attempt))
+		if time.Since(started)+wait > leaderTransitionBudget {
+			wait = 0
+		}
+		if wait > 0 {
 			select {
 			case <-time.After(wait):
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return false
 			}
 		}
+		return true
+	}
 
-		resp, err := c.doRequest(ctx, method, path, body)
+	// attempt counts the distinct "first + configured retries" rounds so the
+	// terminal error keeps the familiar "(after N retries)" shape for the
+	// ordinary (non-reconfiguration) failure modes.
+	attempt := 0
+	for {
+		resp, err := c.doFollowRedirects(ctx, method, path, body)
 		if err != nil {
 			lastErr = err
+			if attempt >= c.maxRetries && time.Since(started) >= leaderTransitionBudget {
+				break
+			}
+			if !waitBackoff(attempt) {
+				return nil, ctx.Err()
+			}
+			attempt++
 			continue // Retry on network errors
 		}
 
@@ -122,54 +167,31 @@ func (c *HTTPClient) doRequestWithRetry(ctx context.Context, method, path string
 			select {
 			case <-time.After(wait):
 				lastErr = fmt.Errorf("metadata server returned 429 (throttled)")
-				continue
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
-		}
-
-		// Handle leader redirect (HTTP 301/307 from follower nodes)
-		if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect {
-			location := resp.Header.Get("Location")
-			resp.Body.Close()
-			if location != "" {
-				redirectURL, err := url.Parse(location)
-				if err == nil && redirectURL.Host != "" {
-					// Follow redirect: construct a temporary URL instead of mutating c.baseURL
-					redirectBase := redirectURL.Scheme + "://" + redirectURL.Host
-					redirectReqURL := redirectBase + path
-					var reqBody io.Reader
-					if body != nil {
-						data, err := json.Marshal(body)
-						if err != nil {
-							lastErr = fmt.Errorf("marshal redirect body: %w", err)
-							continue
-						}
-						reqBody = bytes.NewReader(data)
-					}
-					req, reqErr := http.NewRequestWithContext(ctx, method, redirectReqURL, reqBody)
-					if reqErr != nil {
-						lastErr = reqErr
-						continue
-					}
-					req.Header.Set("Content-Type", "application/json")
-					c.addHeaders(req)
-					resp, err = c.httpClient.Do(req)
-					if err != nil {
-						lastErr = err
-						continue
-					}
-					return resp, nil
-				}
+			if attempt >= c.maxRetries && time.Since(started) >= leaderTransitionBudget {
+				break
 			}
-			lastErr = fmt.Errorf("metad: redirect without location")
+			attempt++
 			continue
 		}
 
-		// Retry on server errors (5xx) and connection-level issues
+		// Retry on server errors (5xx) and connection-level issues. During a
+		// leader transition a follower briefly returns 503 ("no leader
+		// available"); keep retrying until the election settles (bounded by
+		// leaderTransitionBudget) so the write is served rather than surfacing
+		// a spurious 503.
 		if resp.StatusCode >= 500 {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("metad: server error (status=%d)", resp.StatusCode)
+			if time.Since(started) >= leaderTransitionBudget {
+				return nil, fmt.Errorf("metad: %w (after %d retries)", lastErr, c.maxRetries)
+			}
+			if !waitBackoff(attempt) {
+				return nil, ctx.Err()
+			}
+			attempt++
 			continue
 		}
 
@@ -177,6 +199,34 @@ func (c *HTTPClient) doRequestWithRetry(ctx context.Context, method, path string
 	}
 
 	return nil, fmt.Errorf("metad: %w (after %d retries)", lastErr, c.maxRetries)
+}
+
+// doFollowRedirects issues the request and follows up to leaderRedirectMaxHops
+// 307/301 leader redirects. The caller owns the returned response's Body on
+// success; on error (network failure or redirect exhaustion) the Body is closed
+// and an error is returned.
+func (c *HTTPClient) doFollowRedirects(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
+	currentBase := c.baseURL
+	for hop := 0; hop <= leaderRedirectMaxHops; hop++ {
+		resp, err := c.doRequestAt(ctx, method, path, body, currentBase)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusMovedPermanently && resp.StatusCode != http.StatusTemporaryRedirect {
+			return resp, nil
+		}
+		location := resp.Header.Get("Location")
+		resp.Body.Close()
+		if location == "" {
+			return nil, fmt.Errorf("metad: redirect without location")
+		}
+		redirectURL, err := url.Parse(location)
+		if err != nil || redirectURL.Host == "" {
+			return nil, fmt.Errorf("metad: invalid redirect location")
+		}
+		currentBase = redirectURL.Scheme + "://" + redirectURL.Host
+	}
+	return nil, fmt.Errorf("metad: exceeded %d redirect hops", leaderRedirectMaxHops)
 }
 
 func (c *HTTPClient) doAllocationRequest(ctx context.Context, path string, body interface{}) (*http.Response, error) {
@@ -218,6 +268,10 @@ func (c *HTTPClient) doAllocationRequest(ctx context.Context, path string, body 
 }
 
 func (c *HTTPClient) doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
+	return c.doRequestAt(ctx, method, path, body, c.baseURL)
+}
+
+func (c *HTTPClient) doRequestAt(ctx context.Context, method, path string, body interface{}, baseURL string) (*http.Response, error) {
 	var reqBody io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -227,7 +281,7 @@ func (c *HTTPClient) doRequest(ctx context.Context, method, path string, body in
 		reqBody = bytes.NewReader(data)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
