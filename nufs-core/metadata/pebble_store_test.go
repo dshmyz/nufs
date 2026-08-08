@@ -2212,7 +2212,7 @@ func TestRaftE2E_WriteThroughLeader(t *testing.T) {
 	store := newTestPebbleStore(t)
 	cfg := RaftNodeConfig{
 		NodeID:             "meta-1",
-		BindAddr:           "127.0.0.1:10200",
+		BindAddr:           unusedRaftAddress(t),
 		RaftDir:            t.TempDir(),
 		Bootstrap:          true,
 		HeartbeatTimeout:   500 * time.Millisecond,
@@ -2263,7 +2263,7 @@ func TestRaftE2E_LeaderFailover(t *testing.T) {
 	store := newTestPebbleStore(t)
 	cfg := RaftNodeConfig{
 		NodeID:             "meta-1",
-		BindAddr:           "127.0.0.1:10300",
+		BindAddr:           unusedRaftAddress(t),
 		RaftDir:            t.TempDir(),
 		Bootstrap:          true,
 		HeartbeatTimeout:   500 * time.Millisecond,

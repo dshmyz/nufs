@@ -7,6 +7,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -459,6 +460,14 @@ func TestHistogram(t *testing.T) {
 }
 
 func TestMetricsSnapshot(t *testing.T) {
+	// Reset the counters this test asserts on so it is idempotent: Go runs the
+	// same test N times in one process under -count=N, so without a reset the
+	// second iteration sees the first one's increments (open=2, want 1).
+	atomic.StoreUint64(&globalMetrics.OpsOpen, 0)
+	atomic.StoreUint64(&globalMetrics.OpsRead, 0)
+	atomic.StoreUint64(&globalMetrics.S3Get, 0)
+	atomic.StoreUint64(&globalMetrics.ActiveHandles, 0)
+
 	metricsIncOpen()
 	metricsIncRead()
 	metricsIncS3Get()

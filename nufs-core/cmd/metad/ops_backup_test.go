@@ -184,6 +184,12 @@ func TestOpsBackupVerifyRejectsConcurrentBackup(t *testing.T) {
 
 func TestPrometheusBackupMetricsExcludeBackupIDLabelsAndIncludeTombstoneAge(t *testing.T) {
 	backupVerificationFailuresTotal.Store(2)
+	// The restore-ready counters are global and may have been bumped by earlier
+	// tests in this package (a restore-readiness gate can run a real verify, see
+	// restore_readiness_test.go). Reset them so this test, which asserts they are
+	// zero, is idempotent under any package/suite ordering (and -count=N).
+	restoreVerificationFailuresTotal.Store(0)
+	restoreVerificationDurationMillis.Store(0)
 	now := time.Date(2026, 7, 30, 3, 0, 0, 0, time.UTC)
 	source := fakeBackupMetricsSource{
 		status: metadata.BackupCoordinatorStatus{Started: true},
