@@ -30,31 +30,43 @@ spec:
         - name: datanode
           image: "{{ .Values.global.imageRegistry }}{{ .Values.datanode.image.repository }}:{{ .Values.datanode.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.datanode.image.pullPolicy }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           ports:
             - name: data
               containerPort: {{ .Values.datanode.service.dataPort }}
             - name: ops
               containerPort: {{ .Values.datanode.service.opsPort }}
-          args:
-            - "--node-id=auto"
-            - "--listen=0.0.0.0:{{ .Values.datanode.service.dataPort }}"
-            - "--ops-addr=0.0.0.0:{{ .Values.datanode.service.opsPort }}"
-            - "--data-dir=/data"
-            - "--metadata={{ .Release.Name }}-metad:{{ .Values.metad.service.port }}"
-            - "--capacity={{ .Values.datanode.config.capacityGB }}"
-            - "--rack={{ .Values.datanode.config.rack }}"
-            - "--zone={{ .Values.datanode.config.zone }}"
-            {{- if .Values.observability.tracing.enabled }}
-            - "--trace-enabled=true"
-            - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
-            - "--trace-insecure={{ .Values.observability.tracing.insecure }}"
-            {{- end }}
-            - "--log-json=true"
-            {{- if .Values.observability.tracing.enabled }}
-            - "--trace-enabled=true"
-            - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
-            - "--trace-insecure={{ .Values.observability.tracing.insecure }}"
-            {{- end }}
+          # Derive rack/zone from the pod ordinal so each datanode declares its
+          # fault domain (used by EC allocation). topologySpreadConstraints keeps
+          # the ordinals balanced across real zones/racks, so the hint tracks the
+          # physical placement as long as faultDomains matches topology domains.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              ORD="{{ .Values.datanode.config.rackPrefix }}"
+              case "$POD_NAME" in *-*) ORD="${POD_NAME##*-}";; esac
+              RACK=$(( (10#$ORD % {{ .Values.datanode.config.faultDomains }}) + 1 ))
+              ZONE=$(( (10#$ORD % {{ .Values.datanode.config.faultDomains }}) + 1 ))
+              exec /usr/local/bin/datanode \
+                --node-id=auto \
+                --listen=0.0.0.0:{{ .Values.datanode.service.dataPort }} \
+                --ops-addr=0.0.0.0:{{ .Values.datanode.service.opsPort }} \
+                --data-dir=/data \
+                --metadata={{ .Release.Name }}-metad:{{ .Values.metad.service.port }} \
+                --capacity={{ .Values.datanode.config.capacityGB }} \
+                --rack="{{ .Values.datanode.config.rackPrefix }}${RACK}" \
+                --zone="{{ .Values.datanode.config.zonePrefix }}${ZONE}" {{- if .Values.observability.tracing.enabled }} \
+                --trace-enabled=true \
+                --trace-endpoint={{ .Values.observability.tracing.endpoint }} \
+                --trace-insecure={{ .Values.observability.tracing.insecure }} {{- end }} \
+                --log-json=true \
+                "$@"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -94,6 +106,15 @@ spec:
       {{- with .Values.datanode.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.datanode.topologyKey }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.datanode.topologyMaxSkew }}
+          topologyKey: {{ .Values.datanode.topologyKey }}
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              {{- include "nufs.datanode.labels" . | nindent 14 }}
       {{- end }}
   volumeClaimTemplates:
     - metadata:

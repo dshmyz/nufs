@@ -22,6 +22,28 @@ mechanism used by the deployment. Credentials must allow listing, reading,
 writing, and deleting objects below the configured prefix. Use a dedicated
 prefix per NUFS cluster.
 
+### Enable via Helm
+
+The `nufs` chart wires the same flags through `metad.backup` (off by default).
+Set the object-store endpoint, bucket, prefix, region, a stable cluster ID, and
+the IAM/secret, then upgrade:
+
+```sh
+helm upgrade nufs deploy/helm/nufs \
+  --set metad.backup.enabled=true \
+  --set metad.backup.clusterId=<stable-cluster-id> \
+  --set metad.backup.s3.bucket=<bucket> \
+  --set metad.backup.s3.prefix=<env>/metadata \
+  --set metad.backup.s3.region=<region> \
+  --set metad.backup.s3.endpoint=<s3-compatible-endpoint> \
+  --set metad.backup.credentialsSecret=<k8s-secret>  # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+```
+
+For AWS IRSA / workload identity, annotate the metad ServiceAccount instead of
+providing `credentialsSecret`. The local temp dir (`metad.backup.localTmpDir`)
+is scratch only — the S3 bucket is the durable, cross-fault-domain target. The
+backup coordinator runs on the raft leader only.
+
 ## Manual Operations
 
 List recent backup tasks:

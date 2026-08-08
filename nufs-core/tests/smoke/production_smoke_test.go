@@ -108,18 +108,19 @@ func startRaftSmokeCluster(t *testing.T, n int) *raftSmokeCluster {
 			t.Fatalf("create store %d: %v", i+1, err)
 		}
 		_, err = metadata.NewRaftNode(store, metadata.RaftNodeConfig{
-			NodeID:             peers[i].ID,
-			BindAddr:           addrs[i],
-			AdvertiseAddr:      addrs[i],
-			RaftDir:            t.TempDir(),
-			Bootstrap:          true,
-			BootstrapPeers:     peers,
-			HeartbeatTimeout:   100 * time.Millisecond,
-			ElectionTimeout:    100 * time.Millisecond,
-			LeaderLeaseTimeout: 50 * time.Millisecond,
-			SnapshotThreshold:  64,
-			SnapshotInterval:   time.Second,
-			TrailingLogs:       128,
+			NodeID:                peers[i].ID,
+			BindAddr:              addrs[i],
+			AdvertiseAddr:         addrs[i],
+			RaftDir:               t.TempDir(),
+			Bootstrap:             true,
+			BootstrapPeers:        peers,
+			PreSeedBootstrapPeers: true, // in-process: all peers start together, form quorum at boot
+			HeartbeatTimeout:      100 * time.Millisecond,
+			ElectionTimeout:       100 * time.Millisecond,
+			LeaderLeaseTimeout:    50 * time.Millisecond,
+			SnapshotThreshold:     64,
+			SnapshotInterval:      time.Second,
+			TrailingLogs:          128,
 		})
 		if err != nil {
 			_ = store.Close()

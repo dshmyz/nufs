@@ -139,6 +139,14 @@ var SLIDefinitions = []SLI{
 		Unit:        "ratio",
 		Source:      "datanode",
 	},
+	{
+		Name:        "metad_leader_failover_rto",
+		Category:    "availability",
+		Description: "Time from raft leader loss (SIGKILL/failure) until a new leader successfully serves a metadata write. Budget is a hard RTO gate for a 5-9 tier; measured by the failover drill (tests/soak/run-v21-leader-failover.sh) and surfaced here as a machine-checked SLO rather than a run-rate ratio.",
+		Metric:      `metad_leader_failover_rto_seconds`,
+		Unit:        "seconds",
+		Source:      "metad",
+	},
 
 	// ---- Durability SLIs ----
 	{
@@ -296,6 +304,14 @@ var SLODefinitions = []SLO{
 		Severity:    "critical",
 		Description: "Chunk reads must succeed 99.99% of the time (replication provides redundancy)",
 	},
+	{
+		Name:        "metad_leader_failover_rto_15s",
+		SLIName:     "metad_leader_failover_rto",
+		Target:      15,
+		Window:      "1h",
+		Severity:    "critical",
+		Description: "A replaced raft leader must be serving writes within 15s of failure. Drilled automatically; exceeding the budget means the 5-9 availability tier's recovery time is not met.",
+	},
 
 	// ---- Durability SLOs ----
 	{
@@ -442,6 +458,16 @@ var AlertRules = []AlertRule{
 		Severity:  "critical",
 		Summary:   "Raft leader is changing frequently — cluster instability",
 		RunbookURL: "https://docs.nufs.io/runbook/raft-flapping",
+		Labels:    map[string]string{"team": "storage", "component": "metad"},
+	},
+	{
+		Name:      "NUFSLeaderFailoverRTOExceeded",
+		SLOName:   "metad_leader_failover_rto_15s",
+		Expr:      `metad_leader_failover_rto_seconds > 15`,
+		For:       "1m",
+		Severity:  "critical",
+		Summary:   "Leader failover RTO exceeded 15s budget — 5-9 availability tier recovery time not met",
+		RunbookURL: "https://docs.nufs.io/runbook/leader-failover-rto",
 		Labels:    map[string]string{"team": "storage", "component": "metad"},
 	},
 
@@ -645,5 +671,12 @@ var ErrorBudgets = []ErrorBudget{
 		Window:        "7d",
 		BudgetPercent: 1,
 		BudgetMinutes: 100.8,
+	},
+	{
+		SLOName:       "metad_leader_failover_rto_15s",
+		Target:        15,
+		Window:        "1h",
+		BudgetPercent: 100,
+		BudgetMinutes: 0.25, // RTO is a hard one-shot budget, not a windowed ratio
 	},
 }

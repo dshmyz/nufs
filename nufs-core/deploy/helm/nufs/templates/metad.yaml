@@ -35,6 +35,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- if and .Values.metad.backup.enabled .Values.metad.backup.credentialsSecret }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.metad.backup.credentialsSecret }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.metad.backup.credentialsSecret }}
+                  key: AWS_SECRET_ACCESS_KEY
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.metad.service.port }}
@@ -61,6 +73,19 @@ spec:
             {{- else }}
             - "--auto-balance-interval=0"
             {{- end }}
+            {{- if .Values.metad.backup.enabled }}
+            - "--backup-enabled=true"
+            - "--cluster-id={{ .Values.metad.backup.clusterId }}"
+            - "--backup-local-dir={{ .Values.metad.backup.localTmpDir }}"
+            - "--backup-interval={{ .Values.metad.backup.interval }}"
+            - "--backup-retention={{ .Values.metad.backup.retention }}"
+            - "--backup-s3-bucket={{ .Values.metad.backup.s3.bucket }}"
+            - "--backup-s3-prefix={{ .Values.metad.backup.s3.prefix }}"
+            - "--backup-s3-region={{ .Values.metad.backup.s3.region }}"
+            {{- if .Values.metad.backup.s3.endpoint }}
+            - "--backup-s3-endpoint={{ .Values.metad.backup.s3.endpoint }}"
+            {{- end }}
+            {{- end }}
             {{- if .Values.observability.tracing.enabled }}
             - "--trace-enabled=true"
             - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
@@ -70,6 +95,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.metad.backup.enabled }}
+            - name: backup-tmp
+              mountPath: {{ .Values.metad.backup.localTmpDir }}
+            {{- end }}
             {{- if .Values.metad.config.tls.enabled }}
             - name: tls
               mountPath: /tls
@@ -90,6 +119,10 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:
+        {{- if .Values.metad.backup.enabled }}
+        - name: backup-tmp
+          emptyDir: {}
+        {{- end }}
         {{- if .Values.metad.config.tls.enabled }}
         - name: tls
           secret:

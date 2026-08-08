@@ -1,0 +1,28 @@
+{{- if and .Values.metad.pdb.enabled (gt (int .Values.metad.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-metad
+  labels:
+    {{- include "nufs.metad.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.metad.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "nufs.metad.labels" . | nindent 6 }}
+---
+{{- end }}
+{{- if .Values.datanode.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-datanode
+  labels:
+    {{- include "nufs.datanode.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.datanode.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "nufs.datanode.labels" . | nindent 6 }}
+---
+{{- end }}

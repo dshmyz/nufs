@@ -34,6 +34,23 @@ metad:
     tls:
       enabled: false
       certSecret: ""
+  # Remote metadata backups (S3/MinIO). The code path requires Raft + a stable
+  # cluster identity. Off by default — enable in prod so backups are long-lived
+  # and content lives outside the metad failure domain.
+  backup:
+    enabled: false
+    clusterId: ""               # stable across restarts; REQUIRED when enabled
+    localTmpDir: "/var/lib/dfs/backup-tmp"  # scratch only; object store is durable target
+    interval: "1h"
+    retention: 24               # committed backups to retain
+    s3:
+      bucket: ""                # required when enabled (e.g. minio://... or AWS s3://...)
+      prefix: ""                # e.g. "prod/metadata"
+      region: ""
+      endpoint: ""              # S3-compatible (MinIO): set here; path-style is used
+    # Provide AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY via this k8s secret, or
+    # use IRSA/workload identity and leave credentialsSecret empty.
+    credentialsSecret: ""
   nodeSelector: {}
   tolerations: []
   affinity:
@@ -48,9 +65,16 @@ metad:
                   values:
                     - metad
             topologyKey: kubernetes.io/hostname
+  # PDB keeps raft quorum (>= 2/3) during voluntary maintenance.
+  pdb:
+    enabled: true
+    maxUnavailable: 1
 
 # datanode configuration
 datanode:
+  # EC 6+3 = 9 shards. For full rack/zone-failure tolerance place >= 9 datanode
+  # pods across >= 3 fault domains (3 shards each). replicaCount: 3 is the
+  # minimal multi-node default (one shard-set per node) — raise to 9 for 5-9.
   replicaCount: 3
   image:
     repository: nufs/datanode
@@ -73,8 +97,12 @@ datanode:
     storageClass: ""
   config:
     capacityGB: 100
-    rack: rack1
-    zone: zone1
+    # Rack/zone are set per-replica from the pod ordinal (fault-domain hint used
+    # by EC allocation). faultDomains must be >= 3 for EC 6+3 rack tolerance and
+    # must match the number of topology domains the spread below targets.
+    faultDomains: 3
+    rackPrefix: "rack"
+    zonePrefix: "zone"
     writeConcurrency: 64
     repairWorkers: 4
     tls:
@@ -86,18 +114,27 @@ datanode:
       rejectPct: 0.90
   nodeSelector: {}
   tolerations: []
+  # Fault-domain hardening for EC shards (5-9): one datanode pod per physical
+  # node (required anti-affinity) and balanced spread across zones/racks
+  # (topologySpreadConstraints). Set topologyKey to "nufs.io/rack" for on-prem
+  # where racks are not zones.
   affinity:
     podAntiAffinity:
-      preferredDuringSchedulingIgnoredDuringExecution:
-        - weight: 100
-          podAffinityTerm:
-            labelSelector:
-              matchExpressions:
-                - key: app.kubernetes.io/component
-                  operator: In
-                  values:
-                    - datanode
-            topologyKey: kubernetes.io/hostname
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values:
+                  - datanode
+          topologyKey: kubernetes.io/hostname
+  topologyKey: "topology.kubernetes.io/zone"
+  topologyMaxSkew: 1
+  # Optional node label used to target rack topology (on-prem); empty = rely on zones.
+  rackNodeLabel: ""
+  pdb:
+    enabled: true
+    maxUnavailable: 1
 
 # S3 gateway configuration
 s3gateway:

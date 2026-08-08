@@ -1,0 +1,35 @@
+[Unit]
+Description=NUFS raft leader failover drill (RTO + graceful-degradation gate)
+Documentation=https://github.com/example/dfs
+# Runs the periodic failure-injection drill that sustains read/write traffic
+# through a metad raft leader kill and asserts the recovery-time objective.
+# Satisfies the 5-9-tier "定期故障注入演练" requirement with machine-checked
+# evidence instead of ad-hoc testing.
+#
+# The drill launches its own throwaway cluster (3 metad raft + 6 datanode +
+# s3 gateway) on dedicated host ports and tears it down on exit, so it does not
+# touch the production cluster or the production metad services listed by the
+# nufs-*.service units above. Requires Go buildable on this host.
+After=network.target
+
+[Service]
+Type=oneshot
+User=nufs
+Group=nufs
+WorkingDirectory=/opt/nufs/nufs-core
+ExecStart=/opt/nufs/nufs-core/tests/soak/run-v21-leader-failover.sh \
+    --duration 300 \
+    --failover-after 120 \
+    --rto-budget 15 \
+    --window 20 \
+    --results /var/log/nufs-tests
+# A non-zero exit (RTO > budget, out-of-window client errors, or census drift)
+# marks the drill as failed; nagios/alertmanager can key off this unit.
+SuccessExitStatus=
+# Guard against the drill mis-killing a production PID: running as nufs with the
+# throwaway cluster isolated on high ports keeps blast radius small. Diagnostics
+# are written to journald and archived under /var/log/nufs-tests.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

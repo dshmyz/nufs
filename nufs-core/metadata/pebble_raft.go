@@ -1194,6 +1194,16 @@ type RaftNodeConfig struct {
 	// server ID/address pairs. Prefer this over Peers for production
 	// deployments where server IDs differ from network addresses.
 	BootstrapPeers []RaftPeer
+	// PreSeedBootstrapPeers seeds every BootstrapPeer into the initial Raft
+	// configuration as a voter when true. Set it only when all peers start in
+	// the same process at the same time and can form a quorum at boot — i.e.
+	// the in-process multi-node integration harness. It must stay false (default)
+	// for multi-process baremetal/helm deploys, where peer processes come up at
+	// different times: pre-seeding a peer that is not yet up leaves the seed with
+	// no reachable quorum and stalls election. Multi-process thus leaves this
+	// false and relies on the leader-driven reconcile loop (RaftNode.EnsurePeers /
+	// cmd/metad reconcileMetadPeers) to add each peer as a voter once it is up.
+	PreSeedBootstrapPeers bool
 
 	// AdvertiseOpsAddr is the HTTP ops URL (e.g. "http://10.0.0.1:8091")
 	// that other metad nodes should use to reach this node's ops API.
@@ -1340,20 +1350,31 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 		servers := []raft.Server{
 			{ID: raft.ServerID(cfg.NodeID), Address: raft.ServerAddress(advertiseAddr)},
 		}
-		for _, peer := range cfg.BootstrapPeers {
-			if peer.ID == cfg.NodeID {
-				continue
-			}
-			servers = append(servers, raft.Server{
-				ID:      raft.ServerID(peer.ID),
-				Address: raft.ServerAddress(peer.Address),
-			})
-		}
+		// cfg.Peers (legacy) is always seeded: it is used by the in-process test
+		// harness where all nodes share one process and can form a quorum at boot.
 		for _, peer := range cfg.Peers {
 			servers = append(servers, raft.Server{
 				ID:      raft.ServerID(peer),
 				Address: raft.ServerAddress(peer),
 			})
+		}
+		// cfg.BootstrapPeers (multi-process baremetal/helm) is seeded only when
+		// PreSeedBootstrapPeers is true (in-process harness). For multi-process it
+		// stays empty: peer processes may not be up yet, so pre-seeding them as
+		// voters would leave the seed unable to reach a quorum and stall election.
+		// Instead the seed starts with only itself as a voter, becomes leader, and
+		// the leader-driven reconcile loop (cmd/metad reconcileMetadPeers) brings
+		// each BootstrapPeer into the voting set with AddVoter as it comes up.
+		if cfg.PreSeedBootstrapPeers {
+			for _, peer := range cfg.BootstrapPeers {
+				if peer.ID == cfg.NodeID {
+					continue
+				}
+				servers = append(servers, raft.Server{
+					ID:      raft.ServerID(peer.ID),
+					Address: raft.ServerAddress(peer.Address),
+				})
+			}
 		}
 		f := r.BootstrapCluster(raft.Configuration{Servers: servers})
 		if err := f.Error(); err != nil && err != raft.ErrCantBootstrap {
@@ -1967,9 +1988,70 @@ func (n *RaftNode) RemovePeer(id string) error {
 	return f.Error()
 }
 
+// EnsurePeers reconciles cluster membership so every requested peer (id, addr)
+// is a voting member. It is leader-only and idempotent:
+//
+//   - A peer already in the configuration as a voter with the same address is
+//     left untouched and counted under already.
+//   - A peer that is absent, or present under a different address, is added (or
+//     re-addressed) as a voter via AddVoter.
+//
+// The caller must drive this with retry: the method applies the config change
+// on the leader (10s timeout) but cannot make a not-yet-listening peer appear
+// in the cluster on its own — a peer whose transport is down will keep timing
+// out until it is reachable.
+func (n *RaftNode) EnsurePeers(peers []RaftPeer) (added, already int, err error) {
+	if !n.IsLeader() {
+		return 0, 0, fmt.Errorf("not leader")
+	}
+	cfgF := n.raft.GetConfiguration()
+	if err := cfgF.Error(); err != nil {
+		return 0, 0, fmt.Errorf("read raft configuration: %w", err)
+	}
+	members := make(map[string]string, len(cfgF.Configuration().Servers)) // id -> addr
+	for _, s := range cfgF.Configuration().Servers {
+		members[string(s.ID)] = string(s.Address)
+	}
+	for _, peer := range peers {
+		if peer.ID == n.nodeID {
+			// Never add ourselves to our own membership request; the local
+			// server is already part of the bootstrap configuration.
+			continue
+		}
+		if addr, ok := members[peer.ID]; ok && addr == peer.Address {
+			already++
+			continue
+		}
+		// Absent (or present under a stale address): add/re-address as a voter.
+		// AddVoter is idempotent for an already-member id — it just updates the
+		// address — so the same call covers both cases.
+		f := n.raft.AddVoter(raft.ServerID(peer.ID), raft.ServerAddress(peer.Address), 0, 10*time.Second)
+		if err := f.Error(); err != nil {
+			return added, already, fmt.Errorf("add voter %s@%s: %w", peer.ID, peer.Address, err)
+		}
+		added++
+		members[peer.ID] = peer.Address
+	}
+	return added, already, nil
+}
+
 // Stats returns Raft statistics.
 func (n *RaftNode) Stats() map[string]string {
 	return n.raft.Stats()
+}
+
+// Peers returns the current raft configuration membership as id -> address.
+// It is useful for diagnostic/join logic.
+func (n *RaftNode) Peers() map[string]string {
+	cfgF := n.raft.GetConfiguration()
+	if err := cfgF.Error(); err != nil {
+		return nil
+	}
+	members := make(map[string]string, len(cfgF.Configuration().Servers))
+	for _, s := range cfgF.Configuration().Servers {
+		members[string(s.ID)] = string(s.Address)
+	}
+	return members
 }
 
 // Shutdown gracefully stops the node.

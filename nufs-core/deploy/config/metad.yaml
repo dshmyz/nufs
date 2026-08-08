@@ -29,11 +29,21 @@ gc_interval: "10m"
 gc_dry_run: false
 scrub_interval: "1h"
 
-# Backups (empty backup_dir disables scheduled checkpoints)
-backup_dir: ""
-backup_interval: "1h"
-backup_max: 24
-backup_dry_run: false
+# Remote metadata backups (S3/MinIO).
+# These are command-line flags (see docs/runbooks/metadata-disaster-recovery.md);
+# this block documents the values to pass. Off by default — enable in production
+# so backups are long-lived AND content is stored outside the metad fault domain.
+# Requires --raft and a stable --cluster-id. Credentials come from the runtime
+# environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) or the platform secret.
+#--backup-enabled=true
+#--cluster-id=<stable-cluster-id>
+#--backup-local-dir=/var/lib/dfs/backup-tmp
+#--backup-interval=1h
+#--backup-retention=24
+#--backup-s3-bucket=<bucket>
+#--backup-s3-prefix=<env>/metadata
+#--backup-s3-region=<region>
+#--backup-s3-endpoint=<s3-compatible-endpoint>  # MinIO / non-AWS; omit for AWS
 
 # OpenTelemetry tracing
 trace_enabled: false

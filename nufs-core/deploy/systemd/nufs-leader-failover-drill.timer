@@ -1,0 +1,18 @@
+[Unit]
+Description=Run NUFS leader failover drill weekly (RTO + graceful-degradation gate)
+Documentation=https://github.com/example/dfs
+# Periodic failure-injection drill for the 5-9 availability tier. Fires the
+# oneshot drill service on a cadence; each run drives a throwaway multi-metad
+# raft cluster through a leader SIGKILL and archives the measured RTO and the
+# out-of-window client error count. A run that exceeds the RTO budget or
+# surfaces out-of-window errors exits non-zero and is reported by the unit.
+#
+# Cadence is intentionally off the top of the hour to spread load. Adjust the
+# OnCalendar expression to the site's change/slippage rules.
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target

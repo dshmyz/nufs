@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -203,6 +204,9 @@ func main() {
 	}
 
 	var raftNode *metadata.RaftNode
+	// joinStop, when non-nil, is closed at shutdown so the membership-reconcile
+	// goroutine stops driving AddVoter before the raft node is torn down.
+	var joinStop chan struct{}
 
 	// Compute advertised ops URL once, used for both RaftNode config
 	// and ops handler redirect. Defaults to http://<hostname>:<port>.
@@ -276,6 +280,16 @@ func main() {
 			}
 			log.Warn("failed to register ops URL in FSM after 30s", "url", advertiseOpsURL)
 		}()
+
+		// Multi-process membership join: in baremetal/helm every metad is its own
+		// process, so only the node that bootstrapped carries the peer list; the
+		// others start as singletons. Converge the cluster by having the leader
+		// drive each configured peer into the voting set with AddVoter (leader-only,
+		// idempotent). Runs periodically so a late-joining or restarted peer is
+		// absorbed, and re-runs after any election for the newly elected leader.
+		stopJoin := make(chan struct{})
+		go reconcileMetadPeers(log, raftNode, bootstrapPeers, stopJoin)
+		joinStop = stopJoin
 	} else {
 		log.Info("running in single-node mode (Raft disabled)")
 	}
@@ -457,6 +471,11 @@ func main() {
 	}
 
 	log.Info("received signal, shutting down", "signal", sig)
+
+	// Stop the raft membership-reconcile loop before the raft node shuts down.
+	if joinStop != nil {
+		close(joinStop)
+	}
 
 	// Begin draining before shutting down the listener so new protected
 	// requests are rejected while in-flight requests finish.
@@ -809,4 +828,55 @@ func runtimeMode(allowInsecureDev bool) metadata.RuntimeMode {
 		return metadata.RuntimeDev
 	}
 	return metadata.RuntimeProduction
+}
+
+// reconcileMetadPeers keeps every configured --raft-bootstrap-peers entry a
+// voting member of the raft cluster while this process runs. In a multi-process
+// baremetal/helm deployment only the bootstrap node seeds the initial config, so
+// peers that started as singletons must be driven in by the leader with
+// AddVoter. The loop:
+//
+//   - no-ops entirely when this node owns no peers (nothing to reconcile);
+//   - only acts while this node is leader (AddVoter is leader-only);
+//   - reruns periodically so a peer that was not listening yet (or restarted)
+//     is absorbed, and so a newly elected leader re-confirms the voting set;
+//   - stops when stop is closed (process shutdown).
+//
+// It is intentionally non-fatal: an unreachable peer is retried, never treated
+// as a startup error.
+func reconcileMetadPeers(log *slog.Logger, raftNode *metadata.RaftNode, peers []metadata.RaftPeer, stop <-chan struct{}) {
+	hasPeer := false
+	for _, p := range peers {
+		if p.ID != raftNode.NodeID() {
+			hasPeer = true
+			break
+		}
+	}
+	log.Debug("membership reconcile loop started", "has_peer", hasPeer, "n_peers", len(peers))
+	if !hasPeer {
+		return
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
+		if !raftNode.IsLeader() {
+			continue
+		}
+		log.Debug("raft reconcile tick", "configured_peers", len(peers), "members", raftNode.Peers())
+		added, already, err := raftNode.EnsurePeers(peers)
+		if err != nil {
+			log.Warn("raft membership reconcile failed", "error", err)
+			continue
+		}
+		if added > 0 {
+			log.Info("raft membership reconciled: added peers as voters", "added", added)
+		} else if already > 0 {
+			log.Debug("raft membership confirmed: peers already voters", "already", already)
+		}
+	}
 }
