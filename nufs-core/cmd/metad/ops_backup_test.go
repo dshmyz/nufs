@@ -278,7 +278,7 @@ func TestPrometheusBackupAlertsConfigured(t *testing.T) {
 		for_ string
 	}{
 		"NUFSBackupStale": {
-			expr: "time() - nufs_backup_last_success_timestamp_seconds > 4500",
+			expr: "nufs_backup_last_success_timestamp_seconds > 0 and (time() - nufs_backup_last_success_timestamp_seconds > 4500)",
 			for_: "5m",
 		},
 		"NUFSBackupVerificationFailed": {

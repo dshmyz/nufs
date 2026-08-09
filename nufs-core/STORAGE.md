@@ -1,5 +1,10 @@
 # NUFS 文件存储方式详解
 
+> **⚠️ 本文档描述的是早期/遗留存储路径（JSON 序列化、256-shard chunk 布局、WAL、
+> 小文件 block）。当前数据面已升级为 V2.1 segment 引擎，元数据面为 msgpack/JSON
+> 混合序列化。权威描述见 [docs/architecture/data-organization.md](docs/architecture/data-organization.md)。**
+> 本文仅作历史/演进参考，落地细节若与 data-organization.md 冲突，以后者为准。
+
 > 本文档描述 NUFS 分布式文件系统的文件存储内部机制，包括磁盘布局、数据格式、写入/读取/复制路径和元数据模型。
 
 ---

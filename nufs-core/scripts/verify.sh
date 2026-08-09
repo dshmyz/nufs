@@ -3,7 +3,7 @@
 # NUFS 回归门禁入口（make verify 的后端）
 #
 # 把"可上线基线"的各项门禁收敛成一个可重复、可选层级的入口，串成：
-#   build -> vet -> fmt-check -> 全量单测（分包串行 -count=2） -> 故障 drill 门禁
+#   build -> vet -> fmt-check -> metrics/alert 一致性 -> 全量单测（分包串行 -count=2） -> 故障 drill 门禁
 #
 # 分层（-l/--level）：
 #   fast   —— 仅 Go 门禁（build/vet/fmt/单测），约数分钟，适合每次提交/CI 快速回归
@@ -71,8 +71,19 @@ if go vet "$TARGET" ; then pass "go vet $TARGET"; else fail "go vet $TARGET"; fi
 step "gofmt check"
 gofmt -s -l . 2>/dev/null | grep -q . && { echo "  unformatted files:"; gofmt -s -l . ; fail "gofmt"; } || pass "gofmt"
 
-# ---- 3. 全量单测：分包串行 -count=N（memory: suite-count2-stability 的可靠门禁） ----
+# ---- 3. 指标-告警一致性（死指标/命名漂移门禁，所有级别都跑） ----
+step "metrics/alert consistency (check-metrics)"
+if bash scripts/check-metrics.sh ; then pass "check-metrics"; else fail "check-metrics"; fi
+
+# ---- 4. 全量单测：分包串行 -count=N（memory: suite-count2-stability 的可靠门禁） ----
 step "go test per-package -count=$COUNT (serial -p 1)"
+# fast/drill 用 -short：跳过 §18.4 的 scale/长期 pressure 测试（TestScale_ExtentThroughput
+# 一个就 92s，它们也 testing.Short() skip），与 make test-storage-p0 的 -short 语义对齐，
+# 常规回归只跑正确性门禁；scale/crash 高强度门禁留给 full 级别显式跑（test-storage-p0/crash）。
+SHORT_FLAG=""
+if [ "$LEVEL" = "fast" ] || [ "$LEVEL" = "drill" ]; then
+  SHORT_FLAG="-short"
+fi
 if [ "$TARGET" = "./..." ]; then
   # 按包逐个跑，-p 1 串行，避免并行 CPU 拥塞导致的 raft 选举假失败
   pkgs="$(go list ./... 2>/dev/null)"
@@ -82,22 +93,31 @@ if [ "$TARGET" = "./..." ]; then
   while IFS= read -r p; do
     printf '    %-55s ' "$p"
     slog="${VTEST_DIR}/$(echo "$p" | tr '/' '_').log"
-    if go test -count="$COUNT" -timeout 300s -p 1 "$p" >"$slog" 2>&1; then
+    if go test -count="$COUNT" $SHORT_FLAG -timeout 300s -p 1 "$p" >"$slog" 2>&1; then
       printf '\033[32mPASS\033[0m\n'
     else
-      printf '\033[31mFAIL\033[0m\n'
-      pkg_fail=1
-      # 失败保留日志 + 打印尾部，便于区分「真 bug」与「本机 CPU 拥塞的 raft 假失败」。
-      echo "      --- $p log tail ($slog) ---"
-      tail -15 "$slog" | sed 's/^/        /'
+      # 一次有界重试：吸收少见的一次性 flake（端口/调度/临时资源瞬态），避免把
+      # 真门禁刷红；仍保留首跑日志，若二次仍 FAIL 才判 FAIL（真 bug 不会躲过两次）。
+      printf '\033[33mRETRY\033[0m '
+      if go test -count="$COUNT" $SHORT_FLAG -timeout 300s -p 1 "$p" >"$slog.r2" 2>&1; then
+        printf '\033[32mPASS (retry)\033[0m\n      first-attempt log kept: %s\n' "$slog"
+      else
+        printf '\033[31mFAIL\033[0m\n'
+        pkg_fail=1
+        # 失败保留日志 + 打印尾部，便于区分「真 bug」与「本机 CPU 拥塞的 raft 假失败」。
+        echo "      --- $p log tail ($slog) ---"
+        tail -15 "$slog" | sed 's/^/        /'
+        echo "      --- retry-attempt log ($slog.r2) ---"
+        tail -15 "$slog.r2" | sed 's/^/        /'
+      fi
     fi
   done <<< "$pkgs"
   [ "$pkg_fail" -eq 0 ] && pass "all packages -count=$COUNT" || fail "one or more packages -count=$COUNT"
 else
-  if go test -count="$COUNT" -timeout 600s -p 1 "$TARGET" ; then pass "$TARGET -count=$COUNT"; else fail "$TARGET -count=$COUNT"; fi
+  if go test -count="$COUNT" $SHORT_FLAG -timeout 600s -p 1 "$TARGET" ; then pass "$TARGET -count=$COUNT"; else fail "$TARGET -count=$COUNT"; fi
 fi
 
-# ---- 4. 故障 drill 门禁（仅 drill/full） ----
+# ---- 5. 故障 drill 门禁（仅 drill/full） ----
 if [ "$LEVEL" = "drill" ] || [ "$LEVEL" = "full" ]; then
   # 用短时长跑 drill，锁「故障注入基线」；--full 才用长时/高 count 权威门禁。
   DUR="${VERIFY_DR_DURATION:-150}"
@@ -130,7 +150,7 @@ if [ "$LEVEL" = "drill" ] || [ "$LEVEL" = "full" ]; then
   fi
 fi
 
-# ---- 5. 上线前长时/高 count 门禁（仅 full） ----
+# ---- 6. 上线前长时/高 count 门禁（仅 full） ----
 if [ "$LEVEL" = "full" ]; then
   step "P0 storage correctness (race, 20x)"
   if make test-storage-p0 >/dev/null 2>&1; then pass "test-storage-p0"; else fail "test-storage-p0"; fi

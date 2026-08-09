@@ -117,6 +117,9 @@ make verify         # 上线验收回归门禁：make verify [LEVEL=fast|drill|f
                     #   drill = fast + 三个故障 drill（leader-failover/metadata-restore/chaos-soak）
                     #   full  = drill + 长时/高 count P0 门禁（上线前跑）
                     # 详见 scripts/verify.sh；上线验收项见 docs/runbooks/production-readiness-checklist.md
+make verify-docker  # 同一门禁，但跑在 Linux 容器里（macOS 宿主端口池太小，
+                    #  分包 -count=2 会因 EADDRNOTAVAIL 端口耗尽假失败；容器内干净 PASS）
+                    #  = scripts/verify-docker.sh，复用宿主 Go 缓存，无需网络
 ```
 
 安全约束：`gateway/s3/auth.go` 视为不可动（AWS 签名 `providedSig` 不进入任何日志/错误串），
@@ -125,4 +128,23 @@ make verify         # 上线验收回归门禁：make verify [LEVEL=fast|drill|f
 
 ---
 
-详见 [TODO.md](TODO.md)、[ARCHITECTURE.md](ARCHITECTURE.md)、[MULTI_DISK_PLAN.md](MULTI_DISK_PLAN.md)。
+## 6. 运维、监控与数据组织（上线排障入口）
+
+| 主题 | 文档 | 一句话 |
+|------|------|--------|
+| **运维查询** | [docs/runbooks/ops-cli.md](docs/runbooks/ops-cli.md) | `nufs-cli stat/ns/kv/inode/chunks/audit/backups` 查文件元数据、KV、运维状态（本地 + 远程鉴权） |
+| **监控/告警** | [docs/runbooks/monitoring.md](docs/runbooks/monitoring.md) | Prometheus 抓取拓扑、指标命名空间、告警规则、grafana 面板、metrics 一致性门禁 |
+| **数据组织/落盘** | [docs/architecture/data-organization.md](docs/architecture/data-organization.md) | 元数据（Pebble 键空间 + msgpack/JSON 编解码）与数据面 V2.1 segment 磁盘布局、字节格式 |
+| 上线验收 | docs/runbooks/production-readiness-checklist.md | 逐项可勾选的门禁表（[E3 观测](#) 已含机器校验） |
+| 故障 drill | docs/runbooks/leader-failover-drill.md、metadata-backup-restore-drill.md、object-write-recovery.md | 故障注入基线演练 |
+| 通用运维 | docs/runbooks/bucket-quota.md、metadata-disaster-recovery.md | 配额与灾难恢复 |
+
+`make verify`（开发一节）已含 metrics/alert 一致性门禁（死指标=0 + promtool 语法），保证
+「告警规则引用的每个指标都真的被 exporter 发出」，避免规则写了却永远没数据的死链告警。
+
+---
+
+## 7. 其他设计文档
+
+详见 [TODO.md](TODO.md)、[ARCHITECTURE.md](ARCHITECTURE.md)、[MULTI_DISK_PLAN.md](MULTI_DISK_PLAN.md)、
+[STORAGE.md](STORAGE.md)（早期存储设计，V2.1 现状见 data-organization.md）。

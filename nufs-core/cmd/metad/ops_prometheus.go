@@ -48,6 +48,7 @@ func prometheusMetricsHandler(store *metadata.PebbleStore, metrics *metadata.Met
 		writePrometheusNodeMetrics(w, store)
 		writePrometheusEventBus(w, store)
 		writePrometheusClusterReadiness(w, store)
+		writePrometheusRepair(context.Background(), w, store)
 	})
 }
 
@@ -492,4 +493,30 @@ func writePrometheusClusterReadiness(w io.Writer, store *metadata.PebbleStore) {
 	} else {
 		fmt.Fprintf(w, "nufs_cluster_leader_stable 0\n")
 	}
+}
+
+// writePrometheusRepair surfaces the in-flight repair backlog: how many chunks
+// are queued for repair and how old the oldest one is. These back the
+// repair_queue_depth / repair_lag_seconds SLOs and the repair alerts; without
+// them the repair SLOs would reference a metric no exporter ever emits.
+func writePrometheusRepair(ctx context.Context, w io.Writer, store *metadata.PebbleStore) {
+	tasks, err := store.GetRepairQueue(ctx)
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP nufs_repair_tasks_queued Number of chunks queued for repair")
+	fmt.Fprintln(w, "# TYPE nufs_repair_tasks_queued gauge")
+	fmt.Fprintf(w, "nufs_repair_tasks_queued %d\n", len(tasks))
+
+	var oldest int64
+	for _, t := range tasks {
+		ts := t.CreatedAt.Unix()
+		if oldest == 0 || ts < oldest {
+			oldest = ts
+		}
+	}
+	fmt.Fprintln(w, "# HELP nufs_repair_oldest_timestamp Unix timestamp of the oldest queued repair task (0 if none)")
+	fmt.Fprintln(w, "# TYPE nufs_repair_oldest_timestamp gauge")
+	fmt.Fprintf(w, "nufs_repair_oldest_timestamp %d\n", oldest)
 }

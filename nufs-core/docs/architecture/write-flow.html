@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>NUFS 文件上传 → 落盘 核心流程</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
+        onload="mermaid.initialize({ startOnLoad: true, securityLevel: 'loose' });"></script>
+<style>
+  body { margin: 0; padding: 24px; background: #fff; font-family: system-ui, sans-serif; }
+  h1 { font-size: 18px; color: #111; font-weight: 600; }
+  h2 { font-size: 14px; color: #444; font-weight: 600; margin-top: 28px; }
+  .mermaid { margin-top: 16px; }
+  .note { font-size: 12px; color: #666; margin-top: 6px; line-height: 1.6; }
+  code { background: #f4f4f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>NUFS — 一个文件从上传到落盘（核心写入流程）</h1>
+<p class="note">PUT 对象（&gt;64KiB 走常规 extent 路径）｜实现：<code>gateway/s3/committer_put.go</code> → <code>chunkstore/store.go</code> → <code>datanode/storage/segment/store.go</code></p>
+
+<h2>顺序图：PUT /mybucket/docs/report.pdf</h2>
+<div class="mermaid">
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "14px"}}}%%
+sequenceDiagram
+    autonumber
+    participant C as 客户端
+    participant G as 网关 nufs-s3
+    participant M as metad (raft leader)
+    participant D as datanode(s)
+    participant P as 磁盘 segment.Store
+
+    C->>G: PUT /mybucket/docs/report.pdf
+    G->>G: 记录 write-attempt(pending)
+    G->>M: GetBucket(mybucket)
+    M-->>G: Bucket {RootInode, Policy}
+    G->>M: Lookup(RootInode, "docs/report.pdf")
+    M-->>G: 不存在 → 新对象
+    G->>M: CheckBucketQuota(bytes, objects)
+    G->>M: CreateFile(RootInode, key, 0644)
+    M-->>G: inode(ID, CTime)
+    G->>G: 记录 write-attempt(chunks-allocated)
+    G->>M: AdvisoryLock(inodeID)
+    G->>M: Lookup + 校验 inode.ID/CTime 未变
+    G->>M: AllocateChunksBatch(inode, offsets, Policy)
+    M-->>G: [Chunk{ID, Replicas, Generation, PG/Epoch}]
+    loop 每个 chunk（≤64MiB 切块）
+        G->>G: 读 Body 切块
+        G->>D: chunkStore.WriteChunk(chunk, data)
+        D->>P: 追加 RecordHeader + 数据帧 + Trailer
+        D->>P: BatchCommit + 一次 fdatasync
+        Note over P: 提交点：segment 已落盘
+        P-->>D: segment offset
+        D->>D: 应用 committed-delta overlay
+        D-->>G: DurableReceipt
+        G->>M: CommitChunk(id, crc) / SealChunk
+    end
+    G->>G: 记录 write-attempt(chunks-durable)
+    G->>M: UpdateInode(Size, ChunkMap)
+    M-->>G: OK
+    G->>G: 记录 write-attempt(committed) 删旧chunk
+    G-->>C: 201 Created {ETag, Size}
+    D-->>D: 异步刷本地 Pebble extent 索引
+</div>
+
+<h2>落盘字节级视角（同一写入在 datanode 磁盘的形态）</h2>
+<div class="mermaid">
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "14px"}}}%%
+flowchart LR
+    subgraph CHUNK["对象数据（逻辑）"]
+        O["文件 ≤N×64MiB<br/>切分为多个 chunk"]
+    end
+    CHUNK -->|chunkstore.<br/>WritePipeline fan-out| DN["每 chunk 选 replicas<br/>(RF 多副本 / EC K+M)"]
+    DN --> SEG["segments/&lt;class&gt;/active/&lt;id&gt;.seg"]
+    SEG --> REC["SegmentHeader(22B)<br/>+ RecordHeader(55B)<br/>+ 数据帧(64KiB×N)<br/>+ RecordTrailer(12B)<br/>+ ...<br/>SegmentFooter(65B, seal时)"]
+    SEG -.异步.-> IDX["index (Pebble)<br/>extent→segment/offset"]
+    IDX -.读取定位.-> SEG
+</div>
+
+</body>
+</html>

@@ -194,6 +194,10 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, dataSt
 
 	// Audit — query audit trail
 	mux.HandleFunc("/api/v1/audit", s.handleAudit)
+
+	// Raw KV inspection (read-only, operator debug). Deliberately NOT in the
+	// public path allowlist, so it is bearer-protected when --auth-token is set.
+	mux.HandleFunc("/api/v1/kv", s.handleKV)
 }
 
 // --- Health, cluster, metrics ---

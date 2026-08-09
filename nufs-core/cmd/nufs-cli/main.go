@@ -17,8 +17,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"strings"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -30,9 +30,10 @@ import (
 
 func main() {
 	var (
-		metaDir  = flag.String("meta-dir", "/var/lib/dfs/metadata", "Pebble metadata directory (local mode)")
-		metaAddr = flag.String("meta-addr", "localhost:8091", "Metadata HTTP address (remote mode)")
-		mode     = flag.String("mode", "auto", "Connection mode: auto, local, remote")
+		metaDir   = flag.String("meta-dir", "/var/lib/dfs/metadata", "Pebble metadata directory (local mode)")
+		metaAddr  = flag.String("meta-addr", "localhost:8091", "Metadata HTTP address (remote mode)")
+		mode      = flag.String("mode", "auto", "Connection mode: auto, local, remote")
+		authToken = flag.String("auth-token", "", "Bearer token for metad ops API (remote mode)")
 	)
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, `NUFS Cluster Administration Tool
@@ -47,6 +48,13 @@ Flags:
 Commands (local/remote):
   nodes                    List all data nodes
   buckets                  List all buckets
+  stat <bucket>/<path>     Show metadata (inode/xattrs/chunks) for a file or directory
+  ns <bucket>/<dir>        List directory entries under a bucket path
+  kv get <key>             Read a raw metadata KV value
+  kv scan <prefix>         Scan raw metadata KV entries under a catalog prefix
+  inode <id>               Show inode metadata + xattrs by id
+  chunks --inode <id>      List chunk references for an inode
+  chunk <id>               Show full chunk/replica/EC detail
   decommission <id>        Decommission a data node
   repair-queue             Show pending repair tasks
   trigger-rebalance        Trigger cluster-wide rebalance
@@ -60,6 +68,10 @@ Commands (remote only):
   health                   Check node health
   rebalance                Show rebalance plan
   scrub                    Check chunk replica consistency
+  audit [--limit N]        Show audit trail tail (remote only)
+  locks --inode <id>       List advisory locks for an inode (remote only)
+  backups [status]         Show metadata backup status/list (remote only)
+  write-attempts [--state S]  Show object write recovery state (remote only)
 
 Tools (dispatched to subcommands):
   backup [flags]           Metadata backup (was nufs-backup)
@@ -110,7 +122,7 @@ Cluster:
 	if useLocal {
 		runLocal(args, *metaDir)
 	} else {
-		runRemote(args, *metaAddr)
+		runRemote(args, *metaAddr, *authToken)
 	}
 }
 
@@ -150,6 +162,29 @@ func runLocal(args []string, metaDir string) {
 		cmdRebalancePlan(ctx, store)
 	case "scrub":
 		cmdScrub(ctx, store)
+	case "stat":
+		cmdStat(&localNS{ctx: ctx, store: store}, cmdArgs)
+	case "ns":
+		cmdNS(&localNS{ctx: ctx, store: store}, cmdArgs)
+	case "kv":
+		cmdKVLocal(ctx, store, cmdArgs)
+	case "inode":
+		if len(cmdArgs) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: nufs-cli inode <id>")
+			os.Exit(1)
+		}
+		cmdInodeLocal(ctx, store, cmdArgs[0])
+	case "chunks":
+		cmdChunksLocal(ctx, store, cmdArgs)
+	case "chunk":
+		if len(cmdArgs) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: nufs-cli chunk <id>")
+			os.Exit(1)
+		}
+		cmdChunkLocal(ctx, store, cmdArgs[0])
+	case "audit", "locks", "backups", "write-attempts":
+		fmt.Fprintf(os.Stderr, "%s is remote-only (metad ops API); run with --mode=remote\n", cmd)
+		os.Exit(1)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command (local mode): %s\n", cmd)
 		os.Exit(1)
@@ -347,9 +382,9 @@ func cmdScrub(ctx context.Context, store *metadata.PebbleStore) {
 // Remote mode — metad HTTP API
 // ============================================================
 
-func runRemote(args []string, metaAddr string) {
+func runRemote(args []string, metaAddr string, authToken string) {
 	baseURL := "http://" + metaAddr
-	api := &remoteAPI{base: baseURL}
+	api := &remoteAPI{base: baseURL, authToken: authToken}
 
 	cmd, cmdArgs := parseSubcommand(args)
 	switch cmd {
@@ -389,6 +424,34 @@ func runRemote(args []string, metaAddr string) {
 		api.cmdScrub()
 	case "balance":
 		api.cmdBalance()
+	case "stat":
+		cmdStat(&remoteNS{api: api}, cmdArgs)
+	case "ns":
+		cmdNS(&remoteNS{api: api}, cmdArgs)
+	case "kv":
+		kvRemote(api, cmdArgs)
+	case "inode":
+		if len(cmdArgs) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: nufs-cli inode <id>")
+			os.Exit(1)
+		}
+		cmdInodeRemote(api, cmdArgs[0])
+	case "chunks":
+		cmdChunksRemote(api, cmdArgs)
+	case "chunk":
+		if len(cmdArgs) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: nufs-cli chunk <id>")
+			os.Exit(1)
+		}
+		cmdChunkRemote(api, cmdArgs[0])
+	case "audit":
+		cmdAuditRemote(api, cmdArgs)
+	case "locks":
+		cmdLocksRemote(api, cmdArgs)
+	case "backups":
+		cmdBackupsRemote(api, cmdArgs)
+	case "write-attempts":
+		cmdWriteAttemptsRemote(api, cmdArgs)
 	case "disk":
 		api.cmdDisk(cmdArgs)
 	default:
@@ -398,19 +461,39 @@ func runRemote(args []string, metaAddr string) {
 }
 
 type remoteAPI struct {
-	base string
+	base      string
+	authToken string
 }
 
-func (a *remoteAPI) get(path string) []byte {
-	url := a.base + path
-	resp, err := http.Get(url)
+// do performs an HTTP request with an optional bearer token. If the upstream
+// returns an auth error and the caller did not supply a token, it surfaces a
+// hint so operators know to pass --auth-token.
+func (a *remoteAPI) do(method, path string, body io.Reader) (*http.Response, []byte) {
+	req, err := http.NewRequest(method, a.base+path, body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if a.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+a.authToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	data, _ := io.ReadAll(resp.Body)
+	return resp, data
+}
+
+func (a *remoteAPI) get(path string) []byte {
+	resp, body := a.do(http.MethodGet, path, nil)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized && a.authToken == "" {
+			fmt.Fprintf(os.Stderr, "Error: GET %s: %s (401). Pass --auth-token to authenticate.\n", path, resp.Status)
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "Error: GET %s failed: %s: %s\n", path, resp.Status, string(body))
 		os.Exit(1)
 	}
@@ -418,15 +501,12 @@ func (a *remoteAPI) get(path string) []byte {
 }
 
 func (a *remoteAPI) post(path string, body io.Reader) []byte {
-	url := a.base + path
-	resp, err := http.Post(url, "application/json", body)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	resp, b := a.do(http.MethodPost, path, body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized && a.authToken == "" {
+			fmt.Fprintf(os.Stderr, "Error: POST %s: %s (401). Pass --auth-token to authenticate.\n", path, resp.Status)
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "Error: POST %s failed: %s: %s\n", path, resp.Status, string(b))
 		os.Exit(1)
 	}
@@ -559,13 +639,13 @@ func (a *remoteAPI) cmdBalance() {
 			Tier    string  `json:"tier"`
 			Online  bool    `json:"online"`
 		} `json:"nodes"`
-		TotalUsedGB   int64   `json:"total_used_gb"`
-		TotalCapGB    int64   `json:"total_cap_gb"`
-		TotalUsedPct  float64 `json:"total_used_pct"`
-		Imbalance     float64 `json:"imbalance"`
-		MinUsedPct    float64 `json:"min_used_pct"`
-		MaxUsedPct    float64 `json:"max_used_pct"`
-		Recommendation string `json:"recommendation"`
+		TotalUsedGB    int64   `json:"total_used_gb"`
+		TotalCapGB     int64   `json:"total_cap_gb"`
+		TotalUsedPct   float64 `json:"total_used_pct"`
+		Imbalance      float64 `json:"imbalance"`
+		MinUsedPct     float64 `json:"min_used_pct"`
+		MaxUsedPct     float64 `json:"max_used_pct"`
+		Recommendation string  `json:"recommendation"`
 	}
 	json.Unmarshal(resp, &bal)
 

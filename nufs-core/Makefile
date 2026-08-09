@@ -1,4 +1,4 @@
-.PHONY: build test vet clean docker docker-up docker-down fmt lint help test-storage-p0 test-storage-crash verify install install-mount-helper deploy
+.PHONY: build test vet clean docker docker-up docker-down fmt lint help test-storage-p0 test-storage-crash verify verify-docker install install-mount-helper deploy
 
 # Binary output directory
 BIN_DIR := bin
@@ -60,6 +60,9 @@ test-storage-crash: ## P0 abrupt-process-crash (SIGKILL) recovery gate (50x)
 
 verify: ## Production-readiness regression gate: make verify [LEVEL=fast|drill|full]
 	@./scripts/verify.sh --level "$(if $(LEVEL),$(LEVEL),fast)"
+
+verify-docker: ## Same gate, run inside a Linux container (macOS host: -count=2 port-exhaustion fix)
+	@./scripts/verify-docker.sh --level "$(if $(LEVEL),$(LEVEL),fast)"
 
 vet: ## Run go vet
 	go vet ./...

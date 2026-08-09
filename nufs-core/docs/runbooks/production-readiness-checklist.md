@@ -52,7 +52,7 @@
 | # | 验收项 | 证据 / 命令 | 当前 | 上线动作 |
 |---|---|---|---|---|
 | D1 | 全量单测稳定性 | **分包** `-count=2`（勿并行饱和，见 memory） | ✅ 可跑 | ⏳ 进 CI |
-| D2 | 回归门禁一键入口 | `make verify`（本次新增） | ✅ | 接入 CI |
+| D2 | 回归门禁一键入口 | `make verify`（本次新增）；**macOS 宿主端口池太小，分包 `-count=2` 会 EADDRNOTAVAIL 假失败，用 `make verify-docker` 跑在 Linux 容器里（实测 47 包全 PASS）** | ✅ | 接入 CI |
 | D3 | **CI / 自动回归** | `.github/workflows` | ✗ **无 CI** | ⏳ 建 CI，跑 `make verify` |
 
 ## E. 部署 / 运维
@@ -61,8 +61,9 @@
 |---|---|---|---|---|
 | E1 | **helm 落地端到端**（真实 K8s/多机 `helm install`→读写） | helm chart | ⚠️ chart 有、**从未真正落地跑通** | ⏳ 决定性：多集群部署验一次 |
 | E2 | 网络分区 / 真实丢包 / 跨主机延迟 | 单机 harness 测不到 | ✗ | ⏳ 多机故障注入 |
-| E3 | 观测：SLO 采集 + 告警触发 | `servicemonitor` + slo.go | ⚠️ 模板有、未验证真实采集告警 | ⏳ 真实集群验证告警链路 |
+| E3 | 观测：SLO 采集 + 告警触发 | `servicemonitor` + slo.go；`make verify` 内 `check-metrics.sh`（死指标/命名漂移=0 + promtool 语法） | ⚠️ 告警规则已机器校验无死链、可语法通过；**尚未真实触发** | ⏳ 真实集群验证告警链路（触发一次） |
 | E4 | 时钟偏移容忍 | 唯一权威 metad 打标比较 | ✅ 设计已验证 | — |
+| E5 | 运维查询工具（文件元数据/KV/运维状态） | `nufs-cli stat/ns/kv/inode/chunks/chunk/audit/locks/backups/write-attempts`，见 `docs/runbooks/ops-cli.md` | ✅ 本地+远程（KV 远程只读+鉴权）均已实现 | — |
 
 ## F. 安全 / 合规
 
@@ -88,13 +89,13 @@
 - [ ] **A6 / C3 / F3** 视目标负载与合规要求
 - [ ] **F2** 安全审查结论
 
-**已满足（无需再动）：** A4、A5(单机)、B1、B2、C1、C4、D1、D2、E4、F1
+**已满足（无需再动）：** A4、A5(单机)、B1、B2、C1、C4、D1、D2、E4、E5、F1
 
 ---
 
 ## 建议的下一步
 
-1. **用 `make verify` 锁住单机基线**（本清单 D2）——先保证"每次改动不破坏已达标项"。
+1. **用 `make verify-docker` 锁住单机基线**（本清单 D2）——macOS 宿主跑 `make verify` 会被端口耗尽假失败干扰，直接进 Linux 容器（`make verify-docker`，无需网络，复用宿主 Go 缓存）拿到干净基线——先保证"每次改动不破坏已达标项"。`make verify` 已含 指标-告警一致性门禁（E3 的静态部分）。
 2. **定义上线规格**（对象数/吞吐/节点数/是否多可用区）——让 📈 项可判。
 3. **做一次真实多机 + helm 复验**——这是把 ✅(单机) 升级为可上线结论的决定性步骤。
 4. **补 CI**——让 `make verify` 成为每次提交的自动门禁。

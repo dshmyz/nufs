@@ -1023,8 +1023,11 @@ func (s *PebbleStore) scanPrefixPaged(prefix string, cursor []byte, pageSize int
 		UpperBound: prefixUpperBound(prefix),
 	}
 
-	// If cursor is provided, start after that key
-	if cursor != nil {
+	// If cursor is provided, start after that key. Note: an empty (non-nil)
+	// cursor must behave like no cursor — otherwise the empty LowerBound would
+	// replace the prefix bound and the scan would start at the first key of
+	// the whole keyspace.
+	if len(cursor) > 0 {
 		opts.LowerBound = cursor
 	}
 
@@ -1038,7 +1041,7 @@ func (s *PebbleStore) scanPrefixPaged(prefix string, cursor []byte, pageSize int
 	count := 0
 
 	// Position iterator
-	if cursor != nil {
+	if len(cursor) > 0 {
 		// Seek to cursor and skip past it
 		iter.SeekGE(cursor)
 		if iter.Valid() && bytes.Equal(iter.Key(), cursor) {
@@ -1068,11 +1071,13 @@ func (s *PebbleStore) scanPrefixPaged(prefix string, cursor []byte, pageSize int
 		count++
 	}
 
-	// If we got more than pageSize, there are more pages
+	// If we got more than pageSize, there are more pages. NextKey is an
+	// exclusive-start cursor, so it must be the last RETURNED key, not the
+	// first unread one — the next page skips keys <= cursor.
 	if len(result.Keys) > pageSize {
-		result.NextKey = result.Keys[pageSize]
 		result.Keys = result.Keys[:pageSize]
 		result.Values = result.Values[:pageSize]
+		result.NextKey = result.Keys[pageSize-1]
 		result.HasMore = true
 	}
 
