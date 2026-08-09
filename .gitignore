@@ -69,6 +69,9 @@ nufs-admin/bin/
 nufs-admin/web/node_modules/
 nufs-admin/web/dist/
 
+# Repo-root build output (e.g. binaries copied to ./bin by scripts/deploy)
+/bin/
+
 # Personal documents (kept in workspace, not committed)
 *.docx
 convert_to_docx.py
