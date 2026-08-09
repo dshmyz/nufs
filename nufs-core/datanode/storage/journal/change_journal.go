@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // ChangeEvent is an asynchronous/out-of-band state change (V2.1 §12).

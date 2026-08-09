@@ -5,8 +5,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // This file is Program 6 Phase F2/F3: the EC self-heal scan. When shards of a

@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/example/dfs/datanode"
-	"github.com/example/dfs/internal/tlsutil"
+	"github.com/dshmyz/nufs/nufs-core/datanode"
+	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
 )
 
 // productionGateError must not accept a TLS-less or unauthenticated datanode

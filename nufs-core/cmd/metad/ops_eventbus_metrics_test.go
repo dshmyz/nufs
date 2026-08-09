@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // The metadata change-notification bus can silently drop events when a

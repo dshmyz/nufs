@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func TestOpsHandlersWriteAttemptRoundTrip(t *testing.T) {

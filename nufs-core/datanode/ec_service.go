@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // ECAuthority is the narrow authority-seam the EC conversion transaction is

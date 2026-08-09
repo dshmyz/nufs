@@ -4,9 +4,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/index"
-	"github.com/example/dfs/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
 )
 
 // groupCommitConfig holds the §6.4 batch limits.

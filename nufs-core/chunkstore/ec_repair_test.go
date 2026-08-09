@@ -5,7 +5,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // TestRepair_EC_Path verifies the EC repair path end-to-end:

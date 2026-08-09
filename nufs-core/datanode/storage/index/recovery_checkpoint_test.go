@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 var errCheckpointInjected = errors.New("injected recovery checkpoint failure")

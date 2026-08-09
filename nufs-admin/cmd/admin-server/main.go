@@ -8,14 +8,14 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/your-org/nufs-admin/internal/api"
-	"github.com/your-org/nufs-admin/internal/auth"
-	"github.com/your-org/nufs-admin/internal/cache"
-	"github.com/your-org/nufs-admin/internal/cluster"
-	"github.com/your-org/nufs-admin/internal/config"
-	"github.com/your-org/nufs-admin/internal/proxy"
-	"github.com/your-org/nufs-admin/internal/server"
-	"github.com/your-org/nufs-admin/internal/store"
+	"github.com/dshmyz/nufs/nufs-admin/internal/api"
+	"github.com/dshmyz/nufs/nufs-admin/internal/auth"
+	"github.com/dshmyz/nufs/nufs-admin/internal/cache"
+	"github.com/dshmyz/nufs/nufs-admin/internal/cluster"
+	"github.com/dshmyz/nufs/nufs-admin/internal/config"
+	"github.com/dshmyz/nufs/nufs-admin/internal/proxy"
+	"github.com/dshmyz/nufs/nufs-admin/internal/server"
+	"github.com/dshmyz/nufs/nufs-admin/internal/store"
 )
 
 func main() {

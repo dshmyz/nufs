@@ -1,4 +1,4 @@
-module github.com/example/dfs
+module github.com/dshmyz/nufs/nufs-core
 
 go 1.25.0
 

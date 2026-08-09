@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // TestReleaseGate_BehavioralExists proves the V2.1 §21 release gates are

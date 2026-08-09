@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
 )
 
 func TestFlush_CheckpointExcludesCommitPublication(t *testing.T) {

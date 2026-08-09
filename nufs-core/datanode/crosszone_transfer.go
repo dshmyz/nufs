@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // CrossZoneTransferer implements metadata.DataTransferer for cross-zone replication.

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // Scale stress harness (§18.4). The number of extents is configurable so

@@ -1,6 +1,6 @@
 [Unit]
 Description=Run NUFS leader failover drill weekly (RTO + graceful-degradation gate)
-Documentation=https://github.com/example/dfs
+Documentation=https://github.com/dshmyz/nufs/nufs-core
 # Periodic failure-injection drill for the 5-9 availability tier. Fires the
 # oneshot drill service on a cadence; each run drives a throwaway multi-metad
 # raft cluster through a leader SIGKILL and archives the measured RTO and the

@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/segment"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/segment"
 )
 
 // TestCompactor_WithRealStore verifies the compactor works through the

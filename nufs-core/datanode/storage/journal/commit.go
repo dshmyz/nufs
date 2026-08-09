@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // BatchCommit is the foreground durability point (V2.1 §5.3/§6.4).

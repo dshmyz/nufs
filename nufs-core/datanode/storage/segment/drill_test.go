@@ -6,8 +6,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
 )
 
 // Failure drills (§18.3) as automated tests. The kill-9/power-loss

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 

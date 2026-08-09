@@ -1,6 +1,6 @@
 [Unit]
 Description=NUFS Metadata Service
-Documentation=https://github.com/example/dfs
+Documentation=https://github.com/dshmyz/nufs/nufs-core
 After=network.target
 
 [Service]

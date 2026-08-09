@@ -7,7 +7,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // Checkpoint is a point-in-time, durable snapshot of the extent index

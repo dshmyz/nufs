@@ -14,10 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/encryption"
-	"github.com/example/dfs/datanode/storage/index"
-	"github.com/example/dfs/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/encryption"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
 )
 
 // Store implements storage.Store for a single commit stream on one disk

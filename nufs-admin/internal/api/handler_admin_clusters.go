@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/your-org/nufs-admin/internal/auth"
-	"github.com/your-org/nufs-admin/internal/cluster"
-	"github.com/your-org/nufs-admin/internal/store"
+	"github.com/dshmyz/nufs/nufs-admin/internal/auth"
+	"github.com/dshmyz/nufs/nufs-admin/internal/cluster"
+	"github.com/dshmyz/nufs/nufs-admin/internal/store"
 )
 
 // handleClusterManage handles cluster CRUD (add/remove/update dynamic clusters).

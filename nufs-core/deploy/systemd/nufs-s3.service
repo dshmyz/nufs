@@ -1,6 +1,6 @@
 [Unit]
 Description=NUFS S3 Gateway
-Documentation=https://github.com/example/dfs
+Documentation=https://github.com/dshmyz/nufs/nufs-core
 After=network.target nufs-metad.service
 Requires=nufs-metad.service
 

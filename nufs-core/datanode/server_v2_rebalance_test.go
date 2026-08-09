@@ -3,7 +3,7 @@ package datanode
 import (
 	"testing"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // TestV2StoreRebalanceOne verifies a single cross-disk move: locOf re-points

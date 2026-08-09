@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // newTestDiskManager creates a DiskManager in a temp directory for testing.

@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/your-org/nufs-admin/internal/cluster"
+	"github.com/dshmyz/nufs/nufs-admin/internal/cluster"
 )
 
 const bucketQuotaBodyLimit = 64 << 10

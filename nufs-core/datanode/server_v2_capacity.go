@@ -1,8 +1,8 @@
 package datanode
 
 import (
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/maintenance"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/maintenance"
 	"golang.org/x/sys/unix"
 )
 

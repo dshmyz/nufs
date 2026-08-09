@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // startTestDatanodes spins up n in-process datanode TCP servers on

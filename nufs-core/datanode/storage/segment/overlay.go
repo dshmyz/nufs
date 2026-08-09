@@ -4,8 +4,8 @@ import (
 	"encoding/binary"
 	"sync"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
 )
 
 // Overlay is the bounded in-memory committed-delta index (V2.1 §6.4).

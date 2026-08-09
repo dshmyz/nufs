@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/your-org/nufs-admin/internal/auth"
-	"github.com/your-org/nufs-admin/internal/cluster"
-	"github.com/your-org/nufs-admin/internal/proxy"
+	"github.com/dshmyz/nufs/nufs-admin/internal/auth"
+	"github.com/dshmyz/nufs/nufs-admin/internal/cluster"
+	"github.com/dshmyz/nufs/nufs-admin/internal/proxy"
 )
 
 // Router sets up HTTP routing with middleware.

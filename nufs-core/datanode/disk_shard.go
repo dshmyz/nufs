@@ -11,8 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/example/dfs/internal/crypto"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/internal/crypto"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // diskShard holds the per-disk state for one physical disk (JBOD model).

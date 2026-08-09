@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 //go:embed static/*

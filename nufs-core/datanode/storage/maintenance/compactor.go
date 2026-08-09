@@ -3,8 +3,8 @@ package maintenance
 import (
 	"fmt"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
 )
 
 // CompactionCandidate is a sealed segment scored for compaction (§10.2).

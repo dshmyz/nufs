@@ -5,7 +5,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // TestCompressionRoundtrip_Compressible verifies a highly-compressible

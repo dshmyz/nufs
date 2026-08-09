@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode/storage/segment"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/segment"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // startV21Nodes spins up n in-process V2.1 datanode TCP servers on ephemeral

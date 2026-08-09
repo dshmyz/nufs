@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // startTestServer creates a test server with a temp directory and returns it along with its address.

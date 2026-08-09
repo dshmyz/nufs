@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/chunkstore"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/chunkstore"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // ========== 集成测试：验证 ReliabilityWrapper 正确接入 Read/Flush 路径 ==========

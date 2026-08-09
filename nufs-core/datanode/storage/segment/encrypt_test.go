@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/encryption"
-	"github.com/example/dfs/internal/crypto"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/encryption"
+	"github.com/dshmyz/nufs/nufs-core/internal/crypto"
 )
 
 // TestEncryptionRoundtrip verifies per-frame AEAD encryption round-trips

@@ -7,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 type writeAttemptRecoveryStore interface {

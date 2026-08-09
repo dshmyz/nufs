@@ -14,10 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/example/dfs/internal/httputil"
-	"github.com/example/dfs/internal/tlsutil"
-	"github.com/example/dfs/internal/version"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/internal/httputil"
+	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
+	"github.com/dshmyz/nufs/nufs-core/internal/version"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // OpsMetadata is the narrow interface OpsServer needs from the metadata layer.

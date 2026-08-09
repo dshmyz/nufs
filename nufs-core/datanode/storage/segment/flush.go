@@ -4,8 +4,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/example/dfs/datanode/storage/index"
-	"github.com/example/dfs/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
 )
 
 // Flush limits (§7.4). The index (Pebble) may lag the committed

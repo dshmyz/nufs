@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/journal"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // ackRecord records AckChangeEvents calls with the delivered seq.

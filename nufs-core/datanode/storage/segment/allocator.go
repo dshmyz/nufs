@@ -3,8 +3,8 @@ package segment
 import (
 	"sync"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
 )
 
 // Allocator hands out append offsets within an active segment and

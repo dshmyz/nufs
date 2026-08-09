@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/dfs/internal/version"
+	"github.com/dshmyz/nufs/nufs-core/internal/version"
 )
 
 // Capacity thresholds for the V2.1 engine (and the webhook/admin view). They

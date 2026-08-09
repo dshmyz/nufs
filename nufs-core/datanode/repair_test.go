@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"fmt"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // mockMetadataService implements metadata.MetadataService for repair tests.

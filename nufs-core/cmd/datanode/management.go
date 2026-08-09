@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/dfs/datanode"
+	"github.com/dshmyz/nufs/nufs-core/datanode"
 )
 
 // ============================================================

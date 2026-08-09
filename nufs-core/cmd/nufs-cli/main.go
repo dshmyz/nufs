@@ -22,10 +22,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/example/dfs/internal/tools/backup"
-	"github.com/example/dfs/internal/tools/doctor"
-	"github.com/example/dfs/internal/tools/restore"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/internal/tools/backup"
+	"github.com/dshmyz/nufs/nufs-core/internal/tools/doctor"
+	"github.com/dshmyz/nufs/nufs-core/internal/tools/restore"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func main() {

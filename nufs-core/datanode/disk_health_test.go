@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/segment"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/segment"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // ============ Program 8 V1-c: proactive disk-health monitor ============

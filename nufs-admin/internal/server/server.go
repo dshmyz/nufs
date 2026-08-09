@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/your-org/nufs-admin/internal/api"
+	"github.com/dshmyz/nufs/nufs-admin/internal/api"
 )
 
 // Server wraps http.Server with graceful shutdown.

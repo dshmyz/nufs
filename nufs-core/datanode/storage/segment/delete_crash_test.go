@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/index"
-	"github.com/example/dfs/datanode/storage/journal"
-	"github.com/example/dfs/datanode/storage/testutil"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/testutil"
 )
 
 // TestDelete_AcknowledgedBeforeIndexApplySurvivesRecovery restores an index

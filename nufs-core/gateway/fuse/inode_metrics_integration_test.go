@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/example/dfs/chunkstore"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/chunkstore"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // ========== 集成测试：验证 FUSE 操作正确递增 MetricsRecorder 计数器 ==========

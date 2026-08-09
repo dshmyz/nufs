@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/example/dfs/internal/tlsutil"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // Client is a data node client for inter-node chunk replication.

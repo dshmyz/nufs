@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // --- Watch / SSE-style event stream ---

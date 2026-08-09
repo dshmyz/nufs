@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/example/dfs/datanode/storage/benchmark"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/benchmark"
 )
 
 func main() {

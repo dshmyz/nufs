@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // This file is Task #77 / S3: the cross-node EC conversion, where a single

@@ -20,17 +20,17 @@ import (
 	"time"
 
 	// DFS backend
-	"github.com/example/dfs/chunkstore"
-	gofuse "github.com/example/dfs/gateway/fuse"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/chunkstore"
+	gofuse "github.com/dshmyz/nufs/nufs-core/gateway/fuse"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 
 	// S3 backend
-	"github.com/example/dfs/gateway/s3fs"
+	"github.com/dshmyz/nufs/nufs-core/gateway/s3fs"
 
-	"github.com/example/dfs/internal/config"
-	"github.com/example/dfs/internal/logging"
-	"github.com/example/dfs/internal/resilience/breaker"
-	"github.com/example/dfs/internal/resilience/retry"
+	"github.com/dshmyz/nufs/nufs-core/internal/config"
+	"github.com/dshmyz/nufs/nufs-core/internal/logging"
+	"github.com/dshmyz/nufs/nufs-core/internal/resilience/breaker"
+	"github.com/dshmyz/nufs/nufs-core/internal/resilience/retry"
 )
 
 func main() {

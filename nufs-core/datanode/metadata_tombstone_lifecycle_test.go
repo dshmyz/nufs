@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 	"github.com/vmihailenco/msgpack/v5"
 )
 

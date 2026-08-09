@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/example/dfs/chunkstore"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/chunkstore"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func TestPutObjectRejectsByteQuotaExceeded(t *testing.T) {

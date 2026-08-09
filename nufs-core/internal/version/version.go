@@ -3,9 +3,9 @@
 // Build example:
 //
 //	go build -ldflags \
-//	  "-X github.com/example/dfs/internal/version.Version=$(git describe --tags --always) \
-//	   -X github.com/example/dfs/internal/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
-//	   -X github.com/example/dfs/internal/version.GitCommit=$(git rev-parse HEAD)" \
+//	  "-X github.com/dshmyz/nufs/nufs-core/internal/version.Version=$(git describe --tags --always) \
+//	   -X github.com/dshmyz/nufs/nufs-core/internal/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+//	   -X github.com/dshmyz/nufs/nufs-core/internal/version.GitCommit=$(git rev-parse HEAD)" \
 //	  ./cmd/datanode
 package version
 

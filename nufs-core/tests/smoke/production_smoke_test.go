@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/chunkstore"
-	"github.com/example/dfs/gateway/s3"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/chunkstore"
+	"github.com/dshmyz/nufs/nufs-core/gateway/s3"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func TestProductionSmokePutFailoverGet(t *testing.T) {

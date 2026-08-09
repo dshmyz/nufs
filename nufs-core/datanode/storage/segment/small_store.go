@@ -3,8 +3,8 @@ package segment
 import (
 	"context"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/encryption"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/encryption"
 )
 
 // SmallStore is the small-file commit stream (V2.1 §5.1/§9): 1 GiB

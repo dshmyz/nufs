@@ -6,7 +6,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // Segment file layout (§5.3):

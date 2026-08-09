@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/chunkstore"
+	"github.com/dshmyz/nufs/nufs-core/chunkstore"
 	"fmt"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // ========== Mock MetadataService ==========

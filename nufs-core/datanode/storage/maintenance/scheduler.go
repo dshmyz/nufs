@@ -3,7 +3,7 @@ package maintenance
 import (
 	"sort"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // Scheduler selects compaction candidates and enforces the §10.2

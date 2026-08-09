@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 func testPendingWrite(id storage.ExtentID) *pendingWrite {

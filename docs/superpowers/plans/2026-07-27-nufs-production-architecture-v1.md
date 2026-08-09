@@ -198,7 +198,7 @@ Create `nufs-core/gateway/s3/committer_put.go`:
 ```go
 package s3
 
-import "github.com/example/dfs/metadata"
+import "github.com/dshmyz/nufs/nufs-core/metadata"
 
 type metadataObjectCommitter struct {
 	meta       metadata.MetadataService

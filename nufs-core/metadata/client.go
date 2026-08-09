@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/dfs/internal/tlsutil"
+	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
 )
 
 // HTTPClient implements MetadataService over HTTP to a remote metad server.

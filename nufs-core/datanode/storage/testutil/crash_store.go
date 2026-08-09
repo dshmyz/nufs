@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // ErrSimulatedCrash is returned by fault injectors to abort an op at a

@@ -1,4 +1,4 @@
-module github.com/your-org/nufs-admin
+module github.com/dshmyz/nufs/nufs-admin
 
 go 1.22
 

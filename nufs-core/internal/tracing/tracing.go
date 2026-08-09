@@ -74,7 +74,7 @@ func Init(cfg Config) (trace.Tracer, ShutdownFunc, error) {
 		propagation.Baggage{},
 	))
 
-	tracer := provider.Tracer("github.com/example/dfs",
+	tracer := provider.Tracer("github.com/dshmyz/nufs/nufs-core",
 		trace.WithInstrumentationVersion("1.0.0"),
 	)
 
@@ -100,7 +100,7 @@ func newResource(serviceName string) (*sdkresource.Resource, error) {
 // StartSpan starts a new span with the given name and options.
 // Returns the context with the span and a function to end the span.
 func StartSpan(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
-	tracer := otel.Tracer("github.com/example/dfs")
+	tracer := otel.Tracer("github.com/dshmyz/nufs/nufs-core")
 	return tracer.Start(ctx, name, opts...)
 }
 

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // newTestChunkStore creates a ChunkStore in a temporary directory.

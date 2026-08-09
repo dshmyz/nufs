@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // newTestDir returns a DFSDir rooted at the "test" bucket's root inode,

@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/internal/resilience/breaker"
-	"github.com/example/dfs/internal/resilience/lock"
-	"github.com/example/dfs/internal/resilience/retry"
+	"github.com/dshmyz/nufs/nufs-core/internal/resilience/breaker"
+	"github.com/dshmyz/nufs/nufs-core/internal/resilience/lock"
+	"github.com/dshmyz/nufs/nufs-core/internal/resilience/retry"
 )
 
 // ========== ReliabilityWrapper TDD 红测试 ==========

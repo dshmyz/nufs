@@ -3,8 +3,8 @@ package recovery
 import (
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/manifest"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/manifest"
 )
 
 // TestRecover_NoSuperblock verifies a foreign/absent disk is rejected

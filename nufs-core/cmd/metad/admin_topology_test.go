@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func TestBuildTopologyGroupsByFaultDomain(t *testing.T) {

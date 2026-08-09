@@ -3,8 +3,8 @@ package segment
 import (
 	"os"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
 )
 
 // ScannedRecord is one data record found during a sealed-segment scan,

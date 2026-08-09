@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/example/dfs/internal/crypto"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/internal/crypto"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // SyncConcurrency limits concurrent f.Sync() calls per disk to prevent I/O

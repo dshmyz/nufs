@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // --- Namespace handlers (mkdir/rmdir/readdir/create/unlink/lookup/

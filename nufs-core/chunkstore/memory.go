@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // MemoryChunkStore is an in-process ChunkStore used by tests.

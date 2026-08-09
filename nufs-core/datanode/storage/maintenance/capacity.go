@@ -1,7 +1,7 @@
 package maintenance
 
 import (
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 // CapacityGuard enforces the §10.4 capacity protection thresholds and

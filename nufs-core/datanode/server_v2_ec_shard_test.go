@@ -3,9 +3,9 @@ package datanode
 import (
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/segment"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/segment"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // newTestShardMultiStore builds a V2Store over n disks, each hosting both a

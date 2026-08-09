@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // handleAudit returns audit records within a time range.

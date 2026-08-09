@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/example/dfs/internal/version"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/internal/version"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // opsDataStore is the data-plane store surface the gateway-facing

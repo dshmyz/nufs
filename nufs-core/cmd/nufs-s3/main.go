@@ -8,10 +8,10 @@ import (
 	"os"
 	"time"
 
-	gos3 "github.com/example/dfs/gateway/s3"
-	"github.com/example/dfs/internal/config"
-	"github.com/example/dfs/internal/logging"
-	"github.com/example/dfs/metadata"
+	gos3 "github.com/dshmyz/nufs/nufs-core/gateway/s3"
+	"github.com/dshmyz/nufs/nufs-core/internal/config"
+	"github.com/dshmyz/nufs/nufs-core/internal/logging"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func main() {

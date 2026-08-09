@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func TestGCScan_OnlyDeletesOnChunkNotFound(t *testing.T) {

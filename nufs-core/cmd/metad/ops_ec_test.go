@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode"
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/segment"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/segment"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // buildOpsTestMux wires the real ops handlers onto a fresh mux over the given

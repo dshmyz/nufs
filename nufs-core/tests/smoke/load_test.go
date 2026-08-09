@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/chunkstore"
-	"github.com/example/dfs/datanode"
-	"github.com/example/dfs/gateway/s3"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/chunkstore"
+	"github.com/dshmyz/nufs/nufs-core/datanode"
+	"github.com/dshmyz/nufs/nufs-core/gateway/s3"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // TestLoad_SustainedS3Ops runs sustained S3 PUT/GET operations against a

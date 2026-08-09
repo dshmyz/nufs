@@ -8,6 +8,6 @@ keywords:
   - storage
   - distributed
   - s3
-home: https://github.com/example/dfs
+home: https://github.com/dshmyz/nufs/nufs-core
 maintainers:
   - name: nufs-team

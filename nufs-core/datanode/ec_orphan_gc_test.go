@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // Program 7: the production *metadata.HTTPClient must structurally satisfy both

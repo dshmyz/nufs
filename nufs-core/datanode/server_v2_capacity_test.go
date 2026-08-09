@@ -3,9 +3,9 @@ package datanode
 import (
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/maintenance"
-	"github.com/example/dfs/datanode/storage/segment"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/maintenance"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/segment"
 )
 
 // haveSegmentStore builds a small real segment store, the backing a V2Store

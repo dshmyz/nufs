@@ -1,6 +1,6 @@
 [Unit]
 Description=NUFS raft leader failover drill (RTO + graceful-degradation gate)
-Documentation=https://github.com/example/dfs
+Documentation=https://github.com/dshmyz/nufs/nufs-core
 # Runs the periodic failure-injection drill that sustains read/write traffic
 # through a metad raft leader kill and asserts the recovery-time objective.
 # Satisfies the 5-9-tier "定期故障注入演练" requirement with machine-checked

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // mockHeartbeatMetaFail fails heartbeat calls until release is closed,

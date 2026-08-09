@@ -22,13 +22,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/example/dfs/internal/config"
-	internalhttp "github.com/example/dfs/internal/httputil"
-	"github.com/example/dfs/internal/logging"
-	"github.com/example/dfs/internal/tlsutil"
-	"github.com/example/dfs/internal/tracing"
-	"github.com/example/dfs/internal/version"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/internal/config"
+	internalhttp "github.com/dshmyz/nufs/nufs-core/internal/httputil"
+	"github.com/dshmyz/nufs/nufs-core/internal/logging"
+	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
+	"github.com/dshmyz/nufs/nufs-core/internal/tracing"
+	"github.com/dshmyz/nufs/nufs-core/internal/version"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func main() {

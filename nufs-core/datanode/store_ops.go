@@ -3,7 +3,7 @@ package datanode
 import (
 	"context"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // OpsStore is the read/inspect/verify/status subset of the storage backend

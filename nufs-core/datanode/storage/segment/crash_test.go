@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/testutil"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/testutil"
 )
 
 // errFatal marks a write that must never return success.

@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/your-org/nufs-admin/internal/auth"
-	"github.com/your-org/nufs-admin/internal/cache"
-	"github.com/your-org/nufs-admin/internal/cluster"
-	"github.com/your-org/nufs-admin/internal/config"
-	"github.com/your-org/nufs-admin/internal/proxy"
+	"github.com/dshmyz/nufs/nufs-admin/internal/auth"
+	"github.com/dshmyz/nufs/nufs-admin/internal/cache"
+	"github.com/dshmyz/nufs/nufs-admin/internal/cluster"
+	"github.com/dshmyz/nufs/nufs-admin/internal/config"
+	"github.com/dshmyz/nufs/nufs-admin/internal/proxy"
 )
 
 func TestHandleWriteOpsStatusProxiesClusterStatus(t *testing.T) {

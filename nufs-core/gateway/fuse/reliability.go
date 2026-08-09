@@ -3,9 +3,9 @@ package fuse
 import (
 	"fmt"
 
-	"github.com/example/dfs/internal/resilience/breaker"
-	"github.com/example/dfs/internal/resilience/lock"
-	"github.com/example/dfs/internal/resilience/retry"
+	"github.com/dshmyz/nufs/nufs-core/internal/resilience/breaker"
+	"github.com/dshmyz/nufs/nufs-core/internal/resilience/lock"
+	"github.com/dshmyz/nufs/nufs-core/internal/resilience/retry"
 )
 
 // ReliabilityWrapper 将 retry + circuit breaker + 路径锁组合为统一接口，

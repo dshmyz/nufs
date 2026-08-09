@@ -4,8 +4,8 @@ import (
 	"container/list"
 	"sync"
 
-	"github.com/example/dfs/datanode/storage/encryption"
-	"github.com/example/dfs/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/encryption"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
 )
 
 // SegmentDescriptorCache caches open segment Readers per segment ID

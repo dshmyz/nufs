@@ -404,7 +404,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func TestOpsHandlersBucketQuotaRoundTrip(t *testing.T) {
@@ -487,7 +487,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 type bucketQuotaStatus struct {
@@ -666,7 +666,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func TestPutObjectRejectsByteQuotaExceeded(t *testing.T) {
@@ -839,7 +839,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func TestPrometheusMetricsIncludesBucketQuota(t *testing.T) {
@@ -1004,11 +1004,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/your-org/nufs-admin/internal/auth"
-	"github.com/your-org/nufs-admin/internal/cache"
-	"github.com/your-org/nufs-admin/internal/cluster"
-	"github.com/your-org/nufs-admin/internal/config"
-	"github.com/your-org/nufs-admin/internal/proxy"
+	"github.com/dshmyz/nufs/nufs-admin/internal/auth"
+	"github.com/dshmyz/nufs/nufs-admin/internal/cache"
+	"github.com/dshmyz/nufs/nufs-admin/internal/cluster"
+	"github.com/dshmyz/nufs/nufs-admin/internal/config"
+	"github.com/dshmyz/nufs/nufs-admin/internal/proxy"
 )
 
 func TestHandleBucketQuotaProxiesToMetad(t *testing.T) {

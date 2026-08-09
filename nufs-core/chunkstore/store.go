@@ -17,9 +17,9 @@ import (
 	"sort"
 	"time"
 
-	"github.com/example/dfs/datanode"
-	"github.com/example/dfs/internal/tlsutil"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode"
+	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // ChunkStore is the distributed storage interface.

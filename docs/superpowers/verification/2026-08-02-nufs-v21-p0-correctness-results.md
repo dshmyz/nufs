@@ -40,8 +40,8 @@ Verified: `go test ./datanode/storage/segment/... -run TestReleaseGate` passes.
 
 ```
 go test -race -short -count=20 -timeout 900s ./datanode/storage/segment/... ./datanode/storage/recovery/...
-ok  	github.com/example/dfs/datanode/storage/segment	710.516s
-ok  	github.com/example/dfs/datanode/storage/recovery	5.011s
+ok  	github.com/dshmyz/nufs/nufs-core/datanode/storage/segment	710.516s
+ok  	github.com/dshmyz/nufs/nufs-core/datanode/storage/recovery	5.011s
 ```
 
 Exit: 0
@@ -50,7 +50,7 @@ Exit: 0
 
 ```
 go test -count=50 -timeout 20m ./datanode/storage/segment -run TestProcessCrash_AcknowledgedMutationsRecover
-ok  	github.com/example/dfs/datanode/storage/segment	467.191s
+ok  	github.com/dshmyz/nufs/nufs-core/datanode/storage/segment	467.191s
 ```
 
 Exit: 0 — 50 iterations of the SIGKILL-then-recover scenario all recovered every
@@ -73,18 +73,18 @@ All packages pass under `-race` with **zero data races** (`WARNING: DATA RACE` c
 Fast packages (41), 180s budget each — all `ok`, 0 races:
 
 ```
-ok  	github.com/example/dfs/chunkstore	7.674s
-ok  	github.com/example/dfs/cmd/metad         (cached)
-ok  	github.com/example/dfs/cmd/nufs-backup    (cached)
-ok  	github.com/example/dfs/cmd/nufs-doctor    (cached)
-ok  	github.com/example/dfs/cmd/nufs-restore   (cached)
-ok  	github.com/example/dfs/datanode/storage	3.641s
-ok  	github.com/example/dfs/gateway/fuse       (cached)
-ok  	github.com/example/dfs/gateway/s3         (cached)
-ok  	github.com/example/dfs/gateway/s3fs       (cached)
-ok  	github.com/example/dfs/internal/crypto    (cached)
-ok  	github.com/example/dfs/tests/metadata_dr  (cached)
-ok  	github.com/example/dfs/tests/smoke       3.885s
+ok  	github.com/dshmyz/nufs/nufs-core/chunkstore	7.674s
+ok  	github.com/dshmyz/nufs/nufs-core/cmd/metad         (cached)
+ok  	github.com/dshmyz/nufs/nufs-core/cmd/nufs-backup    (cached)
+ok  	github.com/dshmyz/nufs/nufs-core/cmd/nufs-doctor    (cached)
+ok  	github.com/dshmyz/nufs/nufs-core/cmd/nufs-restore   (cached)
+ok  	github.com/dshmyz/nufs/nufs-core/datanode/storage	3.641s
+ok  	github.com/dshmyz/nufs/nufs-core/gateway/fuse       (cached)
+ok  	github.com/dshmyz/nufs/nufs-core/gateway/s3         (cached)
+ok  	github.com/dshmyz/nufs/nufs-core/gateway/s3fs       (cached)
+ok  	github.com/dshmyz/nufs/nufs-core/internal/crypto    (cached)
+ok  	github.com/dshmyz/nufs/nufs-core/tests/metadata_dr  (cached)
+ok  	github.com/dshmyz/nufs/nufs-core/tests/smoke       3.885s
 … (all other fast packages ok)
 ```
 
@@ -93,9 +93,9 @@ are run with an adequate per-package budget. Each passes cleanly when run on its
 (sequential, no cross-package CPU contention):
 
 ```
-ok  	github.com/example/dfs/datanode	47.558s
-ok  	github.com/example/dfs/metadata	125.542s
-ok  	github.com/example/dfs/datanode/storage/segment	166.935s
+ok  	github.com/dshmyz/nufs/nufs-core/datanode	47.558s
+ok  	github.com/dshmyz/nufs/nufs-core/metadata	125.542s
+ok  	github.com/dshmyz/nufs/nufs-core/datanode/storage/segment	166.935s
 ```
 
 > Note: running the three large `-race` suites *concurrently* (as `go test ./...` does)

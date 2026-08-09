@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/index"
-	"github.com/example/dfs/datanode/storage/manifest"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/manifest"
 )
 
 // Bounds on recovery work (V2.1 §7.5). Recovery is bounded by changes

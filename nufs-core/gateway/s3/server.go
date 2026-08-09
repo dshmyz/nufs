@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/example/dfs/internal/tlsutil"
+	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
 )
 
 // ServerConfig controls how Gateway.Run wires an *http.Server and

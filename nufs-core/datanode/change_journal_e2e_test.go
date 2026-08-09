@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/index"
-	"github.com/example/dfs/datanode/storage/journal"
-	"github.com/example/dfs/datanode/storage/segment"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/index"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/segment"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // v21Node bundles one in-process V2.1 datanode: the raw segment store (to

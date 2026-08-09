@@ -5,8 +5,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/example/dfs/chunkstore"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/chunkstore"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // TestGatewayDirectECWrite_ReadBack is the Program 10 capstone: the gateway's

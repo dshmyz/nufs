@@ -6,8 +6,8 @@ import (
 	"hash/crc32"
 	"log/slog"
 
-	"github.com/example/dfs/datanode"
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/datanode"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 // ECWriteAuthority is the write-path direct-EC authority seam (Program 10,

@@ -3,7 +3,7 @@ package journal
 import (
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
 )
 
 func TestChangeJournal_AppendAndResume(t *testing.T) {

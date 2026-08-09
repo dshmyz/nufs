@@ -22,7 +22,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func (h *opsHandlers) handleKV(w http.ResponseWriter, r *http.Request) {

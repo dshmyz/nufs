@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"sync/atomic"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/encryption"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/encryption"
 )
 
 // readerAt is the subset of *os.File the reader needs. It exists so

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/journal"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/journal"
 )
 
 func TestRecoverStreaming_ReplaysCommittedBatchAndTruncatesTail(t *testing.T) {

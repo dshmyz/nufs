@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 	
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 // TestEC_EndToEnd_PlaceWriteRead verifies the complete EC data path:
 // K+M datanodes online → ChunkMeta built with ECGroup →

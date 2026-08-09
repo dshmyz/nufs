@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/your-org/nufs-admin/internal/config"
-	"github.com/your-org/nufs-admin/internal/store"
+	"github.com/dshmyz/nufs/nufs-admin/internal/config"
+	"github.com/dshmyz/nufs/nufs-admin/internal/store"
 )
 
 // HealthStatus represents cluster health state.

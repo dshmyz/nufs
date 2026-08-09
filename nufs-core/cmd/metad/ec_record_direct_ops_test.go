@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/dfs/metadata"
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
 func ecGroupID(cid metadata.ChunkID) string { return "ec-" + strconv.FormatUint(uint64(cid), 10) }

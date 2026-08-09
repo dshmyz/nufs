@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/example/dfs/datanode/storage"
-	"github.com/example/dfs/datanode/storage/segment"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/segment"
 )
 
 // diskCompactStore is the per-disk segment.Store surface the compaction
