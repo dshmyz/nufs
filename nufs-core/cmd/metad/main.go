@@ -441,7 +441,7 @@ func main() {
 
 	opsServer := &http.Server{
 		Addr:         *opsAddr,
-		Handler:      limitedMux,
+		Handler:      instrumentMiddleware(bundle.Metrics, public, limitedMux),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,

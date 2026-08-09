@@ -77,6 +77,14 @@ type Metrics struct {
 	RaftLogIndex  atomic.Int64
 	SnapshotsDone atomic.Int64
 
+	// HTTP (metad ops API) - request counts by status class. These back the
+	// metad_availability SLI (1 - 5xx/total). Store-layer OpsTotal/ErrorsTotal
+	// above only see Pebble paths, not the HTTP surface, so they under-count
+	// failures (raft-not-leader 503, validation 400, auth 401, rate-limit 429).
+	HTTPReq2xx atomic.Int64
+	HTTPReq4xx atomic.Int64
+	HTTPReq5xx atomic.Int64
+
 	// Uptime
 	startTime time.Time
 }
@@ -126,6 +134,24 @@ func (m *Metrics) RecordError() {
 	m.ErrorsTotal.Add(1)
 }
 
+// RecordHTTPStatus increments the ops-API request counter for the HTTP status
+// code's class (2xx/4xx/5xx). 3xx (redirects used for leader forwarding) and
+// 1xx are folded into 2xx/none respectively; only 2xx/4xx/5xx are tracked
+// since those are what the availability SLI uses.
+func (m *Metrics) RecordHTTPStatus(code int) {
+	switch {
+	case code >= 200 && code < 300:
+		m.HTTPReq2xx.Add(1)
+	case code >= 300 && code < 400:
+		// 3xx (leader-forward 307s) are not failures; count as success.
+		m.HTTPReq2xx.Add(1)
+	case code >= 400 && code < 500:
+		m.HTTPReq4xx.Add(1)
+	case code >= 500:
+		m.HTTPReq5xx.Add(1)
+	}
+}
+
 // Snapshot returns a point-in-time snapshot of all metrics.
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	return MetricsSnapshot{
@@ -166,6 +192,9 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		RaftTerm:      m.RaftTerm.Load(),
 		RaftLogIndex:  m.RaftLogIndex.Load(),
 		SnapshotsDone: m.SnapshotsDone.Load(),
+		HTTPReq2xx:    m.HTTPReq2xx.Load(),
+		HTTPReq4xx:    m.HTTPReq4xx.Load(),
+		HTTPReq5xx:    m.HTTPReq5xx.Load(),
 	}
 }
 
@@ -219,6 +248,11 @@ type MetricsSnapshot struct {
 	RaftTerm      int64 `json:"raft_term"`
 	RaftLogIndex  int64 `json:"raft_log_index"`
 	SnapshotsDone int64 `json:"snapshots_done"`
+
+	// HTTP (metad ops API) request counts by status class
+	HTTPReq2xx int64 `json:"http_req_2xx"`
+	HTTPReq4xx int64 `json:"http_req_4xx"`
+	HTTPReq5xx int64 `json:"http_req_5xx"`
 }
 
 // ============================================================

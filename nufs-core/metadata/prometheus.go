@@ -41,6 +41,15 @@ func PrometheusHandler(m *Metrics) http.Handler {
 		sb.WriteString("# TYPE nufs_errors_total counter\n")
 		sb.WriteString(fmt.Sprintf("nufs_errors_total %d\n", snap.ErrorsTotal))
 
+		// HTTP (metad ops API) request counts by status class. Backs the
+		// metad_availability SLI (1 - 5xx/total); store-layer ops/errors above
+		// only see Pebble paths, not the HTTP surface.
+		sb.WriteString("# HELP nufs_metad_http_requests_total HTTP requests served by the metad ops API by status class\n")
+		sb.WriteString("# TYPE nufs_metad_http_requests_total counter\n")
+		sb.WriteString(fmt.Sprintf("nufs_metad_http_requests_total{status=\"2xx\"} %d\n", snap.HTTPReq2xx))
+		sb.WriteString(fmt.Sprintf("nufs_metad_http_requests_total{status=\"4xx\"} %d\n", snap.HTTPReq4xx))
+		sb.WriteString(fmt.Sprintf("nufs_metad_http_requests_total{status=\"5xx\"} %d\n", snap.HTTPReq5xx))
+
 		sb.WriteString("# HELP nufs_cache_hits_total Cache hits\n")
 		sb.WriteString("# TYPE nufs_cache_hits_total counter\n")
 		sb.WriteString(fmt.Sprintf("nufs_cache_hits_total %d\n", snap.CacheHits))
