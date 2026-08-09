@@ -224,6 +224,9 @@ func main() {
 	// joinStop, when non-nil, is closed at shutdown so the membership-reconcile
 	// goroutine stops driving AddVoter before the raft node is torn down.
 	var joinStop chan struct{}
+	// rtoStop, when non-nil, is closed at shutdown so the leader-failover RTO
+	// tracker stops polling raft state before the raft node is torn down.
+	var rtoStop chan struct{}
 
 	// Compute advertised ops URL once, used for both RaftNode config
 	// and ops handler redirect. Defaults to http://<hostname>:<port>.
@@ -344,6 +347,14 @@ func main() {
 	defer bundle.Close()
 
 	bundle.Raft = raftNode
+
+	// Leader-failover RTO tracker: emits nufs_leader_failover_rto_seconds at
+	// runtime so NUFSLeaderFailoverRTOExceeded is a real (non-dead) alert.
+	// Only runs when raft is active; single-node mode has no failover.
+	if raftNode != nil {
+		rtoStop = make(chan struct{})
+		go (&leaderRTOTracker{raft: raftNode, metrics: bundle.Metrics}).run(rtoStop)
+	}
 
 	log.Info("service bundle initialized")
 
@@ -507,6 +518,10 @@ func main() {
 	// Stop the raft membership-reconcile loop before the raft node shuts down.
 	if joinStop != nil {
 		close(joinStop)
+	}
+	// Stop the leader-failover RTO tracker before the raft node shuts down.
+	if rtoStop != nil {
+		close(rtoStop)
 	}
 
 	// Begin draining before shutting down the listener so new protected

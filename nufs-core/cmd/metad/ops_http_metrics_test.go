@@ -17,6 +17,7 @@ func TestPrometheusEmitsHTTPRequestMetric(t *testing.T) {
 	m.HTTPReq2xx.Add(12)
 	m.HTTPReq4xx.Add(3)
 	m.HTTPReq5xx.Add(1)
+	m.LeaderFailoverRTO.Store(8)
 
 	store, _ := newOpsTestStore(t)
 	defer store.Close()
@@ -28,6 +29,7 @@ func TestPrometheusEmitsHTTPRequestMetric(t *testing.T) {
 		`nufs_metad_http_requests_total{status="2xx"} 12`,
 		`nufs_metad_http_requests_total{status="4xx"} 3`,
 		`nufs_metad_http_requests_total{status="5xx"} 1`,
+		`nufs_leader_failover_rto_seconds 8`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics body missing %q", want)

@@ -50,6 +50,13 @@ func PrometheusHandler(m *Metrics) http.Handler {
 		sb.WriteString(fmt.Sprintf("nufs_metad_http_requests_total{status=\"4xx\"} %d\n", snap.HTTPReq4xx))
 		sb.WriteString(fmt.Sprintf("nufs_metad_http_requests_total{status=\"5xx\"} %d\n", snap.HTTPReq5xx))
 
+		// Leader failover RTO (seconds). Only the current leader reports a
+		// non-zero value; followers reset to 0 on step-down. Backs the
+		// leader_failover_rto SLO/alert.
+		sb.WriteString("# HELP nufs_leader_failover_rto_seconds Wall-clock seconds of the most recent raft leader failover (old leader last-contact -> this node winning leadership); 0 on followers\n")
+		sb.WriteString("# TYPE nufs_leader_failover_rto_seconds gauge\n")
+		sb.WriteString(fmt.Sprintf("nufs_leader_failover_rto_seconds %d\n", snap.LeaderFailoverRTO))
+
 		sb.WriteString("# HELP nufs_cache_hits_total Cache hits\n")
 		sb.WriteString("# TYPE nufs_cache_hits_total counter\n")
 		sb.WriteString(fmt.Sprintf("nufs_cache_hits_total %d\n", snap.CacheHits))

@@ -148,6 +148,17 @@ groups:
           summary: "Metadata service availability dropped below 99% (5xx rate over ops-API requests)"
           runbook: "https://docs.nufs.io/runbook/metad-availability"
 
+      - alert: NUFSLeaderFailoverRTOExceeded
+        expr: nufs_leader_failover_rto_seconds > 15
+        for: 1m
+        labels:
+          severity: critical
+          team: storage
+          component: metad
+        annotations:
+          summary: "Leader failover RTO exceeded 15s budget - 5-9 availability tier recovery time not met"
+          runbook: "https://docs.nufs.io/runbook/leader-failover-rto"
+
   - name: nufs.warning
     rules:
       - alert: NUFSDiskUsageHigh

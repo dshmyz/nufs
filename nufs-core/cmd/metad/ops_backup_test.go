@@ -298,6 +298,10 @@ func TestPrometheusBackupAlertsConfigured(t *testing.T) {
 			expr: "nufs_repair_oldest_timestamp > 0 and (time() - nufs_repair_oldest_timestamp > 3600)",
 			for_: "10m",
 		},
+		"NUFSLeaderFailoverRTOExceeded": {
+			expr: "nufs_leader_failover_rto_seconds > 15",
+			for_: "1m",
+		},
 	}
 	for _, group := range doc.Groups {
 		for _, rule := range group.Rules {

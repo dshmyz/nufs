@@ -85,6 +85,14 @@ type Metrics struct {
 	HTTPReq4xx atomic.Int64
 	HTTPReq5xx atomic.Int64
 
+	// LeaderFailoverRTO is the wall-clock seconds the most recent raft leader
+	// failover took (old leader's last contact -> this node winning leadership).
+	// Populated by cmd/metad's leaderRTOTracker; only the current leader holds a
+	// non-zero value (followers reset to 0 on step-down) so the RTO alert
+	// evaluates only on the node that just took over. Backs
+	// metad_leader_failover_rto_seconds + the failover-RTO SLO.
+	LeaderFailoverRTO atomic.Int64
+
 	// Uptime
 	startTime time.Time
 }
@@ -195,6 +203,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		HTTPReq2xx:    m.HTTPReq2xx.Load(),
 		HTTPReq4xx:    m.HTTPReq4xx.Load(),
 		HTTPReq5xx:    m.HTTPReq5xx.Load(),
+		LeaderFailoverRTO: m.LeaderFailoverRTO.Load(),
 	}
 }
 
@@ -253,6 +262,9 @@ type MetricsSnapshot struct {
 	HTTPReq2xx int64 `json:"http_req_2xx"`
 	HTTPReq4xx int64 `json:"http_req_4xx"`
 	HTTPReq5xx int64 `json:"http_req_5xx"`
+
+	// LeaderFailoverRTO (seconds) of the most recent failover; 0 on followers.
+	LeaderFailoverRTO int64 `json:"leader_failover_rto_seconds"`
 }
 
 // ============================================================
