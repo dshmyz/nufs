@@ -126,6 +126,28 @@ groups:
           summary: "Bucket {{ $labels.bucket }} object quota usage exceeds 95%"
           runbook: "docs/runbooks/bucket-quota.md"
 
+      - alert: NUFSDataDurabilityAtRisk
+        expr: 1 - (sum(nufs_cluster_chunks_under_replicated) / clamp_min(sum(nufs_chunks_total), 1)) < 0.999
+        for: 5m
+        labels:
+          severity: critical
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Chunk durability below 99.9% - data loss risk (under-replicated fraction too high)"
+          runbook: "https://docs.nufs.io/runbook/durability-risk"
+
+      - alert: NUFSMetadAvailabilityDrop
+        expr: 1 - (sum(rate(nufs_metad_http_requests_total{status="5xx"}[5m])) / clamp_min(sum(rate(nufs_metad_http_requests_total[5m])), 1)) < 0.99
+        for: 5m
+        labels:
+          severity: critical
+          team: storage
+          component: metad
+        annotations:
+          summary: "Metadata service availability dropped below 99% (5xx rate over ops-API requests)"
+          runbook: "https://docs.nufs.io/runbook/metad-availability"
+
   - name: nufs.warning
     rules:
       - alert: NUFSDiskUsageHigh
@@ -314,6 +336,61 @@ groups:
         annotations:
           summary: "Metadata change events are being dropped — a watcher's buffer is full and notifications are being lost"
           runbook: "docs/runbooks/metadata-disaster-recovery.md"
+
+      - alert: NUFSRepairLagHigh
+        expr: nufs_repair_oldest_timestamp > 0 and (time() - nufs_repair_oldest_timestamp > 3600)
+        for: 10m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Oldest queued repair task is over 1 hour old"
+          runbook: "https://docs.nufs.io/runbook/repair-lag-high"
+
+      - alert: NUFSRepairQueueGrowing
+        expr: nufs_repair_tasks_queued > 1000 and deriv(nufs_repair_tasks_queued[1h]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          team: storage
+          component: metad
+        annotations:
+          summary: "Repair queue is growing - repair may not be keeping up"
+          runbook: "https://docs.nufs.io/runbook/repair-queue-growing"
+
+      - alert: NUFSChunkWriteLatencyHigh
+        expr: (sum(rate(nufs_datanode_write_semaphore_wait_seconds_total[1h])) / clamp_min(sum(rate(nufs_datanode_replication_writes_total[1h])), 1)) * 1000 > 100
+        for: 10m
+        labels:
+          severity: warning
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Mean chunk write-path wait (1h window) exceeds 100ms"
+          runbook: "https://docs.nufs.io/runbook/chunk-write-latency"
+
+      - alert: NUFSChunkReadLatencyHigh
+        expr: 1 - clamp_max(sum(rate(nufs_datanode_read_amplified_bytes_total[1h])) / clamp_min(sum(rate(nufs_datanode_read_requested_bytes_total[1h])), 1), 1) < 0.95
+        for: 10m
+        labels:
+          severity: warning
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Chunk read efficiency (low amplification) dropped below 95%"
+          runbook: "https://docs.nufs.io/runbook/chunk-read-latency"
+
+      - alert: NUFSWALFsyncLatencyHigh
+        expr: (sum(rate(nufs_datanode_fsync_seconds_total[1h])) / clamp_min(sum(rate(nufs_datanode_fsync_total[1h])), 1)) * 1000 > 10
+        for: 5m
+        labels:
+          severity: warning
+          team: storage
+          component: datanode
+        annotations:
+          summary: "Mean chunk-file fsync latency (1h window) exceeds 10ms - write performance at risk"
+          runbook: "https://docs.nufs.io/runbook/wal-fsync-latency"
 
   - name: nufs.info
     rules:

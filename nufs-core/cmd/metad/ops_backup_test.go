@@ -289,6 +289,15 @@ func TestPrometheusBackupAlertsConfigured(t *testing.T) {
 			expr: "nufs_chunk_tombstone_oldest_age_seconds > 93600",
 			for_: "30m",
 		},
+		// Ported SLO-linked alerts (regression guard for the slo.go -> yaml merge).
+		"NUFSMetadAvailabilityDrop": {
+			expr: "1 - (sum(rate(nufs_metad_http_requests_total{status=\"5xx\"}[5m])) / clamp_min(sum(rate(nufs_metad_http_requests_total[5m])), 1)) < 0.99",
+			for_: "5m",
+		},
+		"NUFSRepairLagHigh": {
+			expr: "nufs_repair_oldest_timestamp > 0 and (time() - nufs_repair_oldest_timestamp > 3600)",
+			for_: "10m",
+		},
 	}
 	for _, group := range doc.Groups {
 		for _, rule := range group.Rules {
