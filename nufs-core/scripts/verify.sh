@@ -148,6 +148,13 @@ if [ "$LEVEL" = "drill" ] || [ "$LEVEL" = "full" ]; then
       fail "chaos-soak drill"
     fi
   fi
+
+  step "drill: network-fault-injection (partition/loss/latency via S3 gateway)"
+  if bash scripts/soak/run-v21-network-faults.sh ; then
+    pass "network-fault-injection drill"
+  else
+    fail "network-fault-injection drill"
+  fi
 fi
 
 # ---- 6. 上线前长时/高 count 门禁（仅 full） ----

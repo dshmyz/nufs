@@ -79,6 +79,7 @@ docker: ## Build Docker images
 	docker build --target nufs-s3  -t dfs-nufs-s3  .
 	docker build --target nufs-fuse -t dfs-nufs-fuse .
 	docker build --target nufs-cli -t dfs-nufs-cli .
+	docker build -t nufs-netem:latest -f ../deploy/netem/Dockerfile .
 
 docker-up: ## Start DFS cluster with docker-compose
 	docker-compose up -d --build

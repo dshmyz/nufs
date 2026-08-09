@@ -1,0 +1,175 @@
+version: "3.8"
+
+# E2E Network Fault Injection Test Stack
+# Usage: docker compose -f docker-compose.e2e.yml up -d
+
+services:
+  # ==================== Metadata Service (2 nodes for Raft) ====================
+  metad-1:
+    image: nufs:latest
+    container_name: nufs-metad-1
+    entrypoint: ["/usr/local/bin/metad"]
+    command:
+      - "-data-dir=/var/lib/dfs/metadata"
+      - "-node-id=1"
+      - "-raft"
+      - "-raft-addr=0.0.0.0:7000"
+      - "-raft-advertise-addr=nufs-metad-1:7000"
+      - "-raft-dir=/var/lib/dfs/raft"
+      - "-raft-bootstrap"
+      - "-ops-addr=0.0.0.0:8091"
+      - "-allow-insecure-dev"
+    volumes:
+      - metad1-data:/var/lib/dfs/metadata
+      - metad1-raft:/var/lib/dfs/raft
+    ports:
+      - "8190:8091"   # Operations API
+      - "7100:7000"   # Raft consensus
+    networks:
+      - nufs-e2e-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8091/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  metad-2:
+    image: nufs:latest
+    container_name: nufs-metad-2
+    entrypoint: ["/usr/local/bin/metad"]
+    command:
+      - "-data-dir=/var/lib/dfs/metadata"
+      - "-node-id=2"
+      - "-raft"
+      - "-raft-addr=0.0.0.0:7000"
+      - "-raft-advertise-addr=nufs-metad-2:7000"
+      - "-raft-dir=/var/lib/dfs/raft"
+      - "-ops-addr=0.0.0.0:8091"
+      - "-allow-insecure-dev"
+    volumes:
+      - metad2-data:/var/lib/dfs/metadata
+      - metad2-raft:/var/lib/dfs/raft
+    ports:
+      - "8191:8091"   # Operations API
+      - "7101:7000"   # Raft consensus
+    depends_on:
+      metad-1:
+        condition: service_healthy
+    networks:
+      - nufs-e2e-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8091/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ==================== Data Nodes ====================
+  datanode-1:
+    image: nufs:latest
+    container_name: nufs-datanode-1
+    entrypoint: ["/usr/local/bin/datanode"]
+    command:
+      - "-node-id=1"
+      - "-listen=0.0.0.0:9100"
+      - "-register-addr=nufs-datanode-1:9100"
+      - "-metadata=metad-1:8091"
+      - "-data-dir=/data"
+      - "-rack=rack1"
+      - "-zone=zone1"
+      - "-ops-addr=0.0.0.0:8092"
+    volumes:
+      - datanode1-data:/data
+    ports:
+      - "9101:9100"   # Data TCP
+      - "9091:8092"   # Ops API
+    depends_on:
+      metad-1:
+        condition: service_healthy
+    networks:
+      - nufs-e2e-net
+    restart: unless-stopped
+
+  datanode-2:
+    image: nufs:latest
+    container_name: nufs-datanode-2
+    entrypoint: ["/usr/local/bin/datanode"]
+    command:
+      - "-node-id=2"
+      - "-listen=0.0.0.0:9100"
+      - "-register-addr=nufs-datanode-2:9100"
+      - "-metadata=metad-1:8091"
+      - "-data-dir=/data"
+      - "-rack=rack2"
+      - "-zone=zone1"
+      - "-ops-addr=0.0.0.0:8092"
+    volumes:
+      - datanode2-data:/data
+    ports:
+      - "9102:9100"   # Data TCP
+      - "9092:8092"   # Ops API
+    depends_on:
+      metad-1:
+        condition: service_healthy
+    networks:
+      - nufs-e2e-net
+    restart: unless-stopped
+
+  datanode-3:
+    image: nufs:latest
+    container_name: nufs-datanode-3
+    entrypoint: ["/usr/local/bin/datanode"]
+    command:
+      - "-node-id=3"
+      - "-listen=0.0.0.0:9100"
+      - "-register-addr=nufs-datanode-3:9100"
+      - "-metadata=metad-1:8091"
+      - "-data-dir=/data"
+      - "-rack=rack3"
+      - "-zone=zone1"
+      - "-ops-addr=0.0.0.0:8092"
+    volumes:
+      - datanode3-data:/data
+    ports:
+      - "9103:9100"   # Data TCP
+      - "9093:8092"   # Ops API
+    depends_on:
+      metad-1:
+        condition: service_healthy
+    networks:
+      - nufs-e2e-net
+    restart: unless-stopped
+
+  # ==================== S3 Gateway ====================
+  gateway:
+    image: nufs:latest
+    container_name: nufs-gateway
+    command:
+      - "-listen=:8080"
+      - "-meta-addr=metad-1:8091"
+    ports:
+      - "8180:8080"
+    depends_on:
+      metad-1:
+        condition: service_healthy
+    networks:
+      - nufs-e2e-net
+    restart: unless-stopped
+
+# ==================== Volumes ====================
+volumes:
+  metad1-data:
+  metad1-raft:
+  metad2-data:
+  metad2-raft:
+  datanode1-data:
+  datanode2-data:
+  datanode3-data:
+
+# ==================== Networks ====================
+networks:
+  nufs-e2e-net:
+    driver: bridge
