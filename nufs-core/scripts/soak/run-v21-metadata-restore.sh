@@ -49,11 +49,15 @@ KEEP_ALIVE=0
 METAD_OPS_BASE=${SOAK_METAD_OPS_BASE:-18100}
 METAD_RAFT_BASE=${SOAK_METAD_RAFT_BASE:-18200}
 DATA_BASE=${SOAK_DATA_BASE:-18300}
-S3_LISTEN=${SOAK_S3_LISTEN:-18400}
+S3_LISTEN=${SOAK_S3_LISTEN:-18600}
 
 LOGS_BASE=${NUFS_TEST_LOG_ROOT:-/tmp/nufs-restore}
 [ -n "${NUFS_RESULTS_ROOT:-}" ] && RESULTS_ROOT="$NUFS_RESULTS_ROOT" || RESULTS_ROOT="${LOGS_BASE}/results"
 
+# 对象载荷：写入的对象内容（只关心元数据坐标入 raft，内容即载荷）
+PAYLOAD="nufs-metadata-restore-drill-payload"
+
+# （匿名网关，不需要凭据；保留示例密钥仅供审计/回放时显式切回签名模式用）
 ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
@@ -141,6 +145,24 @@ wait_http() { # url seconds name
   return 1
 }
 
+# 纯 TCP 端口探活（bare connect，不发送任何字节）。datanode 的 data listen 端口是
+# 二进制协议端口，用 curl/HTTP GET 去探会把 "GET " 解析成 1.2GB 的帧头
+# （header too large: 1195725856）并污染日志 —— 故与 leader-failover harness 一致，
+# 用裸 socket connect 判端口就绪。
+port_ready() { # port seconds name
+  local port="$1" secs="$2" name="$3" i
+  for i in $(seq 1 "$secs"); do
+    if python3 -c "import socket,sys
+s=socket.socket();s.settimeout(1)
+try: s.connect(('127.0.0.1',$port));sys.exit(0)
+except OSError:sys.exit(1)" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 current_leader() {
   local i body
   for i in $(seq 1 "$METAD_NODES"); do
@@ -161,6 +183,7 @@ kill_stale() {
   for p in $(seq "$METAD_OPS_BASE" $((METAD_OPS_BASE + 23))) \
            $(seq "$METAD_RAFT_BASE" $((METAD_RAFT_BASE + 23))) \
            $(seq "$DATA_BASE" $((DATA_BASE + 7))) \
+           $(seq $((DATA_BASE + 200)) $((DATA_BASE + 200 + 7))) \
            "$S3_LISTEN"; do
     [ -n "$(lsof -nP -iTCP:$p -sTCP:LISTEN 2>/dev/null)" ] && \
       lsof -nP -t -iTCP:$p -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null || true
@@ -209,33 +232,78 @@ start_cluster() {
   for n in $(seq 1 "$NODES"); do
     lp="$(data_pport "$n")"
     "$DATANODE_BIN" --node-id="$n" --listen="127.0.0.1:$lp" \
-      --register-addr="127.0.0.1:$lp" --ops-addr="127.0.0.1:$((DATA_BASE+100+$n-1))" \
+      --register-addr="127.0.0.1:$lp" --ops-addr="127.0.0.1:$((DATA_BASE+200+$n-1))" \
       --data-dirs="$(node_dirs "$n")" --metadata="127.0.0.1:$(metad_ops "$leader")" \
       --rack="rack$(( (n-1) % 3 + 1 ))" --zone="zone$(( (n-1) % 3 + 1 ))" \
       --storage-version=v2.1 --allow-insecure-dev --log-level=info \
       > "$LOG_ROOT/log/datanode$n.log" 2>&1 &
     echo $! > "$LOG_ROOT/run/datanode$n.pid"
   done
-  for n in $(seq 1 "$NODES"); do wait_http "http://127.0.0.1:$(data_pport "$n")/health" 30 "datanode$n"; done
+  # data listen 端口是二进制协议端口，需裸 TCP 探活（不能用 HTTP GET）
+  for n in $(seq 1 "$NODES"); do port_ready "$(data_pport "$n")" 40 "datanode$n" || die "datanode$n not listening"; done
 
+  # 匿名模式（不传 --access-key/--secret-key）：本演练只关心「元数据坐标提交到
+  # raft 多数派」这一事实，对象本身是载荷。配凭据会让网关强制 SigV4 签名
+  # （auth.go: HasCredentials→拒绝未签名请求→403），本地一次性演练无此必要，
+  # 匿名模式免去签名即可把坐标写进 raft。
   "$S3_BIN" --listen="127.0.0.1:$S3_LISTEN" --meta-addr="127.0.0.1:$(metad_ops "$leader")" \
-    --access-key="$ACCESS_KEY" --secret-key="$SECRET_KEY" \
-    --allow-insecure-dev --log-level=info \
+    --log-level=info \
     > "$LOG_ROOT/log/s3.log" 2>&1 &
   echo $! > "$LOG_ROOT/run/s3.pid"
-  wait_http "http://127.0.0.1:$S3_LISTEN/health" 30 s3
+  wait_http "http://127.0.0.1:$S3_LISTEN/healthz" 30 s3 || die "s3 not healthy"
 
   log "cluster up: metad=$METAD_NODES nodes=$NODES leader=meta-$leader gw=$S3_LISTEN"
 }
 
-# 写一个对象（经 s3 网关，元数据坐标落入 raft），返回真/假
+# 建桶：经 metad 的 /api/v1/buckets（这是建桶的权威路径，S3 网关的 PUT /bucket
+# 不负责建桶）——逐任一 act metad 入口（follower 会 307 重定向到 leader）。
+# object 写入要求 bucket 已存在，否则返回 ErrObjectBucketNotFound。
+#
+# 桶的复制因子必须 ≤ 在线 datanode 数：PlaceChunk 在 candidates*maxPerNode < RF 时
+# 返回 ErrInsufficientNodes("insufficient healthy nodes for placement") → allocation 500。
+# 本演练只关心「对象元数据坐标提交到 raft 多数派」，数据面副本数不是目标，故 RF 取
+# min(3, NODES)：NODES=1 时 RF=1（1 节点放 1 副本即可满足），多节点时惯例 RF=3。
+# （实测曾硬编码 RF=3 配 NODES=1 默认，导致 allocation 恒 500。）
+#
+# 注意：禁止在这里重复建同一桶。metad 的 bucket POST 对「已存在桶」返回 500
+# （ops_buckets.go 未把 ErrBucketExists 映射为 409），若每个 write_object 都重建桶，
+# 则第二次及以后调用会在建桶步全灭、从不发起 PUT —— 这正是层 1 after-kill 写
+# 一直失败、s3 日志却看不到任何 after-kill PUT 的根因。因此建桶只做一次。
+ensure_bucket() { # bucket
+  local bucket="$1" st ok cpu n rf
+  rf="$([ "$NODES" -ge 3 ] && echo 3 || echo "$NODES")"
+  st=0; ok=0
+  for n in $(seq 1 "$METAD_NODES"); do
+    cpu="$(curl -sS --max-time 5 -X POST -H 'Content-Type: application/json' \
+      --data "{\"name\":\"$bucket\",\"policy\":{\"replication_factor\":$rf}}" \
+      -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(metad_ops "$n")/api/v1/buckets" 2>/dev/null)" \
+      && st="$cpu" || continue
+    case "$st" in
+      201) ok=1; break;;      # created
+      200) ok=1; break;;      # idempotent ok
+      409) ok=1; break;;      # already exists
+      *) :;;                  # 其它（含已存在桶的 500）继续试下一个入口
+    esac
+  done
+  return $(( 1 - ok ))
+}
+
+# 写对象（经匿名 s3 网关，元数据坐标落入 raft）。前提：bucket 已由 ensure_bucket 建好。
+# datanode 注册/心跳（10s 间隔）落位到 metad 的 placement index 之前，
+# allocation 可能因节点尚未在线返回 500 —— 与 leader-failover harness 的
+# warmup 一致：自旋重试直到干净 200，既消化节点上线竞态也消化 raft 收敛。
 write_object() { # bucket key
-  local bucket="$1" key="$2"
-  curl -sf -X PUT -H "X-Owner: uid-0" \
-    "http://127.0.0.1:$S3_LISTEN/$bucket" >/dev/null 2>&1 || return 1
-  curl -sf -X PUT -H "X-Owner: uid-0" --data-binary "payload-$_LOG_TS" \
-    "http://127.0.0.1:$S3_LISTEN/$bucket/$key" >/dev/null 2>&1 || return 1
-  return 0
+  local bucket="$1" key="$2" i code
+  for i in $(seq 1 40); do
+    code="$(curl -s -X PUT -H "Content-Length: ${#PAYLOAD}" \
+      --data-binary "$PAYLOAD" \
+      -w '%{http_code}' -o /dev/null \
+      "http://127.0.0.1:$S3_LISTEN/$bucket/$key" 2>/dev/null)"
+    [ "$code" = "200" ] && return 0
+    [ "$i" -eq 20 ] && log "  write_object: waiting for placement (last http=$code)"
+    sleep 1
+  done
+  return 1
 }
 
 # 层 1: 单节点坏盘 —— 杀进程 + 整目录抹掉，断言多数派仍服务新写
@@ -246,6 +314,9 @@ run_layer1_baddisk() {
   # 挑一个非 leader 作为 victim（最坏情形：一条完整副本进程+盘全毁）
   local victim="$(( leader % METAD_NODES + 1 ))"
   [ "$victim" = "$leader" ] && { victim=1; [ "$victim" = "$leader" ] && victim=2; }
+
+  # 建桶仅一次（见 ensure_bucket 上方注释：已存在桶的 POST 会 500，不能每次 write 重建）
+  ensure_bucket "dr-$_LOG_TS" || die "ensure bucket dr-$_LOG_TS failed"
 
   write_object "dr-$_LOG_TS" "before-kill.txt" || die "write before kill failed"
 
