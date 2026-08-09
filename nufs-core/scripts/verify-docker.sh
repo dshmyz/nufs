@@ -24,11 +24,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
 
-# 复用宿主的 Go 缓存，让容器内 build/test 免重新下载依赖、免重编依赖
+# 缓存挂载策略：
+#   - GOMODCACHE：ro 挂宿主模块缓存。模块与 OS 无关、跨 run 复用，配合
+#     GOPROXY=off 免网络下载。只读安全。
+#   - GOCACHE：用可写命名卷 nufs-verify-gocache，而非宿主 GOCACHE。宿主是
+#     darwin 构建缓存，对容器内 linux 编译毫无复用价值，且 Go 必须把 linux
+#     编译产物写回缓存--ro 挂载会让 go build 立刻因 read-only file system
+#     失败。命名卷跨 run 复用 linux 编译缓存，且不污染宿主 darwin 缓存。
 GOMODCACHE_HOST="$(go env GOMODCACHE)"
-GOCACHE_HOST="$(go env GOCACHE)"
 [ -d "$GOMODCACHE_HOST" ] || { echo "GOMODCACHE 不存在: $GOMODCACHE_HOST" >&2; exit 2; }
-[ -d "$GOCACHE_HOST" ]    || mkdir -p "$GOCACHE_HOST"
 
 # 容器内固定路径
 SRC_DIR=/src
@@ -40,12 +44,12 @@ BIN_DIR=/nufs-bin   # drill 进程的 Linux 二进制落这里，不污染宿主
 GO_IMAGE="${NUFS_VERIFY_GO_IMAGE:-golang:1.26}"
 
 echo "== NUFS verify (Docker) image=$GO_IMAGE src=$CORE_DIR bin->container-local =="
-echo "   mounts: GOMODCACHE=$GOMODCACHE_HOST (ro), GOCACHE=$GOCACHE_HOST (ro)"
+echo "   mounts: GOMODCACHE=$GOMODCACHE_HOST (ro), GOCACHE=nufs-verify-gocache (named volume, rw)"
 
 exec docker run --rm \
   -v "$CORE_DIR":"$SRC_DIR" \
   -v "$GOMODCACHE_HOST":"$MOD":ro \
-  -v "$GOCACHE_HOST":"$CACHE":ro \
+  -v nufs-verify-gocache:"$CACHE" \
   -e GOMODCACHE="$MOD" \
   -e GOCACHE="$CACHE" \
   -e GOPROXY=off \
