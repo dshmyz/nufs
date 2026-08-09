@@ -112,6 +112,11 @@ make build          # 编译 bin/
 make test           # go test -race ./...
 make build-linux    # 交叉编译 linux/amd64 到 bin/linux-amd64/
 make lint / vet / fmt
+make verify         # 上线验收回归门禁：make verify [LEVEL=fast|drill|full]
+                    #   fast  = build/vet/fmt/全量单测（分包 -count=2 串行）
+                    #   drill = fast + 三个故障 drill（leader-failover/metadata-restore/chaos-soak）
+                    #   full  = drill + 长时/高 count P0 门禁（上线前跑）
+                    # 详见 scripts/verify.sh；上线验收项见 docs/runbooks/production-readiness-checklist.md
 ```
 
 安全约束：`gateway/s3/auth.go` 视为不可动（AWS 签名 `providedSig` 不进入任何日志/错误串），
