@@ -178,9 +178,14 @@ start_cluster() {
   for n in $(seq 1 "$METAD_NODES"); do
     local ops raft
     ops="$(metad_ops "$n")"; raft="$(metad_raft "$n")"
+    # 与 leader-failover/helm 生产形态一致：每节点都传 --raft-bootstrap=true，
+    # 但用 --raft-bootstrap-owner=meta-1 指定唯一自举 Owner，其余节点 defer（不自举、以空
+    # 配置启动，被 Owner 的 leader-driven reconcile 经 AddVoter 拉入投票组）。
+    # 若省略 owner，全部节点各自自举会在 1/1 quorum 下各自当选、term 冲突，形成三分裂
+    # "leadership lost while committing log" 死循环，永远选不出稳定 leader。
     "$METAD_BIN" --node-id="$n" --data-dir="$(metad_dir "$n")" \
       --ops-addr="127.0.0.1:$ops" \
-      --raft=true --raft-bootstrap=true --raft-addr="127.0.0.1:$raft" \
+      --raft=true --raft-bootstrap=true --raft-bootstrap-owner=meta-1 --raft-addr="127.0.0.1:$raft" \
       --raft-advertise-addr="127.0.0.1:$raft" \
       --raft-dir="$(metad_raftdir "$n")" \
       --raft-bootstrap-peers="$(raft_peer_desc)" \
