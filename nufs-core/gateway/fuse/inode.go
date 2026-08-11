@@ -304,6 +304,24 @@ func (f *DFSFile) spillOldestChunk() error {
 	return f.spillToDisk(oldest)
 }
 
+// recordFlushAttempt records a flush state transition in the write-attempt
+// ledger. This is best-effort: failure is logged but does not fail the flush,
+// because the ledger is for observability and crash recovery — not for
+// correctness (the inode update is the correctness boundary).
+func (f *DFSFile) recordFlushAttempt(ctx context.Context, attemptID string, meta *metadata.InodeMeta, state metadata.WriteAttemptState, lastErr string) {
+	chunks := make([]metadata.ChunkRef, len(meta.ChunkMap))
+	copy(chunks, meta.ChunkMap)
+	_ = f.fs.Meta().PutWriteAttempt(ctx, &metadata.ObjectWriteAttempt{
+		ID:         attemptID,
+		Bucket:     f.fs.bucketName,
+		InodeID:    f.inodeID,
+		InodeCTime: meta.CTime,
+		Chunks:     chunks,
+		State:      state,
+		LastError:  lastErr,
+	})
+}
+
 // cleanStagingDir removes all files in the staging directory. Called once
 // at Mount time to clean up orphaned files left by previous runs or crashes.
 // Files in active use belong to the current process (PID-unique path) or
@@ -938,6 +956,13 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	oldRefs := make([]metadata.ChunkRef, len(metaInode.ChunkMap))
 	copy(oldRefs, metaInode.ChunkMap)
 
+	// Write-attempt ledger: record flush state transitions for
+	// observability and crash recovery. The ObjectWriteRecoveryWorker
+	// (shared with S3) picks up incomplete attempts and cleans up
+	// orphaned chunks.
+	attemptID := fmt.Sprintf("fuse-%d-%d", f.inodeID, time.Now().UnixNano())
+	f.recordFlushAttempt(ctx, attemptID, metaInode, metadata.WriteAttemptPending, "")
+
 	policy := f.resolveChunkPolicy(ctx, metaInode)
 
 	// Determine the file size to persist. logicalSize tracks the high-water
@@ -1004,6 +1029,7 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 			chunks = append(chunks, batch...)
 			start = end
 		}
+		f.recordFlushAttempt(ctx, attemptID, metaInode, metadata.WriteAttemptChunksAllocated, "")
 
 		// Write each dirty chunk. Buffers already have committed data loaded
 		// (via loadCommittedChunkLocked), so they are complete images.
@@ -1072,6 +1098,9 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 		}
 	}
 
+	// All chunks written to datanode (durable). Record before updating inode.
+	f.recordFlushAttempt(ctx, attemptID, metaInode, metadata.WriteAttemptChunksDurable, "")
+
 	// Build new ChunkMap: preserve untouched committed chunks + add written chunks.
 	// Untouched committed chunks are NOT loaded into memory — just copied as refs.
 	writtenSet := make(map[int64]bool, len(written))
@@ -1103,9 +1132,14 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	if err := f.reliability.DoMeta("flush", func() error {
 		return f.fs.Meta().UpdateInode(ctx, metaInode)
 	}); err != nil {
+		f.recordFlushAttempt(ctx, attemptID, metaInode, metadata.WriteAttemptRecoveryNeeded, err.Error())
 		rec.IncOpError("flush")
 		return syscall.EIO
 	}
+
+	// Flush succeeded: mark attempt committed so recovery worker knows
+	// this inode's chunk references are authoritative.
+	f.recordFlushAttempt(ctx, attemptID, metaInode, metadata.WriteAttemptCommitted, "")
 
 	// Reclaim the superseded chunks.
 	for _, cref := range oldRefs {
