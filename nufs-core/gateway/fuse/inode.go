@@ -150,20 +150,6 @@ var _ = (fs.NodeAllocater)((*DFSFile)(nil))
 // Chunk-level buffer helpers
 // =====================================================================
 
-// effectiveSize returns the file's logical size, accounting for any
-// un-flushed tail that extends past the committed size. Must be called
-// with f.mu held.
-func (f *DFSFile) effectiveSize() int64 {
-	maxEnd := int64(0)
-	for base := range f.chunkBufs {
-		end := base + int64(len(f.chunkBufs[base]))
-		if end > maxEnd {
-			maxEnd = end
-		}
-	}
-	return maxEnd
-}
-
 // chunkBase returns the base offset of the 64-MiB chunk that contains off.
 func chunkBase(off int64) int64 {
 	return (off / MaxChunkPayload) * MaxChunkPayload
