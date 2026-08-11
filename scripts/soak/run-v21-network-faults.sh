@@ -148,9 +148,13 @@ scenario_partition_leader() {
     # Write baseline data
     write_test_data "scenario1-before" 10
 
-    # Start netem sidecar to partition leader
+    # Start netem sidecar to partition leader.
+    # --cap-add=NET_ADMIN is required: the sidecar shares the metad netns and
+    # `tc qdisc add` refuses to run without CAP_NET_ADMIN (Docker drops it by
+    # default). Without it the partition never takes effect and the scenario
+    # reports a vacuous PASS against a healthy cluster.
     log "Starting partition on leader..."
-    docker run -d --name netem-partition-leader \
+    docker run -d --cap-add=NET_ADMIN --name netem-partition-leader \
         --net container:"$LEADER_CONTAINER" \
         --pid container:"$LEADER_CONTAINER" \
         nufs-netem:latest partition
@@ -181,8 +185,12 @@ scenario_partition_leader() {
     # Check health during partition
     local health_errors=$(check_health)
 
-    # Remove partition
+    # Remove partition. The drop-100% rule lives in the metad's shared netns, so
+    # first delete it explicitly via the sidecar (which still holds NET_ADMIN in
+    # that netns), then stop the container. Both the sidecar's SIGTERM trap and
+    # this explicit `reset` make the cleanup robust.
     log "Removing partition..."
+    docker exec netem-partition-leader /scripts/netem-apply.sh reset 2>/dev/null || true
     docker stop netem-partition-leader 2>/dev/null || true
     docker rm netem-partition-leader 2>/dev/null || true
 
@@ -233,9 +241,10 @@ scenario_partition_minority() {
     # Write baseline data
     write_test_data "scenario2-before" 10
 
-    # Start netem sidecar to partition non-leader
+    # Start netem sidecar to partition non-leader (see scenario 1 for why
+    # --cap-add=NET_ADMIN is required).
     log "Starting partition on non-leader..."
-    docker run -d --name netem-partition-minority \
+    docker run -d --cap-add=NET_ADMIN --name netem-partition-minority \
         --net container:"$NON_LEADER_CONTAINER" \
         --pid container:"$NON_LEADER_CONTAINER" \
         nufs-netem:latest partition
@@ -266,8 +275,10 @@ scenario_partition_minority() {
     # Check health during partition
     local health_errors=$(check_health)
 
-    # Remove partition
+    # Remove partition. The drop-100% rule lives in the non-leader's shared
+    # netns; reset it explicitly before stopping the container.
     log "Removing partition..."
+    docker exec netem-partition-minority /scripts/netem-apply.sh reset 2>/dev/null || true
     docker stop netem-partition-minority 2>/dev/null || true
     docker rm netem-partition-minority 2>/dev/null || true
 
@@ -298,15 +309,15 @@ scenario_loss_latency() {
     # Write baseline data
     write_test_data "scenario3-before" 10
 
-    # Start netem sidecar on first datanode
+    # Start netem sidecar on first datanode. Use the combined `losslat` command
+    # so packet loss and latency are applied as ONE root qdisc — issuing loss and
+    # delay as two separate `tc qdisc add ... root` calls fails with "File exists"
+    # (a netns holds a single root qdisc), silently dropping the latency half.
     log "Starting packet loss + latency injection..."
-    docker run -d --name netem-loss-latency \
+    docker run -d --cap-add=NET_ADMIN --name netem-loss-latency \
         --net container:nufs-datanode-1 \
         --pid container:nufs-datanode-1 \
-        nufs-netem:latest loss 20 60
-
-    # Also add latency
-    docker exec netem-loss-latency sh -c "tc qdisc add dev eth0 root netem delay 50ms" 2>/dev/null || true
+        nufs-netem:latest losslat 20 50ms 60
 
     # Wait for effects to take place
     sleep 5
@@ -334,8 +345,11 @@ scenario_loss_latency() {
     # Check health during loss+latency
     local health_errors=$(check_health)
 
-    # Remove injection
+    # Remove injection. The qdisc lives in the datanode's shared netns; the
+    # losslat command has a 60s auto-remove, but reset explicitly in case the
+    # drill is still within that window.
     log "Removing packet loss + latency..."
+    docker exec netem-loss-latency /scripts/netem-apply.sh reset 2>/dev/null || true
     docker stop netem-loss-latency 2>/dev/null || true
     docker rm netem-loss-latency 2>/dev/null || true
 

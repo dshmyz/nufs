@@ -66,6 +66,9 @@ func main() {
 		tlsRequireClientCert = flag.Bool("tls-require-client-cert", false, "Require clients to present a certificate signed by tls-ca")
 		tlsSkipVerify        = flag.Bool("tls-skip-verify", false, "Skip TLS server certificate verification (dev only)")
 		authToken            = flag.String("auth-token", "", "Bearer token for ops API auth (empty = no auth)")
+		tokenSigningKey      = flag.String("token-signing-key", "", "HMAC key for signing mount auth tokens (shared with nufs-fuse: must be set to authenticate mounts)")
+		tokenSigningKeyPrev  = flag.String("token-signing-key-previous", "", "Superseded HMAC key still accepted for verification during a key rotation (never used to mint new tokens)")
+		devSeedCred          = flag.String("dev-seed-cred", "", "Dev only: seed a credential as <access-key>:<secret-key> on startup (never use in production)")
 		allowInsecureDev     = flag.Bool("allow-insecure-dev", false, "Allow running without auth, TLS, or multi-node Raft (dev only)")
 		backupEnabled        = flag.Bool("backup-enabled", false, "Enable leader-only metadata backups")
 		backupLocalDir       = flag.String("backup-local-dir", "/var/lib/dfs/backup-tmp", "Local temporary directory for metadata backups")
@@ -84,10 +87,13 @@ func main() {
 		traceInsecure        = flag.Bool("trace-insecure", true, "Use insecure OTLP connection")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON              = flag.Bool("log-json", false, "JSON log output")
+		logFile              = flag.String("log-file", "", "Log file path (empty = stderr)")
+		logMaxSize           = flag.Int("log-max-size", 100, "Max log file size in MB before rotation")
+		logMaxBackups        = flag.Int("log-max-backups", 7, "Max number of rotated log files to keep")
 	)
-	_ = configPath
 	config.Preload()
 	flag.Parse()
+
 	if *restoreMinReplicas < 1 {
 		fmt.Fprintln(os.Stderr, "invalid restore readiness configuration: --restore-minimum-readable-replicas must be at least 1")
 		os.Exit(1)
@@ -131,8 +137,40 @@ func main() {
 		os.Exit(1)
 	}
 
-	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})
+	logging.Init(logging.Config{
+		Level:      *logLevel,
+		JSON:       *logJSON,
+		AddSource:  true,
+		LogFile:    *logFile,
+		MaxSize:    int64(*logMaxSize) * 1024 * 1024, // flag is MB, Config takes bytes
+		MaxBackups: *logMaxBackups,
+	})
 	log := logging.Named("metad")
+
+	// Warn when secrets are passed via CLI (visible in ps(1)).
+	// Prefer env vars or --config file for production deployments.
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "--token-signing-key=") || strings.HasPrefix(arg, "--auth-token=") {
+			log.Warn("secret passed via CLI flag — visible in ps(1); prefer env or --config file in production")
+			break
+		}
+	}
+
+	// Signing-key rotation is "new key current, old key still verifiable".
+	// A previous key with no current key would mint tokens with the key we are
+	// trying to retire; an equal pair means the rotation never actually moved.
+	if *tokenSigningKeyPrev != "" {
+		if *tokenSigningKey == "" {
+			fmt.Fprintln(os.Stderr, "invalid configuration: --token-signing-key-previous requires --token-signing-key (the new key mints tokens; the previous one is verify-only)")
+			os.Exit(1)
+		}
+		if *tokenSigningKeyPrev == *tokenSigningKey {
+			fmt.Fprintln(os.Stderr, "invalid configuration: --token-signing-key-previous must differ from --token-signing-key")
+			os.Exit(1)
+		}
+		log.Warn("token signing key rotation active — remove --token-signing-key-previous after the longest token TTL has elapsed",
+			"token_ttl", metadata.DefaultTokenTTL())
+	}
 
 	// Production safety validation: ensure auth, TLS, and Raft are configured
 	// before starting the service. Can be bypassed with --allow-insecure-dev.
@@ -161,6 +199,7 @@ func main() {
 		RaftNodeCount:    raftNodeCount,
 		TLSEnabled:       *tlsCert != "",
 		AllowInsecureDev: *allowInsecureDev,
+		TokenSigningKey:  *tokenSigningKey,
 	}); err != nil {
 		log.Error("production config validation failed", "error", err)
 		os.Exit(1)
@@ -218,6 +257,27 @@ func main() {
 		}
 		dataStore = sharded
 		log.Info("sharded data plane active", "shards", *shards, "dir", *dataDir)
+	}
+
+	// Dev-only bootstrap: seed the first access credential so a local mount
+	// can exchange it for a signed token. Never enabled in production — the
+	// production config validation below rejects --allow-insecure-dev.
+	if *allowInsecureDev && *devSeedCred != "" {
+		ak, sk, ok := strings.Cut(*devSeedCred, ":")
+		if !ok || ak == "" || sk == "" {
+			log.Error("malformed --dev-seed-cred, want <access-key>:<secret-key>")
+			os.Exit(1)
+		}
+		hash, err := metadata.HashSecret(sk)
+		if err != nil {
+			log.Error("failed to hash dev seed secret", "error", err)
+			os.Exit(1)
+		}
+		if err := store.PutCredential(context.Background(), metadata.Credential{AccessKey: ak, SecretHash: hash}); err != nil {
+			log.Error("failed to seed dev credential", "access_key", ak, "error", err)
+			os.Exit(1)
+		}
+		log.Info("seeded dev credential", "access_key", ak)
 	}
 
 	var raftNode *metadata.RaftNode
@@ -412,6 +472,7 @@ func main() {
 		})
 	}
 	registerOpsHandlers(mux, store, dataStore, bundle, advertiseOpsURL, backupDeps...)
+	registerOpsAuthHandlers(mux, store, *tokenSigningKey)
 
 	admin := newAdminServer(store, bundle)
 	admin.RegisterRoutes(mux)
@@ -429,18 +490,26 @@ func main() {
 	// Initialize graceful shutdown drain and wire it into request handling.
 	drain := metadata.NewShutdownDrain(15 * time.Second)
 	public := map[string]struct{}{
-		"/health":         {},
-		"/healthz":        {},
-		"/ready":          {},
-		"/metrics":        {},
-		"/api/v1/metrics": {},
-		"/api/v1/health":  {},
-		"/version":        {},
+		"/health":            {},
+		"/healthz":           {},
+		"/ready":             {},
+		"/metrics":           {},
+		"/api/v1/metrics":    {},
+		"/api/v1/health":     {},
+		"/version":           {},
+		"/api/v1/auth/token": {}, // self-authenticating: accessKey/secretKey in body
 	}
 	var handler http.Handler = rejectEmptyBucketQuotaPath(drain.Middleware(public, mux))
-	if *authToken != "" {
-		log.Info("auth token enabled for ops API")
-		handler = internalhttp.BearerAuth(*authToken, public, handler)
+	if *authToken != "" || *tokenSigningKey != "" {
+		signingKeys := []string{*tokenSigningKey}
+		if *tokenSigningKeyPrev != "" {
+			signingKeys = append(signingKeys, *tokenSigningKeyPrev)
+		}
+		log.Info("auth enabled for ops API",
+			"simple_token", *authToken != "",
+			"signed_token", *tokenSigningKey != "",
+			"rotation_previous_key", *tokenSigningKeyPrev != "")
+		handler = internalhttp.BearerAuth(*authToken, signingKeys, public, handler)
 	}
 
 	// Rate limiting middleware: 100 req/s, burst 200

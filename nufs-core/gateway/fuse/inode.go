@@ -6,6 +6,9 @@ import (
 	"context"
 	"fmt"
 	"hash/crc32"
+	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -29,6 +32,13 @@ var readBufPool = sync.Pool{
 		return &buf
 	},
 }
+
+// directIOEnabled controls whether Open returns FOPEN_DIRECT_IO,
+// bypassing the kernel page cache. Set via SetDirectIO before mounting.
+var directIOEnabled atomic.Bool
+
+// SetDirectIO enables or disables DirectIO for all subsequent Open calls.
+func SetDirectIO(enabled bool) { directIOEnabled.Store(enabled) }
 
 // ========== DFSFile: regular file inode ==========
 
@@ -66,7 +76,7 @@ func (f *DFSFile) resolveChunkPolicy(ctx context.Context, inode *metadata.InodeM
 	var bucket *metadata.BucketInfo
 	if err := f.reliability.DoMeta("flush", func() error {
 		var gerr error
-		bucket, gerr = f.meta.GetBucketByRoot(ctx, inode.BucketRoot)
+		bucket, gerr = f.fs.Meta().GetBucketByRoot(ctx, inode.BucketRoot)
 		return gerr
 	}); err != nil {
 		logf("flush: get bucket by root %d for policy lookup: %v — using default", inode.BucketRoot, err)
@@ -79,7 +89,10 @@ func (f *DFSFile) resolveChunkPolicy(ctx context.Context, inode *metadata.InodeM
 type DFSFile struct {
 	fs.Inode
 
-	meta       metadata.MetadataService
+	// fs is the owning filesystem root. It is a stable pointer across
+	// metadata hot-swaps (SwapMetadata), so per-inode methods resolve the
+	// current metadata service via fs.Meta() rather than caching it.
+	fs         *DFSFileSystem
 	chunkStore chunkstore.ChunkStore
 	cache      *ChunkCache
 	inodeID    metadata.InodeID
@@ -98,18 +111,28 @@ type DFSFile struct {
 	// nil 时为 passthrough 模式（直接调用 fn），兼容旧测试。
 	reliability *ReliabilityWrapper
 
-	// Write buffer for small writes before flush
-	mu     sync.Mutex
-	dirty  bool
-	buffer []byte
-
-	// loaded reports whether buffer, when non-nil, holds a faithful image
-	// of the file's *committed* prefix [0, committedSize). It is false right
-	// after a Flush (buffer reset) and true once the buffer has either been
-	// hydrated from the chunk store or fully overwritten from offset 0.
-	// Guards against a write/append at a nonzero offset rebuilding the whole
-	// file from an empty buffer and zeroing the committed prefix.
-	loaded bool
+	// Write buffer for small writes before flush. Instead of one flat
+	// []byte covering the whole file (OOM-prone for large files),
+	// chunkBufs holds only the 64-MiB chunks that have actually been
+	// written to. Memory use = accessed_chunks × 64 MiB, not file_size.
+	// Flush merges dirty chunks with committed data and preserves
+	// untouched committed chunks in the ChunkMap.
+	mu        sync.RWMutex
+	dirty     bool
+	chunkBufs map[int64][]byte // chunkBaseOffset → data buffer
+	dirtyMap  map[int64]bool   // chunkBaseOffset → has unflushed writes
+	// dirtyBytes tracks the current memory held by chunkBufs.
+	// Checked against f.fs.maxDirtyBytes before allocating new buffers.
+	dirtyBytes int64
+	// spilledChunks tracks dirty chunks that have been spilled from memory
+	// to disk staging files. Key is chunk base offset, value is staging file path.
+	spilledChunks map[int64]string
+	// spilledBytes tracks total bytes held by staging files on disk.
+	spilledBytes int64
+	// logicalSize tracks the actual high-water mark of all writes (not
+	// chunk-aligned). This is the true file size when dirty, independent
+	// of the 64-MiB chunk buffer allocation. Must be called with f.mu held.
+	logicalSize int64
 }
 
 var _ = (fs.NodeOpener)((*DFSFile)(nil))
@@ -122,6 +145,186 @@ var _ = (fs.NodeFlusher)((*DFSFile)(nil))
 var _ = (fs.NodeReleaser)((*DFSFile)(nil))
 var _ = (fs.NodeAccesser)((*DFSFile)(nil))
 var _ = (fs.NodeAllocater)((*DFSFile)(nil))
+
+// =====================================================================
+// Chunk-level buffer helpers
+// =====================================================================
+
+// effectiveSize returns the file's logical size, accounting for any
+// un-flushed tail that extends past the committed size. Must be called
+// with f.mu held.
+func (f *DFSFile) effectiveSize() int64 {
+	maxEnd := int64(0)
+	for base := range f.chunkBufs {
+		end := base + int64(len(f.chunkBufs[base]))
+		if end > maxEnd {
+			maxEnd = end
+		}
+	}
+	return maxEnd
+}
+
+// chunkBase returns the base offset of the 64-MiB chunk that contains off.
+func chunkBase(off int64) int64 {
+	return (off / MaxChunkPayload) * MaxChunkPayload
+}
+
+// getChunk returns the chunk buffer at base, allocating a zero-filled
+// 64-MiB buffer if it doesn't exist yet. Must be called with f.mu held.
+func (f *DFSFile) getChunk(base int64) []byte {
+	if f.chunkBufs == nil {
+		f.chunkBufs = make(map[int64][]byte)
+	}
+	c, ok := f.chunkBufs[base]
+	if !ok {
+		c = make([]byte, MaxChunkPayload)
+		f.chunkBufs[base] = c
+		f.dirtyBytes += int64(MaxChunkPayload)
+	}
+	return c
+}
+
+// markDirty marks the chunk at base as having unflushed writes.
+func (f *DFSFile) markDirty(base int64) {
+	if f.dirtyMap == nil {
+		f.dirtyMap = make(map[int64]bool)
+	}
+	f.dirtyMap[base] = true
+	f.dirty = true
+}
+
+// clearChunks releases all chunk buffers and dirty state. Called after
+// a successful Flush or on Release. Also cleans up any staging files
+// left by disk spill.
+func (f *DFSFile) clearChunks() {
+	f.cleanupStaging()
+	f.chunkBufs = nil
+	f.dirtyMap = nil
+	f.dirty = false
+	f.dirtyBytes = 0
+	f.spilledBytes = 0
+	f.logicalSize = 0
+}
+
+// stagingPath returns the staging file path for a spilled chunk.
+func (f *DFSFile) stagingPath(base int64) string {
+	return fmt.Sprintf("%s/%d_%d.dat", f.fs.writeStagingDir, f.inodeID, base)
+}
+
+// spillToDisk moves the dirty chunk buffer at base from memory to a disk
+// staging file. The caller must hold f.mu. The chunk is removed from
+// chunkBufs and the global dirty counter is decremented.
+func (f *DFSFile) spillToDisk(base int64) error {
+	if f.fs.writeStagingDir == "" {
+		return fmt.Errorf("spill: staging dir not configured")
+	}
+	buf, ok := f.chunkBufs[base]
+	if !ok {
+		return nil // nothing to spill
+	}
+	path := f.stagingPath(base)
+	if err := os.WriteFile(path, buf, 0600); err != nil {
+		return fmt.Errorf("spill chunk %d: %w", base, err)
+	}
+	delete(f.chunkBufs, base)
+	f.dirtyBytes -= int64(len(buf))
+	f.spilledBytes += int64(len(buf))
+	f.fs.globalDirtyBytes.Add(-int64(len(buf)))
+	if f.spilledChunks == nil {
+		f.spilledChunks = make(map[int64]string)
+	}
+	f.spilledChunks[base] = path
+	return nil
+}
+
+// loadFromDisk loads a spilled chunk from its staging file back into memory.
+// The caller must hold f.mu. Returns the loaded buffer.
+func (f *DFSFile) loadFromDisk(base int64) ([]byte, error) {
+	path, ok := f.spilledChunks[base]
+	if !ok {
+		return nil, fmt.Errorf("loadFromDisk: base %d not in staging", base)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("load staging %d: %w", base, err)
+	}
+	// Remove staging file and tracking state.
+	_ = os.Remove(path)
+	delete(f.spilledChunks, base)
+	f.spilledBytes -= int64(len(data))
+	// Put back into memory — use getChunk's raw allocation to avoid
+	// triggering another spill loop.
+	if f.chunkBufs == nil {
+		f.chunkBufs = make(map[int64][]byte)
+	}
+	f.chunkBufs[base] = data
+	f.dirtyBytes += int64(len(data))
+	f.fs.globalDirtyBytes.Add(int64(len(data)))
+	return data, nil
+}
+
+// cleanupStaging removes all staging files for this inode. Called on
+// clearChunks (flush/release) to ensure no orphans are left on disk.
+// MUST be called with f.mu held (all callers go through Flush which
+// acquires f.mu).
+func (f *DFSFile) cleanupStaging() {
+	for base, path := range f.spilledChunks {
+		_ = os.Remove(path)
+		delete(f.spilledChunks, base)
+	}
+	f.spilledBytes = 0
+}
+
+// spillOldestChunk spills the dirty chunk with the lowest base offset
+// from memory to disk staging. Returns nil if no spill was needed.
+// No-op if staging is not configured or no chunks can be spilled.
+// Must be called with f.mu held.
+//
+// DESIGN NOTE: when the global dirty budget is exceeded, we only spill
+// from the current file (the one pushing over the limit), not from
+// other files. This matches the Linux kernel's vm.dirty_ratio behavior:
+// the writing task that pushes over the limit is throttled, not other
+// tasks' dirty pages. Cross-file eviction is possible but adds lock
+// ordering complexity with minimal benefit — the current-file approach
+// is sufficient backpressure.
+func (f *DFSFile) spillOldestChunk() error {
+	if f.fs.writeStagingDir == "" || len(f.chunkBufs) == 0 {
+		return nil
+	}
+	// Find the dirty chunk with the lowest base offset.
+	var oldest int64 = -1
+	for base := range f.dirtyMap {
+		if oldest < 0 || base < oldest {
+			oldest = base
+		}
+	}
+	if oldest < 0 {
+		return nil // no dirty chunks to spill
+	}
+	return f.spillToDisk(oldest)
+}
+
+// cleanStagingDir removes all files in the staging directory. Called once
+// at Mount time to clean up orphaned files left by previous runs or crashes.
+// Files in active use belong to the current process (PID-unique path) or
+// have been cleaned by clearChunks, so this only runs at startup.
+func cleanStagingDir(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return // dir doesn't exist or can't be read — nothing to clean
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+}
+
+// ensureChunksLoadedInRange is DEPRECATED — writes no longer need pre-loading.
+// Flush handles merging dirty data with committed chunks.
+func (f *DFSFile) ensureChunksLoadedInRange(ctx context.Context, start, end int64, rec MetricsRecorder) error {
+	return nil // no-op: flush handles merge
+}
 
 // FALLOC_FL_* mode bits for NodeAllocater.Allocate. The syscall package on
 // Linux does not export these (they live in golang.org/x/sys/unix), so we
@@ -150,10 +353,55 @@ type DFSFileHandle struct {
 	lockAcquired bool
 }
 
+// checkOpenAccess verifies that the caller's uid/gid has the POSIX permission
+// bits required by the open flags (read/write), mirroring the implicit
+// permission check the kernel performs for access(2) but not for open(2) when
+// a filesystem implements NodeAccesser.
+func (f *DFSFile) checkOpenAccess(ctx context.Context, flags uint32) syscall.Errno {
+	caller, ok := ctx.(*fuse.Context)
+	if !ok {
+		return 0
+	}
+	metaInode, err := f.fs.Meta().GetInode(ctx, f.inodeID)
+	if err != nil {
+		return syscall.EIO
+	}
+	perm := metaInode.Mode & 0o7777 // mask to permission + sticky/setuid/setgid bits
+
+	// Map open flags to the 3-bit R/W/X mask that hasPOSIXAccess expects
+	// (it applies the owner/group/other shift internally).
+	var mask uint32
+	switch flags & (syscall.O_RDONLY | syscall.O_WRONLY | syscall.O_RDWR) {
+	case syscall.O_WRONLY, syscall.O_RDWR:
+		mask = 0o2 // W_OK
+	case syscall.O_RDONLY:
+		mask = 0o4 // R_OK
+	}
+	if mask == 0 {
+		return 0
+	}
+	if hasPOSIXAccess(caller.Uid, caller.Gid, metaInode.UID, metaInode.GID, perm, mask) {
+		return 0
+	}
+	return syscall.EACCES
+}
+
 // Open opens the file.
 func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	rec := recorderFor(f.recorder)
 	rec.IncOp("open")
+	start := time.Now()
+	defer func() { rec.ObserveOpLatency("open", time.Since(start)) }()
+
+	// POSIX requires open(2) to check the requested access mode (read/write)
+	// against the file's permission bits before allowing the file descriptor to
+	// be returned.  This is the same check access(2) would perform for the
+	// corresponding R_OK / W_OK probe, but enforced synchronously on open so
+	// that a mode-0000 file cannot be opened for reading or writing.
+	if errno := f.checkOpenAccess(ctx, flags); errno != 0 {
+		rec.IncOpError("open")
+		return nil, 0, errno
+	}
 
 	// Linux delivers open(2)'s O_TRUNC via the Open flags (the kernel does not
 	// issue a separate SETATTR for it), so the filesystem must perform the
@@ -171,16 +419,16 @@ func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fus
 	// Acquire an advisory file lock.  O_WRONLY|O_RDWR → exclusive;
 	// O_RDONLY → shared.  An empty lockOwner (unit tests that supply
 	// no lock manager) skips locking entirely.
-	if f.lockOwner != "" && f.meta != nil {
+	if f.lockOwner != "" && f.fs != nil {
 		isWrite := (flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0)
 		if isWrite {
-			if err := f.meta.AdvisoryLock(ctx, f.inodeID, f.lockOwner); err != nil {
+			if err := f.fs.Meta().AdvisoryLock(ctx, f.inodeID, f.lockOwner); err != nil {
 				logf("open: advisory lock %d: %v", f.inodeID, err)
 				rec.IncOpError("open")
 				return nil, 0, syscall.EIO
 			}
 		} else {
-			if err := f.meta.AdvisoryLockShared(ctx, f.inodeID, f.lockOwner); err != nil {
+			if err := f.fs.Meta().AdvisoryLockShared(ctx, f.inodeID, f.lockOwner); err != nil {
 				logf("open: advisory shared lock %d: %v", f.inodeID, err)
 				rec.IncOpError("open")
 				return nil, 0, syscall.EIO
@@ -189,7 +437,10 @@ func (f *DFSFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fus
 		h.lockAcquired = true
 	}
 
-	return h, 0, 0
+	if directIOEnabled.Load() {
+		fuseFlags = fuse.FOPEN_DIRECT_IO
+	}
+	return h, fuseFlags, 0
 }
 
 // truncateOnOpen implements O_TRUNC semantics for Open: the file becomes
@@ -207,7 +458,7 @@ func (f *DFSFile) truncateOnOpen(ctx context.Context, rec MetricsRecorder) sysca
 	var metaInode *metadata.InodeMeta
 	if err := f.reliability.DoMeta("truncate", func() error {
 		var gerr error
-		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
+		metaInode, gerr = f.fs.Meta().GetInode(ctx, f.inodeID)
 		return gerr
 	}); err != nil {
 		logf("open otrunc: get inode %d: %v", f.inodeID, err)
@@ -215,16 +466,17 @@ func (f *DFSFile) truncateOnOpen(ctx context.Context, rec MetricsRecorder) sysca
 	}
 
 	f.mu.Lock()
-	f.buffer = nil
-	f.dirty = true
-	f.loaded = true
+	f.chunkBufs = nil
+	f.dirtyMap = nil
+	f.dirty = true // truncation needs to be flushed
+	f.logicalSize = 0
 	metaInode.Size = 0
 	metaInode.MTime = time.Now().UnixNano()
 	metaInode.CTime = time.Now().UnixNano()
 	f.mu.Unlock()
 
 	if err := f.reliability.DoMeta("truncate", func() error {
-		return f.meta.UpdateInode(ctx, metaInode)
+		return f.fs.Meta().UpdateInode(ctx, metaInode)
 	}); err != nil {
 		logf("open otrunc: update inode %d: %v", f.inodeID, err)
 		return syscall.EIO
@@ -233,35 +485,35 @@ func (f *DFSFile) truncateOnOpen(ctx context.Context, rec MetricsRecorder) sysca
 }
 
 // Read reads data from the file. The returned window is the merged view of
-// the committed chunk store and any un-flushed buffered writes: a buffered
-// (dirty) region is authoritative over the committed bytes it overlaps, so a
+// the in-memory chunk buffers (dirty writes) and the committed chunk store:
+// a dirty chunk is authoritative over the committed bytes it overlaps, so a
 // read immediately after a write (before Flush) sees the new data rather than
-// stale committed content. (Same-class fix as the buffer hydration work.)
+// stale committed content. Memory use is proportional to the number of
+// accessed chunks (×64 MiB), not the total file size.
 func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	rec := recorderFor(f.recorder)
 	rec.IncOp("read")
+	start := time.Now()
+	defer func() { rec.ObserveOpLatency("read", time.Since(start)) }()
 
 	var metaInode *metadata.InodeMeta
 	if err := f.reliability.DoMeta("read", func() error {
 		var gerr error
-		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
+		metaInode, gerr = f.fs.Meta().GetInode(ctx, f.inodeID)
 		return gerr
 	}); err != nil {
 		rec.IncOpError("read")
 		return nil, syscall.EIO
 	}
 
-	// f.mu guards the dirty buffer. A read races a concurrent Write/Flush
-	// on f.buffer otherwise, so the whole window resolution runs under it.
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 
-	// Effective file size accounts for an un-flushed buffered tail that
-	// extends past the committed size (e.g. after an O_APPEND write). A read
-	// must be able to see bytes a process wrote but hasn't fsync/flushed.
-	size := metaInode.Size
-	if int64(len(f.buffer)) > size {
-		size = int64(len(f.buffer))
+	// Effective file size accounts for un-flushed buffered tail that
+	// extends past the committed size (e.g. after an O_APPEND write).
+	size := int64(metaInode.Size)
+	if f.logicalSize > size {
+		size = f.logicalSize
 	}
 	if off >= size {
 		return fuse.ReadResultData(nil), 0
@@ -271,152 +523,127 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 		end = size
 	}
 
-	// Dirty buffer present: it is a faithful image of the committed prefix
-	// [0, committed) (writeLocked / ensureHydratedLocked keep loaded=true
-	// whenever buffer is non-nil) plus any dirty tail, so it is authoritative
-	// for the whole window up to its end. Anything past the buffer is a hole.
-	// ensureHydratedLocked is a defensive re-check of the invariant: it is a
-	// no-op when the buffer already covers committed content.
-	if len(f.buffer) > 0 {
-		if err := f.ensureHydratedLocked(ctx, rec); err != nil {
-			rec.IncOpError("read")
-			return nil, syscall.EIO
-		}
-		out := make([]byte, end-off)
-		bufStart := int(off)
-		if bufStart < 0 {
-			bufStart = 0
-		}
-		if bufStart < len(f.buffer) {
-			n := len(f.buffer) - bufStart
-			if n > len(out) {
-				n = len(out)
+	// Fast path: empty ChunkMap + no dirty chunks = every byte is a hole.
+	if len(metaInode.ChunkMap) == 0 && len(f.chunkBufs) == 0 {
+		return fuse.ReadResultData(make([]byte, end-off)), 0
+	}
+
+	// readChunkRange reads committed data for [start, end) from the ChunkMap.
+	// Returns the bytes and advances next. Caller holds f.mu.
+	readChunkRange := func(start, end int64) []byte {
+		result := make([]byte, 0, end-start)
+		pos := start
+		for pos < end {
+			// Find committed chunk overlapping [pos, end)
+			found := false
+			for _, cref := range metaInode.ChunkMap {
+				cEnd := cref.Offset + int64(cref.Length)
+				if cEnd <= pos || cref.Offset >= end {
+					continue
+				}
+				// Fetch committed payload
+				var payload []byte
+				if f.cache != nil {
+					if p, ok := f.cache.Get(uint64(cref.ID)); ok {
+						payload = p
+					}
+				}
+				if payload == nil {
+					var chunk *metadata.ChunkMeta
+					if err := f.reliability.DoMeta("read", func() error {
+						var gerr error
+						chunk, gerr = f.fs.Meta().GetChunk(ctx, cref.ID)
+						return gerr
+					}); err != nil {
+						return nil
+					}
+					if err := f.reliability.DoChunk("read", func() error {
+						var gerr error
+						payload, gerr = f.chunkStore.ReadChunk(ctx, chunk)
+						return gerr
+					}); err != nil {
+						return nil
+					}
+					if f.cache != nil {
+						f.cache.Add(uint64(cref.ID), payload)
+					}
+				}
+				// Zero-fill gap before this chunk
+				if cref.Offset > pos {
+					gap := cref.Offset - pos
+					if gap > end-pos {
+						gap = end - pos
+					}
+					result = append(result, make([]byte, gap)...)
+					pos += gap
+				}
+				relStart := pos - cref.Offset
+				relEnd := end - cref.Offset
+				if relEnd > int64(cref.Length) {
+					relEnd = int64(cref.Length)
+				}
+				if relEnd > int64(len(payload)) {
+					relEnd = int64(len(payload))
+				}
+				if relStart < relEnd {
+					result = append(result, payload[relStart:relEnd]...)
+					pos += relEnd - relStart
+				}
+				found = true
+				break
 			}
-			copy(out, f.buffer[bufStart:bufStart+n])
+			if !found {
+				// Hole: no chunk covers this region
+				gap := end - pos
+				result = append(result, make([]byte, gap)...)
+				pos += gap
+			}
 		}
-		return fuse.ReadResultData(out), 0
-	}
-	if off >= metaInode.Size {
-		return fuse.ReadResultData(nil), 0
-	}
-	end = off + int64(len(dest))
-	if end > metaInode.Size {
-		end = metaInode.Size
+		return result
 	}
 
-	// Fast path: empty ChunkMap means the file has no on-disk chunks at
-	// all — every byte is a hole. This covers the freshly-created /
-	// never-flushed state and, more importantly, a truncate-extended file
-	// (Size > 0 with no data written into the new range). Serve zeros for
-	// the requested window rather than round-tripping through an empty
-	// ChunkMap and returning zero bytes. (B1 fix.)
-	//
-	// Note the Size==0 case needs no special handling: the EOF clamp above
-	// (off >= Size, i.e. off >= 0) already returns nil for it, so a
-	// zero-size file never reaches here.
-	if len(metaInode.ChunkMap) == 0 {
-		size := end - off
-		return fuse.ReadResultData(make([]byte, size)), 0
-	}
-
-	// Grab a reusable 128 KB buffer from the pool. The pool buffer
-	// is used as scratch space for individual chunk reads; the final
-	// result is assembled in a separate (right-sized) output slice
-	// so the pool buffer can be returned immediately.
-	bufp := readBufPool.Get().(*[]byte)
-	defer readBufPool.Put(bufp)
-
-	// Walk the ChunkMap and pick out the bytes that overlap the requested
-	// window. Each chunk owns [cref.Offset, +cref.Length). The window is in
-	// (off, end] in file coordinates; we trim each chunk payload to that
-	// range and concatenate.
-	//
-	// (Same-class hardening) The ChunkMap is length-ordered, but it is not
-	// guaranteed contiguous: after a truncate or an externally-produced
-	// sparse layout there can be a hole between chunks whose bytes are never
-	// materialized. Collapsing such holes would both misplace every
-	// subsequent chunk at the wrong file coordinate and return a short read.
-	// So the walk zero-fills any gap before each overlapping chunk, and
-	// always returns a full (end-off)-byte window at correct coordinates.
+	// Walk the read range in 64-MiB chunk steps. For each step, check
+	// chunkBufs (dirty data) first, then the committed ChunkMap, then
+	// zero-fill holes.
 	out := make([]byte, 0, end-off)
-	next := off // next file offset already filled, in [off, end]
-	for _, cref := range metaInode.ChunkMap {
-		chunkStart := cref.Offset
-		chunkEnd := cref.Offset + int64(cref.Length)
-		if chunkEnd <= next || chunkStart >= end {
-			// chunk entirely outside the remaining window
-			continue
+	next := off
+	for next < end {
+		base := chunkBase(next)
+		n := end - next
+		if n > MaxChunkPayload {
+			n = MaxChunkPayload
 		}
-		var payload []byte
-		if f.cache != nil {
-			if p, ok := f.cache.Get(uint64(cref.ID)); ok {
-				payload = p
+
+		// Check dirty chunk buffer first (authoritative for unflushed writes).
+		// Buffers have committed data loaded, so they are complete.
+		if f.chunkBufs != nil {
+			if buf, ok := f.chunkBufs[base]; ok {
+				within := next - base
+				if within < 0 {
+					within = 0
+				}
+				limit := int64(len(buf)) - within
+				if n > limit {
+					n = limit
+				}
+				if n > 0 {
+					out = append(out, buf[within:within+n]...)
+				}
+				next += n
+				continue
 			}
 		}
-		if payload == nil {
-			var chunk *metadata.ChunkMeta
-			if err := f.reliability.DoMeta("read", func() error {
-				var gerr error
-				chunk, gerr = f.meta.GetChunk(ctx, cref.ID)
-				return gerr
-			}); err != nil {
-				rec.IncOpError("read")
-				return nil, syscall.EIO
-			}
-			if err := f.reliability.DoChunk("read", func() error {
-				var gerr error
-				payload, gerr = f.chunkStore.ReadChunk(ctx, chunk)
-				return gerr
-			}); err != nil {
-				rec.IncOpError("read")
-				return nil, syscall.EIO
-			}
-			if f.cache != nil {
-				f.cache.Add(uint64(cref.ID), payload)
-			}
-		}
-		// Zero-fill any hole between the last filled offset and this chunk.
-		if chunkStart > next {
-			gap := chunkStart - next
-			if gap > end-next {
-				gap = end - next
-			}
-			out = append(out, make([]byte, gap)...)
-			next += gap
-		}
-		// Map file-coordinates [off,end) to chunk-local coordinates. Bound
-		// by BOTH the chunk's declared file extent (cref.Length) and its
-		// actual payload length, so we never serve bytes past the file
-		// coordinate that this chunk genuinely owns.
-		relStart := next - chunkStart
-		relEnd := end - chunkStart
-		if relEnd > int64(cref.Length) {
-			relEnd = int64(cref.Length)
-		}
-		if relEnd > int64(len(payload)) {
-			relEnd = int64(len(payload))
-		}
-		if relStart >= relEnd {
-			continue
-		}
-		// If the chunk slice fits in the pool buffer, copy it there
-		// first so we avoid growing `out` with tiny appends.
-		chunkLen := int(relEnd - relStart)
-		if chunkLen <= cap(*bufp) {
-			buf := (*bufp)[:chunkLen]
-			copy(buf, payload[relStart:relEnd])
-			out = append(out, buf...)
+
+		// No dirty buffer — read committed data directly
+		committed := readChunkRange(next, next+n)
+		if committed != nil {
+			out = append(out, committed...)
+			next += int64(len(committed))
 		} else {
-			out = append(out, payload[relStart:relEnd]...)
+			// Error or hole — zero fill
+			out = append(out, make([]byte, n)...)
+			next += n
 		}
-		next += int64(chunkLen)
-		if next >= end {
-			break
-		}
-	}
-	// Zero-fill a trailing hole after the last chunk (before 'end').
-	if next < end {
-		out = append(out, make([]byte, end-next)...)
 	}
 	return fuse.ReadResultData(out), 0
 }
@@ -429,27 +656,17 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 // first hydrated from the committed file content so the next Flush's whole-file
 // rebuild doesn't zero the committed prefix.
 func (f *DFSFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	dfs := f.fs
+	if err := dfs.checkAccess(dfs.bucketName, metadata.PermWrite); err != nil {
+		return 0, toErrno(err)
+	}
 	rec := recorderFor(f.recorder)
 	rec.IncOp("write")
+	start := time.Now()
+	defer func() { rec.ObserveOpLatency("write", time.Since(start)) }()
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	// Hydrate the committed prefix whenever the buffer isn't loaded. This
-	// must happen for ANY write offset, including 0: a write at offset 0 is
-	// only a full-file overwrite if it covers the whole committed file. A
-	// partial off-0 overwrite (e.g. pwrite(fd, buf, 20, 0) over a 100-byte
-	// committed file on a freshly re-opened handle) replaces the head and
-	// must preserve the committed [off+len, committed) tail — otherwise the
-	// next Flush rebuilds the file from an under-faithful buffer and silently
-	// truncates/drops it. (Same-class fix; ensureHydratedLocked is a cheap
-	// no-op for a fresh/empty file, writing at 0 into one stays untouched.)
-	if !f.loaded {
-		if err := f.ensureHydratedLocked(ctx, rec); err != nil {
-			rec.IncOpError("write")
-			return 0, syscall.EIO
-		}
-	}
 	return f.writeLocked(ctx, data, off, rec)
 }
 
@@ -461,17 +678,23 @@ func (f *DFSFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, off 
 func (f *DFSFile) AppendWrite(ctx context.Context, fh fs.FileHandle, data []byte) (uint32, syscall.Errno) {
 	rec := recorderFor(f.recorder)
 	rec.IncOp("write")
+	start := time.Now()
+	defer func() { rec.ObserveOpLatency("write", time.Since(start)) }()
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Resolve the true end of file: hydrate so the buffered tail reflects
-	// committed content, then append after whatever is already buffered.
-	if err := f.ensureHydratedLocked(ctx, rec); err != nil {
-		rec.IncOpError("write")
-		return 0, syscall.EIO
+	// Append position = max of logical dirty size and committed size.
+	// When logicalSize is 0 (after flush or fresh open), we need to
+	// fetch the committed size from metadata to know where to append.
+	tail := f.logicalSize
+	if tail == 0 {
+		metaInode, err := f.fs.Meta().GetInode(ctx, f.inodeID)
+		if err != nil {
+			return 0, syscall.EIO
+		}
+		tail = int64(metaInode.Size)
 	}
-	tail := int64(len(f.buffer))
 	return f.writeLocked(ctx, data, tail, rec)
 }
 
@@ -481,123 +704,145 @@ func (f *DFSFile) AppendWrite(ctx context.Context, fh fs.FileHandle, data []byte
 //
 // DFSFile's core state invariant is:
 //
-//	loaded == true  ⟹  f.buffer is a faithful image of the committed
-//	                   prefix [0, committedSize), i.e. len(buffer) >= committed
+//	loaded == true  ⟹  chunkBufs contains all committed chunks
 //
-// Every path that sets loaded=true must uphold it. Production never enforces
-// this (it only reads a package-level atomic flag and costs nothing when
-// off); tests turn it on so a future violation panics at the point of the
-// write, instead of surfacing much later as silent data loss on Flush / a
-// stale Read. The same-class bugs fixed in this series (most notably the
-// off-0 partial-overwrite data loss) were all violations of this invariant,
-// so it doubles as a regression tripwire.
+// Every path that sets loaded=true must uphold it.
+
 var bufferImageInvariantOn atomic.Bool
 
 // EnableBufferImageInvariant turns on the debug invariant assertion. Only
 // tests should call it; production stays off for zero overhead.
 func EnableBufferImageInvariant() { bufferImageInvariantOn.Store(true) }
 
-// assertBufferImageLocked verifies that, when loaded, the buffer is at least
-// as large as the currently committed file size. Must be called with f.mu
-// held. It is a no-op when the invariant guard is off, or when a metadata
-// read fails (an I/O failure is a real error path, not an invariant break).
+// assertBufferImageLocked verifies that every chunk marked dirty in dirtyMap
+// has a corresponding buffer in chunkBufs. Must be called with f.mu held.
+// It is a no-op when the invariant guard is off.
 func (f *DFSFile) assertBufferImageLocked(ctx context.Context) {
-	if !bufferImageInvariantOn.Load() || !f.loaded {
+	if !bufferImageInvariantOn.Load() || !f.dirty {
 		return
 	}
-	meta, err := f.meta.GetInode(ctx, f.inodeID)
-	if err != nil {
-		return
-	}
-	if int64(len(f.buffer)) < meta.Size {
-		panic(fmt.Sprintf("DFSFile invariant violated: loaded=true but buffer len=%d < committed size=%d (inode %d)",
-			len(f.buffer), meta.Size, f.inodeID))
+	for base := range f.dirtyMap {
+		if _, ok := f.chunkBufs[base]; !ok {
+			panic(fmt.Sprintf("DFSFile invariant violated: dirty chunk at offset %d has no buffer (inode %d)",
+				base, f.inodeID))
+		}
 	}
 }
 
 // writeLocked applies a buffered write at the given offset. Must be called
-// with f.mu held and the buffer hydrated to cover the committed prefix
-// (callers — Write, AppendWrite — hydrate whenever !loaded regardless of
-// offset, so a partial off-0 overwrite cannot drop the committed tail).
+// with f.mu held. When creating a new chunk buffer, committed data is loaded
+// from the ChunkMap so that partial writes preserve the committed prefix/suffix.
 func (f *DFSFile) writeLocked(ctx context.Context, data []byte, off int64, rec MetricsRecorder) (uint32, syscall.Errno) {
-	// Buffer write data locally until flush
-	needed := int(off) + len(data)
-	if needed > len(f.buffer) {
-		newBuf := make([]byte, needed)
-		copy(newBuf, f.buffer)
-		f.buffer = newBuf
-	}
-	copy(f.buffer[off:], data)
-	f.dirty = true
-	f.loaded = true
-	f.assertBufferImageLocked(ctx)
+	end := off + int64(len(data))
 
+	// Check dirty-memory limit before allocating new chunk buffers.
+	// Count how many new chunks this write would touch (bases not yet in
+	// chunkBufs). When the limit is exceeded, the oldest dirty chunk is
+	// spilled to disk staging (if available) before returning ENOSPC.
+	if max := f.fs.maxDirtyBytes; max > 0 {
+		newBases := make(map[int64]struct{})
+		for pos := off; pos < end; {
+			base := chunkBase(pos)
+			if _, exists := f.chunkBufs[base]; !exists {
+				newBases[base] = struct{}{}
+			}
+			next := base + MaxChunkPayload
+			if next > end {
+				next = end
+			}
+			pos = next
+		}
+		needed := int64(len(newBases)) * int64(MaxChunkPayload)
+		if f.dirtyBytes+needed > max {
+			// Try spilling the oldest dirty chunk in this file to free memory.
+			if err := f.spillOldestChunk(); err != nil {
+				rec.IncStagingSpillErr()
+				logf("write: spill failed: %v", err)
+			} else if len(f.spilledChunks) > 0 {
+				rec.IncStagingSpill()
+			}
+			// Also try spilling if global budget is exceeded.
+			if f.fs.globalDirtyBudget > 0 && f.fs.globalDirtyBytes.Load()+needed > f.fs.globalDirtyBudget {
+				if err := f.spillOldestChunk(); err != nil {
+					rec.IncStagingSpillErr()
+				} else if len(f.spilledChunks) > 0 {
+					rec.IncStagingSpill()
+				}
+			}
+			if f.dirtyBytes+needed > max {
+				return 0, syscall.ENOSPC
+			}
+		}
+	}
+
+	// For each chunk touched by this write, ensure the buffer exists and
+	// has committed data loaded (so partial writes don't zero committed bytes).
+	for pos := off; pos < end; {
+		base := chunkBase(pos)
+		if _, exists := f.chunkBufs[base]; !exists {
+			// New buffer — load committed data for this chunk first
+			f.loadCommittedChunkLocked(ctx, base, rec)
+		}
+		pos = (base + MaxChunkPayload)
+		if pos > end {
+			pos = end
+		}
+	}
+
+	for pos := off; pos < end; {
+		base := chunkBase(pos)
+		buf := f.getChunk(base)
+		within := pos - base
+		n := int64(len(data)) - (pos - off)
+		if within+n > int64(len(buf)) {
+			n = int64(len(buf)) - within
+		}
+		copy(buf[within:within+n], data[pos-off:pos-off+n])
+		f.markDirty(base)
+		pos += n
+	}
+	// Track the actual high-water mark of writes (not chunk-aligned).
+	// logicalSize is initialized to the committed size at Open, so a partial
+	// overwrite at a nonzero offset never shrinks the file below its
+	// committed extent without a per-write metadata round-trip.
+	if end > f.logicalSize {
+		f.logicalSize = end
+	}
+	f.assertBufferImageLocked(ctx)
 	return uint32(len(data)), 0
 }
 
-// ensureHydratedLocked guarantees that f.buffer is a faithful image of the
-// file's committed prefix [0, committedSize), zero-filling holes. This is
-// required because Flush rebuilds the whole file from f.buffer: if the
-// buffer started empty and a write landed at a nonzero offset, the
-// committed [0, off) prefix must be loaded from the chunk store or the next
-// Flush would write zeros over it (data loss for append /
-// random-overwrite-after-Flush). Any already-buffered (un-flushed) bytes
-// that extend past the committed size are preserved on top. Must be called
-// with f.mu held.
-func (f *DFSFile) ensureHydratedLocked(ctx context.Context, rec MetricsRecorder) error {
-	if f.loaded {
-		return nil
+// loadCommittedChunkLocked loads committed chunk data for the given chunk base
+// into the chunk buffer. This ensures that partial writes preserve committed
+// bytes that were already flushed. Must be called with f.mu held.
+func (f *DFSFile) loadCommittedChunkLocked(ctx context.Context, base int64, rec MetricsRecorder) {
+	metaInode, err := f.fs.Meta().GetInode(ctx, f.inodeID)
+	if err != nil {
+		return // can't load — buffer stays zero-filled (safe for new files)
 	}
-	var metaInode *metadata.InodeMeta
-	if err := f.reliability.DoMeta("read", func() error {
-		var gerr error
-		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
-		return gerr
-	}); err != nil {
-		return err
-	}
-	committed := int(metaInode.Size)
-	if committed <= 0 {
-		f.loaded = true
-		f.assertBufferImageLocked(ctx)
-		return nil
-	}
-
-	// Preserve any already-buffered tail that extends past the committed
-	// size (un-flushed bytes written while the buffer wasn't loaded).
-	var tail []byte
-	if len(f.buffer) > committed {
-		tail = f.buffer[committed:]
-	}
-	buf := make([]byte, committed+len(tail))
-	f.buffer = buf
-	if err := f.loadChunkRangeLocked(ctx, rec, metaInode); err != nil {
-		return err
-	}
-	if tail != nil {
-		copy(f.buffer[committed:], tail)
-	}
-	f.loaded = true
-	f.assertBufferImageLocked(ctx)
-	return nil
-}
-
-// loadChunkRangeLocked fills f.buffer's [0, committed) region from the
-// inode's committed ChunkMap. Must be called with f.mu held and f.buffer
-// already sized to at least the committed file size.
-func (f *DFSFile) loadChunkRangeLocked(ctx context.Context, rec MetricsRecorder, metaInode *metadata.InodeMeta) error {
+	// Collect every committed chunk overlapping this base and merge them in
+	// offset order. A single 64 MiB base can hold multiple committed refs
+	// (small writes across flushes each become their own ref); stopping at the
+	// first would zero-fill the others and lose committed data.
+	overlaps := make([]metadata.ChunkRef, 0, 2)
 	for _, cref := range metaInode.ChunkMap {
-		chunkStart := int(cref.Offset)
-		if chunkStart < 0 {
-			continue
+		cEnd := cref.Offset + int64(cref.Length)
+		if cEnd > base && cref.Offset < base+MaxChunkPayload {
+			overlaps = append(overlaps, cref)
 		}
-		chunkEnd := chunkStart + int(cref.Length)
-		if chunkStart >= len(f.buffer) {
-			break
+	}
+	if len(overlaps) == 0 {
+		return
+	}
+	// Sort by offset (then ID for determinism) so later refs overwrite earlier
+	// ones at overlapping ranges, matching the latest-version-wins semantics.
+	sort.Slice(overlaps, func(i, j int) bool {
+		if overlaps[i].Offset != overlaps[j].Offset {
+			return overlaps[i].Offset < overlaps[j].Offset
 		}
-		if chunkEnd > len(f.buffer) {
-			chunkEnd = len(f.buffer)
-		}
+		return overlaps[i].ID < overlaps[j].ID
+	})
+	for _, cref := range overlaps {
 		var payload []byte
 		if f.cache != nil {
 			if p, ok := f.cache.Get(uint64(cref.ID)); ok {
@@ -608,35 +853,45 @@ func (f *DFSFile) loadChunkRangeLocked(ctx context.Context, rec MetricsRecorder,
 			var chunk *metadata.ChunkMeta
 			if err := f.reliability.DoMeta("read", func() error {
 				var gerr error
-				chunk, gerr = f.meta.GetChunk(ctx, cref.ID)
+				chunk, gerr = f.fs.Meta().GetChunk(ctx, cref.ID)
 				return gerr
 			}); err != nil {
-				return err
+				continue
 			}
 			if err := f.reliability.DoChunk("read", func() error {
 				var gerr error
 				payload, gerr = f.chunkStore.ReadChunk(ctx, chunk)
 				return gerr
 			}); err != nil {
-				return err
+				continue
 			}
 			if f.cache != nil {
 				f.cache.Add(uint64(cref.ID), payload)
 			}
 		}
-		rel := chunkStart - int(cref.Offset) // == 0 normally
-		n := chunkEnd - chunkStart
-		if rel < 0 {
-			rel = 0
+		buf := f.getChunk(base)
+		rel := cref.Offset - base
+		// Cap at the ref's declared live length: the payload may hold stale
+		// bytes beyond cref.Length (e.g. a reused/legacy chunk), and copying
+		// them would resurrect data outside the ref's extent.
+		n := int64(cref.Length)
+		if n > int64(len(payload)) {
+			n = int64(len(payload))
 		}
-		if rel >= len(payload) {
-			continue
+		if rel+n > int64(len(buf)) {
+			n = int64(len(buf)) - rel
 		}
-		if rel+n > len(payload) {
-			n = len(payload) - rel
-		}
-		copy(f.buffer[chunkStart:chunkStart+n], payload[rel:rel+n])
+		copy(buf[rel:rel+n], payload[:n])
 	}
+}
+
+// ensureHydratedLocked is DEPRECATED — flush handles merge.
+func (f *DFSFile) ensureHydratedLocked(ctx context.Context, rec MetricsRecorder) error {
+	return nil
+}
+
+// loadChunkRangeLocked is DEPRECATED — flush handles merge.
+func (f *DFSFile) loadChunkRangeLocked(ctx context.Context, rec MetricsRecorder, metaInode *metadata.InodeMeta) error {
 	return nil
 }
 
@@ -644,19 +899,18 @@ func (f *DFSFile) loadChunkRangeLocked(ctx context.Context, rec MetricsRecorder,
 // the inode's ChunkMap + size. It is idempotent: a second Flush on
 // the same dirty buffer is a no-op (a clean Flush never re-writes).
 //
-// Multi-chunk (Program 11), aligned with the production S3 PUT
-// overwrite path (metadataObjectCommitter.Put): the buffer is the
-// whole new file content, so Flush cuts it into MaxChunkPayload
-// windows, AllocateChunksBatch'es fresh chunk IDs at offsets
-// [0, MaxChunkPayload, 2*MaxChunkPayload, ...), writes/commits/seals
-// each, then wholesale-replaces the inode's ChunkMap with the new
-// refs and DeleteChunk's the superseded old chunks. Fresh allocation
-// + supersede + delete sidesteps the ErrChunkAlreadySealed invariant
-// (a sealed chunk can never be re-committed) with zero metadata
-// changes — exactly how S3 already reuses across PUTs.
+// Only dirty chunks are written. Untouched committed chunks are preserved
+// in the new ChunkMap without being loaded into memory — this keeps memory
+// proportional to dirty data, not file size.
 func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
+	dfs := f.fs
+	if err := dfs.checkAccess(dfs.bucketName, metadata.PermWrite); err != nil {
+		return toErrno(err)
+	}
 	rec := recorderFor(f.recorder)
 	rec.IncOp("flush")
+	start := time.Now()
+	defer func() { rec.ObserveOpLatency("flush", time.Since(start)) }()
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -667,7 +921,6 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 
 	// 路径锁：串行化同一 inode 的并发 Flush，防止不同 DFSFile
 	// 实例（go-fuse inode cache eviction 后重建）交叉写入。
-	// nil receiver 时为 no-op（passthrough 模式）。
 	unlock := f.reliability.LockInode(uint64(f.inodeID))
 	defer unlock()
 
@@ -676,7 +929,7 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	var metaInode *metadata.InodeMeta
 	if err := f.reliability.DoMeta("flush", func() error {
 		var gerr error
-		metaInode, gerr = f.meta.GetInode(ctx, f.inodeID)
+		metaInode, gerr = f.fs.Meta().GetInode(ctx, f.inodeID)
 		return gerr
 	}); err != nil {
 		rec.IncOpError("flush")
@@ -685,115 +938,185 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	oldRefs := make([]metadata.ChunkRef, len(metaInode.ChunkMap))
 	copy(oldRefs, metaInode.ChunkMap)
 
-	// Resolve the placement policy from the file's containing bucket
-	// instead of using a hardcoded fuseChunkPolicy. This ensures a
-	// bucket configured with ReplicationFactor=3 actually gets 3
-	// replicas for FUSE writes (fixes D3).
 	policy := f.resolveChunkPolicy(ctx, metaInode)
 
-	size := len(f.buffer)
-	nChunks := (size + MaxChunkPayload - 1) / int(MaxChunkPayload)
-	if nChunks == 0 {
-		nChunks = 1 // an empty buffer still allocates one chunk at offset 0
+	// Determine the file size to persist. logicalSize tracks the high-water
+	// mark of writes since the last clearChunks() (which resets it to 0), so it
+	// can be 0 (no dirty tail - use committed size), larger than committed (a
+	// write extended the file - use logicalSize), OR smaller than committed (a
+	// partial in-place overwrite that didn't reach the old EOF). Taking the max
+	// prevents that last case from shrinking the file and silently dropping the
+	// committed tail: e.g. pwrite(fd, 5B, offset=100) on a 200-byte file sets
+	// logicalSize=105, and without the max the committed bytes [105,200) would
+	// be truncated away. Legitimate truncation-down goes through Setattr, which
+	// commits the new smaller Size before the next Flush, so max() never blocks
+	// it. This mirrors AppendWrite's own max(logicalSize, committed) rule.
+	committedSize := int64(metaInode.Size)
+	size := f.logicalSize
+	if committedSize > size {
+		size = committedSize
 	}
-	offsets := make([]int64, nChunks)
-	segEnd := make([]int, nChunks)
-	for i := 0; i < nChunks; i++ {
-		offsets[i] = int64(i) * MaxChunkPayload
-		end := (i + 1) * MaxChunkPayload
+
+	// Collect dirty chunk bases and sort them for deterministic allocation.
+	dirtyBases := make([]int64, 0, len(f.dirtyMap))
+	for base := range f.dirtyMap {
+		dirtyBases = append(dirtyBases, base)
+	}
+	sort.Slice(dirtyBases, func(i, j int) bool { return dirtyBases[i] < dirtyBases[j] })
+
+	// For each dirty chunk: merge dirty buffer with committed data (if any),
+	// allocating a new chunk ID. Only chunks that are actually dirty are
+	// loaded — untouched committed chunks are preserved as-is.
+	type writtenRef struct {
+		base    int64
+		data    []byte
+		chunkID metadata.ChunkID
+	}
+	written := make([]writtenRef, 0, len(dirtyBases))
+
+	// Batch-allocate chunk IDs for all dirty chunks.
+	offsets := make([]int64, len(dirtyBases))
+	for i, base := range dirtyBases {
+		end := base + MaxChunkPayload
 		if end > size {
 			end = size
 		}
-		segEnd[i] = end
+		offsets[i] = base
+		_ = end // chunk length derived later from actual data
+	}
+	if len(offsets) > 0 {
+		chunks := make([]*metadata.ChunkMeta, 0, len(offsets))
+		for start := 0; start < len(offsets); {
+			end := start + metadata.MaxChunkAllocationBatch
+			if end > len(offsets) {
+				end = len(offsets)
+			}
+			var batch []*metadata.ChunkMeta
+			if err := f.reliability.DoMeta("flush", func() error {
+				var gerr error
+				batch, gerr = f.fs.Meta().AllocateChunksBatch(ctx, f.inodeID, offsets[start:end], policy)
+				return gerr
+			}); err != nil {
+				logf("flush: allocate chunk batch [%d:%d): %v", start, end, err)
+				rec.IncOpError("flush")
+				return syscall.EIO
+			}
+			chunks = append(chunks, batch...)
+			start = end
+		}
+
+		// Write each dirty chunk. Buffers already have committed data loaded
+		// (via loadCommittedChunkLocked), so they are complete images.
+		for i, base := range dirtyBases {
+			end := base + MaxChunkPayload
+			if end > size {
+				end = size
+			}
+			chunkLen := int(end - base)
+
+			// Use the dirty buffer directly — it has committed data merged in.
+			// If the chunk was spilled to disk during a memory-pressure event,
+			// load it back from the staging file. A load failure aborts the
+			// entire flush — zero-filling here would silently corrupt data.
+			var chunkData []byte
+			if buf, ok := f.chunkBufs[base]; ok {
+				n := chunkLen
+				if n > len(buf) {
+					n = len(buf)
+				}
+				chunkData = buf[:n]
+			} else if _, spilled := f.spilledChunks[base]; spilled {
+				loaded, err := f.loadFromDisk(base)
+				if err != nil {
+					logf("flush: load spilled chunk %d: %v — aborting", base, err)
+					rec.IncOpError("flush")
+					return syscall.EIO
+				}
+				rec.IncStagingLoad()
+				n := chunkLen
+				if n > len(loaded) {
+					n = len(loaded)
+				}
+				chunkData = loaded[:n]
+			} else {
+				chunkData = make([]byte, chunkLen) // hole: all zeros
+			}
+
+			// Write, commit, seal the new chunk.
+			chunk := chunks[i]
+			if err := f.reliability.DoChunk("flush", func() error {
+				return f.chunkStore.WriteChunk(ctx, chunk, chunkData)
+			}); err != nil {
+				logf("flush: write chunk %d: %v", chunk.ID, err)
+				rec.IncOpError("flush")
+				return syscall.EIO
+			}
+			checksum := crc32.ChecksumIEEE(chunkData)
+			if err := f.reliability.DoMeta("flush", func() error {
+				return f.fs.Meta().CommitChunk(ctx, chunk.ID, checksum)
+			}); err != nil {
+				logf("flush: commit chunk %d: %v", chunk.ID, err)
+				rec.IncOpError("flush")
+				return syscall.EIO
+			}
+			if err := f.reliability.DoMeta("flush", func() error {
+				return f.fs.Meta().SealChunk(ctx, chunk.ID)
+			}); err != nil {
+				logf("flush: seal chunk %d: %v", chunk.ID, err)
+			}
+			written = append(written, writtenRef{
+				base:    base,
+				data:    chunkData,
+				chunkID: chunk.ID,
+			})
+		}
 	}
 
-	// AllocateChunksBatch is capped at metadata.MaxChunkAllocationBatch
-	// (1024) chunks per request. A single flush beyond that (>64 GiB) is
-	// unrealistic, but loop defensively so the batch allocation never
-	// trips the per-request cap. Each batch offsets are already sorted
-	// ascending, so the concatenated result preserves file order.
-	chunks := make([]*metadata.ChunkMeta, 0, nChunks)
-	for start := 0; start < nChunks; {
-		end := start + metadata.MaxChunkAllocationBatch
-		if end > nChunks {
-			end = nChunks
-		}
-		var batch []*metadata.ChunkMeta
-		if err := f.reliability.DoMeta("flush", func() error {
-			var gerr error
-			batch, gerr = f.meta.AllocateChunksBatch(ctx, f.inodeID, offsets[start:end], policy)
-			return gerr
-		}); err != nil {
-			logf("flush: allocate chunk batch [%d:%d): %v", start, end, err)
-			rec.IncOpError("flush")
-			return syscall.EIO
-		}
-		chunks = append(chunks, batch...)
-		start = end
+	// Build new ChunkMap: preserve untouched committed chunks + add written chunks.
+	// Untouched committed chunks are NOT loaded into memory — just copied as refs.
+	writtenSet := make(map[int64]bool, len(written))
+	for _, w := range written {
+		writtenSet[w.base] = true
 	}
-
-	// Write, commit, and seal each chunk, then assemble the new
-	// ChunkMap refs. Mirrors S3 metadataObjectCommitter.Put: one
-	// ChunkRef{ID, Offset, Length, Version} per chunk at its
-	// MaxChunkPayload-aligned offset.
-	newRefs := make([]metadata.ChunkRef, 0, nChunks)
-	for i, chunk := range chunks {
-		data := f.buffer[i*MaxChunkPayload:segEnd[i]]
-		if err := f.reliability.DoChunk("flush", func() error {
-			return f.chunkStore.WriteChunk(ctx, chunk, data)
-		}); err != nil {
-			logf("flush: write chunk %d: %v", chunk.ID, err)
-			rec.IncOpError("flush")
-			return syscall.EIO
+	newRefs := make([]metadata.ChunkRef, 0, len(oldRefs)+len(written))
+	// First: all untouched committed chunks (not in dirty set)
+	for _, cref := range oldRefs {
+		if !writtenSet[cref.Offset] {
+			newRefs = append(newRefs, cref)
 		}
-		checksum := crc32.ChecksumIEEE(data)
-		if err := f.reliability.DoMeta("flush", func() error {
-			return f.meta.CommitChunk(ctx, chunk.ID, checksum)
-		}); err != nil {
-			logf("flush: commit chunk %d: %v", chunk.ID, err)
-			rec.IncOpError("flush")
-			return syscall.EIO
-		}
-		if err := f.reliability.DoMeta("flush", func() error {
-			return f.meta.SealChunk(ctx, chunk.ID)
-		}); err != nil {
-			logf("flush: seal chunk %d: %v", chunk.ID, err)
-			// Not fatal: a sealed chunk can already be read.
-		}
+	}
+	// Second: all newly written chunks
+	for _, w := range written {
 		newRefs = append(newRefs, metadata.ChunkRef{
-			ID:      chunk.ID,
-			Offset:  offsets[i],
-			Length:  int32(len(data)),
+			ID:      w.chunkID,
+			Offset:  w.base,
+			Length:  int32(len(w.data)),
 			Version: 1,
 		})
 	}
 
-	// Wholesale-replace the ChunkMap + size + mtime (S3 overwrite
-	// semantics), so Read walks the fresh refs across every chunk.
+	// Wholesale-replace the ChunkMap + size + mtime.
 	metaInode.ChunkMap = newRefs
 	metaInode.Size = int64(size)
 	metaInode.MTime = time.Now().UnixNano()
 
 	if err := f.reliability.DoMeta("flush", func() error {
-		return f.meta.UpdateInode(ctx, metaInode)
+		return f.fs.Meta().UpdateInode(ctx, metaInode)
 	}); err != nil {
 		rec.IncOpError("flush")
 		return syscall.EIO
 	}
 
-	// Reclaim the superseded chunks. Fresh-allocation guarantees none
-	// of the new IDs overlap the old refs, so deleting by ID is safe.
+	// Reclaim the superseded chunks.
 	for _, cref := range oldRefs {
 		if err := f.reliability.DoMeta("flush", func() error {
-			return f.meta.DeleteChunk(ctx, cref.ID)
+			return f.fs.Meta().DeleteChunk(ctx, cref.ID)
 		}); err != nil {
 			logf("flush: delete old chunk %d: %v", cref.ID, err)
 		}
 	}
 
-	f.buffer = nil
-	f.dirty = false
-	f.loaded = false
+	f.clearChunks()
 	return 0
 }
 
@@ -806,6 +1129,8 @@ func (f *DFSFile) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sys
 func (f *DFSFile) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	rec := recorderFor(f.recorder)
 	rec.IncOp("release")
+	start := time.Now()
+	defer func() { rec.ObserveOpLatency("release", time.Since(start)) }()
 
 	// Flush first so buffered data hits the chunk store before we
 	// release the advisory lock.
@@ -816,7 +1141,7 @@ func (f *DFSFile) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	// Release the advisory lock that Open acquired.  If no lock was
 	// acquired (unit tests / empty lockOwner) this is a no-op.
 	if h, ok := fh.(*DFSFileHandle); ok && h.lockAcquired && f.lockOwner != "" {
-		if err := f.meta.AdvisoryUnlock(ctx, f.inodeID, f.lockOwner); err != nil {
+		if err := f.fs.Meta().AdvisoryUnlock(ctx, f.inodeID, f.lockOwner); err != nil {
 			logf("release: advisory unlock %d: %v", f.inodeID, err)
 			// POSIX-flock: unlock failure is non-fatal; log only.
 		}
@@ -828,7 +1153,7 @@ func (f *DFSFile) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 // Getattr returns file attributes.
 func (f *DFSFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	rec := recorderFor(f.recorder)
-	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
+	metaInode, err := f.fs.Meta().GetInode(ctx, f.inodeID)
 	if err != nil {
 		rec.IncOpError("getattr")
 		return syscall.EIO
@@ -840,8 +1165,8 @@ func (f *DFSFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrO
 	// write/append will land rather than lagging behind on committed size.
 	// Same-class fix: the buffered image must be reflected in the view.
 	f.mu.Lock()
-	if int64(len(f.buffer)) > int64(out.Attr.Size) {
-		out.Attr.Size = uint64(len(f.buffer))
+	if f.logicalSize > int64(out.Attr.Size) {
+		out.Attr.Size = uint64(f.logicalSize)
 	}
 	f.mu.Unlock()
 	return 0
@@ -850,7 +1175,13 @@ func (f *DFSFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrO
 // Setattr sets file attributes (truncate, chmod, etc.).
 func (f *DFSFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	rec := recorderFor(f.recorder)
-	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
+
+	// Block truncation in read-only mode; allow chmod/chown (metadata-only).
+	if _, ok := in.GetSize(); ok && f.fs.readOnly {
+		return syscall.EROFS
+	}
+
+	metaInode, err := f.fs.Meta().GetInode(ctx, f.inodeID)
 	if err != nil {
 		rec.IncOpError("setattr")
 		return syscall.EIO
@@ -858,50 +1189,58 @@ func (f *DFSFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 
 	if size, ok := in.GetSize(); ok {
 		f.mu.Lock()
-		if int(size) >= len(f.buffer) && !f.loaded {
-			// Truncating up (or to the same size) over a buffer that
-			// doesn't yet hold the committed prefix: hydrate it first so
-			// the extension zero-fills only the new range and preserves
-			// the committed content (truncate-extend), and so a later
-			// Flush's whole-file rebuild doesn't zero committed bytes.
-			if err := f.ensureHydratedLocked(ctx, rec); err != nil {
-				rec.IncOpError("setattr")
-				f.mu.Unlock()
-				return syscall.EIO
+		newSize := int64(size)
+		oldEnd := f.logicalSize
+		if oldEnd == 0 {
+			oldEnd = metaInode.Size
+		}
+
+		if newSize < oldEnd {
+			// Truncation DOWN: remove chunks beyond newSize, trim the last chunk.
+			newBase := chunkBase(newSize)
+			for base := range f.chunkBufs {
+				if base > newBase {
+					delete(f.chunkBufs, base)
+					delete(f.dirtyMap, base)
+				} else if base == newBase && newSize%MaxChunkPayload != 0 {
+					// Trim the last chunk to the exact size
+					f.chunkBufs[base] = f.chunkBufs[base][:newSize%MaxChunkPayload]
+				}
 			}
-		}
-		if int(size) < len(f.buffer) {
-			f.buffer = f.buffer[:size]
-			// Truncating down: the file is genuinely smaller now, so the
-			// buffer is a faithful image of the new file. Committed bytes
-			// beyond `size` are intentionally dropped on the next Flush.
 			f.dirty = true
-		} else if int(size) > len(f.buffer) {
-			newBuf := make([]byte, size)
-			copy(newBuf, f.buffer)
-			f.buffer = newBuf
+			f.logicalSize = newSize
+		} else if newSize > oldEnd {
+			// Extension: new region is zeros (holes). No need to load
+			// anything — the flush will create appropriate chunks.
 			f.dirty = true
-		} else {
-			// size == len(f.buffer): no buffer change, but the attr still
-			// applies below (mtime/ctime).
+			f.logicalSize = newSize
 		}
-		metaInode.Size = int64(size)
+		// newSize == oldEnd: no buffer change
+		metaInode.Size = newSize
 		f.mu.Unlock()
 	}
 
 	if mode, ok := in.GetMode(); ok {
 		metaInode.Mode = mode
 	}
+	var chown bool
 	if uid, ok := in.GetUID(); ok {
 		metaInode.UID = uid
+		chown = true
 	}
 	if gid, ok := in.GetGID(); ok {
 		metaInode.GID = gid
+		chown = true
+	}
+	// POSIX: chown always clears setuid/setgid bits (security requirement
+	// to prevent privilege escalation).
+	if chown && metaInode.Mode&(sIsuid|sIsgid) != 0 {
+		metaInode.Mode &^= sIsuid | sIsgid
 	}
 	metaInode.MTime = time.Now().UnixNano()
 	metaInode.CTime = time.Now().UnixNano()
 
-	if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+	if err := f.fs.Meta().UpdateInode(ctx, metaInode); err != nil {
 		rec.IncOpError("setattr")
 		return syscall.EIO
 	}
@@ -932,6 +1271,9 @@ func (f *DFSFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 // buffer doesn't yet reflect it (so an extension never zeroes committed
 // bytes), mark the file dirty, bump mtime, and persist Size when it changes.
 func (f *DFSFile) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size uint64, mode uint32) syscall.Errno {
+	if f.fs.readOnly {
+		return syscall.EROFS
+	}
 	rec := recorderFor(f.recorder)
 	rec.IncOp("allocate")
 
@@ -947,7 +1289,7 @@ func (f *DFSFile) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, si
 		return syscall.EOPNOTSUPP
 	}
 
-	metaInode, err := f.meta.GetInode(ctx, f.inodeID)
+	metaInode, err := f.fs.Meta().GetInode(ctx, f.inodeID)
 	if err != nil {
 		rec.IncOpError("allocate")
 		return syscall.EIO
@@ -967,39 +1309,28 @@ func (f *DFSFile) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, si
 	// Default (preallocate) path: extend the file to cover [off, off+size),
 	// honoring KEEP_SIZE by leaving the logical Size untouched.
 	f.mu.Lock()
-	if !f.loaded && int64(off+size) >= int64(len(f.buffer)) {
-		// Fetch the committed prefix before extending so the added region is
-		// genuinely zero and the pre-existing bytes survive the whole-file
-		// rebuild in Flush.
-		if err := f.ensureHydratedLocked(ctx, rec); err != nil {
-			f.mu.Unlock()
-			rec.IncOpError("allocate")
-			return syscall.EIO
-		}
-	}
 	end := off + size
-	// Captured before the buffer is grown: the current extent (max of the
-	// buffered tail and the committed size) is the threshold against which
-	// we decide whether this window actually extends the file. The committed
-	// Size lags the buffer until Flush, so comparing against it alone would
-	// under-report an extension over already-buffered data.
-	ef := int64(len(f.buffer))
+	ef := f.logicalSize
 	if metaInode.Size > ef {
 		ef = metaInode.Size
 	}
-	if int(end) > len(f.buffer) {
-		newBuf := make([]byte, end)
-		copy(newBuf, f.buffer)
-		f.buffer = newBuf
+	// Extend chunkBufs to cover the new range, loading committed data first
+	// so that untouched regions preserve their committed content.
+	for base := chunkBase(int64(off)); base < int64(end); base += MaxChunkPayload {
+		if _, exists := f.chunkBufs[base]; !exists {
+			f.loadCommittedChunkLocked(ctx, base, rec)
+		}
+		_ = f.getChunk(base) // allocates zero-filled chunk if missing
 	}
 	f.dirty = true
 	if mode&fallocKeepSize == 0 && int64(end) > ef {
 		metaInode.Size = int64(end)
+		f.logicalSize = int64(end)
 	}
 	metaInode.MTime = time.Now().UnixNano()
 	f.mu.Unlock()
 
-	if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+	if err := f.fs.Meta().UpdateInode(ctx, metaInode); err != nil {
 		rec.IncOpError("allocate")
 		return syscall.EIO
 	}
@@ -1015,7 +1346,7 @@ func (f *DFSFile) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, si
 // lock is released.
 func (f *DFSFile) zeroRange(ctx context.Context, rec MetricsRecorder, metaInode *metadata.InodeMeta, off uint64, size uint64, extend bool) syscall.Errno {
 	f.mu.Lock()
-	cur := int64(len(f.buffer))
+	cur := f.logicalSize
 	if metaInode.Size > cur {
 		cur = metaInode.Size
 	}
@@ -1028,32 +1359,82 @@ func (f *DFSFile) zeroRange(ctx context.Context, rec MetricsRecorder, metaInode 
 		// Nothing to zero; still refresh mtime per POSIX and persist.
 		metaInode.MTime = time.Now().UnixNano()
 		f.mu.Unlock()
-		if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+		if err := f.fs.Meta().UpdateInode(ctx, metaInode); err != nil {
 			rec.IncOpError("allocate")
 			return syscall.EIO
 		}
 		return 0
 	}
-	// If the buffer doesn't yet reflect the committed prefix, hydrate before
-	// zeroing so the hole is punched over real committed bytes (not zeros where
-	// committed data should remain, or stale bytes where it should be zeroed).
-	// Extensions also hydrate so the pre-existing prefix survives Flush.
-	if !f.loaded {
-		if err := f.ensureHydratedLocked(ctx, rec); err != nil {
-			f.mu.Unlock()
-			rec.IncOpError("allocate")
-			return syscall.EIO
+	// Load committed chunks overlapping the zero range so the non-zeroed
+	// portion of each affected chunk is preserved. Only the affected chunks
+	// are loaded — not the entire file.
+	for base := chunkBase(int64(off)); base < int64(end); base += MaxChunkPayload {
+		if _, ok := f.chunkBufs[base]; ok {
+			continue // already in buffer (from prior write)
+		}
+		// Find committed chunk for this base
+		for _, cref := range metaInode.ChunkMap {
+			cEnd := cref.Offset + int64(cref.Length)
+			if cEnd <= base || cref.Offset >= base+MaxChunkPayload {
+				continue
+			}
+			// Load this committed chunk into the buffer
+			var payload []byte
+			if f.cache != nil {
+				if p, ok := f.cache.Get(uint64(cref.ID)); ok {
+					payload = p
+				}
+			}
+			if payload == nil {
+				var chunk *metadata.ChunkMeta
+				if err := f.reliability.DoMeta("flush", func() error {
+					var gerr error
+					chunk, gerr = f.fs.Meta().GetChunk(ctx, cref.ID)
+					return gerr
+				}); err != nil {
+					f.mu.Unlock()
+					rec.IncOpError("allocate")
+					return syscall.EIO
+				}
+				if err := f.reliability.DoChunk("flush", func() error {
+					var gerr error
+					payload, gerr = f.chunkStore.ReadChunk(ctx, chunk)
+					return gerr
+				}); err != nil {
+					f.mu.Unlock()
+					rec.IncOpError("allocate")
+					return syscall.EIO
+				}
+				if f.cache != nil {
+					f.cache.Add(uint64(cref.ID), payload)
+				}
+			}
+			buf := f.getChunk(base)
+			rel := cref.Offset - base
+			n := int64(len(payload))
+			if rel+n > int64(len(buf)) {
+				n = int64(len(buf)) - rel
+			}
+			copy(buf[rel:rel+n], payload[:n])
+			break
 		}
 	}
-	if int(end) > len(f.buffer) {
-		newBuf := make([]byte, end)
-		copy(newBuf, f.buffer)
-		f.buffer = newBuf
+	// Zero within each affected chunk.
+	for base := chunkBase(int64(off)); base < int64(end); base += MaxChunkPayload {
+		buf := f.getChunk(base)
+		zeroStart := int64(off) - base
+		if zeroStart < 0 {
+			zeroStart = 0
+		}
+		zeroEnd := int64(end) - base
+		if zeroEnd > int64(len(buf)) {
+			zeroEnd = int64(len(buf))
+		}
+		for i := zeroStart; i < zeroEnd; i++ {
+			buf[i] = 0
+		}
+		f.markDirty(base)
 	}
-	for i := off; i < end; i++ {
-		f.buffer[i] = 0
-	}
-	f.dirty = true
 	// Grow the logical Size only when the window runs past the file's current
 	// extent. `cur` (captured at the top, before the buffer was grown to the
 	// window) is the pre-operation extent = max(buffered tail, committed size);
@@ -1062,25 +1443,26 @@ func (f *DFSFile) zeroRange(ctx context.Context, rec MetricsRecorder, metaInode 
 	// in-range window (truncating on the next whole-file Flush rebuild).
 	if extend && int64(end) > cur {
 		metaInode.Size = int64(end)
+		f.logicalSize = int64(end)
 	}
 	metaInode.MTime = time.Now().UnixNano()
 	f.mu.Unlock()
 
-	if err := f.meta.UpdateInode(ctx, metaInode); err != nil {
+	if err := f.fs.Meta().UpdateInode(ctx, metaInode); err != nil {
 		rec.IncOpError("allocate")
 		return syscall.EIO
 	}
 	return 0
 }
 
-// Access always returns 0 (allow-all).
+// Access evaluates the file's POSIX mode bits against the requesting caller.
 func (f *DFSFile) Access(ctx context.Context, mask uint32) syscall.Errno {
-	return 0
+	return checkPOSIXAccess(ctx, f.fs, f.inodeID, mask)
 }
 
 // OpenXAttr returns an xattr handle for this file.
 func (f *DFSFile) OpenXAttr() *DFSXAttr {
-	return &DFSXAttr{meta: f.meta, inodeID: f.inodeID}
+	return &DFSXAttr{meta: f.fs.Meta(), inodeID: f.inodeID}
 }
 
 // ========== DFSFileHandle methods ==========

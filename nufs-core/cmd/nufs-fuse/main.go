@@ -6,16 +6,22 @@
 //
 // Usage:
 //
-//	nufs-fuse --backend=dfs [flags] <mountpoint>
+//	nufs-fuse --backend=dfs --bucket=<bucket> [flags] <mountpoint>
 //	nufs-fuse --backend=s3 [flags] <s3-endpoint/bucket/prefix> <mountpoint>
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,12 +37,13 @@ import (
 	"github.com/dshmyz/nufs/nufs-core/internal/logging"
 	"github.com/dshmyz/nufs/nufs-core/internal/resilience/breaker"
 	"github.com/dshmyz/nufs/nufs-core/internal/resilience/retry"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 func main() {
 	var (
-		configPath = flag.String("config", "", "Path to YAML config file")
-		backend    = flag.String("backend", "nufs", "Backend: dfs (distributed filesystem) or s3 (external S3 bucket)")
+		backend = flag.String("backend", "nufs", "Backend: dfs (distributed filesystem) or s3 (external S3 bucket)")
 
 		// DFS backend flags
 		metaDir  = flag.String("meta-dir", "/var/lib/dfs/metadata", "DFS: Pebble metadata directory (local mode)")
@@ -44,48 +51,95 @@ func main() {
 
 		// S3 backend flags
 		scanTTL     = flag.Duration("scan-ttl", 60*time.Second, "S3: Directory scan cache TTL")
-		readOnly    = flag.Bool("read-only", false, "S3: Read-only mode")
 		cacheQuota  = flag.Int64("cache-quota", 0, "S3: Cache disk quota in bytes (0=unlimited)")
 		metricsAddr = flag.String("metrics-addr", ":9900", "S3: Metrics/health HTTP address")
 		insecure    = flag.Bool("insecure", false, "S3: Skip TLS verification")
-		debug       = flag.Bool("debug", false, "S3: Debug logging")
-		uid         = flag.Uint("uid", 0, "S3: File owner UID")
-		gid         = flag.Uint("gid", 0, "S3: File owner GID")
 
 		// Shared flags
-		cacheDir = flag.String("cache-dir", "", "Cache directory (empty=memory only)")
-		logLevel = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
-		logJSON  = flag.Bool("log-json", false, "JSON log output")
+		cacheDir      = flag.String("cache-dir", "", "Cache directory (empty=memory only)")
+		logLevel      = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
+		logJSON       = flag.Bool("log-json", false, "JSON log output")
+		logFile       = flag.String("log-file", "", "Log file path (default: nufs-{mountpoint}.log; empty = that default)")
+		logMaxSize    = flag.Int("log-max-size", 100, "Max log file size in MB before rotation")
+		logMaxBackups = flag.Int("log-max-backups", 7, "Max number of rotated log files to keep")
+
+		// Shared FUSE flags
+		uid        = flag.Uint("uid", 0, "File owner UID (0 = caller's uid)")
+		gid        = flag.Uint("gid", 0, "File owner GID (0 = caller's gid)")
+		allowOther = flag.Bool("allow-other", false, "Allow other users to access the mount")
+		readOnly   = flag.Bool("read-only", false, "Read-only mount (deny all writes with EROFS)")
+		debug      = flag.Bool("debug", false, "Debug logging (verbose FUSE + metadata traces)")
 
 		// DFS metrics flag
 		dfsMetricsAddr = flag.String("dfs-metrics-addr", ":9901", "DFS: Metrics/health HTTP address (empty=disabled)")
 
 		// DFS cache quota flag
 		dfsCacheQuota = flag.Int64("dfs-cache-quota", 1<<30, "DFS: Chunk cache byte quota (0=unlimited, default 1GiB)")
+
+		// DFS DirectIO flag
+		directIO = flag.Bool("direct-io", false, "DFS: Bypass kernel page cache (DirectIO)")
+
+		// DFS bucket flag
+		bucket = flag.String("bucket", "", "DFS: bucket to mount (required)")
+
+		// DFS credential flags — exchange accessKey/secretKey for a signed
+		// principal-bound token at mount time.
+		accessKey = flag.String("access-key", "", "DFS: access key to authenticate the mount with metad")
+		secretKey = flag.String("secret-key", "", "DFS: secret key to authenticate the mount with metad")
+
+		// Optional credential source: a directory holding credentials.json
+		// (0600). Env vars META_ACCESS_KEY/META_SECRET_KEY/META_ENDPOINT are
+		// always read as a supplement when the corresponding --access-key
+		// etc. is unset. LoadCredentials in gateway/fuse implements this.
+		credentialsDir = flag.String("credentials-dir", "", "DFS: directory containing credentials.json; env META_* fall back when flags are unset")
 	)
-	_ = configPath
-	config.Preload()
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  %s --backend=dfs [flags] <mountpoint>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --config nufs-fuse.yaml <mountpoint>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --backend=dfs --bucket=<bucket> [flags] <mountpoint>\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --backend=s3 [flags] <s3-endpoint/bucket/prefix> <mountpoint>\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Backends:\n")
 		fmt.Fprintf(os.Stderr, "  dfs  Mount the DFS distributed filesystem (default)\n")
 		fmt.Fprintf(os.Stderr, "  s3   Mount an external S3 bucket\n\n")
+		fmt.Fprintf(os.Stderr, "Configuration:\n")
+		fmt.Fprintf(os.Stderr, "  --config loads a YAML/JSON/TOML file; CLI flags override file values.\n")
+		fmt.Fprintf(os.Stderr, "  Credential precedence: --access-key > credentials-dir/META_* env > --config.\n")
+		fmt.Fprintf(os.Stderr, "  Secrets should NOT be passed via CLI (visible in ps(1)); use env or --config.\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}
 	config.Preload()
 	flag.Parse()
-	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})
+
+	// Derive default log-file from mountpoint when --log-file is unset.
+	logFileVal := *logFile
+	if logFileVal == "" && len(flag.Args()) > 0 {
+		logFileVal = "nufs-" + sanitizeForFilename(flag.Args()[0]) + ".log"
+	}
+	logging.Init(logging.Config{
+		Level:      *logLevel,
+		JSON:       *logJSON,
+		AddSource:  true,
+		LogFile:    logFileVal,
+		MaxSize:    int64(*logMaxSize) * 1024 * 1024, // flag is MB, Config takes bytes
+		MaxBackups: *logMaxBackups,
+	})
 	log := logging.Named("nufs-fuse")
+
+	// Warn when secrets are passed via CLI (visible in ps(1)).
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "--secret-key=") {
+			log.Warn("secret passed via CLI flag — visible in ps(1); prefer env or --config file in production")
+			break
+		}
+	}
 
 	switch *backend {
 	case "nufs":
 		mountpoint := mountpointFromArgs(flag.Args())
-		runNUFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir, *dfsCacheQuota, *dfsMetricsAddr)
+		runNUFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir, *dfsCacheQuota, *dfsMetricsAddr, *directIO, *bucket, *accessKey, *secretKey, *credentialsDir, uint32(*uid), uint32(*gid), *allowOther, *readOnly, *debug)
 	case "s3":
-		runS3(log, flag.Args(), *cacheDir, *scanTTL, *readOnly, *cacheQuota, *metricsAddr, *insecure, *debug, *uid, *gid)
+		runS3(log, flag.Args(), *cacheDir, *scanTTL, *readOnly, *cacheQuota, *metricsAddr, *insecure, *debug, uint32(*uid), uint32(*gid))
 	default:
 		fmt.Fprintf(os.Stderr, "unknown backend: %q (use nufs or s3)\n", *backend)
 		os.Exit(1)
@@ -102,8 +156,36 @@ func mountpointFromArgs(args []string) string {
 	return args[0]
 }
 
+// sanitizeForFilename converts a mountpoint path into a safe log-file
+// suffix: takes the last path component, replaces non-alphanumerics with
+// underscores, and strips leading underscores (from leading slashes).
+//
+//	/mnt/mybucket   → mybucket
+//	/mnt/my bucket  → my_bucket
+//	/mnt/data       → data
+func sanitizeForFilename(mountpoint string) string {
+	base := filepath.Base(mountpoint)
+	var b strings.Builder
+	for _, r := range base {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	s := strings.TrimLeft(b.String(), "_")
+	if s == "" {
+		s = "default"
+	}
+	return s
+}
+
 // runNUFS mounts the DFS distributed filesystem via FUSE.
-func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, cacheQuota int64, metricsAddr string) {
+func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, cacheQuota int64, metricsAddr string, directIO bool, bucket string, accessKey, secretKey string, credentialsDir string, mountUID, mountGID uint32, allowOther, readOnly, debug bool) {
+	if bucket == "" {
+		log.Error("DFS backend requires --bucket=<name>")
+		os.Exit(1)
+	}
 	if _, err := os.Stat(mountpoint); os.IsNotExist(err) {
 		if err := os.MkdirAll(mountpoint, 0755); err != nil {
 			log.Error("failed to create mountpoint", "mountpoint", mountpoint, "error", err)
@@ -111,76 +193,480 @@ func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, c
 		}
 	}
 
-	var meta metadata.MetadataService
-	if metaAddr != "" {
-		meta = metadata.NewHTTPClient("http://"+metaAddr, 30*time.Second)
-		log.Info("remote mode", "meta_addr", metaAddr)
-	} else {
-		var err error
-		meta, err = metadata.NewPebbleStore(metadata.PebbleStoreConfig{Dir: metaDir})
-		if err != nil {
-			log.Error("failed to create metadata store", "error", err)
-			os.Exit(1)
-		}
-		log.Info("local mode (development)", "dir", metaDir)
-	}
-	defer meta.Close()
-
-	chunkStore := chunkstore.NewDatanodeChunkStore()
-
-	var chunkCache *gofuse.ChunkCache
-	if cacheDir != "" {
-		var err error
-		chunkCache, err = gofuse.NewChunkCacheWithQuota(cacheDir, 0, cacheQuota, gofuse.GlobalMetricsRecorder())
-		if err != nil {
-			log.Error("failed to create chunk cache", "error", err)
-			os.Exit(1)
-		}
-		log.Info("chunk cache enabled", "dir", cacheDir, "quota_bytes", cacheQuota)
-	}
-
-	// 启动 metrics HTTP 端点（/metrics + /healthz）。
-	// fuseMetrics 是 gofuse 包内的全局 FUSEMetrics 实例，实现 MetricsRecorder。
-	if metricsAddr != "" {
-		if srv := gofuse.StartMetricsServer(metricsAddr); srv != nil {
-			log.Info("metrics server started", "addr", metricsAddr)
+	// Credential source: explicit flags win; otherwise fall back to the
+	// gateway/fuse scaffold (credentials.json + META_* env) so a mount can
+	// authenticate purely from injected secrets without CLI flags.
+	ak, sk := accessKey, secretKey
+	if accessKey == "" || secretKey == "" {
+		useScaffold := credentialsDir != "" ||
+			os.Getenv("META_ACCESS_KEY") != "" ||
+			os.Getenv("META_SECRET_KEY") != "" ||
+			os.Getenv("META_ENDPOINT") != ""
+		if useScaffold {
+			cred := gofuse.LoadCredentials(credentialsDir)
+			if ak == "" {
+				ak = cred.AccessKey
+			}
+			if sk == "" {
+				sk = cred.SecretKey
+			}
 		}
 	}
 
-	// 构造 ReliabilityWrapper：retry + breaker + pathlock。
-	// 默认重试 3 次（指数退避 500ms→5s），熔断阈值 5 次失败 / 30s 恢复。
-	recorder := gofuse.GlobalMetricsRecorder()
-	reliability := gofuse.NewReliabilityWrapper(
-		recorder,
-		retry.Config{
-			MaxAttempts: 4,
-			BaseDelay:   500 * time.Millisecond,
-			MaxDelay:    5 * time.Second,
+	// mountState holds the mutable mount state for remount support.
+	state := &nufsMountState{
+		cfg: mountConfig{
+			log:        log,
+			mountpoint: mountpoint,
+			metaDir:    metaDir,
+			cacheDir:   cacheDir,
+			cacheQuota: cacheQuota,
+			directIO:   directIO,
+			bucket:     bucket,
+			mountUID:   mountUID,
+			mountGID:   mountGID,
+			allowOther: allowOther,
+			readOnly:   readOnly,
+			debug:      debug,
 		},
-		breaker.Config{
-			Threshold: 5,
-			Timeout:   30 * time.Second,
-		},
-	)
+		metaAddr:  metaAddr,
+		accessKey: ak,
+		secretKey: sk,
+	}
 
-	server, err := gofuse.Mount(mountpoint, meta, chunkStore, chunkCache, recorder, reliability, nil)
+	state.mu.Lock()
+	err := state.mount()
+	state.mu.Unlock()
 	if err != nil {
-		log.Error("failed to mount", "error", err)
+		log.Error("failed to initial mount", "error", err)
 		os.Exit(1)
 	}
-	defer server.Unmount()
 
-	log.Info("mounted", "mountpoint", mountpoint, "backend", "nufs")
+	// Start control HTTP server for remount + status.
+	if metricsAddr != "" {
+		startControlServer(log, metricsAddr, state)
+	}
+
+	log.Info("mounted", "mountpoint", mountpoint, "bucket", bucket, "backend", "nufs")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 
 	log.Info("received signal, unmounting", "signal", sig)
+	state.mu.Lock()
+	state.unmount()
+	state.mu.Unlock()
+}
+
+// mountConfig holds the immutable mount parameters, separate from the
+// per-mount runtime state below. It never changes after construction.
+type mountConfig struct {
+	log        *slog.Logger
+	mountpoint string
+	metaDir    string
+	cacheDir   string
+	cacheQuota int64
+	directIO   bool
+	bucket     string
+	mountUID   uint32
+	mountGID   uint32
+	allowOther bool
+	readOnly   bool
+	debug      bool
+}
+
+// nufsMountState holds the mutable mount state for remount support. Config
+// is split out into mountConfig so a field here means "the mount is live or
+// its secrets are in flux", not "another static parameter".
+type nufsMountState struct {
+	cfg mountConfig
+	mu  sync.Mutex // protects all mutable fields below
+
+	// metaAddr is mutable: remount() hot-swaps the authoritative endpoint.
+	metaAddr string
+	// credential inputs driving re-authentication on remount.
+	accessKey string
+	secretKey string
+	// The live signed bearer, replaced by exchangeAndStoreToken on mount
+	// and remount. Used only for /status reporting.
+	bearerToken    string
+	mountedAt      time.Time
+	tokenExpiresAt time.Time
+
+	// tokenRefreshCancel stops the background token-refresh goroutine.
+	// nil when no refresh is running (local mode or no credentials).
+	tokenRefreshCancel context.CancelFunc
+
+	server   *fuse.Server
+	fsys     *gofuse.DFSFileSystem
+	meta     metadata.MetadataService
+	cache    *gofuse.ChunkCache
+	recorder gofuse.MetricsRecorder
+}
+
+// mount creates a new FUSE mount. Caller must hold mu.
+func (s *nufsMountState) mount() error {
+	s.mountedAt = time.Now()
+	var meta metadata.MetadataService
+	var ownerForMount string
+	if s.metaAddr != "" {
+		client := metadata.NewHTTPClient("http://"+s.metaAddr, 30*time.Second)
+
+		// Exchange accessKey/secretKey for a signed, principal-bound token.
+		// The verified principal drives RBAC; an empty owner means no RBAC
+		// boundary (local/dev mode without credentials).
+		if s.accessKey != "" && s.secretKey != "" {
+			principal, err := s.exchangeAndStoreToken(client)
+			if err != nil {
+				return err
+			}
+			ownerForMount = principal
+			s.startTokenRefresh()
+		}
+
+		meta = client
+		s.cfg.log.Info("remote mode", "meta_addr", s.metaAddr, "principal", ownerForMount)
+	} else {
+		var err error
+		meta, err = metadata.NewPebbleStore(metadata.PebbleStoreConfig{Dir: s.cfg.metaDir})
+		if err != nil {
+			return fmt.Errorf("metadata store: %w", err)
+		}
+		s.cfg.log.Info("local mode (development)", "dir", s.cfg.metaDir)
+	}
+	s.meta = meta
+
+	chunkStore := chunkstore.NewDatanodeChunkStore()
+
+	if s.cfg.cacheDir != "" {
+		var err error
+		s.cache, err = gofuse.NewChunkCacheWithQuota(s.cfg.cacheDir, 0, s.cfg.cacheQuota, gofuse.GlobalMetricsRecorder())
+		if err != nil {
+			meta.Close()
+			return fmt.Errorf("chunk cache: %w", err)
+		}
+		s.cfg.log.Info("chunk cache enabled", "dir", s.cfg.cacheDir, "quota_bytes", s.cfg.cacheQuota)
+	}
+
+	s.recorder = gofuse.GlobalMetricsRecorder()
+	reliability := gofuse.NewReliabilityWrapper(
+		s.recorder,
+		retry.Config{MaxAttempts: 4, BaseDelay: 500 * time.Millisecond, MaxDelay: 5 * time.Second},
+		breaker.Config{Threshold: 5, Timeout: 30 * time.Second},
+		s.cfg.log,
+	)
+
+	if s.cfg.directIO {
+		gofuse.SetDirectIO(true)
+		s.cfg.log.Info("DirectIO enabled")
+	}
+
+	server, fsys, err := gofuse.Mount(gofuse.MountOptions{
+		Mountpoint:  s.cfg.mountpoint,
+		Meta:        meta,
+		ChunkStore:  chunkStore,
+		Cache:       s.cache,
+		Recorder:    s.recorder,
+		Reliability: reliability,
+		FUSEOpts:    &fuse.MountOptions{AllowOther: s.cfg.allowOther, Name: "dfs", FsName: "dfs"},
+		BucketName:  s.cfg.bucket,
+		Owner:       ownerForMount,
+		MountUID:    s.cfg.mountUID,
+		MountGID:    s.cfg.mountGID,
+		ReadOnly:    s.cfg.readOnly,
+	})
+	if err != nil {
+		meta.Close()
+		return fmt.Errorf("fuse mount: %w", err)
+	}
+	s.server = server
+	s.fsys = fsys
+	return nil
+}
+
+// exchangeAndStoreToken authenticates the client's credentials against metad,
+// stores the returned bearer on the client, and returns the verified
+// principal. The endpoint is pinned to the metad ops origin so the token
+// request reaches the auth authority the fuse will actually talk to.
+func (s *nufsMountState) exchangeAndStoreToken(client *metadata.HTTPClient) (string, error) {
+	authClient := metadata.NewHTTPClient("http://"+s.metaAddr, 30*time.Second)
+	result, err := authClient.ExchangeCredential(context.Background(), s.accessKey, s.secretKey, s.cfg.bucket)
+	if err != nil {
+		return "", fmt.Errorf("authenticate with metad: %w", err)
+	}
+	if result.Token == "" || result.Principal == "" {
+		return "", fmt.Errorf("metad returned an invalid token response")
+	}
+	client.SetAuthToken(result.Token)
+	s.bearerToken = result.Token
+	// Record expiry for /status and refresh scheduling. The FUSE does not
+	// hold the signing key so we estimate from the TTL returned by metad.
+	if result.TTLSeconds > 0 {
+		s.tokenExpiresAt = time.Now().Add(time.Duration(result.TTLSeconds) * time.Second)
+	}
+	s.cfg.log.Info("authenticated with metad", "principal", result.Principal, "ttl_seconds", result.TTLSeconds)
+	return result.Principal, nil
+}
+
+// tokenRefreshRetryDelay is how long to wait before retrying a failed
+// proactive refresh. Short relative to the token TTL so a transient metad blip
+// costs a retry rather than the whole refresh chain: giving up would let the
+// token expire and turn a recoverable hiccup into a hard mount failure.
+const tokenRefreshRetryDelay = 30 * time.Second
+
+// startTokenRefresh starts a background goroutine that re-exchanges
+// credentials before the current token expires. The refresh fires at 50%
+// of the token TTL, giving ample margin. Caller must hold mu.
+func (s *nufsMountState) startTokenRefresh() {
+	// Cancel any prior refresh (e.g. after remount).
+	if s.tokenRefreshCancel != nil {
+		s.tokenRefreshCancel()
+	}
+	if s.accessKey == "" || s.secretKey == "" {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.tokenRefreshCancel = cancel
+
+	// Read the expiry here, under the caller's lock, rather than in the
+	// goroutine: exchangeAndStoreToken writes it from other goroutines.
+	ttl := time.Until(s.tokenExpiresAt)
+	if ttl <= 0 {
+		ttl = metadata.DefaultTokenTTL()
+	}
+	refreshIn := ttl / 2
+	log := s.cfg.log
+
+	go func() {
+		log.Info("token refresh scheduled", "in", refreshIn.Round(time.Second))
+		for delay := refreshIn; ; delay = tokenRefreshRetryDelay {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+
+			s.mu.Lock()
+			// Refresh on the serving client itself, not a throwaway: the token
+			// must land on the *metadata.HTTPClient wired into the mount
+			// (s.fsys.Meta()), or the renewed token never reaches the data path
+			// and the mount starts 401ing once the original token's TTL lapses.
+			serving, ok := s.fsys.Meta().(*metadata.HTTPClient)
+			if !ok {
+				s.mu.Unlock()
+				log.Error("token refresh: metadata client is not an HTTP client; giving up")
+				return
+			}
+			_, err := s.exchangeAndStoreToken(serving)
+			if err == nil {
+				// Chain the next refresh off the new expiry, then hand the
+				// lock back — startTokenRefresh cancels ctx, ending this loop.
+				s.startTokenRefresh()
+				s.mu.Unlock()
+				log.Info("token refreshed proactively")
+				return
+			}
+			s.mu.Unlock()
+			log.Error("token refresh failed, will retry", "error", err, "retry_in", tokenRefreshRetryDelay)
+		}
+	}()
+}
+
+// unmount releases the current mount. Caller must hold mu.
+func (s *nufsMountState) unmount() {
+	if s.tokenRefreshCancel != nil {
+		s.tokenRefreshCancel()
+		s.tokenRefreshCancel = nil
+	}
+	if s.server != nil {
+		s.server.Unmount()
+		s.server = nil
+	}
+	if s.meta != nil {
+		s.meta.Close()
+		s.meta = nil
+	}
+	s.cache = nil
+}
+
+// remount 热切换：原子替换 metadata 客户端，不 unmount，不产生 EBADF。
+// Caller must hold mu.
+func (s *nufsMountState) remount(newMetaAddr string) error {
+	if s.fsys == nil {
+		return fmt.Errorf("filesystem not mounted")
+	}
+
+	if newMetaAddr == "" {
+		newMetaAddr = s.metaAddr
+	}
+
+	s.metaAddr = newMetaAddr
+	newMeta := metadata.NewHTTPClient("http://"+newMetaAddr, 30*time.Second)
+	if s.accessKey != "" && s.secretKey != "" {
+		// Stop any running refresh goroutine before re-authenticating.
+		if s.tokenRefreshCancel != nil {
+			s.tokenRefreshCancel()
+			s.tokenRefreshCancel = nil
+		}
+		// Re-authenticate against the new authority; the old token was scoped
+		// to its signer and the new node may hold a different signing key.
+		if _, err := s.exchangeAndStoreToken(newMeta); err != nil {
+			return err
+		}
+		s.startTokenRefresh()
+	}
+
+	s.fsys.SwapMetadata(newMeta)
+	s.cfg.log.Info("metadata hot-swapped", "addr", newMetaAddr)
+	return nil
+}
+
+// startControlServer starts the HTTP control server with /remount, /status and /healthz.
+func startControlServer(log *slog.Logger, addr string, state *nufsMountState) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"mountpoint":    state.cfg.mountpoint,
+			"meta_addr":     state.metaAddr,
+			"mounted":       state.server != nil,
+			"direct_io":     state.cfg.directIO,
+			"mounted_at":    state.mountedAt.Format(time.RFC3339),
+			"token_expires": state.tokenExpiresAt.Format(time.RFC3339),
+		})
+	})
+
+	mux.HandleFunc("/control/log-level", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"level": logging.CurrentLevel(),
+			})
+		case http.MethodPost:
+			var req struct {
+				Level string `json:"level"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			valid := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+			if !valid[req.Level] {
+				http.Error(w, "level must be one of: debug, info, warn, error", http.StatusBadRequest)
+				return
+			}
+			logging.SetLevel(req.Level)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"level": req.Level,
+			})
+			log.Info("log level changed", "new_level", req.Level)
+		default:
+			http.Error(w, "GET or POST required", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/remount", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			MetaAddr string `json:"meta_addr,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		state.mu.Lock()
+		defer state.mu.Unlock()
+
+		log.Info("remounting", "new_meta_addr", req.MetaAddr)
+		if err := state.remount(req.MetaAddr); err != nil {
+			log.Error("remount failed", "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":     "remounted",
+			"mountpoint": state.cfg.mountpoint,
+			"meta_addr":  state.metaAddr,
+		})
+		log.Info("remount succeeded", "meta_addr", state.metaAddr)
+	})
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		// Snapshot state under the lock, then release it: the metad probe below
+		// can block for up to 3s, and a liveness scrape must not stall a
+		// concurrent token refresh or remount.
+		state.mu.Lock()
+		mounted := state.server != nil
+		metaAddr := state.metaAddr
+		tokenExpires := state.tokenExpiresAt
+		mountedAt := state.mountedAt
+		state.mu.Unlock()
+
+		healthy := true
+		reasons := []string{}
+
+		// Check 1: mount is alive.
+		if !mounted {
+			healthy = false
+			reasons = append(reasons, "not mounted")
+		}
+
+		// Check 2: metadata service is reachable (quick GET /version).
+		if metaAddr != "" {
+			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+			defer cancel()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+metaAddr+"/version", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				healthy = false
+				reasons = append(reasons, "metadata unreachable: "+err.Error())
+			} else {
+				resp.Body.Close()
+			}
+		}
+
+		// Check 3: token is not expired (if using credential flow).
+		if !tokenExpires.IsZero() && time.Now().After(tokenExpires) {
+			healthy = false
+			reasons = append(reasons, "token expired")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if !healthy {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"healthy":       healthy,
+			"reasons":       reasons,
+			"token_expires": tokenExpires.Format(time.RFC3339),
+			"mounted_at":    mountedAt.Format(time.RFC3339),
+		})
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		log.Info("control server started", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("control server error", "error", err)
+		}
+	}()
 }
 
 // runS3 mounts an external S3 bucket via FUSE.
-func runS3(log *slog.Logger, args []string, cacheDir string, scanTTL time.Duration, readOnly bool, cacheQuota int64, metricsAddr string, insecure bool, debug bool, uid, gid uint) {
+func runS3(log *slog.Logger, args []string, cacheDir string, scanTTL time.Duration, readOnly bool, cacheQuota int64, metricsAddr string, insecure bool, debug bool, uid, gid uint32) {
 	if len(args) < 2 {
 		fmt.Fprintf(os.Stderr, "error: s3 backend requires <endpoint/bucket/prefix> <mountpoint>\n\n")
 		flag.Usage()

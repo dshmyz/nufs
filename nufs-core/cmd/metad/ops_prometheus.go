@@ -26,6 +26,20 @@ func prometheusMetricsHandler(store *metadata.PebbleStore, metrics *metadata.Met
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rr := httptestResponseRecorder()
+
+		// Compute cluster readiness once per scrape BEFORE the base handler
+		// snapshots the metrics. The base PrometheusHandler emits
+		// nufs_nodes_online / nufs_nodes_total / nufs_chunks_total from atomics
+		// that ComputeClusterReadiness populates from live ListNodes/ScrubAllChunks;
+		// refreshing them first keeps a single scrape internally consistent
+		// (the gauges would otherwise lag one scrape behind). The result also
+		// feeds the cluster-scoped gauges below, so readiness is computed exactly
+		// once per scrape, not once by the base path and again by the writer.
+		var readiness metadata.ClusterReadiness
+		if hc := store.GetHealthChecker(); hc != nil {
+			readiness = hc.ComputeClusterReadiness()
+		}
+
 		base.ServeHTTP(rr, r)
 		for key, values := range rr.headers {
 			for _, value := range values {
@@ -47,7 +61,7 @@ func prometheusMetricsHandler(store *metadata.PebbleStore, metrics *metadata.Met
 		writePrometheusBackup(r.Context(), w, backupSource, time.Now().UTC())
 		writePrometheusNodeMetrics(w, store)
 		writePrometheusEventBus(w, store)
-		writePrometheusClusterReadiness(w, store)
+		writePrometheusClusterReadiness(w, readiness)
 		writePrometheusRepair(context.Background(), w, store)
 	})
 }
@@ -459,13 +473,7 @@ func writePrometheusEventBus(w io.Writer, store *metadata.PebbleStore) {
 	fmt.Fprintf(w, "nufs_events_watcher_count %d\n", eb.WatcherCount())
 }
 
-func writePrometheusClusterReadiness(w io.Writer, store *metadata.PebbleStore) {
-	hc := store.GetHealthChecker()
-	if hc == nil {
-		return
-	}
-	r := hc.ComputeClusterReadiness()
-
+func writePrometheusClusterReadiness(w io.Writer, r metadata.ClusterReadiness) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "# HELP nufs_cluster_readiness Cluster readiness status (0=not_ready, 1=degraded, 2=ready)")
 	fmt.Fprintln(w, "# TYPE nufs_cluster_readiness gauge")

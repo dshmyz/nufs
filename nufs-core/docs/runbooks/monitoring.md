@@ -65,7 +65,6 @@ scrape_configs:
 | `nufs_cluster_chunks_under_replicated` | 副本不足的 chunk 数 |
 | `nufs_cluster_can_write_rf` | 当前能否按 RF 写入 |
 | `nufs_raft_state` / `nufs_raft_term` / `nufs_raft_log_index` | Raft 状态 / 任期 / 日志 index |
-| `nufs_leader_stable` 相关 | leader 稳定性衡量 |
 
 ### 2.2 元数据面（metad 核心 `metadata/prometheus.go`）
 `nufs_read_ops_total` / `nufs_write_ops_total` / `nufs_errors_total`、
@@ -114,8 +113,9 @@ scrape_configs:
 | `nufs.warning` | 17 | `NUFSDiskUsageHigh`、`NUFSNodeOffline`、`NUFSMetadReadLatencyHigh`、`NUFSMetadWriteLatencyHigh`、`NUFSDatanodeReplicationErrors`、`NUFSNodeWriteErrorRateHigh`、`NUFSObjectWriteRecoveryBacklog`、`NUFSBucketQuotaBytesHigh`、`NufsEventsDropped`、`NUFSDiskDegraded` |
 | `nufs.info` | 1 | `NUFSDiskDegraded`（磁盘降级提示，等待恢复） |
 
-> 完整清单见 yaml 本身；规则语义与 SLO 对齐的另一副本在 `internal/slo/slo.go`（描述性
-> registry，声明 SLI 表达式 + AlertRules 供审计）。
+> 完整清单见 yaml 本身；`internal/slo/slo.go` 是描述性 SLO/SLI/error-budget 目录（声明 SLI
+> 表达式供审计），告警规则只存在于 `deploy/monitoring/alerting-rules.yaml` 这一个权威副本，
+> 不再在 slo.go 中重复维护。
 
 ---
 

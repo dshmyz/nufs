@@ -777,6 +777,78 @@ func TestChunkGCTombstonesOrphansBeforePhysicalPurge(t *testing.T) {
 	}
 }
 
+// TestChunkGCOrphanLifecycleEndToEnd pins the full orphan chunk lifecycle in a
+// single non-dry-run pass: a chunk that was allocated and committed but never
+// attached to any inode (the FUSE flush crash-between-write-and-UpdateInode
+// signature, and the S3 abandoned-allocated case) must be (1) caught and
+// tombstoned by the first Scan, and (2) physically purged by a later Scan once
+// the quarantine window has elapsed and a newer backup frees the payload. This
+// closes the gap between TestChunkGCTombstonesOrphansBeforePhysicalPurge (stops
+// at tombstone) and TestChunkGCPurgesEligibleTombstonesBeyondPublicListLimit
+// (starts from a pre-seeded tombstone): the GC-produced tombstone is never
+// exercised through to purge, which is exactly the path that reclaims a FUSE
+// orphan's storage.
+func TestChunkGCOrphanLifecycleEndToEnd(t *testing.T) {
+	store := newTestPebbleStore(t)
+	defer store.Close()
+	ctx := context.Background()
+
+	// A raw orphan: chunk metadata exists, no inode references it, and it was
+	// never DeleteChunk'd — the crash-leftover profile.
+	chunkID := ChunkID(46)
+	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, chunkID), &ChunkMeta{ID: chunkID, Size: 512, State: ChunkReady}); err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+
+	// First GC cycle: the orphan must be tombstoned, but retained (metadata +
+	// payload) through the quarantine window.
+	first, err := NewChunkGC(store, nil, nil, false).Scan(ctx)
+	if err != nil {
+		t.Fatalf("first GC scan: %v", err)
+	}
+	if first.TombstonesCreated != 1 || first.ChunksPurged != 0 || first.DeletedChunks != 0 {
+		t.Fatalf("first GC result = %+v, want one tombstone and no purge", first)
+	}
+	if _, err := store.GetChunk(ctx, chunkID); err != nil {
+		t.Fatalf("orphan must not be purged in the same cycle that tombstones it: %v", err)
+	}
+	tombstones, err := store.ListChunkTombstones(ctx, 1)
+	if err != nil || len(tombstones) != 1 {
+		t.Fatalf("tombstones after first cycle = (%v, %v), want one", tombstones, err)
+	}
+
+	// Advance the tombstone past quarantine and record a backup newer than the
+	// deletion, so the next cycle is allowed to physically purge the payload.
+	deletedAt := tombstones[0].DeletedAt
+	aged := ChunkTombstone{
+		ChunkID:     chunkID,
+		Replicas:    tombstones[0].Replicas,
+		Size:        tombstones[0].Size,
+		Reason:      tombstones[0].Reason,
+		DeletedAt:   deletedAt.Add(-chunkTombstoneQuarantine - time.Hour),
+		DeleteAfter: deletedAt.Add(-time.Hour),
+	}
+	if err := store.putMsgpack(chunkTombstoneKey(chunkID), &aged); err != nil {
+		t.Fatalf("age tombstone: %v", err)
+	}
+	putCommittedCatalog(t, store, aged.DeletedAt.Add(time.Second), time.Now().UTC().Round(0))
+
+	// Second GC cycle: the orphan (now tombstoned + eligible) is purged.
+	second, err := NewChunkGC(store, nil, nil, false).Scan(ctx)
+	if err != nil {
+		t.Fatalf("second GC scan: %v", err)
+	}
+	if second.ChunksPurged != 1 || second.DeletedChunks != 1 || second.FreedBytes != 512 {
+		t.Fatalf("second GC result = %+v, want one chunk purged, 512 bytes freed", second)
+	}
+	if _, err := store.GetChunk(ctx, chunkID); !errors.Is(err, ErrChunkNotFound) {
+		t.Fatalf("chunk after purge = %v, want ErrChunkNotFound", err)
+	}
+	if tombstones, err := store.ListChunkTombstones(ctx, 0); err != nil || len(tombstones) != 0 {
+		t.Fatalf("tombstones after purge = (%v, %v), want none", tombstones, err)
+	}
+}
+
 func TestChunkGCPurgesEligibleTombstonesBeyondPublicListLimit(t *testing.T) {
 	store := newTestPebbleStore(t)
 	ctx := context.Background()

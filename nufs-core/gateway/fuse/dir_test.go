@@ -12,7 +12,10 @@ import (
 
 // newTestDir returns a DFSDir rooted at the "test" bucket's root inode,
 // backed by the in-memory PebbleStore. The bucket already contains the
-// pre-created "hello.txt" file (see newTestMetaStore).
+// pre-created "hello.txt" file (see newTestMetaStore). A real
+// DFSFileSystem root is created so the dir's `fs` field resolves
+// Meta()/checkAccess; the dir is not attached to a FUSE bridge (unit
+// tests exercise its methods directly).
 func newTestDir(t *testing.T) (*metadata.PebbleStore, *DFSDir) {
 	t.Helper()
 	store, _ := newTestMetaStore(t)
@@ -20,7 +23,9 @@ func newTestDir(t *testing.T) (*metadata.PebbleStore, *DFSDir) {
 	if err != nil {
 		t.Fatalf("GetBucket: %v", err)
 	}
-	dir := &DFSDir{meta: store, inodeID: bucket.RootInode}
+
+	dfs := NewDFSFileSystem(store, nil, nil, nil, nil)
+	dir := &DFSDir{fs: dfs, inodeID: bucket.RootInode}
 	return store, dir
 }
 

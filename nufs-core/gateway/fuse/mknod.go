@@ -22,7 +22,8 @@ import (
 type DFSFifo struct {
 	fs.Inode
 
-	meta    metadata.MetadataService
+	// fs is the owning filesystem root; stable across SwapMetadata swaps.
+	fs      *DFSFileSystem
 	inodeID metadata.InodeID
 
 	// recorder 记录 FUSE 操作指标。nil 时不打点。
@@ -43,7 +44,7 @@ func (n *DFSFifo) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fus
 	rec := recorderFor(n.recorder)
 	rec.IncOp("open")
 
-	metaInode, err := n.meta.GetInode(ctx, n.inodeID)
+	metaInode, err := n.fs.Meta().GetInode(ctx, n.inodeID)
 	if err != nil {
 		rec.IncOpError("open")
 		return nil, 0, syscall.EIO
@@ -65,7 +66,7 @@ func (n *DFSFifo) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 // S_IF* type bit and (for devices) Rdev.
 func (n *DFSFifo) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	rec := recorderFor(n.recorder)
-	metaInode, err := n.meta.GetInode(ctx, n.inodeID)
+	metaInode, err := n.fs.Meta().GetInode(ctx, n.inodeID)
 	if err != nil {
 		rec.IncOpError("getattr")
 		return syscall.EIO
@@ -77,7 +78,7 @@ func (n *DFSFifo) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrO
 // Setattr updates chmod/chown only. Size is not applicable to special nodes.
 func (n *DFSFifo) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	rec := recorderFor(n.recorder)
-	metaInode, err := n.meta.GetInode(ctx, n.inodeID)
+	metaInode, err := n.fs.Meta().GetInode(ctx, n.inodeID)
 	if err != nil {
 		rec.IncOpError("setattr")
 		return syscall.EIO
@@ -98,7 +99,7 @@ func (n *DFSFifo) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 	}
 	if changed {
 		metaInode.CTime = time.Now().UnixNano()
-		if err := n.meta.UpdateInode(ctx, metaInode); err != nil {
+		if err := n.fs.Meta().UpdateInode(ctx, metaInode); err != nil {
 			rec.IncOpError("setattr")
 			return syscall.EIO
 		}
@@ -108,9 +109,9 @@ func (n *DFSFifo) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAtt
 	return 0
 }
 
-// Access always returns 0 (allow-all).
+// Access evaluates the fifo's POSIX mode bits against the requesting caller.
 func (n *DFSFifo) Access(ctx context.Context, mask uint32) syscall.Errno {
-	return 0
+	return checkPOSIXAccess(ctx, n.fs, n.inodeID, mask)
 }
 
 // errnoForCreateNode maps a CreateNode error to a FUSE errno (nil → 0).

@@ -62,6 +62,21 @@ func TestComputeClusterReadiness_AllHealthy(t *testing.T) {
 	if r.Checks["replication"] != "ok" {
 		t.Errorf("replication check = %q, want ok", r.Checks["replication"])
 	}
+
+	// ComputeClusterReadiness must populate the atomics that back the
+	// nufs_nodes_online / nufs_nodes_total / nufs_chunks_total gauges exposed by
+	// PrometheusHandler. These feed the datanode_availability and chunk_durability
+	// SLOs; if they stay 0 the alerts can never fire (SLO = 0/0 NaN). See
+	// metadata/prometheus.go PrometheusHandler.
+	if got := metrics.NodesOnline.Load(); got != 3 {
+		t.Errorf("metrics.NodesOnline = %d, want 3", got)
+	}
+	if got := metrics.NodesTotal.Load(); got != 3 {
+		t.Errorf("metrics.NodesTotal = %d, want 3", got)
+	}
+	if got := metrics.ChunksTotal.Load(); got != 1 {
+		t.Errorf("metrics.ChunksTotal = %d, want 1", got)
+	}
 }
 
 func TestComputeClusterReadiness_NoQuorum(t *testing.T) {
@@ -154,6 +169,11 @@ func TestComputeClusterReadiness_UnderReplicated(t *testing.T) {
 	}
 	if r.ChunksTotal != 1 {
 		t.Errorf("chunks_total = %d, want 1", r.ChunksTotal)
+	}
+
+	// The atomics backing the Prometheus gauges must reflect the real scan.
+	if got := metrics.ChunksTotal.Load(); got != 1 {
+		t.Errorf("metrics.ChunksTotal = %d, want 1", got)
 	}
 }
 

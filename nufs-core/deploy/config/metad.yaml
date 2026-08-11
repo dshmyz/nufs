@@ -2,12 +2,19 @@
 # Usage: metad --config=metad.yaml
 # CLI flags override YAML values.
 
+config_version: 1                 # config schema version; a mismatch with the binary
+                                  # logs a WARN at startup so a renamed key is not
+                                  # silently dropped on upgrade
+
 data_dir: "/var/lib/dfs/metadata"
 cache_dir: ""
 ops_addr: "0.0.0.0:8091"
 node_id: 1
 log_level: "info"
 log_json: false
+log_file: ""                      # log file path (empty = stderr)
+log_max_size: 100                 # max log file size in MB before rotation
+log_max_backups: 7                # max rotated log files to keep
 
 # Raft consensus (optional, for multi-node HA)
 raft:
@@ -22,6 +29,17 @@ tls_key: ""
 
 # Auth token for ops API (empty = no auth)
 auth_token: ""
+
+# HMAC key that signs mount auth tokens. Must be set for nufs-fuse mounts to
+# authenticate; keep it here or in the platform secret rather than on the CLI
+# (CLI values are visible in ps(1)).
+token_signing_key: ""
+
+# Key rotation: set this to the OLD key while token_signing_key holds the new
+# one. New tokens are always minted with token_signing_key; the previous key is
+# verify-only, so tokens already handed out stay valid until they expire.
+# Remove it once the longest token TTL (6h) has elapsed.
+token_signing_key_previous: ""
 
 # Background tasks
 lease_ttl: "30s"

@@ -53,16 +53,24 @@ type opsHandlers struct {
 // false. Callers (mutating handlers) should return immediately after
 // this returns false. Read-only handlers can skip the check.
 func (h *opsHandlers) requireLeader(w http.ResponseWriter, r *http.Request) bool {
-	if h.store.IsLeader() {
+	return requireLeaderRedirect(w, r, h.store)
+}
+
+// requireLeaderRedirect is the shared leader-gate helper: if store is the Raft
+// leader it returns true; otherwise it 307-redirects the request to the
+// leader's ops address (or 503s when no leader is known) and returns false.
+// Both the ops handlers and the standalone auth registration use it so the
+// leader-redirect logic has a single implementation.
+func requireLeaderRedirect(w http.ResponseWriter, r *http.Request, store *metadata.PebbleStore) bool {
+	if store.IsLeader() {
 		return true
 	}
-	leaderAddr := h.store.LeaderOpsAddr()
+	leaderAddr := store.LeaderOpsAddr()
 	if leaderAddr == "" {
 		writeJSONError(w, http.StatusServiceUnavailable, "no leader available")
 		return false
 	}
-	target := leaderRedirectTarget(leaderAddr, r.URL)
-	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	http.Redirect(w, r, leaderRedirectTarget(leaderAddr, r.URL), http.StatusTemporaryRedirect)
 	return false
 }
 
@@ -118,6 +126,9 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, dataSt
 	// Buckets (mutating: POST/PUT/DELETE; read: GET uses same handler that method-switches)
 	mux.HandleFunc("/api/v1/buckets", mut(s.handleBuckets))
 	mux.HandleFunc("/api/v1/buckets/", mut(s.handleBucketByID))
+
+	// ACL (bucket policies)
+	mux.HandleFunc("/api/v1/acl/", mut(s.handleACL))
 
 	// Nodes (register/heartbeat/decommission are mutating)
 	mux.HandleFunc("/api/v1/nodes", mut(s.handleNodes))

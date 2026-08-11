@@ -17,7 +17,8 @@ import (
 type DFSSymlink struct {
 	fs.Inode
 
-	meta    metadata.MetadataService
+	// fs is the owning filesystem root; stable across SwapMetadata swaps.
+	fs      *DFSFileSystem
 	inodeID metadata.InodeID
 
 	// recorder 记录 FUSE 操作指标。nil 时不打点。
@@ -31,7 +32,7 @@ var _ = (fs.NodeSetattrer)((*DFSSymlink)(nil))
 
 // Readlink reads the target path of the symlink.
 func (s *DFSSymlink) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
-	target, err := s.meta.Readlink(ctx, s.inodeID)
+	target, err := s.fs.Meta().Readlink(ctx, s.inodeID)
 	if err != nil {
 		if errors.Is(err, metadata.ErrNotSymlink) {
 			return nil, syscall.EINVAL
@@ -43,7 +44,7 @@ func (s *DFSSymlink) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 
 // Getattr returns symlink attributes.
 func (s *DFSSymlink) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	metaInode, err := s.meta.GetInode(ctx, s.inodeID)
+	metaInode, err := s.fs.Meta().GetInode(ctx, s.inodeID)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -51,14 +52,14 @@ func (s *DFSSymlink) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.At
 	return 0
 }
 
-// Access always returns 0 (allow-all).
+// Access evaluates the symlink's POSIX mode bits against the requesting caller.
 func (s *DFSSymlink) Access(ctx context.Context, mask uint32) syscall.Errno {
-	return 0
+	return checkPOSIXAccess(ctx, s.fs, s.inodeID, mask)
 }
 
 // Setattr updates symlink metadata (uid, gid, mode).
 func (s *DFSSymlink) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
-	metaInode, err := s.meta.GetInode(ctx, s.inodeID)
+	metaInode, err := s.fs.Meta().GetInode(ctx, s.inodeID)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -78,7 +79,7 @@ func (s *DFSSymlink) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.Set
 	}
 	if changed {
 		metaInode.CTime = time.Now().UnixNano()
-		if err := s.meta.UpdateInode(ctx, metaInode); err != nil {
+		if err := s.fs.Meta().UpdateInode(ctx, metaInode); err != nil {
 			return syscall.EIO
 		}
 	}
@@ -89,5 +90,5 @@ func (s *DFSSymlink) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.Set
 
 // OpenXAttr returns an xattr handle for this symlink.
 func (s *DFSSymlink) OpenXAttr() *DFSXAttr {
-	return &DFSXAttr{meta: s.meta, inodeID: s.inodeID}
+	return &DFSXAttr{meta: s.fs.Meta(), inodeID: s.inodeID}
 }

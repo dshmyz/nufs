@@ -1,28 +1,62 @@
 # NUFS FUSE Gateway Configuration
+# ───────────────────────────────
 # Usage:
-#   nufs-fuse --config=nufs-fuse.yaml <mountpoint>
-#   nufs-fuse --backend=dfs [flags] <mountpoint>
-#   nufs-fuse --backend=s3 [flags] <s3-endpoint/bucket/prefix> <mountpoint>
+#   nufs-fuse --config nufs-fuse.yaml <mountpoint>
 #
-# CLI flags override YAML values.
+# All keys are flag names (kebab-case or snake_case both work).
+# CLI flags unconditionally override YAML values.
+# Secrets should be set via env vars or this file, NOT via CLI flags
+# (CLI values are visible in ps(1)).
 
-backend: "dfs"
-cache_dir: ""
-log_level: "info"
-log_json: false
+# ── General ────────────────────────────────────────────────────────
+config_version: 1                     # config schema version; a mismatch with the
+                                      # binary logs a WARN at startup so a renamed
+                                      # key is not silently dropped on upgrade
+backend: "dfs"                        # "dfs" (distributed filesystem) or "s3" (external S3 bucket)
 
-# DFS backend options
-meta_addr: ""                            # Remote: metadata HTTP address (e.g., "localhost:8091")
-meta_dir: "/var/lib/dfs/metadata"        # Local: Pebble data directory (mutually exclusive with meta_addr)
+# ── Logging ────────────────────────────────────────────────────────
+log_level:  "info"                    # debug | info | warn | error
+log_json:   false                     # true = structured JSON output
+log_file:   ""                        # log file path (default: nufs-{mountpoint}.log; empty = that default)
+log_max_size:     100                 # max log file size in MB before rotation
+log_max_backups:  7                   # max rotated log files to keep
 
-# S3 backend options (used when --backend=s3)
-target: ""
-mountpoint: "/mnt/nufs"
-scan_ttl: "60s"
-read_only: false
-cache_quota: 0
-metrics_addr: ":9900"
-insecure: false
-debug: false
-uid: 0
-gid: 0
+# ── DFS backend ────────────────────────────────────────────────────
+# (required when backend=dfs)
+
+bucket:     ""                        # bucket to mount (REQUIRED for DFS)
+
+# Metadata source: remote (mutually exclusive with meta_dir).
+meta_addr:      ""                    # metad HTTP address, e.g. "10.0.0.1:8091"
+meta_dir:       "/var/lib/dfs/metadata"  # local Pebble directory (for single-node dev)
+
+# ── DFS authentication ─────────────────────────────────────────────
+# Credential flow (recommended): metad exchanges these for a short-lived
+# signed token at mount time. Token auto-refreshes at 50% of TTL.
+access_key:     ""                    # metad access key (or set via META_ACCESS_KEY env)
+secret_key:     ""                    # metad secret key (or set via META_SECRET_KEY env)
+
+# Optional: directory containing credentials.json (loaded when flags unset).
+# credentials_dir: ""
+
+# ── DFS cache & I/O ────────────────────────────────────────────────
+cache_dir:      ""                    # chunk cache directory (empty = memory only)
+dfs_cache_quota: 1073741824           # chunk cache byte quota (default 1 GiB, 0 = unlimited)
+direct_io:      false                 # bypass kernel page cache (DirectIO)
+
+# ── FUSE mount options (shared) ───────────────────────────────────
+uid:            0                     # file owner UID (0 = caller's uid)
+gid:            0                     # file owner GID (0 = caller's gid)
+allow_other:    false                 # allow other users to access the mount
+read_only:      false                 # read-only mount (deny all writes with EROFS)
+debug:          false                 # verbose FUSE + metadata traces
+
+# ── DFS metrics & monitoring ──────────────────────────────────────
+dfs_metrics_addr: ":9901"             # DFS metrics/health HTTP address (empty = disabled)
+
+# ── S3 backend ────────────────────────────────────────────────────
+# (used when backend=s3; all DFS fields above are ignored)
+scan_ttl:       "60s"                 # directory scan cache TTL
+cache_quota:    0                     # S3 cache disk quota in bytes (0 = unlimited)
+metrics_addr:   ":9900"               # S3 metrics/health HTTP address
+insecure:       false                 # skip TLS verification

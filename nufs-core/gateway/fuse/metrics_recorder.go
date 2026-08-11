@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -30,24 +31,94 @@ type MetricsRecorder interface {
 	// IncBreakerOpen 递增熔断器开路计数（dep: meta / chunkStore）。
 	IncBreakerOpen(dep string)
 
-	// IncRetry 递增重试次数（op: read/write/flush/lookup 等）。
+	// IncRetry increments the retry count for an op.
 	IncRetry(op string)
+
+	// ObserveOpLatency records the wall-clock duration of an op, feeding
+	// per-op latency histograms exposed via /metrics.
+	ObserveOpLatency(op string, d time.Duration)
+
+	// IncStagingSpill increments the staging spill count (dirty chunk moved
+	// from memory to disk staging).
+	IncStagingSpill()
+	// IncStagingLoad increments the staging load count (spilled chunk
+	// loaded back from disk staging during flush).
+	IncStagingLoad()
+	// IncStagingSpillErr increments the staging spill error count.
+	IncStagingSpillErr()
 }
 
 // noopMetricsRecorder 是空实现，用于测试和默认关闭场景。
 type noopMetricsRecorder struct{}
 
-func (noopMetricsRecorder) IncOp(string)         {}
-func (noopMetricsRecorder) IncOpError(string)    {}
-func (noopMetricsRecorder) IncCacheHit()         {}
-func (noopMetricsRecorder) IncCacheMiss()        {}
-func (noopMetricsRecorder) IncCacheEvict()       {}
-func (noopMetricsRecorder) IncBreakerOpen(string) {}
-func (noopMetricsRecorder) IncRetry(string)      {}
+func (noopMetricsRecorder) IncOp(string)                           {}
+func (noopMetricsRecorder) IncOpError(string)                      {}
+func (noopMetricsRecorder) IncCacheHit()                           {}
+func (noopMetricsRecorder) IncCacheMiss()                          {}
+func (noopMetricsRecorder) IncCacheEvict()                         {}
+func (noopMetricsRecorder) IncBreakerOpen(string)                  {}
+func (noopMetricsRecorder) IncRetry(string)                        {}
+func (noopMetricsRecorder) ObserveOpLatency(string, time.Duration) {}
+func (noopMetricsRecorder) IncStagingSpill()                       {}
+func (noopMetricsRecorder) IncStagingLoad()                        {}
+func (noopMetricsRecorder) IncStagingSpillErr()                    {}
 
 // FUSEMetrics 实现 MetricsRecorder，同时保持 HTTP /metrics 端点能力。
 // 原有字段（OpsOpen 等）保留兼容；新增 error/cache/breaker/retry 计数。
 var _ MetricsRecorder = (*FUSEMetrics)(nil)
+
+// opHistogram tracks latency distribution for a single FUSE op, using
+// exponential buckets from 1 ms to 60 s. The structure mirrors the
+// self-contained s3fs histogram in gateway/s3fs/metrics.go.
+type opHistogram struct {
+	mu      sync.Mutex
+	count   uint64
+	sum     float64 // seconds
+	buckets []opHistBucket
+}
+
+type opHistBucket struct {
+	le    float64
+	count uint64
+}
+
+var fuseLatencyBuckets = []float64{
+	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
+}
+
+func newOpHistogram() *opHistogram {
+	b := make([]opHistBucket, len(fuseLatencyBuckets))
+	for i, le := range fuseLatencyBuckets {
+		b[i].le = le
+	}
+	return &opHistogram{buckets: b}
+}
+
+func (h *opHistogram) observe(seconds float64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.count++
+	h.sum += seconds
+	for i := range h.buckets {
+		if seconds <= h.buckets[i].le {
+			h.buckets[i].count++
+		}
+	}
+}
+
+func (h *opHistogram) snapshot() opHistSnapshot {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	buckets := make([]opHistBucket, len(h.buckets))
+	copy(buckets, h.buckets)
+	return opHistSnapshot{count: h.count, sum: h.sum, buckets: buckets}
+}
+
+type opHistSnapshot struct {
+	count   uint64
+	sum     float64
+	buckets []opHistBucket
+}
 
 // 新增计数器（不在原 Snapshot 中暴露，避免破坏现有格式）
 // —— 通过新增 SnapshotV2 暴露给 OpenMetrics 端点
@@ -104,12 +175,39 @@ func (m *FUSEMetrics) IncBreakerOpen(dep string) {
 	atomic.AddUint64(&m.BreakerOpens, 1)
 }
 
+func (m *FUSEMetrics) IncStagingSpill()    { atomic.AddUint64(&m.StagingSpills, 1) }
+func (m *FUSEMetrics) IncStagingLoad()     { atomic.AddUint64(&m.StagingLoads, 1) }
+func (m *FUSEMetrics) IncStagingSpillErr() { atomic.AddUint64(&m.StagingSpillErr, 1) }
+
 func (m *FUSEMetrics) IncRetry(op string) {
 	atomic.AddUint64(&m.OpsRetries, 1)
 }
 
-// ObserveOpLatency 记录操作延迟（当前仅记录到 noopMetrics 的扩展用，
-// 暂未接入直方图；后续可接入 Prometheus histogram）。
 func (m *FUSEMetrics) ObserveOpLatency(op string, d time.Duration) {
-	// TODO: 接入 prometheus histogram
+	h := m.getOrCreateHistogram(op)
+	h.observe(d.Seconds())
+}
+
+// latency tracks per-op histogram instances. Lazily allocated on first
+// ObserveOpLatency call; never shrunk. Concurrent-safe: only the map
+// itself is guarded; individual histograms have their own mutex.
+var latency sync.Map // map[string]*opHistogram
+
+func (*FUSEMetrics) getOrCreateHistogram(op string) *opHistogram {
+	if v, ok := latency.Load(op); ok {
+		return v.(*opHistogram)
+	}
+	h := newOpHistogram()
+	actual, _ := latency.LoadOrStore(op, h)
+	return actual.(*opHistogram)
+}
+
+// opLatencySnapshots returns a snapshot of every observed op histogram.
+func opLatencySnapshots() map[string]opHistSnapshot {
+	out := make(map[string]opHistSnapshot)
+	latency.Range(func(key, value interface{}) bool {
+		out[key.(string)] = value.(*opHistogram).snapshot()
+		return true
+	})
+	return out
 }

@@ -45,7 +45,7 @@ func fastBreakerCfg(onChange func(string, breaker.State, breaker.State)) breaker
 
 // TestReliabilityWrapper_DoMeta_RetriesAndSucceeds 验证 DoMeta 在瞬时错误时重试并最终成功。
 func TestReliabilityWrapper_DoMeta_RetriesAndSucceeds(t *testing.T) {
-	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil))
+	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	var calls int32
 	err := w.DoMeta("read", func() error {
@@ -65,7 +65,7 @@ func TestReliabilityWrapper_DoMeta_RetriesAndSucceeds(t *testing.T) {
 
 // TestReliabilityWrapper_DoMeta_NoRetryOnNonRetryable 验证不可重试错误立即返回。
 func TestReliabilityWrapper_DoMeta_NoRetryOnNonRetryable(t *testing.T) {
-	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil))
+	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	nonRetryable := errors.New("permanent failure")
 
@@ -84,7 +84,7 @@ func TestReliabilityWrapper_DoMeta_NoRetryOnNonRetryable(t *testing.T) {
 
 // TestReliabilityWrapper_DoMeta_BreakerOpensAfterThreshold 验证持续失败后熔断器开路。
 func TestReliabilityWrapper_DoMeta_BreakerOpensAfterThreshold(t *testing.T) {
-	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil))
+	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	// 每次调用都返回不可重试错误，快速累积失败。
 	failFn := func() error { return errors.New("fail") }
@@ -110,7 +110,7 @@ func TestReliabilityWrapper_DoMeta_BreakerOpensAfterThreshold(t *testing.T) {
 
 // TestReliabilityWrapper_DoChunk_RetriesAndSucceeds 验证 DoChunk 同样支持重试。
 func TestReliabilityWrapper_DoChunk_RetriesAndSucceeds(t *testing.T) {
-	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil))
+	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	var calls int32
 	err := w.DoChunk("write", func() error {
@@ -131,7 +131,7 @@ func TestReliabilityWrapper_DoChunk_RetriesAndSucceeds(t *testing.T) {
 // TestReliabilityWrapper_IncrementsRetryCounter 验证重试时递增 retry 计数器。
 func TestReliabilityWrapper_IncrementsRetryCounter(t *testing.T) {
 	rec := &FUSEMetrics{}
-	w := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil))
+	w := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	_ = w.DoMeta("read", func() error {
 		return transientErr{msg: "transient"}
@@ -145,7 +145,7 @@ func TestReliabilityWrapper_IncrementsRetryCounter(t *testing.T) {
 // TestReliabilityWrapper_IncrementsBreakerCounter 验证熔断器开路时递增 breaker 计数器。
 func TestReliabilityWrapper_IncrementsBreakerCounter(t *testing.T) {
 	rec := &FUSEMetrics{}
-	w := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil))
+	w := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	// 触发熔断（3 次失败）。
 	for i := 0; i < 3; i++ {
@@ -159,7 +159,7 @@ func TestReliabilityWrapper_IncrementsBreakerCounter(t *testing.T) {
 
 // TestReliabilityWrapper_LockInode_SerializesConcurrent 验证路径锁串行化并发访问。
 func TestReliabilityWrapper_LockInode_SerializesConcurrent(t *testing.T) {
-	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil))
+	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	var (
 		concurrent int32
@@ -195,7 +195,7 @@ func TestReliabilityWrapper_LockInode_SerializesConcurrent(t *testing.T) {
 
 // TestReliabilityWrapper_LockInode_DifferentInodesParallel 验证不同 inode 的锁不互斥。
 func TestReliabilityWrapper_LockInode_DifferentInodesParallel(t *testing.T) {
-	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil))
+	w := NewReliabilityWrapper(nil, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	var (
 		concurrent int32

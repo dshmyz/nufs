@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/dshmyz/nufs/nufs-core/internal/resilience/breaker"
 	"github.com/dshmyz/nufs/nufs-core/internal/resilience/lock"
@@ -24,6 +25,7 @@ type ReliabilityWrapper struct {
 	retryCfg     retry.Config
 	pathLock     *lock.Manager
 	recorder     MetricsRecorder
+	log          *slog.Logger
 }
 
 // NewReliabilityWrapper 创建 ReliabilityWrapper。
@@ -33,11 +35,16 @@ type ReliabilityWrapper struct {
 //   - breakerCfg: 熔断配置（同时应用于 meta 和 chunk 两个熔断器）
 //     breakerCfg.OnStateChange 会被包装以递增 breaker 计数器，
 //     原有回调仍然执行。
-func NewReliabilityWrapper(rec MetricsRecorder, retryCfg retry.Config, breakerCfg breaker.Config) *ReliabilityWrapper {
+//   - log: 结构化日志器（nil 时使用 slog.Default()）
+func NewReliabilityWrapper(rec MetricsRecorder, retryCfg retry.Config, breakerCfg breaker.Config, log *slog.Logger) *ReliabilityWrapper {
+	if log == nil {
+		log = slog.Default()
+	}
 	w := &ReliabilityWrapper{
 		retryCfg: retryCfg,
 		pathLock: lock.New(),
 		recorder: rec,
+		log:      log,
 	}
 
 	origOnChange := breakerCfg.OnStateChange
@@ -47,6 +54,7 @@ func NewReliabilityWrapper(rec MetricsRecorder, retryCfg retry.Config, breakerCf
 		if to == breaker.StateOpen {
 			r := recorderFor(w.recorder)
 			r.IncBreakerOpen("meta")
+			w.log.Warn("circuit breaker opened", "target", "meta", "from", from)
 		}
 		if origOnChange != nil {
 			origOnChange(name, from, to)
@@ -58,6 +66,7 @@ func NewReliabilityWrapper(rec MetricsRecorder, retryCfg retry.Config, breakerCf
 		if to == breaker.StateOpen {
 			r := recorderFor(w.recorder)
 			r.IncBreakerOpen("chunk")
+			w.log.Warn("circuit breaker opened", "target", "chunk", "from", from)
 		}
 		if origOnChange != nil {
 			origOnChange(name, from, to)
@@ -81,6 +90,11 @@ func (w *ReliabilityWrapper) DoMeta(op string, fn func() error) error {
 		if attempts > 1 {
 			r := recorderFor(w.recorder)
 			r.IncRetry(op)
+			if err != nil {
+				w.log.Warn("retry exhausted", "op", op, "attempts", attempts, "error", err)
+			} else {
+				w.log.Warn("retry succeeded", "op", op, "attempts", attempts)
+			}
 		}
 		return err
 	})
@@ -98,6 +112,11 @@ func (w *ReliabilityWrapper) DoChunk(op string, fn func() error) error {
 		if attempts > 1 {
 			r := recorderFor(w.recorder)
 			r.IncRetry(op)
+			if err != nil {
+				w.log.Warn("retry exhausted", "op", op, "attempts", attempts, "error", err)
+			} else {
+				w.log.Warn("retry succeeded", "op", op, "attempts", attempts)
+			}
 		}
 		return err
 	})

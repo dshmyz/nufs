@@ -90,7 +90,7 @@ func TestDFSFifo_Node(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateNode fifo: %v", err)
 		}
-		n := &DFSFifo{meta: store, inodeID: metaInode.ID}
+		n := &DFSFifo{fs: dir.fs, inodeID: metaInode.ID}
 
 		var out fuse.AttrOut
 		if errno := n.Getattr(ctx, nil, &out); errno != 0 {
@@ -121,7 +121,7 @@ func TestDFSFifo_Node(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateNode chardev: %v", err)
 		}
-		n := &DFSFifo{meta: store, inodeID: metaInode.ID}
+		n := &DFSFifo{fs: dir.fs, inodeID: metaInode.ID}
 
 		var out fuse.AttrOut
 		if errno := n.Getattr(ctx, nil, &out); errno != 0 {
@@ -145,7 +145,7 @@ func TestDFSFifo_Node(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateNode sock: %v", err)
 		}
-		n := &DFSFifo{meta: store, inodeID: metaInode.ID}
+		n := &DFSFifo{fs: dir.fs, inodeID: metaInode.ID}
 
 		var in fuse.SetAttrIn
 		in.Valid = fuse.FATTR_MODE
@@ -174,8 +174,9 @@ func TestDFSFifo_Node(t *testing.T) {
 // rather than a panic.
 func TestDFSFifo_Open_MissingNode(t *testing.T) {
 	store, _ := newTestMetaStore(t)
+	dfs := NewDFSFileSystem(store, nil, nil, nil, nil)
 	ctx := context.Background()
-	n := &DFSFifo{meta: store, inodeID: 999999}
+	n := &DFSFifo{fs: dfs, inodeID: 999999}
 	if _, _, errno := n.Open(ctx, syscall.O_RDONLY); errno != syscall.EIO {
 		t.Errorf("Open missing node errno=%v, want EIO", errno)
 	}

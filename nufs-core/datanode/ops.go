@@ -166,7 +166,7 @@ func NewOpsServerWithRepair(cfg Config, store OpsStore, meta OpsMetadata,
 		}
 		s.listener = &http.Server{
 			Addr:    cfg.OpsListenAddr,
-			Handler: httputil.BearerAuth(cfg.OpsAuthToken, public, mux),
+			Handler: httputil.BearerAuth(cfg.OpsAuthToken, nil, public, mux),
 		}
 	} else {
 		s.listener = &http.Server{

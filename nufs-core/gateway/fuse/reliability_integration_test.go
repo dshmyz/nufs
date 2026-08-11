@@ -17,8 +17,9 @@ import (
 
 // newTestFileWithReliability 创建带 ReliabilityWrapper 的 DFSFile。
 func newTestFileWithReliability(meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID, rec MetricsRecorder, rel *ReliabilityWrapper) *DFSFile {
+	dfs := NewDFSFileSystem(meta, cs, nil, rec, nil)
 	return &DFSFile{
-		meta:        meta,
+		fs:          dfs,
 		chunkStore:  cs,
 		inodeID:     id,
 		recorder:    rec,
@@ -33,7 +34,7 @@ func TestDFSFile_Read_WithReliability_Works(t *testing.T) {
 	meta, id := newTestMetaStore(t)
 	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
-	rel := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil))
+	rel := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	f := newTestFileWithReliability(meta, cs, id, rec, rel)
 
@@ -60,7 +61,7 @@ func TestDFSFile_Flush_WithReliability_Works(t *testing.T) {
 	meta, id := newTestMetaStore(t)
 	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
-	rel := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil))
+	rel := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	f := newTestFileWithReliability(meta, cs, id, rec, rel)
 
@@ -118,7 +119,7 @@ func TestDFSFile_Flush_SerializesConcurrent(t *testing.T) {
 	meta, id := newTestMetaStore(t)
 	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
-	rel := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil))
+	rel := NewReliabilityWrapper(rec, fastRetryCfg(), fastBreakerCfg(nil), nil)
 
 	var concurrent, maxConc int32
 	trackingCS := &concurrencyTrackingChunkStore{
@@ -157,10 +158,11 @@ func TestDFSFile_Flush_NilReliability_Passthrough(t *testing.T) {
 	meta, id := newTestMetaStore(t)
 	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
+	dfs := NewDFSFileSystem(meta, cs, nil, rec, nil)
 
 	// reliability=nil → passthrough
 	f := &DFSFile{
-		meta:       meta,
+		fs:         dfs,
 		chunkStore: cs,
 		inodeID:    id,
 		recorder:   rec,

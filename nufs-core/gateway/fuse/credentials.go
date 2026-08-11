@@ -12,6 +12,13 @@ type Credentials struct {
 	Endpoint  string `json:"metadata_endpoint,omitempty"`
 }
 
+// LoadCredentials reads the mount credential from credentials.json (if
+// present) and META_ACCESS_KEY/META_SECRET_KEY/META_ENDPOINT env vars. Env
+// wins over the file. There is intentionally no SaveCredentials counterpart:
+// the accessKey/secretKey are inputs the operator injects (file or env), and
+// the signed token exchanged from them is deliberately kept in memory only —
+// persisting it would leave an expired-token file that silently goes stale.
+// On remount the in-memory secret is re-exchanged for a fresh token instead.
 func LoadCredentials(cfgDir string) *Credentials {
 	c := &Credentials{}
 	data, err := os.ReadFile(path.Join(cfgDir, "credentials.json"))
@@ -28,15 +35,4 @@ func LoadCredentials(cfgDir string) *Credentials {
 		c.Endpoint = v
 	}
 	return c
-}
-
-func SaveCredentials(cfgDir string, c *Credentials) error {
-	if err := os.MkdirAll(cfgDir, 0700); err != nil {
-		return err
-	}
-	data, err := json.Marshal(c)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path.Join(cfgDir, "credentials.json"), data, 0600)
 }

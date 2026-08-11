@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -61,13 +63,13 @@ func TestMountConfigFUSEOptions(t *testing.T) {
 
 func TestCredentialsRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	creds := &Credentials{
-		AccessKey: "ak",
-		SecretKey: "sk",
-		Endpoint:  "http://localhost:9000",
-	}
-	if err := SaveCredentials(dir, creds); err != nil {
-		t.Fatalf("SaveCredentials: %v", err)
+
+	// Write credentials.json manually — the write path is operator-injected
+	// (file or env); there is no SaveCredentials because the signed token is
+	// deliberately kept in-memory only.
+	data := []byte(`{"access_key":"ak","secret_key":"sk","metadata_endpoint":"http://localhost:9000"}`)
+	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), data, 0600); err != nil {
+		t.Fatal(err)
 	}
 
 	loaded := LoadCredentials(dir)
@@ -78,7 +80,8 @@ func TestCredentialsRoundTrip(t *testing.T) {
 
 func TestCredentialsEnvOverride(t *testing.T) {
 	dir := t.TempDir()
-	SaveCredentials(dir, &Credentials{AccessKey: "from_file", SecretKey: "from_file", Endpoint: "http://meta:9000"})
+	data := []byte(`{"access_key":"from_file","secret_key":"from_file","metadata_endpoint":"http://meta:9000"}`)
+	os.WriteFile(filepath.Join(dir, "credentials.json"), data, 0600)
 
 	t.Setenv("META_ACCESS_KEY", "from_env")
 	t.Setenv("META_SECRET_KEY", "from_env")
@@ -167,9 +170,9 @@ func TestMetricsJSONOutput(t *testing.T) {
 func TestCredentialsJSON(t *testing.T) {
 	dir := t.TempDir()
 	c := &Credentials{AccessKey: "ak", SecretKey: "sk", Endpoint: "http://meta:9000"}
-	SaveCredentials(dir, c)
-
 	data, _ := json.Marshal(c)
+	os.WriteFile(filepath.Join(dir, "credentials.json"), data, 0600)
+
 	var decoded Credentials
 	json.Unmarshal(data, &decoded)
 	if decoded.AccessKey != "ak" {

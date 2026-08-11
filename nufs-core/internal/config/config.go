@@ -19,35 +19,85 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Load reads a config file and sets the corresponding flag values.
-// Supported formats: .yaml, .yml, .json, .toml.
-// Keys are matched against registered flag names after normalizing common
-// YAML spellings (snake_case to kebab-case, plus selected nested aliases).
-// Call this before flag.Parse so later CLI values override file defaults.
-func Load(path string) error {
+// CurrentVersion is the config schema version this binary was built against.
+// Bump it whenever a key is renamed or its meaning changes, so an operator
+// upgrading the binary is told their file predates the change instead of
+// silently losing a setting to the unknown-key path.
+const CurrentVersion = 1
+
+// versionKeys are the spellings accepted for the schema version. The key is
+// consumed by the version check and never forwarded to applyFlags — there is
+// no --config-version flag.
+var versionKeys = []string{"config_version", "config-version", "configVersion"}
+
+// checkVersion reports the file's declared schema version (removing the key
+// from raw) and warns when it disagrees with CurrentVersion. An absent key is
+// treated as the current version: config files predate this field, and failing
+// them would break every existing deployment on upgrade.
+func checkVersion(path string, raw map[string]interface{}) {
+	for _, k := range versionKeys {
+		v, ok := raw[k]
+		if !ok {
+			continue
+		}
+		delete(raw, k)
+		var got int
+		if _, err := fmt.Sscanf(fmt.Sprintf("%v", v), "%d", &got); err != nil {
+			slog.Warn("config: unparseable config_version", "file", path, "value", v)
+			return
+		}
+		switch {
+		case got < CurrentVersion:
+			slog.Warn("config: file declares an older schema version — some keys may have been renamed; re-check it against deploy/config/",
+				"file", path, "file_version", got, "binary_version", CurrentVersion)
+		case got > CurrentVersion:
+			slog.Warn("config: file declares a newer schema version than this binary understands — unknown keys will be ignored",
+				"file", path, "file_version", got, "binary_version", CurrentVersion)
+		}
+		return
+	}
+}
+
+// parseFile reads and decodes a config file into a generic map, consuming the
+// schema-version key.
+func parseFile(path string) (map[string]interface{}, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+		return nil, fmt.Errorf("read config: %w", err)
 	}
 
 	var raw map[string]interface{}
 	switch ext := filepath.Ext(path); ext {
 	case ".yaml", ".yml":
 		if err := yaml.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("parse yaml: %w", err)
+			return nil, fmt.Errorf("parse yaml: %w", err)
 		}
 	case ".json":
 		if err := json.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("parse json: %w", err)
+			return nil, fmt.Errorf("parse json: %w", err)
 		}
 	case ".toml":
 		if err := toml.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("parse toml: %w", err)
+			return nil, fmt.Errorf("parse toml: %w", err)
 		}
 	default:
-		return fmt.Errorf("unsupported config format: %s (use .yaml, .json, or .toml)", ext)
+		return nil, fmt.Errorf("unsupported config format: %s (use .yaml, .json, or .toml)", ext)
 	}
 
+	checkVersion(path, raw)
+	return raw, nil
+}
+
+// Load reads a config file and sets the corresponding flag values.
+// Supported formats: .yaml, .yml, .json, .toml.
+// Keys are matched against registered flag names after normalizing common
+// YAML spellings (snake_case to kebab-case, plus selected nested aliases).
+// Call this before flag.Parse so later CLI values override file defaults.
+func Load(path string) error {
+	raw, err := parseFile(path)
+	if err != nil {
+		return err
+	}
 	return applyFlags(raw, "")
 }
 
@@ -173,26 +223,9 @@ func Watch(ctx context.Context, path string, onReload func()) error {
 
 func reload(path string, onReload func()) error {
 	// Re-read and apply flags from the file.
-	data, err := os.ReadFile(path)
+	raw, err := parseFile(path)
 	if err != nil {
 		return fmt.Errorf("re-read config: %w", err)
-	}
-	var raw map[string]interface{}
-	switch ext := filepath.Ext(path); ext {
-	case ".yaml", ".yml":
-		if err := yaml.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("re-parse yaml: %w", err)
-		}
-	case ".json":
-		if err := json.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("re-parse json: %w", err)
-		}
-	case ".toml":
-		if err := toml.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("re-parse toml: %w", err)
-		}
-	default:
-		return fmt.Errorf("unsupported config format for reload: %s", ext)
 	}
 	if err := applyFlags(raw, ""); err != nil {
 		return fmt.Errorf("re-apply flags: %w", err)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -30,6 +31,11 @@ type FUSEMetrics struct {
 
 	CacheHits   uint64
 	CacheMisses uint64
+
+	// Staging (disk spill) counters
+	StagingSpills   uint64 // dirty chunks spilled to disk staging
+	StagingLoads    uint64 // spilled chunks loaded back from staging
+	StagingSpillErr uint64 // failed spills (staging dir I/O errors)
 
 	startTime time.Time
 }
@@ -64,9 +70,12 @@ func (m *FUSEMetrics) Snapshot() map[string]interface{} {
 			"misses": atomic.LoadUint64(&m.CacheMisses),
 			"evicts": atomic.LoadUint64(&m.CacheEvicts),
 		},
-		"errors":    atomic.LoadUint64(&m.OpsErrors),
-		"retries":   atomic.LoadUint64(&m.OpsRetries),
-		"breaker":   atomic.LoadUint64(&m.BreakerOpens),
+		"errors":            atomic.LoadUint64(&m.OpsErrors),
+		"retries":           atomic.LoadUint64(&m.OpsRetries),
+		"breaker":           atomic.LoadUint64(&m.BreakerOpens),
+		"staging_spills":    atomic.LoadUint64(&m.StagingSpills),
+		"staging_loads":     atomic.LoadUint64(&m.StagingLoads),
+		"staging_spill_err": atomic.LoadUint64(&m.StagingSpillErr),
 	}
 }
 
@@ -97,6 +106,8 @@ func StartMetricsServer(addr string) *http.Server {
 			cache["hits"], cache["misses"], cache["evicts"])
 		fmt.Fprintf(w, "\nfusegw_ops_errors_total %d\nfusegw_ops_retries_total %d\nfusegw_breaker_opens_total %d\n",
 			snap["errors"], snap["retries"], snap["breaker"])
+		fmt.Fprintf(w, "\nfusegw_staging_spills_total %d\nfusegw_staging_loads_total %d\nfusegw_staging_spill_err_total %d\n",
+			snap["staging_spills"], snap["staging_loads"], snap["staging_spill_err"])
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -149,5 +160,33 @@ func writeFUSEOpenMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE fusegw_ops_errors_total counter\nfusegw_ops_errors_total %d\n", atomic.LoadUint64(&fuseMetrics.OpsErrors))
 	fmt.Fprintf(w, "# TYPE fusegw_ops_retries_total counter\nfusegw_ops_retries_total %d\n", atomic.LoadUint64(&fuseMetrics.OpsRetries))
 	fmt.Fprintf(w, "# TYPE fusegw_breaker_opens_total counter\nfusegw_breaker_opens_total %d\n", atomic.LoadUint64(&fuseMetrics.BreakerOpens))
+	fmt.Fprintf(w, "# TYPE fusegw_staging_spills_total counter\nfusegw_staging_spills_total %d\n", atomic.LoadUint64(&fuseMetrics.StagingSpills))
+	fmt.Fprintf(w, "# TYPE fusegw_staging_loads_total counter\nfusegw_staging_loads_total %d\n", atomic.LoadUint64(&fuseMetrics.StagingLoads))
+	fmt.Fprintf(w, "# TYPE fusegw_staging_spill_err_total counter\nfusegw_staging_spill_err_total %d\n", atomic.LoadUint64(&fuseMetrics.StagingSpillErr))
+	writeFUSELatencyHistograms(w)
 	fmt.Fprintln(w, "# EOF")
+}
+
+// writeFUSELatencyHistograms renders per-op latency histograms for every op
+// that has received at least one ObserveOpLatency call.
+func writeFUSELatencyHistograms(w io.Writer) {
+	for _, snap := range opLatencySnapshots() {
+		writeOpHistogramProm(w, snap)
+	}
+}
+
+// writeOpHistogramProm renders one histogram in Prometheus text exposition
+// format. The bucket ordering in the snapshot is deterministic (copied from
+// fuseLatencyBuckets), so no sorting is needed. Mirrors gateway/s3fs
+// writeHistogramProm.
+func writeOpHistogramProm(w io.Writer, snap opHistSnapshot) {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "# HELP fusegw_op_latency_seconds Operation latency histogram.\n")
+	fmt.Fprintf(&sb, "# TYPE fusegw_op_latency_seconds histogram\n")
+	for _, b := range snap.buckets {
+		fmt.Fprintf(&sb, "fusegw_op_latency_seconds_bucket{le=\"%g\"} %d\n", b.le, b.count)
+	}
+	fmt.Fprintf(&sb, "fusegw_op_latency_seconds_bucket{le=\"+Inf\"} %d\n", snap.count)
+	fmt.Fprintf(&sb, "fusegw_op_latency_seconds_sum %g\nfusegw_op_latency_seconds_count %d\n\n", snap.sum, snap.count)
+	_, _ = w.Write([]byte(sb.String()))
 }

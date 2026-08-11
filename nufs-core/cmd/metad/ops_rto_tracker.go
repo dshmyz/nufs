@@ -39,6 +39,16 @@ type raftStatSource interface {
 	Stats() map[string]string
 }
 
+// leaderRTODecayAfter bounds how long the RTO gauge holds a failover's value
+// before decaying to 0. Without it the wasLeader latch means one overtime
+// failover pins nufs_leader_failover_rto_seconds above budget indefinitely —
+// re-evaluating NUFSLeaderFailoverRTOExceeded every `for: 1m` window until the
+// next step-down, so a single old breach keeps the alert stuck with no way to
+// clear but another election. The window is deliberately much longer than the
+// alert's `for` period, so a real breach still fires and stays visible for
+// operator action, and only then clears automatically instead of sticking.
+const leaderRTODecayAfter = 10 * time.Minute
+
 type leaderRTOTracker struct {
 	raft    raftStatSource
 	metrics *metadata.Metrics
@@ -49,6 +59,9 @@ type leaderRTOTracker struct {
 	// pinned at the old leader's last heartbeat until a new leader wins.
 	lastContactWall atomic.Int64
 	wasLeader       atomic.Bool
+	// rtoSetAt is the wall-clock unix-nano the current RTO gauge value was
+	// written. 0 when no RTO is being held. Used to decay a stale breach.
+	rtoSetAt atomic.Int64
 }
 
 // tick performs one polling pass. Extracted from run for testing.
@@ -64,21 +77,37 @@ func (t *leaderRTOTracker) tick(now time.Time) {
 		// Non-leaders report 0 so the alert only fires on the current leader.
 		if t.wasLeader.Load() {
 			t.metrics.LeaderFailoverRTO.Store(0)
+			t.rtoSetAt.Store(0)
 			t.wasLeader.Store(false)
 		}
 		return
 	}
 	// Leader: on the fresh transition into leadership, compute RTO from the
 	// last known leader contact. Subsequent ticks while still leader no-op so
-	// the gauge holds the failover's RTO.
+	// the gauge holds the failover's RTO — until it outlives leaderRTODecayAfter,
+	// at which point it decays to 0 so an old breach doesn't pin the alert.
 	if !t.wasLeader.Load() {
 		if lc := t.lastContactWall.Load(); lc > 0 {
 			if rto := now.UnixNano() - lc; rto > 0 {
-				t.metrics.LeaderFailoverRTO.Store(rto / int64(time.Second))
+				// Round UP to the next whole second rather than truncating: the
+				// alert is `nufs_leader_failover_rto_seconds > 15`, and a floor
+				// (rto/time.Second) would under-report a 15.0-15.99s failover as
+				// "15" and silently miss the budget breach right at the boundary.
+				t.metrics.LeaderFailoverRTO.Store((rto + int64(time.Second) - 1) / int64(time.Second))
+				t.rtoSetAt.Store(now.UnixNano())
 			}
 		}
 		t.wasLeader.Store(true)
+		return
 	}
+	// Already leader holding a stored RTO: decay it once it has outlived
+	// leaderRTODecayAfter so a stale breach clears itself (the next real
+	// failover — a fresh !wasLeader transition — recomputes and repins it).
+	if t.rtoSetAt.Load() > 0 && now.UnixNano()-t.rtoSetAt.Load() > int64(leaderRTODecayAfter) {
+		t.metrics.LeaderFailoverRTO.Store(0)
+		t.rtoSetAt.Store(0)
+	}
+}
 }
 
 func (t *leaderRTOTracker) run(stop <-chan struct{}) {

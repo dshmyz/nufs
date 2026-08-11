@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -145,7 +146,7 @@ func runLocal(args []string, metaDir string) {
 	case "nodes":
 		cmdNodes(ctx, store)
 	case "buckets":
-		cmdBuckets(ctx, store)
+		cmdBuckets(ctx, store, cmdArgs)
 	case "decommission":
 		if len(cmdArgs) < 1 {
 			fmt.Println("Usage: nufs-cli decommission <node_id>")
@@ -250,7 +251,22 @@ func cmdNodes(ctx context.Context, store *metadata.PebbleStore) {
 	fmt.Printf("\nTotal: %d nodes\n", len(nodes))
 }
 
-func cmdBuckets(ctx context.Context, store *metadata.PebbleStore) {
+func cmdBuckets(ctx context.Context, store *metadata.PebbleStore, args []string) {
+	if len(args) == 0 {
+		cmdBucketList(ctx, store)
+		return
+	}
+	switch args[0] {
+	case "info":
+		cmdBucketInfoLocal(ctx, store, args[1:])
+	case "delete":
+		cmdBucketDeleteLocal(ctx, store, args[1:])
+	default:
+		cmdBucketList(ctx, store)
+	}
+}
+
+func cmdBucketList(ctx context.Context, store *metadata.PebbleStore) {
 	buckets, err := store.ListBuckets(ctx)
 	if err != nil {
 		log.Fatalf("list buckets: %v", err)
@@ -265,6 +281,48 @@ func cmdBuckets(ctx context.Context, store *metadata.PebbleStore) {
 	}
 	w.Flush()
 	fmt.Printf("\nTotal: %d buckets\n", len(buckets))
+}
+
+func cmdBucketInfoLocal(ctx context.Context, store *metadata.PebbleStore, args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli bucket info <name>")
+		os.Exit(1)
+	}
+	bucket, err := store.GetBucket(ctx, args[0])
+	if err != nil {
+		log.Fatalf("get bucket: %v", err)
+	}
+	fmt.Printf("Name:         %s\n", bucket.Name)
+	fmt.Printf("Root Inode:   %d\n", bucket.RootInode)
+	fmt.Printf("Policy ID:    %s\n", bucket.Policy.ID)
+	if bucket.Policy.ECConfig != nil && bucket.Policy.ECConfig.DataShards > 0 {
+		fmt.Printf("EC:           %d+%d (tolerates %d failures)\n",
+			bucket.Policy.ECConfig.DataShards, bucket.Policy.ECConfig.ParityShards,
+			bucket.Policy.ECConfig.MaxFailures())
+	} else {
+		fmt.Printf("Replication:  %d\n", bucket.Policy.ReplicationFactor)
+	}
+	fmt.Printf("Storage Tier: %d\n", bucket.Policy.StorageTier)
+	fmt.Printf("Created:      %s\n", bucket.CreationDate.Format(time.RFC3339))
+}
+
+func cmdBucketDeleteLocal(ctx context.Context, store *metadata.PebbleStore, args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli bucket delete <name>")
+		os.Exit(1)
+	}
+	name := args[0]
+	fmt.Printf("Delete bucket '%s'? This only works if the bucket is empty. [y/N] ", name)
+	var confirm string
+	fmt.Scanln(&confirm)
+	if confirm != "y" && confirm != "Y" {
+		fmt.Println("Aborted.")
+		return
+	}
+	if err := store.DeleteBucket(ctx, name); err != nil {
+		log.Fatalf("delete bucket: %v", err)
+	}
+	fmt.Printf("Bucket '%s' deleted\n", name)
 }
 
 func cmdDecommission(ctx context.Context, store *metadata.PebbleStore, args []string) {
@@ -384,7 +442,7 @@ func cmdScrub(ctx context.Context, store *metadata.PebbleStore) {
 
 func runRemote(args []string, metaAddr string, authToken string) {
 	baseURL := "http://" + metaAddr
-	api := &remoteAPI{base: baseURL, authToken: authToken}
+	api := newRemoteAPI(baseURL, authToken)
 
 	cmd, cmdArgs := parseSubcommand(args)
 	switch cmd {
@@ -452,6 +510,10 @@ func runRemote(args []string, metaAddr string, authToken string) {
 		cmdBackupsRemote(api, cmdArgs)
 	case "write-attempts":
 		cmdWriteAttemptsRemote(api, cmdArgs)
+	case "acl":
+		api.cmdACL(cmdArgs)
+	case "auth":
+		api.cmdAuth(cmdArgs)
 	case "disk":
 		api.cmdDisk(cmdArgs)
 	default:
@@ -463,6 +525,32 @@ func runRemote(args []string, metaAddr string, authToken string) {
 type remoteAPI struct {
 	base      string
 	authToken string
+	client    *http.Client
+}
+
+// newRemoteAPI builds a remoteAPI whose HTTP client preserves the bearer token
+// across cross-host redirects. http.DefaultClient strips Authorization when a
+// 307 leader redirect changes hosts, so ops/auth calls that land on a Raft
+// follower (which 307s to the leader) would otherwise arrive without their
+// token and 401.
+func newRemoteAPI(base, authToken string) *remoteAPI {
+	return &remoteAPI{
+		base:      base,
+		authToken: authToken,
+		client: &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return fmt.Errorf("stopped after 10 redirects")
+				}
+				// Re-apply the bearer token on the redirected request, including
+				// cross-host leader redirects Go's default would strip it from.
+				if authToken != "" {
+					req.Header.Set("Authorization", "Bearer "+authToken)
+				}
+				return nil
+			},
+		},
+	}
 }
 
 // do performs an HTTP request with an optional bearer token. If the upstream
@@ -477,7 +565,7 @@ func (a *remoteAPI) do(method, path string, body io.Reader) (*http.Response, []b
 	if a.authToken != "" {
 		req.Header.Set("Authorization", "Bearer "+a.authToken)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := a.client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -513,6 +601,32 @@ func (a *remoteAPI) post(path string, body io.Reader) []byte {
 	return b
 }
 
+func (a *remoteAPI) put(path string, body io.Reader) []byte {
+	resp, b := a.do(http.MethodPut, path, body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized && a.authToken == "" {
+			fmt.Fprintf(os.Stderr, "Error: PUT %s: %s (401). Pass --auth-token to authenticate.\n", path, resp.Status)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Error: PUT %s failed: %s: %s\n", path, resp.Status, string(b))
+		os.Exit(1)
+	}
+	return b
+}
+
+func (a *remoteAPI) delete(path string) []byte {
+	resp, b := a.do(http.MethodDelete, path, nil)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized && a.authToken == "" {
+			fmt.Fprintf(os.Stderr, "Error: DELETE %s: %s (401). Pass --auth-token to authenticate.\n", path, resp.Status)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Error: DELETE %s failed: %s: %s\n", path, resp.Status, string(b))
+		os.Exit(1)
+	}
+	return b
+}
+
 func (a *remoteAPI) prettyJSON(data []byte) {
 	var v interface{}
 	json.Unmarshal(data, &v)
@@ -536,41 +650,428 @@ func (a *remoteAPI) cmdNodes() {
 }
 
 func (a *remoteAPI) cmdBuckets(args []string) {
-	if len(args) > 0 && args[0] == "create" {
-		if len(args) < 2 {
-			fmt.Println("Usage: nufs-cli bucket create <name>")
-			os.Exit(1)
-		}
-		req := struct {
-			Name   string                   `json:"name"`
-			Policy metadata.PlacementPolicy `json:"policy"`
-		}{
-			Name: args[1],
-			Policy: metadata.PlacementPolicy{
-				ID:                "default",
-				ReplicationFactor: 3,
-				TopologySpread:    metadata.SpreadNode,
-			},
-		}
-		body, err := json.Marshal(req)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: marshal bucket request: %v\n", err)
-			os.Exit(1)
-		}
-		a.post("/api/v1/buckets", bytes.NewReader(body))
-		fmt.Printf("Bucket '%s' created\n", args[1])
+	if len(args) == 0 {
+		a.cmdBucketList()
 		return
 	}
+	switch args[0] {
+	case "create":
+		a.cmdBucketCreate(args[1:])
+	case "info":
+		a.cmdBucketInfo(args[1:])
+	case "delete":
+		a.cmdBucketDelete(args[1:])
+	case "quota":
+		a.cmdBucketQuota(args[1:])
+	case "usage":
+		a.cmdBucketUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "Usage: nufs-cli bucket [create|info|delete|quota|usage] ...\n")
+		os.Exit(1)
+	}
+}
+
+func (a *remoteAPI) cmdBucketList() {
 	resp := a.get("/api/v1/buckets")
-	var buckets []string
+	var buckets []metadata.BucketInfo
 	json.Unmarshal(resp, &buckets)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "BUCKET")
+	fmt.Fprintln(w, "NAME\tROOT_INODE\tREPLICATION\tCREATED")
 	for _, b := range buckets {
-		fmt.Fprintf(w, "%s\n", b)
+		fmt.Fprintf(w, "%s\t%d\t%d\t%s\n",
+			b.Name, b.RootInode, b.Policy.ReplicationFactor,
+			b.CreationDate.Format(time.RFC3339))
 	}
 	w.Flush()
+	fmt.Printf("\nTotal: %d buckets\n", len(buckets))
+}
+
+func (a *remoteAPI) cmdBucketCreate(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli bucket create <name> [--ec-data N --ec-parity N]")
+		fmt.Println("  Default: replication factor 3 (no erasure coding)")
+		fmt.Println("  EC mode: --ec-data 4 --ec-parity 2 → 4 data + 2 parity shards")
+		os.Exit(1)
+	}
+	name := args[0]
+	rf := 3
+	var ec *metadata.ECConfig
+	haveData, haveParity := false, false
+
+	for i := 1; i < len(args); i++ {
+		parseShard := func() int {
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "Error: %s requires an integer argument\n", args[i])
+				os.Exit(1)
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n < 1 {
+				fmt.Fprintf(os.Stderr, "Error: %s requires a positive integer, got %q\n", args[i], args[i+1])
+				os.Exit(1)
+			}
+			return n
+		}
+		switch args[i] {
+		case "--ec-data":
+			n := parseShard()
+			if ec == nil {
+				ec = &metadata.ECConfig{}
+			}
+			ec.DataShards = n
+			haveData = true
+			i++
+		case "--ec-parity":
+			n := parseShard()
+			if ec == nil {
+				ec = &metadata.ECConfig{}
+			}
+			ec.ParityShards = n
+			haveParity = true
+			i++
+		}
+	}
+
+	// EC shard counts are structural: data and parity must be supplied together
+	// and both positive, or we would silently mint a replication factor with no
+	// parity (e.g. --ec-data 4 alone -> rf=4) that offers no redundancy.
+	if haveData != haveParity {
+		fmt.Fprintln(os.Stderr, "Error: --ec-data and --ec-parity must be specified together")
+		os.Exit(1)
+	}
+	if haveData {
+		rf = ec.DataShards + ec.ParityShards
+	}
+
+	req := struct {
+		Name   string                   `json:"name"`
+		Policy metadata.PlacementPolicy `json:"policy"`
+	}{
+		Name: name,
+		Policy: metadata.PlacementPolicy{
+			ID:                "default",
+			ReplicationFactor: rf,
+			ECConfig:          ec,
+			TopologySpread:    metadata.SpreadNode,
+		},
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: marshal bucket request: %v\n", err)
+		os.Exit(1)
+	}
+	a.post("/api/v1/buckets", bytes.NewReader(body))
+	if ec != nil && ec.DataShards > 0 {
+		fmt.Printf("Bucket '%s' created (EC %d+%d)\n", name, ec.DataShards, ec.ParityShards)
+	} else {
+		fmt.Printf("Bucket '%s' created (RF=%d)\n", name, rf)
+	}
+}
+
+func (a *remoteAPI) cmdBucketInfo(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli bucket info <name>")
+		os.Exit(1)
+	}
+	name := args[0]
+	resp := a.get("/api/v1/buckets/" + name)
+	var bucket metadata.BucketInfo
+	json.Unmarshal(resp, &bucket)
+
+	fmt.Printf("Name:         %s\n", bucket.Name)
+	fmt.Printf("Root Inode:   %d\n", bucket.RootInode)
+	fmt.Printf("Policy ID:    %s\n", bucket.Policy.ID)
+	if bucket.Policy.ECConfig != nil && bucket.Policy.ECConfig.DataShards > 0 {
+		fmt.Printf("EC:           %d+%d (tolerates %d failures)\n",
+			bucket.Policy.ECConfig.DataShards, bucket.Policy.ECConfig.ParityShards,
+			bucket.Policy.ECConfig.MaxFailures())
+	} else {
+		fmt.Printf("Replication:  %d\n", bucket.Policy.ReplicationFactor)
+	}
+	fmt.Printf("Storage Tier: %d\n", bucket.Policy.StorageTier)
+	fmt.Printf("Created:      %s\n", bucket.CreationDate.Format(time.RFC3339))
+}
+
+func (a *remoteAPI) cmdBucketDelete(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli bucket delete <name>")
+		os.Exit(1)
+	}
+	name := args[0]
+	fmt.Printf("Delete bucket '%s'? This only works if the bucket is empty. [y/N] ", name)
+	var confirm string
+	fmt.Scanln(&confirm)
+	if confirm != "y" && confirm != "Y" {
+		fmt.Println("Aborted.")
+		return
+	}
+	a.delete("/api/v1/buckets/" + name)
+	fmt.Printf("Bucket '%s' deleted\n", name)
+}
+
+func (a *remoteAPI) cmdBucketQuota(args []string) {
+	if len(args) < 2 {
+		fmt.Println("Usage: nufs-cli bucket quota <get|set|delete> <bucket> [--max-bytes N] [--max-objects N]")
+		os.Exit(1)
+	}
+	action, name := args[0], args[1]
+	switch action {
+	case "get":
+		resp := a.get("/api/v1/buckets/" + name + "/quota")
+		var status struct {
+			Bucket string `json:"bucket"`
+			Quota  *struct {
+				MaxSizeBytes int64 `json:"max_bytes"`
+				MaxObjects   int64 `json:"max_objects"`
+			} `json:"quota"`
+			Usage *struct {
+				UsedBytes int64 `json:"used_bytes"`
+				Objects   int   `json:"objects"`
+			} `json:"usage"`
+		}
+		json.Unmarshal(resp, &status)
+
+		fmt.Printf("Bucket: %s\n", name)
+		if status.Quota != nil {
+			fmt.Printf("Max Bytes:   %s\n", humanBytes(status.Quota.MaxSizeBytes))
+			fmt.Printf("Max Objects: %s\n", formatCount(status.Quota.MaxObjects))
+		} else {
+			fmt.Println("Quota:       (none)")
+		}
+		if status.Usage != nil {
+			fmt.Printf("Used Bytes:  %s\n", humanBytes(status.Usage.UsedBytes))
+			fmt.Printf("Objects:     %s\n", formatCount(int64(status.Usage.Objects)))
+		}
+
+	case "set":
+		var maxBytes, maxObjects int64
+		for i := 2; i < len(args); i++ {
+			switch args[i] {
+			case "--max-bytes":
+				if i+1 < len(args) {
+					fmt.Sscanf(args[i+1], "%d", &maxBytes)
+					i++
+				}
+			case "--max-objects":
+				if i+1 < len(args) {
+					fmt.Sscanf(args[i+1], "%d", &maxObjects)
+					i++
+				}
+			}
+		}
+		req := struct {
+			MaxSizeBytes int64 `json:"max_bytes"`
+			MaxObjects   int64 `json:"max_objects"`
+		}{MaxSizeBytes: maxBytes, MaxObjects: maxObjects}
+		body, _ := json.Marshal(req)
+		a.put("/api/v1/buckets/"+name+"/quota", bytes.NewReader(body))
+		fmt.Printf("Quota set for bucket '%s'\n", name)
+
+	case "delete":
+		a.delete("/api/v1/buckets/" + name + "/quota")
+		fmt.Printf("Quota removed for bucket '%s'\n", name)
+
+	default:
+		fmt.Fprintf(os.Stderr, "Usage: nufs-cli bucket quota <get|set|delete> <bucket>\n")
+		os.Exit(1)
+	}
+}
+
+func (a *remoteAPI) cmdBucketUsage() {
+	resp := a.get("/api/v1/admin/bucket-usage")
+	var usage []struct {
+		Name      string `json:"name"`
+		UsedBytes int64  `json:"used_bytes"`
+		Objects   int    `json:"objects"`
+	}
+	json.Unmarshal(resp, &usage)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "BUCKET\tUSED\tOBJECTS")
+	for _, u := range usage {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", u.Name, humanBytes(u.UsedBytes), formatCount(int64(u.Objects)))
+	}
+	w.Flush()
+	fmt.Printf("\nTotal: %d buckets\n", len(usage))
+}
+
+func (a *remoteAPI) cmdACL(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli acl <get|set|delete> <bucket> [flags]")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "get":
+		a.cmdACLGet(args[1:])
+	case "set":
+		a.cmdACLSet(args[1:])
+	case "delete":
+		a.cmdACLDelete(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Usage: nufs-cli acl <get|set|delete> <bucket>\n")
+		os.Exit(1)
+	}
+}
+
+func (a *remoteAPI) cmdACLGet(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli acl get <bucket>")
+		os.Exit(1)
+	}
+	resp := a.get("/api/v1/acl/" + args[0])
+	var policy metadata.BucketPolicy
+	json.Unmarshal(resp, &policy)
+
+	fmt.Printf("Bucket:        %s\n", policy.Bucket)
+	fmt.Printf("Owner:         %s\n", policy.Owner)
+	fmt.Printf("Default Access: %s\n", policy.DefaultAccess)
+	if len(policy.Statements) > 0 {
+		fmt.Println("Statements:")
+		for _, s := range policy.Statements {
+			perms := make([]string, len(s.Permissions))
+			for i, p := range s.Permissions {
+				perms[i] = string(p)
+			}
+			fmt.Printf("  %s  %s  [%s]  %s\n", s.Effect, s.Principal, strings.Join(perms, ","), s.Resource)
+		}
+	} else {
+		fmt.Println("Statements:    (none)")
+	}
+}
+
+func (a *remoteAPI) cmdACLSet(args []string) {
+	if len(args) < 2 {
+		fmt.Println("Usage: nufs-cli acl set <bucket> --default <allow|deny> [--owner <name>] [--allow <principal> <perms>] [--deny <principal> <perms>]")
+		fmt.Println("  perms: comma-separated list of read,write,admin,list")
+		os.Exit(1)
+	}
+	bucket := args[0]
+	policy := metadata.BucketPolicy{
+		Bucket:        bucket,
+		DefaultAccess: "deny",
+	}
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--default":
+			if i+1 < len(args) {
+				policy.DefaultAccess = args[i+1]
+				i++
+			}
+		case "--owner":
+			if i+1 < len(args) {
+				policy.Owner = args[i+1]
+				i++
+			}
+		case "--allow":
+			if i+2 < len(args) {
+				stmt := metadata.Statement{
+					Effect:    "allow",
+					Principal: metadata.Principal(args[i+1]),
+					Resource:  bucket,
+				}
+				for _, p := range strings.Split(args[i+2], ",") {
+					stmt.Permissions = append(stmt.Permissions, metadata.Permission(strings.TrimSpace(p)))
+				}
+				policy.Statements = append(policy.Statements, stmt)
+				i += 2
+			}
+		case "--deny":
+			if i+2 < len(args) {
+				stmt := metadata.Statement{
+					Effect:    "deny",
+					Principal: metadata.Principal(args[i+1]),
+					Resource:  bucket,
+				}
+				for _, p := range strings.Split(args[i+2], ",") {
+					stmt.Permissions = append(stmt.Permissions, metadata.Permission(strings.TrimSpace(p)))
+				}
+				policy.Statements = append(policy.Statements, stmt)
+				i += 2
+			}
+		}
+	}
+
+	body, _ := json.Marshal(policy)
+	a.put("/api/v1/acl/"+bucket, bytes.NewReader(body))
+	fmt.Printf("Policy set for bucket '%s'\n", bucket)
+}
+
+func (a *remoteAPI) cmdACLDelete(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli acl delete <bucket>")
+		os.Exit(1)
+	}
+	a.delete("/api/v1/acl/" + args[0])
+	fmt.Printf("Policy deleted for bucket '%s'\n", args[0])
+}
+
+// cmdAuth manages the metad credential registry (the authentication
+// authority for mounts). Credentials map an accessKey -> {secretHash,
+// boundPrincipal}; a mount exchanges them for a signed token at startup.
+func (a *remoteAPI) cmdAuth(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli auth <add|del|list> [access-key] [flags]")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "add":
+		a.cmdCredAdd(args[1:])
+	case "del", "delete":
+		a.cmdCredDelete(args[1:])
+	case "list", "ls":
+		a.cmdCredList()
+	default:
+		fmt.Fprintf(os.Stderr, "Usage: nufs-cli auth <add|del|list> [access-key]\n")
+		os.Exit(1)
+	}
+}
+
+func (a *remoteAPI) cmdCredAdd(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli auth add <access-key> --secret <secret-key> [--principal <name>]")
+		os.Exit(1)
+	}
+	ak := args[0]
+	var secret, principal string
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--secret":
+			if i+1 < len(args) {
+				secret = args[i+1]
+				i++
+			}
+		case "--principal":
+			if i+1 < len(args) {
+				principal = args[i+1]
+				i++
+			}
+		}
+	}
+	if secret == "" {
+		fmt.Fprintln(os.Stderr, "Error: --secret <secret-key> is required")
+		os.Exit(1)
+	}
+	body, _ := json.Marshal(map[string]string{
+		"secret_key": secret,
+		"principal":  principal,
+	})
+	a.put("/api/v1/auth/creds/"+ak, bytes.NewReader(body))
+	fmt.Printf("Credential '%s' added\n", ak)
+}
+
+func (a *remoteAPI) cmdCredDelete(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: nufs-cli auth del <access-key>")
+		os.Exit(1)
+	}
+	a.delete("/api/v1/auth/creds/" + args[0])
+	fmt.Printf("Credential '%s' deleted\n", args[0])
+}
+
+func (a *remoteAPI) cmdCredList() {
+	resp := a.get("/api/v1/auth/creds/")
+	a.prettyJSON(resp)
 }
 
 func (a *remoteAPI) cmdDecommission(nodeID string) {
@@ -906,4 +1407,11 @@ func humanBytes(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func formatCount(n int64) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return fmt.Sprintf("%d", n) // simple for now
 }

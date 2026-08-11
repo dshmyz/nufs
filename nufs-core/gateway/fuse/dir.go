@@ -17,7 +17,8 @@ import (
 type DFSDir struct {
 	fs.Inode
 
-	meta    metadata.MetadataService
+	// fs is the owning filesystem root; stable across SwapMetadata swaps.
+	fs      *DFSFileSystem
 	inodeID metadata.InodeID
 
 	// recorder 记录 FUSE 操作指标。nil 时不打点。
@@ -50,13 +51,17 @@ const readdirPageSize = 4096
 // page through the O(limit) cursor-based ReadDirFrom until a page comes back
 // short (i.e. we hit the end). This guarantees every entry is listed.
 func (d *DFSDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	dfs := d.fs
+	if err := dfs.checkAccess(dfs.bucketName, metadata.PermList); err != nil {
+		return nil, toErrno(err)
+	}
 	rec := recorderFor(d.recorder)
 	rec.IncOp("readdir")
 
 	var fuseEntries []fuse.DirEntry
 	cursor := ""
 	for {
-		entries, err := d.meta.ReadDirFrom(ctx, d.inodeID, cursor, readdirPageSize)
+		entries, err := d.fs.Meta().ReadDirFrom(ctx, d.inodeID, cursor, readdirPageSize)
 		if err != nil {
 			logf("readdir error: %v", err)
 			rec.IncOpError("readdir")
@@ -108,10 +113,14 @@ func typeFromReaddir(t metadata.FileType) uint32 {
 
 // Lookup looks up a child entry by name.
 func (d *DFSDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	dfs := d.fs
+	if err := dfs.checkAccess(dfs.bucketName, metadata.PermRead); err != nil {
+		return nil, toErrno(err)
+	}
 	rec := recorderFor(d.recorder)
 	rec.IncOp("lookup")
 
-	metaInode, err := d.meta.Lookup(ctx, d.inodeID, name)
+	metaInode, err := d.fs.Meta().Lookup(ctx, d.inodeID, name)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
 			// ENOENT 不是错误（合法的"不存在"响应），不计入 errors
@@ -122,7 +131,6 @@ func (d *DFSDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*
 		return nil, syscall.EIO
 	}
 
-	dfs := rootFromInode(&d.Inode)
 	child := newChildInode(dfs, metaInode)
 	attr := inodeMetaToAttr(metaInode)
 
@@ -135,25 +143,16 @@ func (d *DFSDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*
 	return inode, 0
 }
 
-// rootFromInode walks up to the DFSFileSystem root so newChildInode
-// can read the chunk store. go-fuse exposes the embedder tree via
-// Inode.Root().Operations(), which is the DFSFileSystem instance we
-// constructed in NewDFSFileSystem. The argument is a pointer so
-// the embedded fs.Inode (which contains a sync.Mutex) is not copied.
-func rootFromInode(inode *fs.Inode) *DFSFileSystem {
-	root := inode.Root().Operations()
-	if r, ok := root.(*DFSFileSystem); ok {
-		return r
-	}
-	return nil
-}
-
 // Mkdir creates a new directory.
 func (d *DFSDir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	dfs := d.fs
+	if err := dfs.checkAccess(dfs.bucketName, metadata.PermWrite); err != nil {
+		return nil, toErrno(err)
+	}
 	rec := recorderFor(d.recorder)
 	rec.IncOp("mkdir")
 
-	metaInode, err := d.meta.MkDir(ctx, d.inodeID, name, mode)
+	metaInode, err := d.fs.Meta().MkDir(ctx, d.inodeID, name, mode)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryExists) {
 			// EEXIST 不是错误（合法的"已存在"响应），不计入 errors
@@ -164,7 +163,13 @@ func (d *DFSDir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.
 		return nil, syscall.EIO
 	}
 
-	child := &DFSDir{meta: d.meta, inodeID: metaInode.ID, recorder: rec}
+	// setgid inheritance: when the parent directory has S_ISGID set, new child
+	// directories inherit the parent's gid (POSIX semantics), overriding the
+	// mount default; applyMountOwner applies and persists it.
+	dirMeta, _ := d.fs.Meta().GetInode(ctx, d.inodeID)
+	dfs.applyMountOwner(ctx, metaInode, dirMeta)
+
+	child := &DFSDir{fs: dfs, inodeID: metaInode.ID, recorder: rec}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{
@@ -178,10 +183,14 @@ func (d *DFSDir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.
 
 // Rmdir removes an empty directory.
 func (d *DFSDir) Rmdir(ctx context.Context, name string) syscall.Errno {
+	dfs := d.fs
+	if err := dfs.checkAccess(dfs.bucketName, metadata.PermWrite); err != nil {
+		return toErrno(err)
+	}
 	rec := recorderFor(d.recorder)
 	rec.IncOp("rmdir")
 
-	err := d.meta.RmDir(ctx, d.inodeID, name)
+	err := d.fs.Meta().RmDir(ctx, d.inodeID, name)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) {
 			return syscall.ENOENT
@@ -198,14 +207,18 @@ func (d *DFSDir) Rmdir(ctx context.Context, name string) syscall.Errno {
 
 // Create creates and opens a new file.
 func (d *DFSDir) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	dfs := d.fs
+	if err := dfs.checkAccess(dfs.bucketName, metadata.PermWrite); err != nil {
+		return nil, nil, 0, toErrno(err)
+	}
 	rec := recorderFor(d.recorder)
 	rec.IncOp("create")
 
-	metaInode, err := d.meta.CreateFile(ctx, d.inodeID, name, mode)
+	metaInode, err := d.fs.Meta().CreateFile(ctx, d.inodeID, name, mode)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryExists) {
 			// File exists — lookup and open it
-			metaInode, err = d.meta.Lookup(ctx, d.inodeID, name)
+			metaInode, err = d.fs.Meta().Lookup(ctx, d.inodeID, name)
 			if err != nil {
 				rec.IncOpError("create")
 				return nil, nil, 0, syscall.EIO
@@ -215,10 +228,14 @@ func (d *DFSDir) Create(ctx context.Context, name string, flags uint32, mode uin
 			rec.IncOpError("create")
 			return nil, nil, 0, syscall.EIO
 		}
+	} else {
+		// New file created — apply mount-level uid/gid override plus setgid
+		// inheritance from the parent, persisted together.
+		dirMeta, _ := d.fs.Meta().GetInode(ctx, d.inodeID)
+		dfs.applyMountOwner(ctx, metaInode, dirMeta)
 	}
 
-	dfs := rootFromInode(&d.Inode)
-	file := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability}
+	file := &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability, logicalSize: metaInode.Size}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, file, fs.StableAttr{
@@ -227,7 +244,10 @@ func (d *DFSDir) Create(ctx context.Context, name string, flags uint32, mode uin
 	})
 
 	out.Attr = attr
-	return inode, file, 0, 0
+	if directIOEnabled.Load() {
+		fuseFlags = fuse.FOPEN_DIRECT_IO
+	}
+	return inode, file, fuseFlags, 0
 }
 
 // Mknod creates a special (non-regular) node: FIFO, char/block device or
@@ -255,7 +275,7 @@ func (d *DFSDir) Mknod(ctx context.Context, name string, mode uint32, dev uint32
 		return nil, syscall.EINVAL
 	}
 
-	metaInode, err := d.meta.CreateNode(ctx, d.inodeID, name, ftype, mode&07777, rdev)
+	metaInode, err := d.fs.Meta().CreateNode(ctx, d.inodeID, name, ftype, mode&07777, rdev)
 	if errno := errnoForCreateNode(err); errno != 0 {
 		if errno == syscall.EIO {
 			logf("mknod error: %v", err)
@@ -264,8 +284,13 @@ func (d *DFSDir) Mknod(ctx context.Context, name string, mode uint32, dev uint32
 		return nil, errno
 	}
 
+	// setgid inheritance: when the parent directory has S_ISGID set, new child
+	// nodes inherit the parent's gid (POSIX semantics), overriding the mount
+	// default; applyMountOwner applies and persists it.
+	dirMeta, _ := d.fs.Meta().GetInode(ctx, d.inodeID)
+	d.fs.applyMountOwner(ctx, metaInode, dirMeta)
 	attr := inodeMetaToAttr(metaInode)
-	inode := d.NewInode(ctx, &DFSFifo{meta: d.meta, inodeID: metaInode.ID, recorder: rec}, fs.StableAttr{
+	inode := d.NewInode(ctx, &DFSFifo{fs: d.fs, inodeID: metaInode.ID, recorder: rec}, fs.StableAttr{
 		Mode: attr.Mode & syscall.S_IFMT,
 		Ino:  uint64(metaInode.ID),
 	})
@@ -273,12 +298,56 @@ func (d *DFSDir) Mknod(ctx context.Context, name string, mode uint32, dev uint32
 	return inode, 0
 }
 
+// checkStickyDir returns EACCES when the directory dirID has the sticky bit
+// (S_ISVTX) set and the caller is neither the owner of fileUid nor root.  This
+// mirrors the kernel's own sticky-directory enforcement for unlink(2) and
+// rename(2), which is bypassed when FUSE handles NodeUnlinker/NodeRenamer.
+func (d *DFSDir) checkStickyDir(ctx context.Context, dirID metadata.InodeID, fileUid uint32) error {
+	dirMeta, err := d.fs.Meta().GetInode(ctx, dirID)
+	if err != nil {
+		return syscall.EIO
+	}
+	if dirMeta.Mode&sIsvtx == 0 {
+		return nil // no sticky bit → no restriction
+	}
+	caller, ok := ctx.(*fuse.Context)
+	if !ok || caller.Uid == 0 {
+		return nil // root bypass
+	}
+	if caller.Uid == fileUid {
+		return nil
+	}
+	return syscall.EACCES
+}
+
+// checkStickyBit returns EACCES when the parent directory (this dir) has the
+// sticky bit set and the caller is neither the named child's owner nor root.
+func (d *DFSDir) checkStickyBit(ctx context.Context, name string) error {
+	childMeta, err := d.fs.Meta().Lookup(ctx, d.inodeID, name)
+	if err != nil {
+		return syscall.EIO
+	}
+	return d.checkStickyDir(ctx, d.inodeID, childMeta.UID)
+}
+
 // Unlink removes a file entry.
 func (d *DFSDir) Unlink(ctx context.Context, name string) syscall.Errno {
+	dfs := d.fs
+	if err := dfs.checkAccess(dfs.bucketName, metadata.PermWrite); err != nil {
+		return toErrno(err)
+	}
 	rec := recorderFor(d.recorder)
 	rec.IncOp("unlink")
 
-	err := d.meta.Unlink(ctx, d.inodeID, name)
+	// Sticky-bit check: when the parent directory has S_ISVTX set, only
+	// the file owner (or root) may unlink.  This mirrors the kernel's own
+	// sticky-directory check for unlink(2) which is NOT performed by FUSE
+	// when the filesystem implements NodeUnlinker.
+	if err := d.checkStickyBit(ctx, name); err != nil {
+		return toErrno(err)
+	}
+
+	err := d.fs.Meta().Unlink(ctx, d.inodeID, name)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) {
 			return syscall.ENOENT
@@ -292,6 +361,10 @@ func (d *DFSDir) Unlink(ctx context.Context, name string) syscall.Errno {
 
 // Rename renames/moves a file or directory.
 func (d *DFSDir) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	dfs := d.fs
+	if err := dfs.checkAccess(dfs.bucketName, metadata.PermWrite); err != nil {
+		return toErrno(err)
+	}
 	rec := recorderFor(d.recorder)
 	rec.IncOp("rename")
 
@@ -304,7 +377,23 @@ func (d *DFSDir) Rename(ctx context.Context, name string, newParent fs.InodeEmbe
 		return syscall.EINVAL
 	}
 
-	err := d.meta.Rename(ctx, d.inodeID, name, newParentDir.inodeID, newName)
+	// Sticky-bit checks apply on BOTH the source and the destination directory
+	// (POSIX): renaming a file out of a sticky directory OR into a sticky
+	// directory both require the caller to own the file being moved (or be
+	// root). Fetch the moved file's uid once and check each directory.
+	srcChild, err := d.fs.Meta().Lookup(ctx, d.inodeID, name)
+	if err != nil {
+		rec.IncOpError("rename")
+		return toErrno(err)
+	}
+	if err := d.checkStickyDir(ctx, d.inodeID, srcChild.UID); err != nil {
+		return toErrno(err)
+	}
+	if err := d.checkStickyDir(ctx, newParentDir.inodeID, srcChild.UID); err != nil {
+		return toErrno(err)
+	}
+
+	err = d.fs.Meta().Rename(ctx, d.inodeID, name, newParentDir.inodeID, newName)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) {
 			return syscall.ENOENT
@@ -321,7 +410,7 @@ func (d *DFSDir) Symlink(ctx context.Context, target, name string, out *fuse.Ent
 	rec := recorderFor(d.recorder)
 	rec.IncOp("symlink")
 
-	metaInode, err := d.meta.Symlink(ctx, d.inodeID, name, target)
+	metaInode, err := d.fs.Meta().Symlink(ctx, d.inodeID, name, target)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryExists) {
 			return nil, syscall.EEXIST
@@ -331,7 +420,9 @@ func (d *DFSDir) Symlink(ctx context.Context, target, name string, out *fuse.Ent
 		return nil, syscall.EIO
 	}
 
-	child := &DFSSymlink{meta: d.meta, inodeID: metaInode.ID, recorder: rec}
+	// Symlinks do not inherit a setgid parent's gid (POSIX), so pass a nil parent.
+	d.fs.applyMountOwner(ctx, metaInode, nil)
+	child := &DFSSymlink{fs: d.fs, inodeID: metaInode.ID, recorder: rec}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{
@@ -357,15 +448,15 @@ func (d *DFSDir) Link(ctx context.Context, target fs.InodeEmbedder, name string,
 		return nil, syscall.EINVAL
 	}
 
-	metaInode, err := d.meta.Link(ctx, d.inodeID, name, targetFile.inodeID)
+	metaInode, err := d.fs.Meta().Link(ctx, d.inodeID, name, targetFile.inodeID)
 	if err != nil {
 		logf("link error: %v", err)
 		rec.IncOpError("link")
 		return nil, syscall.EIO
 	}
 
-	dfs := rootFromInode(&d.Inode)
-	child := &DFSFile{meta: d.meta, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability}
+	dfs := d.fs
+	child := &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability, logicalSize: metaInode.Size}
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{
@@ -380,7 +471,7 @@ func (d *DFSDir) Link(ctx context.Context, target fs.InodeEmbedder, name string,
 // Getattr returns the attributes of this directory inode.
 func (d *DFSDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	rec := recorderFor(d.recorder)
-	metaInode, err := d.meta.GetInode(ctx, d.inodeID)
+	metaInode, err := d.fs.Meta().GetInode(ctx, d.inodeID)
 	if err != nil {
 		rec.IncOpError("getattr")
 		return syscall.EIO
@@ -392,7 +483,7 @@ func (d *DFSDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOu
 // Setattr sets attributes on this directory inode.
 func (d *DFSDir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	rec := recorderFor(d.recorder)
-	metaInode, err := d.meta.GetInode(ctx, d.inodeID)
+	metaInode, err := d.fs.Meta().GetInode(ctx, d.inodeID)
 	if err != nil {
 		rec.IncOpError("setattr")
 		return syscall.EIO
@@ -409,7 +500,7 @@ func (d *DFSDir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttr
 	}
 	metaInode.CTime = time.Now().UnixNano()
 
-	if err := d.meta.UpdateInode(ctx, metaInode); err != nil {
+	if err := d.fs.Meta().UpdateInode(ctx, metaInode); err != nil {
 		rec.IncOpError("setattr")
 		return syscall.EIO
 	}
@@ -418,12 +509,12 @@ func (d *DFSDir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttr
 	return 0
 }
 
-// Access always returns 0 (allow-all).
+// Access evaluates the directory's POSIX mode bits against the requesting caller.
 func (d *DFSDir) Access(ctx context.Context, mask uint32) syscall.Errno {
-	return 0
+	return checkPOSIXAccess(ctx, d.fs, d.inodeID, mask)
 }
 
 // OpenXAttr returns an xattr handle for this directory.
 func (d *DFSDir) OpenXAttr() *DFSXAttr {
-	return &DFSXAttr{meta: d.meta, inodeID: d.inodeID}
+	return &DFSXAttr{meta: d.fs.Meta(), inodeID: d.inodeID}
 }

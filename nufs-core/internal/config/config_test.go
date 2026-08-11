@@ -141,3 +141,43 @@ trace_endpoint: "otel:4317"
 		}
 	})
 }
+
+func TestLoadConsumesConfigVersionKey(t *testing.T) {
+	// config_version is metadata for the operator, not a flag. It must not
+	// reach applyFlags (there is no --config-version) and must not break Load.
+	for _, spelling := range []string{"config_version", "config-version", "configVersion"} {
+		t.Run(spelling, func(t *testing.T) {
+			withFlagSet(t, func() {
+				logLevel := flag.String("log-level", "info", "")
+				path := writeConfig(t, spelling+": 1\nlog_level: debug\n")
+				if err := Load(path); err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				if *logLevel != "debug" {
+					t.Fatalf("log-level not loaded alongside %s: %q", spelling, *logLevel)
+				}
+			})
+		})
+	}
+}
+
+func TestLoadToleratesVersionMismatch(t *testing.T) {
+	// A stale or future version only warns — failing here would break every
+	// existing deployment the moment the schema version is bumped.
+	for _, body := range []string{
+		"config_version: 0\nlog_level: debug\n",
+		"config_version: 999\nlog_level: debug\n",
+		"config_version: not-a-number\nlog_level: debug\n",
+		"log_level: debug\n", // absent key = treated as current
+	} {
+		withFlagSet(t, func() {
+			logLevel := flag.String("log-level", "info", "")
+			if err := Load(writeConfig(t, body)); err != nil {
+				t.Fatalf("Load(%q): %v", body, err)
+			}
+			if *logLevel != "debug" {
+				t.Fatalf("log-level not loaded for %q: %q", body, *logLevel)
+			}
+		})
+	}
+}

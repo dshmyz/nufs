@@ -33,7 +33,7 @@ func TestMain(m *testing.M) {
 // newTestMetaStore returns an in-memory PebbleStore wired with a
 // single pre-created bucket "test" and a pre-created file at the
 // bucket root. The returned inode ID is what the file uses.
-func newTestMetaStore(t *testing.T) (*metadata.PebbleStore, metadata.InodeID) {
+func newTestMetaStore(t testing.TB) (*metadata.PebbleStore, metadata.InodeID) {
 	t.Helper()
 	store, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
 		Dir:         t.TempDir(), // required even in UseInMemory mode; storage is mem-VFS
@@ -76,24 +76,39 @@ func newTestMetaStore(t *testing.T) (*metadata.PebbleStore, metadata.InodeID) {
 }
 
 // newTestFile returns a DFSFile backed by the given meta+chunkStore,
-// with a pre-set inodeID. The test does not have a real FUSE server
-// so the fs.Inode embedded field stays zero-value; we exercise the
-// Read/Write/Flush methods directly.
+// with a pre-set inodeID. A real DFSFileSystem root is created so the
+// file's `fs` field resolves Meta()/checkAccess; the inode is not
+// attached to a FUSE bridge (unit tests exercise its methods directly).
+// logicalSize is seeded from the committed inode size, mirroring the
+// production Open path — a partial overwrite must not shrink the file
+// below its committed extent.
 func newTestFile(meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID) *DFSFile {
+	dfs := NewDFSFileSystem(meta, cs, nil, nil, nil)
+	logicalSize := int64(0)
+	if inode, err := meta.GetInode(context.Background(), id); err == nil {
+		logicalSize = inode.Size
+	}
 	return &DFSFile{
-		meta:       meta,
-		chunkStore: cs,
-		inodeID:    id,
+		fs:          dfs,
+		chunkStore:  cs,
+		inodeID:     id,
+		logicalSize: logicalSize,
 	}
 }
 
 // newTestFileWithRecorder 同 newTestFile 但注入 MetricsRecorder。
 func newTestFileWithRecorder(meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID, rec MetricsRecorder) *DFSFile {
+	dfs := NewDFSFileSystem(meta, cs, nil, rec, nil)
+	logicalSize := int64(0)
+	if inode, err := meta.GetInode(context.Background(), id); err == nil {
+		logicalSize = inode.Size
+	}
 	return &DFSFile{
-		meta:       meta,
-		chunkStore: cs,
-		inodeID:    id,
-		recorder:   rec,
+		fs:          dfs,
+		chunkStore:  cs,
+		inodeID:     id,
+		recorder:    rec,
+		logicalSize: logicalSize,
 	}
 }
 
@@ -258,8 +273,8 @@ func TestDFSFile_Read_SparseCommittedChunkMap_ZeroFillsHoles(t *testing.T) {
 	if errno := f.Flush(context.Background(), nil); errno != 0 {
 		t.Fatalf("Flush: errno=%v", errno)
 	}
-	if f.buffer != nil {
-		t.Fatalf("post-Flush: buffer=%v, want nil (committed-walk path)", f.buffer)
+	if f.chunkBufs != nil {
+		t.Fatalf("post-Flush: chunkBufs=%v, want nil (committed-walk path)", f.chunkBufs)
 	}
 
 	// Rewrite the committed ChunkMap to a sparse layout with a hole:
@@ -518,8 +533,8 @@ func TestDFSFile_Flush_Idempotent(t *testing.T) {
 	// false. These are implementation details but they're the
 	// direct fix for the B3 bug; locking them in here documents
 	// the contract.
-	if f.buffer != nil {
-		t.Fatalf("after flush: buffer=%v, want nil (B3 fix)", f.buffer)
+	if f.chunkBufs != nil {
+		t.Fatalf("after flush: chunkBufs=%v, want nil (B3 fix)", f.chunkBufs)
 	}
 	if f.dirty {
 		t.Fatalf("after flush: dirty=true, want false (B3 fix)")
@@ -559,16 +574,25 @@ func TestDFSFile_Flush_Oversized_AllocatesMultiChunk(t *testing.T) {
 	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
-	// Directly seed the in-memory buffer past the chunk limit, as the
-	// old EFBIG test did, so we don't copy ~128MiB through Write.
+	// Directly seed the in-memory chunk buffers past the chunk limit.
 	size := 2*MaxChunkPayload + 123
 	buf := make([]byte, size)
 	for i := range buf {
 		buf[i] = byte(i % 251)
 	}
 	f.mu.Lock()
-	f.buffer = buf
+	f.chunkBufs = make(map[int64][]byte)
+	f.dirtyMap = make(map[int64]bool)
+	for base := int64(0); base < int64(size); base += MaxChunkPayload {
+		end := base + MaxChunkPayload
+		if end > int64(size) {
+			end = int64(size)
+		}
+		f.chunkBufs[base] = buf[base:end]
+		f.dirtyMap[base] = true
+	}
 	f.dirty = true
+	f.logicalSize = int64(size)
 	f.mu.Unlock()
 
 	errno := f.Flush(context.Background(), nil)
@@ -851,9 +875,153 @@ func TestDFSFile_Write_NonZeroOffset_AfterFlush_PreservesPrefix(t *testing.T) {
 	}
 }
 
+// TestDFSFile_PartialOverwrite_DoesNotTruncateCommittedTail guards the
+// data-loss regression where a partial in-place overwrite whose end is below
+// the committed EOF shrank the file. Sequence: commit a 200-byte file, then
+// pwrite 5 bytes at offset 100 (end=105 < 200). Before the fix, Flush computed
+// size = logicalSize = 105 (the size==0 fallback didn't fire because 105 != 0)
+// and UpdateInode wrote Size=105, silently dropping committed bytes [105,200).
+// The fix takes max(logicalSize, committedSize) so the tail is preserved.
+func TestDFSFile_PartialOverwrite_DoesNotTruncateCommittedTail(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	// Commit a 200-byte file: all 'A' except a sentinel tail we will check for.
+	seed := make([]byte, 200)
+	for i := range seed {
+		seed[i] = 'A'
+	}
+	copy(seed[190:], []byte("TAIL123")) // bytes [190,197) = "TAIL123"
+	if _, errno := f.Write(context.Background(), nil, seed, 0); errno != 0 {
+		t.Fatalf("Write seed: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush seed: errno=%v", errno)
+	}
+
+	// Partial in-place overwrite that ends BEFORE the committed EOF.
+	patch := []byte("XXXXX") // 5 bytes at offset 100 -> end=105 < 200
+	if _, errno := f.Write(context.Background(), nil, patch, 100); errno != 0 {
+		t.Fatalf("Write patch: errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush patch: errno=%v", errno)
+	}
+
+	// The committed Size must still be 200 - not 105.
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if inode.Size != 200 {
+		t.Fatalf("inode.Size = %d, want 200 (partial overwrite truncated committed tail)", inode.Size)
+	}
+
+	// Read the whole file back; the tail sentinel must survive, and the patch
+	// must be applied at offset 100.
+	dest := make([]byte, 200)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	if len(got) != 200 {
+		t.Fatalf("read-back len = %d, want 200", len(got))
+	}
+	if string(got[100:105]) != "XXXXX" {
+		t.Errorf("patch at [100,105) = %q, want %q", got[100:105], "XXXXX")
+	}
+	if string(got[190:197]) != "TAIL123" {
+		t.Errorf("tail sentinel at [190,197) = %q, want %q (committed tail was truncated)", got[190:197], "TAIL123")
+	}
+}
+
 // TestDFSFile_Append_Concurrent_NoCollision verifies that two append
 // writes to the same inode land back-to-back rather than at the same
 // offset (the serialization point is the per-inode f.mu in AppendWrite).
+// TestDFSFile_LoadCommitted_MultipleRefsInChunk_PreservesAll guards a
+// data-loss hazard in loadCommittedChunkLocked: a single 64 MiB base can
+// hold more than one committed ChunkRef (e.g. non-aligned refs from a
+// sparse/legacy ChunkMap). A partial overwrite that triggers hydration
+// must merge ALL overlapping refs, not just the first — otherwise refs
+// after the first get zero-filled and their committed data is lost.
+func TestDFSFile_LoadCommitted_MultipleRefsInChunk_PreservesAll(t *testing.T) {
+	meta, id := newTestMetaStore(t)
+	cs := chunkstore.NewMemoryChunkStore()
+	f := newTestFile(meta, cs, id)
+
+	// Seed a real 16-byte file, then rewrite ChunkMap to two non-contiguous
+	// refs inside the SAME base [0, MaxChunkPayload):
+	//   ref A: file [0,4)  -> "0123"
+	//   ref B: file [10,14) -> "abcd"
+	seed := []byte("0123456789abcdef")
+	if _, errno := f.Write(context.Background(), nil, seed, 0); errno != 0 {
+		t.Fatalf("Write (seed): errno=%v", errno)
+	}
+	if errno := f.Flush(context.Background(), nil); errno != 0 {
+		t.Fatalf("Flush (seed): errno=%v", errno)
+	}
+
+	inode, err := meta.GetInode(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if len(inode.ChunkMap) != 1 {
+		t.Fatalf("seed ChunkMap len=%d, want 1", len(inode.ChunkMap))
+	}
+	cidA := inode.ChunkMap[0].ID
+
+	// Second real chunk carrying "abcd" at file offset 10.
+	bucket, err := meta.GetBucket(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	alloc, err := meta.AllocateChunksBatch(context.Background(), id, []int64{10}, bucket.Policy)
+	if err != nil {
+		t.Fatalf("AllocateChunksBatch: %v", err)
+	}
+	if len(alloc) != 1 {
+		t.Fatalf("allocated %d chunks, want 1", len(alloc))
+	}
+	chunkB := alloc[0]
+	if err := cs.WriteChunk(context.Background(), chunkB, []byte("abcd")); err != nil {
+		t.Fatalf("WriteChunk (ref B): %v", err)
+	}
+	if err := meta.CommitChunk(context.Background(), chunkB.ID, 0); err != nil {
+		t.Fatalf("CommitChunk (ref B): %v", err)
+	}
+
+	twoRefs := []metadata.ChunkRef{
+		{ID: cidA, Offset: 0, Length: 4, Version: 1},       // "0123"
+		{ID: chunkB.ID, Offset: 10, Length: 4, Version: 1}, // "abcd"
+	}
+	inode.ChunkMap = twoRefs
+	inode.Size = 14
+	if err := meta.UpdateInode(context.Background(), inode); err != nil {
+		t.Fatalf("UpdateInode (twoRefs): %v", err)
+	}
+
+	// Partial overwrite in the gap at offset 5 -> hydration must load BOTH refs.
+	if _, errno := f.Write(context.Background(), nil, []byte("XY"), 5); errno != 0 {
+		t.Fatalf("Write (gap): errno=%v", errno)
+	}
+
+	dest := make([]byte, 14)
+	rr, errno := f.Read(context.Background(), nil, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read: errno=%v", errno)
+	}
+	got, _ := rr.Bytes(dest)
+	// ref A="0123" at [0,4), gap zero at [4,5), write "XY" at [5,7),
+	// gap zero at [7,10), ref B="abcd" at [10,14).
+	want := append([]byte("0123"), []byte{0, 'X', 'Y', 0, 0, 0}...)
+	want = append(want, []byte("abcd")...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("multi-ref merge mismatch:\n got %q\nwant %q (second ref was zero-filled: data loss)", got, want)
+	}
+}
+
 func TestDFSFile_Append_Concurrent_NoCollision(t *testing.T) {
 	meta, id := newTestMetaStore(t)
 	cs := chunkstore.NewMemoryChunkStore()
@@ -1032,8 +1200,8 @@ func TestDFSFile_Read_AfterFlush_FallsBackToCommitted(t *testing.T) {
 	if errno := f.Flush(context.Background(), nil); errno != 0 {
 		t.Fatalf("Flush: errno=%v", errno)
 	}
-	if f.buffer != nil {
-		t.Fatalf("after Flush buffer should be nil, got %q", f.buffer)
+	if f.chunkBufs != nil {
+		t.Fatalf("after Flush buffer should be nil, got %v", f.chunkBufs)
 	}
 	dest := make([]byte, 32)
 	rr, errno := f.Read(context.Background(), nil, dest, 0)
@@ -1277,105 +1445,6 @@ func TestDFSXAttr_NotFound(t *testing.T) {
 	}
 }
 
-// ========== Root inode: bucket-as-shared-root ==========
-
-// TestDFSFileSystem_Readdir_ListsBuckets is the "ls /mnt/dfs" path.
-// The root inode (RootInodeID) must list every bucket as a directory
-// entry with its RootInode as the inode number. Pre-fix, the root
-// was a bare fs.Inode with no Readdir/Lookup, so "ls /mnt/dfs"
-// returned ENOTDIR.
-func TestDFSFileSystem_Readdir_ListsBuckets(t *testing.T) {
-	store, _ := newTestMetaStore(t)
-	dfs := NewDFSFileSystem(store, chunkstore.NewMemoryChunkStore(), nil, nil, nil)
-	ctx := context.Background()
-
-	// Create a second bucket so we have two entries.
-	if err := store.CreateBucket(ctx, "another", metadata.PlacementPolicy{
-		ID: "another", ReplicationFactor: 1, TopologySpread: metadata.SpreadNode,
-	}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
-
-	ds, errno := dfs.Readdir(ctx)
-	if errno != 0 {
-		t.Fatalf("Readdir: errno=%v", errno)
-	}
-	var names []string
-	for ds.HasNext() {
-		entry, _ := ds.Next()
-		names = append(names, entry.Name)
-	}
-	if len(names) != 2 {
-		t.Fatalf("Readdir: got %d entries %v, want 2", len(names), names)
-	}
-	// Entries should include both "another" and "test".
-	found := map[string]bool{}
-	for _, n := range names {
-		found[n] = true
-	}
-	if !found["test"] || !found["another"] {
-		t.Fatalf("Readdir: missing expected buckets, got %v", names)
-	}
-}
-
-// TestDFSFileSystem_Lookup_ExistingBucket resolves "test" to a
-// DFSDir with inodeID == bucket.RootInode. The returned *fs.Inode
-// must have StableAttr.Ino equal to the bucket's RootInode so the
-// kernel caches it correctly.
-//
-// NOTE: this test requires a live FUSE bridge: dfs.Lookup calls
-// dfs.NewInode, which dereferences the root inode's rawBridge (set only by
-// fs.Mount / the bridge runtime). With no mounted bridge the rawBridge is nil
-// and the test panics, aborting the whole package run. The kernel-caching
-// contract it exercises belongs to go-fuse's Inode layer, not to this fs's
-// own logic — so we skip here rather than fake a bridge. (The inode/attr
-// data behind it is covered by TestDFSDir_Lookup and inodeMetaToAttr.)
-func TestDFSFileSystem_Lookup_ExistingBucket(t *testing.T) {
-	// dfs.Lookup → dfs.NewInode dereferences the root inode's rawBridge, which
-	// is only set by fs.Mount/the bridge runtime. In a unit test there is no
-	// mounted bridge, so rawBridge is nil and calling Lookup panics — aborting
-	// the whole package run. This kernel-caching contract belongs to go-fuse's
-	// Inode layer, not this fs's own logic, so we skip rather than fake a
-	// bridge. (The inode/attr data behind it is covered by TestDFSDir_Lookup /
-	// TestDFSDir_Getattr / inodeMetaToAttr.)
-	t.Skip("requires a live FUSE bridge (rawBridge nil without fs.Mount)")
-
-	store, _ := newTestMetaStore(t)
-	dfs := NewDFSFileSystem(store, chunkstore.NewMemoryChunkStore(), nil, nil, nil)
-	ctx := context.Background()
-
-	bucket, err := store.GetBucket(ctx, "test")
-	if err != nil {
-		t.Fatalf("GetBucket: %v", err)
-	}
-
-	var out fuse.EntryOut
-	inode, errno := dfs.Lookup(ctx, "test", &out)
-	if errno != 0 {
-		t.Fatalf("Lookup: errno=%v", errno)
-	}
-	if inode == nil {
-		t.Fatalf("Lookup: returned nil inode for existing bucket")
-	}
-	if out.Attr.Ino != uint64(bucket.RootInode) {
-		t.Fatalf("Lookup: Ino=%d, want %d (bucket.RootInode)", out.Attr.Ino, bucket.RootInode)
-	}
-}
-
-// TestDFSFileSystem_Lookup_MissingBucket returns ENOENT for a bucket
-// that doesn't exist.
-func TestDFSFileSystem_Lookup_MissingBucket(t *testing.T) {
-	store, _ := newTestMetaStore(t)
-	dfs := NewDFSFileSystem(store, chunkstore.NewMemoryChunkStore(), nil, nil, nil)
-	ctx := context.Background()
-
-	var out fuse.EntryOut
-	_, errno := dfs.Lookup(ctx, "no-such-bucket", &out)
-	if errno != syscall.ENOENT {
-		t.Fatalf("Lookup missing bucket: errno=%v, want ENOENT", errno)
-	}
-}
-
 // ========== Advisory lock integration ==========
 
 // TestDFSFile_Open_AcquiresExclusiveLock verifies that opening a
@@ -1389,7 +1458,7 @@ func TestDFSFile_Open_AcquiresExclusiveLock(t *testing.T) {
 
 	dfs := NewDFSFileSystem(store, cs, nil, nil, nil)
 	f := &DFSFile{
-		meta:       store,
+		fs:         dfs,
 		chunkStore: cs,
 		inodeID:    id,
 		lockOwner:  dfs.lockOwner,
@@ -1412,7 +1481,7 @@ func TestDFSFile_Open_AcquiresExclusiveLock(t *testing.T) {
 	// A concurrent open from a DIFFERENT owner must fail (exclusive
 	// lock is held).
 	f2 := &DFSFile{
-		meta:       store,
+		fs:         dfs,
 		chunkStore: cs,
 		inodeID:    id,
 		lockOwner:  "fusegw-other-pid",
@@ -1443,10 +1512,11 @@ func TestDFSFile_Open_AcquiresExclusiveLock(t *testing.T) {
 func TestDFSFile_Open_AcquiresSharedLock(t *testing.T) {
 	store, id := newTestMetaStore(t)
 	cs := chunkstore.NewMemoryChunkStore()
+	dfs := NewDFSFileSystem(store, cs, nil, nil, nil)
 
-	f1 := &DFSFile{meta: store, chunkStore: cs, inodeID: id, lockOwner: "reader-1"}
-	f2 := &DFSFile{meta: store, chunkStore: cs, inodeID: id, lockOwner: "reader-2"}
-	fw := &DFSFile{meta: store, chunkStore: cs, inodeID: id, lockOwner: "writer"}
+	f1 := &DFSFile{fs: dfs, chunkStore: cs, inodeID: id, lockOwner: "reader-1"}
+	f2 := &DFSFile{fs: dfs, chunkStore: cs, inodeID: id, lockOwner: "reader-2"}
+	fw := &DFSFile{fs: dfs, chunkStore: cs, inodeID: id, lockOwner: "writer"}
 	ctx := context.Background()
 
 	// Two readers can coexist.
@@ -1892,13 +1962,17 @@ func TestDFSFile_Allocate_KeepSize_GrowsBufferNotSize(t *testing.T) {
 	if inode.Size != 3 {
 		t.Fatalf("after Allocate(KEEP_SIZE): Size=%d, want 3 (unchanged)", inode.Size)
 	}
-	if len(f.buffer) != 32 {
-		t.Fatalf("after Allocate(KEEP_SIZE): buffer len=%d, want 32 (physical prealloc)", len(f.buffer))
+
+	// The written head must still be intact in the chunk buffer.
+	chunk := f.getChunk(0)
+	if string(chunk[:3]) != "abc" {
+		t.Fatalf("KEEP_SIZE clobbered head: chunk[:3]=%q, want \"abc\"", chunk[:3])
 	}
 
-	// The written head must still be intact in the buffer.
-	if string(f.buffer[:3]) != "abc" {
-		t.Fatalf("KEEP_SIZE clobbered head: buffer[:3]=%q, want \"abc\"", f.buffer[:3])
+	// Verify that the physical allocation extended the buffer beyond the
+	// committed size. The chunk buffer should be at least 32 bytes.
+	if len(chunk) < 32 {
+		t.Fatalf("after Allocate(KEEP_SIZE): chunk len=%d, want >= 32 (physical prealloc)", len(chunk))
 	}
 }
 
@@ -2026,8 +2100,8 @@ func TestDFSFile_Allocate_UnsupportedFlags_EOPNOTSUPP(t *testing.T) {
 	if inode.Size != 2 {
 		t.Fatalf("after rejected Allocate: Size=%d, want 2", inode.Size)
 	}
-	if f.buffer != nil {
-		t.Fatalf("after rejected Allocate: buffer=%v, want nil (state untouched)", f.buffer)
+	if f.chunkBufs != nil {
+		t.Fatalf("after rejected Allocate: chunkBufs=%v, want nil (state untouched)", f.chunkBufs)
 	}
 	dest := make([]byte, 4)
 	rr, errno := f.Read(context.Background(), nil, dest, 0)
