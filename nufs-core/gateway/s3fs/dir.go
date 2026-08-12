@@ -17,8 +17,8 @@ type S3Dir struct {
 	fs.Inode
 
 	mfs     *S3FileSystem
-	dir     *S3Dir  // parent directory (nil for root)
-	Path    string  // relative path within parent
+	dir     *S3Dir // parent directory (nil for root)
+	Path    string // relative path within parent
 	InodeID uint64
 	Mode    os.FileMode
 	Size    uint64
@@ -34,19 +34,19 @@ type S3Dir struct {
 }
 
 var (
-	_ fs.NodeOnAdder     = (*S3Dir)(nil)
-	_ fs.NodeLookuper    = (*S3Dir)(nil)
-	_ fs.NodeReaddirer   = (*S3Dir)(nil)
-	_ fs.NodeMkdirer     = (*S3Dir)(nil)
-	_ fs.NodeCreater     = (*S3Dir)(nil)
-	_ fs.NodeUnlinker    = (*S3Dir)(nil)
-	_ fs.NodeRenamer     = (*S3Dir)(nil)
-	_ fs.NodeRmdirer     = (*S3Dir)(nil)
-	_ fs.NodeSymlinker   = (*S3Dir)(nil)
-	_ fs.NodeLinker      = (*S3Dir)(nil)
-	_ fs.NodeGetattrer   = (*S3Dir)(nil)
-	_ fs.NodeSetattrer   = (*S3Dir)(nil)
-	_ fs.NodeAccesser    = (*S3Dir)(nil)
+	_ fs.NodeOnAdder   = (*S3Dir)(nil)
+	_ fs.NodeLookuper  = (*S3Dir)(nil)
+	_ fs.NodeReaddirer = (*S3Dir)(nil)
+	_ fs.NodeMkdirer   = (*S3Dir)(nil)
+	_ fs.NodeCreater   = (*S3Dir)(nil)
+	_ fs.NodeUnlinker  = (*S3Dir)(nil)
+	_ fs.NodeRenamer   = (*S3Dir)(nil)
+	_ fs.NodeRmdirer   = (*S3Dir)(nil)
+	_ fs.NodeSymlinker = (*S3Dir)(nil)
+	_ fs.NodeLinker    = (*S3Dir)(nil)
+	_ fs.NodeGetattrer = (*S3Dir)(nil)
+	_ fs.NodeSetattrer = (*S3Dir)(nil)
+	_ fs.NodeAccesser  = (*S3Dir)(nil)
 )
 
 func (d *S3Dir) FullPath() string {
@@ -123,14 +123,14 @@ func (d *S3Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*f
 	// Check if it's a symlink.
 	if child.SymlinkTarget != "" {
 		sym := &S3Symlink{
-			mfs:    d.mfs,
-			dir:    d,
-			Path:   name,
-			Target: child.SymlinkTarget,
+			mfs:     d.mfs,
+			dir:     d,
+			Path:    name,
+			Target:  child.SymlinkTarget,
 			InodeID: child.ID,
-			Mode:   os.FileMode(child.Mode),
-			UID:    child.UID,
-			GID:    child.GID,
+			Mode:    os.FileMode(child.Mode),
+			UID:     child.UID,
+			GID:     child.GID,
 		}
 		node := d.NewPersistentInode(ctx, sym, fs.StableAttr{Mode: fuse.S_IFLNK})
 		out.NodeId = node.StableAttr().Ino
@@ -206,7 +206,7 @@ func (d *S3Dir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.E
 		mfs:     d.mfs,
 		dir:     d,
 		Path:    name,
-		InodeID:   childID,
+		InodeID: childID,
 		Mode:    os.FileMode(mode) | os.ModeDir,
 		UID:     d.mfs.config.UID,
 		GID:     d.mfs.config.GID,
@@ -253,7 +253,7 @@ func (d *S3Dir) Create(ctx context.Context, name string, flags uint32, mode uint
 		mfs:     d.mfs,
 		dir:     d,
 		Path:    name,
-		InodeID:   childID,
+		InodeID: childID,
 		Size:    0,
 		Mode:    os.FileMode(mode),
 		UID:     d.mfs.config.UID,
@@ -401,7 +401,11 @@ func (d *S3Dir) Rmdir(ctx context.Context, name string) syscall.Errno {
 	return 0
 }
 
-// Symlink creates a symbolic link.
+// Symlink creates a symbolic link stored in the local Pebble metadata cache.
+// The symlink is locally persistent (survives remount as long as CacheDir
+// is reused) but is NOT stored in S3 — other mount points will not see it.
+// This is the standard trade-off for S3-backed FUSE: local metadata that
+// doesn't have a native S3 primitive.
 func (d *S3Dir) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if d.mfs.config.ReadOnly {
 		return nil, syscall.EPERM
@@ -443,53 +447,11 @@ func (d *S3Dir) Symlink(ctx context.Context, target, name string, out *fuse.Entr
 	return node, 0
 }
 
-// Link creates a hardlink (via CopyObject since S3 doesn't support hardlinks).
+// Link is not supported — S3 has no hard link primitive.
+// Returning ENOSYS tells the kernel to fall back to copy semantics
+// (cp + unlink) which is the only correct behavior for S3.
 func (d *S3Dir) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	if d.mfs.config.ReadOnly {
-		return nil, syscall.EPERM
-	}
-
-	oldFile, ok := target.(*S3File)
-	if !ok {
-		return nil, syscall.EPERM
-	}
-
-	childID := d.mfs.cache.NextID()
-	now := time.Now()
-	newFile := &S3File{
-		mfs:     d.mfs,
-		dir:     d,
-		Path:    name,
-		InodeID:   childID,
-		Size:    oldFile.Size,
-		Mode:    oldFile.Mode,
-		UID:     oldFile.UID,
-		GID:     oldFile.GID,
-		ETag:    oldFile.ETag,
-		Chgtime: now,
-		Crtime:  now,
-		Mtime:   now,
-		Atime:   now,
-	}
-
-	sr := newCopyOp(oldFile.dir.RemotePath()+"/"+oldFile.Path, d.RemotePath()+"/"+name)
-	if err := d.mfs.sync(sr); err != nil {
-		return nil, syscall.EIO
-	}
-	if err := <-sr.Error; err != nil {
-		return nil, syscall.EIO
-	}
-
-	if err := d.mfs.cache.PutInode(newFile.toCacheInode()); err != nil {
-		return nil, syscall.EIO
-	}
-	if err := d.mfs.cache.PutDirEntry(d.InodeID, name, childID); err != nil {
-		return nil, syscall.EIO
-	}
-
-	node := d.NewPersistentInode(ctx, newFile, fs.StableAttr{})
-	out.NodeId = node.StableAttr().Ino
-	return node, 0
+	return nil, syscall.ENOSYS
 }
 
 // Getattr returns directory attributes.
@@ -588,7 +550,7 @@ func (d *S3Dir) scan(ctx context.Context) error {
 				mfs:     d.mfs,
 				dir:     d,
 				Path:    name,
-				InodeID:   childID,
+				InodeID: childID,
 				Mode:    os.ModeDir | 0750,
 				UID:     d.mfs.config.UID,
 				GID:     d.mfs.config.GID,
@@ -608,7 +570,7 @@ func (d *S3Dir) scan(ctx context.Context) error {
 				mfs:     d.mfs,
 				dir:     d,
 				Path:    name,
-				InodeID:   childID,
+				InodeID: childID,
 				Size:    uint64(obj.Size),
 				Mode:    d.mfs.config.Mode,
 				UID:     d.mfs.config.UID,

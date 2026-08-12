@@ -48,17 +48,17 @@ func (f *S3File) RemotePath() string {
 
 func (f *S3File) toCacheInode() *CacheInode {
 	return &CacheInode{
-		ID:      f.InodeID,
-		IsDir:   false,
-		Name:    f.Path,
-		Size:    f.Size,
-		Mode:    uint32(f.Mode),
-		UID:     f.UID,
-		GID:     f.GID,
-		Mtime:   f.Mtime.UnixNano(),
-		Ctime:   f.Chgtime.UnixNano(),
-		Atime:   f.Atime.UnixNano(),
-		ETag:    f.ETag,
+		ID:    f.InodeID,
+		IsDir: false,
+		Name:  f.Path,
+		Size:  f.Size,
+		Mode:  uint32(f.Mode),
+		UID:   f.UID,
+		GID:   f.GID,
+		Mtime: f.Mtime.UnixNano(),
+		Ctime: f.Chgtime.UnixNano(),
+		Atime: f.Atime.UnixNano(),
+		ETag:  f.ETag,
 	}
 }
 
@@ -156,6 +156,10 @@ func (f *S3File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttr
 	}
 	if size, ok := in.GetSize(); ok {
 		f.Size = size
+		// Truncate the local cache file if it's open, so Flush uploads
+		// the correct (truncated) content. Without this, a truncate
+		// followed by Flush would upload the full old file.
+		f.truncateCacheFile(size)
 	}
 	if mt, ok := in.GetMTime(); ok {
 		f.Mtime = mt
@@ -174,6 +178,20 @@ func (f *S3File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttr
 		Nlink: 1,
 	}
 	return 0
+}
+
+// truncateCacheFile finds the open handle for this inode and truncates
+// its local cache file to the given size. This ensures that a subsequent
+// Flush uploads the truncated content to S3.
+func (f *S3File) truncateCacheFile(size uint64) {
+	f.mfs.mu.RLock()
+	defer f.mfs.mu.RUnlock()
+	for _, h := range f.mfs.handles {
+		if h.f != nil && h.f.InodeID == f.InodeID {
+			h.File.Truncate(int64(size))
+			return
+		}
+	}
 }
 
 // Access always returns 0 (allow-all).
