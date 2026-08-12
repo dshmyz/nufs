@@ -184,9 +184,9 @@ var SLIDefinitions = []SLI{
 		Source:      "metad",
 	},
 	{
-		Name:        "chunk_write_latency_p99",
+		Name:        "chunk_write_latency_mean",
 		Category:    "latency",
-		Description: "Mean chunk write-path wait (write semaphore) in ms over a 1h rate window — the datanode exposes cumulative latency counters, not a p99 histogram, so this is the metric-derived mean",
+		Description: "Mean chunk write-path wait (write semaphore) in ms over a 1h rate window — the datanode exposes cumulative latency counters, not a p99 histogram, so this is the metric-derived mean. Named 'mean', not 'p99', to avoid implying tail-latency coverage it does not provide",
 		Metric:      `(sum(rate(nufs_datanode_write_semaphore_wait_seconds_total[1h])) / clamp_min(sum(rate(nufs_datanode_replication_writes_total[1h])),1)) * 1000`,
 		Unit:        "ms",
 		Source:      "datanode",
@@ -194,13 +194,13 @@ var SLIDefinitions = []SLI{
 	{
 		Name:        "chunk_read_efficiency",
 		Category:    "latency",
-		Description: "Read-path efficiency over a 1h rate window = fraction of requested chunk bytes served without amplification (1 - amplified/requested)",
-		Metric:      `1 - clamp_max(sum(rate(nufs_datanode_read_amplified_bytes_total[1h]))/clamp_min(sum(rate(nufs_datanode_read_requested_bytes_total[1h])),1), 1)`,
+		Description: "Read-path efficiency over a 1h rate window = fraction of amplified bytes served that were actually requested (requested/amplified). The datanode reads a whole stored payload to serve a small range read, so amplified >= requested; requested/amplified is 1 when a read is served without amplification (whole-chunk read) and falls toward 0 as range reads over-read",
+		Metric:      `clamp_max(sum(rate(nufs_datanode_read_requested_bytes_total[1h]))/clamp_min(sum(rate(nufs_datanode_read_amplified_bytes_total[1h])),1), 1)`,
 		Unit:        "ratio",
 		Source:      "datanode",
 	},
 	{
-		Name:        "wal_fsync_latency_p99",
+		Name:        "wal_fsync_latency_mean",
 		Category:    "latency",
 		Description: "Mean chunk-file fsync latency in ms over a 1h rate window (fsync seconds / fsync count) — write durabilty cost; no p99 histogram exposed",
 		Metric:      `(sum(rate(nufs_datanode_fsync_seconds_total[1h])) / clamp_min(sum(rate(nufs_datanode_fsync_total[1h])),1)) * 1000`,
@@ -341,12 +341,12 @@ var SLODefinitions = []SLO{
 		Description: "Metadata writes at p99 must complete within 50ms (includes Raft consensus)",
 	},
 	{
-		Name:        "chunk_write_p99_under_100ms",
-		SLIName:     "chunk_write_latency_p99",
+		Name:        "chunk_write_mean_under_100ms",
+		SLIName:     "chunk_write_latency_mean",
 		Target:      100,
 		Window:      "7d",
 		Severity:    "high",
-		Description: "Chunk writes at p99 must complete within 100ms",
+		Description: "Mean chunk write-path wait must stay under 100ms (mean, not p99 — the datanode does not expose a write-latency histogram)",
 	},
 	{
 		Name:        "chunk_read_efficiency_high",
@@ -459,7 +459,7 @@ var ErrorBudgets = []ErrorBudget{
 		BudgetMinutes: 100.8, // 1% of 7 * 24 * 60
 	},
 	{
-		SLOName:       "chunk_write_p99_under_100ms",
+		SLOName:       "chunk_write_mean_under_100ms",
 		Target:        99,
 		Window:        "7d",
 		BudgetPercent: 1,

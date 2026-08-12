@@ -108,7 +108,6 @@ func (t *leaderRTOTracker) tick(now time.Time) {
 		t.rtoSetAt.Store(0)
 	}
 }
-}
 
 func (t *leaderRTOTracker) run(stop <-chan struct{}) {
 	ticker := time.NewTicker(500 * time.Millisecond)

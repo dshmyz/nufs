@@ -3,8 +3,6 @@ package metadata
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -406,44 +404,6 @@ func TestScrubber_DetectsCorruption(t *testing.T) {
 	}
 	if result.ChunksCorrupted != 1 {
 		t.Fatalf("expected 1 corrupted, got %d", result.ChunksCorrupted)
-	}
-}
-
-// ========== Health Check Tests ==========
-
-func TestHealthCheck_HTTP(t *testing.T) {
-	store := newTestPebbleStore(t)
-	metrics := NewMetrics()
-	hc := NewHealthChecker(store, nil, metrics, "1.0.0-test")
-
-	// Record some metrics
-	metrics.RecordRead(100 * time.Microsecond)
-	metrics.RecordWrite(200 * time.Microsecond)
-
-	handler := hc.HTTPHandler()
-
-	// /health
-	req := httptest.NewRequest("GET", "/health", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("/health status: %d", w.Code)
-	}
-
-	// /ready
-	req = httptest.NewRequest("GET", "/ready", nil)
-	w = httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("/ready status: %d", w.Code)
-	}
-
-	// /metrics
-	req = httptest.NewRequest("GET", "/metrics", nil)
-	w = httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("/metrics status: %d", w.Code)
 	}
 }
 

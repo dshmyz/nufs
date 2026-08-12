@@ -103,6 +103,7 @@ func TestDFSFile_Read_HitCache_IncrementsCacheHits(t *testing.T) {
 	meta, id := newTestMetaStore(t)
 	cs := chunkstore.NewMemoryChunkStore()
 	rec := &FUSEMetrics{}
+	dfs := NewDFSFileSystem(meta, cs, nil, rec, nil)
 
 	// 创建带缓存 + recorder 的 DFSFile
 	cache, err := NewChunkCache("")
@@ -112,7 +113,7 @@ func TestDFSFile_Read_HitCache_IncrementsCacheHits(t *testing.T) {
 	cache.recorder = rec
 
 	f := &DFSFile{
-		meta:       meta,
+		fs:         dfs,
 		chunkStore: cs,
 		inodeID:    id,
 		cache:      cache,
@@ -206,7 +207,6 @@ func TestDFSFile_Flush_ErrorIncrementsOpsErrors(t *testing.T) {
 func TestDFSFile_Getattr_IncrementsOpsErrorsOnFailure(t *testing.T) {
 	rec := &FUSEMetrics{}
 	f := &DFSFile{
-		meta:     nil, // 触发 GetInode panic 或 error
 		inodeID:  1,
 		recorder: rec,
 	}

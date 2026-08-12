@@ -28,12 +28,12 @@ import (
 
 // Config configures the global logger.
 type Config struct {
-	Level     string // debug, info, warn, error
-	JSON      bool   // true = JSON output, false = text
-	AddSource bool   // include source file/line
-	LogFile   string // path to log file (empty = stderr). File is auto-rotated.
-	MaxSize   int64  // max log file size in bytes before rotation (default 100MB)
-	MaxBackups int   // max rotated files to keep (default 7)
+	Level      string // debug, info, warn, error
+	JSON       bool   // true = JSON output, false = text
+	AddSource  bool   // include source file/line
+	LogFile    string // path to log file (empty = stderr). File is auto-rotated.
+	MaxSize    int64  // max log file size in bytes before rotation (default 100MB)
+	MaxBackups int    // max rotated files to keep (default 7)
 }
 
 // Init initializes the global logger. Must be called once at startup.
@@ -57,10 +57,18 @@ func Init(cfg Config) {
 
 	var w io.Writer
 	if cfg.LogFile != "" {
+		maxSize := int(cfg.MaxSize / 1024 / 1024) // bytes → MB
+		if maxSize <= 0 {
+			maxSize = 100
+		}
+		maxBackups := cfg.MaxBackups
+		if maxBackups <= 0 {
+			maxBackups = 7
+		}
 		w = &lumberjack.Logger{
 			Filename:   cfg.LogFile,
-			MaxSize:    int(cfg.MaxSize / 1024 / 1024), // lumberjack uses MB
-			MaxBackups: cfg.MaxBackups,
+			MaxSize:    maxSize,
+			MaxBackups: maxBackups,
 			MaxAge:     30, // days
 			Compress:   true,
 		}
@@ -96,6 +104,21 @@ func SetLevel(levelStr string) {
 	}
 	dynamicLevel.Set(level)
 	slog.Info("log level changed", "new_level", levelStr)
+}
+
+// CurrentLevel returns the current log level as a lowercase string.
+func CurrentLevel() string {
+	lvl := slog.Level(dynamicLevel.Level())
+	switch {
+	case lvl >= slog.LevelError:
+		return "error"
+	case lvl >= slog.LevelWarn:
+		return "warn"
+	case lvl <= slog.LevelDebug:
+		return "debug"
+	default:
+		return "info"
+	}
 }
 
 // Named returns a logger with a component name attached.

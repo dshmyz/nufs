@@ -85,6 +85,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		// PartDir is advisory; silence error in production.
 		// Callers can check logs for misconfiguration.
 	}
+	activeUploads.startCleanup(defaultUploadTTL)
 	gw := &Gateway{
 		meta:       cfg.MetaService,
 		creds:      cfg.Creds,

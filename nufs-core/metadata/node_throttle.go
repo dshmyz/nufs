@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/time/rate"
 )
@@ -59,14 +60,18 @@ func DefaultNodeThrottleConfig() NodeThrottleConfig {
 type NodeRegistrationThrottle struct {
 	config atomic.Value // holds NodeThrottleConfig
 
-	mu      sync.Mutex
-	global  *rate.Limiter
-	perNode map[NodeID]*rate.Limiter
+	mu       sync.Mutex
+	global   *rate.Limiter
+	perNode  map[NodeID]*rate.Limiter
+	lastSeen map[NodeID]time.Time
 
 	// Counters (exposed to admin/metrics page)
 	allowedTotal  atomic.Int64
 	rejectedTotal atomic.Int64
 	rejectedBurst atomic.Int64 // rejection due to per-node burst
+
+	stopCleanup chan struct{}
+	cleanupDone chan struct{}
 }
 
 // NewNodeRegistrationThrottle creates a limiter with the given
@@ -77,7 +82,8 @@ func NewNodeRegistrationThrottle(cfg *NodeThrottleConfig) *NodeRegistrationThrot
 		c = *cfg
 	}
 	t := &NodeRegistrationThrottle{
-		perNode: make(map[NodeID]*rate.Limiter),
+		perNode:  make(map[NodeID]*rate.Limiter),
+		lastSeen: make(map[NodeID]time.Time),
 	}
 	t.config.Store(c)
 	t.global = rate.NewLimiter(c.GlobalRate, c.GlobalBurst)
@@ -94,6 +100,7 @@ func (t *NodeRegistrationThrottle) Reconfigure(cfg NodeThrottleConfig) {
 	// Per-node limiters are rebuilt lazily on next Allow() to
 	// avoid iterating the map under lock.
 	t.perNode = make(map[NodeID]*rate.Limiter)
+	t.lastSeen = make(map[NodeID]time.Time)
 	t.mu.Unlock()
 }
 
@@ -124,6 +131,7 @@ func (t *NodeRegistrationThrottle) Allow(nodeID NodeID) bool {
 		nodeLimiter = rate.NewLimiter(cfg.PerNodeRate, cfg.PerNodeBurst)
 		t.perNode[nodeID] = nodeLimiter
 	}
+	t.lastSeen[nodeID] = time.Now()
 	t.mu.Unlock()
 
 	if !nodeLimiter.Allow() {
@@ -150,6 +158,7 @@ func (t *NodeRegistrationThrottle) Wait(ctx context.Context, nodeID NodeID) erro
 		nodeLimiter = rate.NewLimiter(cfg.PerNodeRate, cfg.PerNodeBurst)
 		t.perNode[nodeID] = nodeLimiter
 	}
+	t.lastSeen[nodeID] = time.Now()
 	t.mu.Unlock()
 	return nodeLimiter.Wait(ctx)
 }
@@ -174,4 +183,50 @@ func (t *NodeRegistrationThrottle) Stats() NodeThrottleStats {
 		RejectedBurst: t.rejectedBurst.Load(),
 		TrackedNodes:  nn,
 	}
+}
+
+// StartCleanup launches a background goroutine that evicts per-node
+// rate limiters for nodes not seen within maxAge. The goroutine runs
+// until StopCleanup is called.
+func (t *NodeRegistrationThrottle) StartCleanup(maxAge time.Duration) {
+	t.stopCleanup = make(chan struct{})
+	t.cleanupDone = make(chan struct{})
+	go func() {
+		defer close(t.cleanupDone)
+		ticker := time.NewTicker(maxAge / 2)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-t.stopCleanup:
+				return
+			case <-ticker.C:
+				t.evictStale(maxAge)
+			}
+		}
+	}()
+}
+
+// StopCleanup terminates the background cleanup goroutine and waits.
+func (t *NodeRegistrationThrottle) StopCleanup() {
+	if t.stopCleanup != nil {
+		close(t.stopCleanup)
+		<-t.cleanupDone
+	}
+}
+
+// evictStale removes per-node limiters for nodes not seen within maxAge.
+func (t *NodeRegistrationThrottle) evictStale(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge)
+	t.mu.Lock()
+	var stale []NodeID
+	for id, last := range t.lastSeen {
+		if last.Before(cutoff) {
+			stale = append(stale, id)
+		}
+	}
+	for _, id := range stale {
+		delete(t.perNode, id)
+		delete(t.lastSeen, id)
+	}
+	t.mu.Unlock()
 }

@@ -20,6 +20,10 @@ type ProductionValidationConfig struct {
 	RaftNodeCount    int
 	TLSEnabled       bool
 	AllowInsecureDev bool
+	// TokenSigningKey is the HMAC key metad uses to sign mount auth tokens.
+	// Required in production: without it the fuse cannot authenticate, and a
+	// dev-default value would allow forging tokens.
+	TokenSigningKey string
 }
 
 func ValidateProductionConfig(cfg ProductionValidationConfig) error {
@@ -35,6 +39,11 @@ func ValidateProductionConfig(cfg ProductionValidationConfig) error {
 		strings.Contains(cfg.JWTSecret, "dev-secret") ||
 		strings.Contains(cfg.JWTSecret, "change-in-production") {
 		errs = append(errs, "production JWT secret is empty or uses a dev default")
+	}
+	if cfg.TokenSigningKey == "" ||
+		strings.Contains(cfg.TokenSigningKey, "dev-token-key") ||
+		strings.Contains(cfg.TokenSigningKey, "change-in-production") {
+		errs = append(errs, "production token signing key is empty or uses a dev default")
 	}
 	if cfg.S3CredentialPath == "" {
 		errs = append(errs, "production S3 credential source is required")

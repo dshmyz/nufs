@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"os/signal"
@@ -90,6 +91,7 @@ func main() {
 		logFile              = flag.String("log-file", "", "Log file path (empty = stderr)")
 		logMaxSize           = flag.Int("log-max-size", 100, "Max log file size in MB before rotation")
 		logMaxBackups        = flag.Int("log-max-backups", 7, "Max number of rotated log files to keep")
+		enablePprof          = flag.Bool("pprof", false, "Enable /debug/pprof/ profiling endpoints")
 	)
 	config.Preload()
 	flag.Parse()
@@ -237,6 +239,11 @@ func main() {
 	// production-safe defaults; values can be tweaked per-environment
 	// by reading config flags if needed later.
 	store.SetNodeThrottle(metadata.NewNodeRegistrationThrottle(nil))
+	// Evict per-node rate limiters for nodes not seen within 5× the lease
+	// TTL (default 150s) so the map doesn't grow unboundedly with churned
+	// StatefulSet ordinals or decommissioned nodes.
+	store.GetNodeThrottle().StartCleanup(5 * *leaseTTL)
+	defer store.GetNodeThrottle().StopCleanup()
 	// Install the event bus so watch API and placement engine can
 	// subscribe to metadata changes. Without this, watch returns 501.
 	store.SetEventBus(metadata.NewEventBus(1024))
@@ -487,6 +494,15 @@ func main() {
 		_ = json.NewEncoder(w).Encode(version.Info())
 	})
 
+	// pprof — runtime profiling endpoints, disabled by default.
+	if *enablePprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+
 	// Initialize graceful shutdown drain and wire it into request handling.
 	drain := metadata.NewShutdownDrain(15 * time.Second)
 	public := map[string]struct{}{
@@ -500,6 +516,9 @@ func main() {
 		"/api/v1/auth/token": {}, // self-authenticating: accessKey/secretKey in body
 	}
 	var handler http.Handler = rejectEmptyBucketQuotaPath(drain.Middleware(public, mux))
+	// Body size limit: cap POST/PUT/DELETE/PATCH request bodies to prevent
+	// unbounded memory allocation via json.Decoder on oversized payloads.
+	handler = maxBodySizeMiddleware(10<<20, handler)
 	if *authToken != "" || *tokenSigningKey != "" {
 		signingKeys := []string{*tokenSigningKey}
 		if *tokenSigningKeyPrev != "" {
@@ -944,6 +963,19 @@ func runtimeMode(allowInsecureDev bool) metadata.RuntimeMode {
 		return metadata.RuntimeDev
 	}
 	return metadata.RuntimeProduction
+}
+
+// maxBodySizeMiddleware wraps POST/PUT/DELETE/PATCH request bodies with
+// http.MaxBytesReader to prevent unbounded memory allocation. GET/HEAD
+// requests pass through untouched.
+func maxBodySizeMiddleware(maxBytes int64, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // reconcileMetadPeers keeps every configured --raft-bootstrap-peers entry a

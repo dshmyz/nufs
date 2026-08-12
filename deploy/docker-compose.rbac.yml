@@ -1,0 +1,109 @@
+version: "3.8"
+
+# Isolated bucket-level RBAC test stack (does not touch the e2e drill cluster).
+# - Single self-bootstrapped raft metad (leader) serving /api/v1/acl/* and
+#   /api/v1/auth/* (the mount-authentication authority)
+# - One datanode for chunk allocation
+# - A privileged nufs-fuse container mounting a bucket using a credential
+#   (--access-key/--secret-key) exchanged for a signed token at mount time
+#
+# Usage:
+#   docker compose -f docker-compose.rbac.yml up -d
+#   create bucket via nufs-cli, set policy, then exec into nufs-rbac-fuse to test.
+#
+# The seed credential (RBAC_SECRET_KEY) is dev-only, seeded via --dev-seed-cred
+# because this stack runs with --allow-insecure-dev. Production uses nufs-cli
+# `auth cred add` against a rotation-managed secret instead.
+
+services:
+  metad:
+    image: nufs-rbac:latest
+    container_name: nufs-rbac-metad
+    entrypoint: ["/usr/local/bin/metad"]
+    command:
+      - "-data-dir=/var/lib/dfs/metadata"
+      - "-node-id=1"
+      - "-raft"
+      - "-raft-addr=0.0.0.0:7000"
+      - "-raft-advertise-addr=nufs-rbac-metad:7000"
+      - "-raft-dir=/var/lib/dfs/raft"
+      - "-raft-bootstrap"
+      - "-ops-addr=0.0.0.0:8091"
+      - "-allow-insecure-dev"
+      - "-auth-token=rbac-ops-secret-change-in-production"
+      - "-token-signing-key=rbac-token-key-change-in-production"
+      - "-dev-seed-cred=app-server-1:${RBAC_SECRET_KEY:-secret123}"
+    volumes:
+      - rbac-metad-data:/var/lib/dfs/metadata
+      - rbac-metad-raft:/var/lib/dfs/raft
+    ports:
+      - "8590:8091"   # Operations API
+    networks:
+      - nufs-rbac-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8091/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  datanode:
+    image: nufs-rbac:latest
+    container_name: nufs-rbac-datanode
+    entrypoint: ["/usr/local/bin/datanode"]
+    command:
+      - "-node-id=1"
+      - "-listen=0.0.0.0:9100"
+      - "-register-addr=nufs-rbac-datanode:9100"
+      - "-metadata=nufs-rbac-metad:8091"
+      - "-data-dir=/data"
+      - "-rack=rack1"
+      - "-zone=zone1"
+      - "-ops-addr=0.0.0.0:8092"
+      - "-allow-insecure-dev"
+    volumes:
+      - rbac-datanode-data:/data
+    depends_on:
+      metad:
+        condition: service_healthy
+    networks:
+      - nufs-rbac-net
+
+  fuse:
+    image: nufs-rbac:latest
+    container_name: nufs-rbac-fuse
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /mnt/rbac
+        # Secret injected via META_SECRET_KEY env (read by gateway/fuse
+        # LoadCredentials) so it never appears in the process command line.
+        exec nufs-fuse --backend=nufs --meta-addr=nufs-rbac-metad:8091 \
+          --bucket secdata --log-level debug /mnt/rbac
+    environment:
+      META_ACCESS_KEY: app-server-1
+      META_SECRET_KEY: ${RBAC_SECRET_KEY:-secret123}
+      META_ENDPOINT: "http://nufs-rbac-metad:8091"
+    privileged: true
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - rbac-fuse-mnt:/mnt/rbac
+    depends_on:
+      metad:
+        condition: service_healthy
+    networks:
+      - nufs-rbac-net
+
+volumes:
+  rbac-metad-data:
+  rbac-metad-raft:
+  rbac-datanode-data:
+  rbac-fuse-mnt:
+
+networks:
+  nufs-rbac-net:
+    driver: bridge

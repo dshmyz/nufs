@@ -1306,5 +1306,55 @@ func (s *ShardedStore) DeleteBucketPolicy(ctx context.Context, bucket string) er
 	return shard.DeleteBucketPolicy(ctx, bucket)
 }
 
+// ========== CredentialService Implementation ==========
+
+func (s *ShardedStore) PutCredential(ctx context.Context, cred Credential) error {
+	shard, err := s.GetShard(cred.AccessKey)
+	if err != nil {
+		return err
+	}
+	return shard.PutCredential(ctx, cred)
+}
+
+func (s *ShardedStore) GetCredential(ctx context.Context, accessKey string) (*Credential, error) {
+	shard, err := s.GetShard(accessKey)
+	if err != nil {
+		return nil, err
+	}
+	return shard.GetCredential(ctx, accessKey)
+}
+
+func (s *ShardedStore) DeleteCredential(ctx context.Context, accessKey string) error {
+	shard, err := s.GetShard(accessKey)
+	if err != nil {
+		return err
+	}
+	return shard.DeleteCredential(ctx, accessKey)
+}
+
+func (s *ShardedStore) ListCredentials(ctx context.Context) ([]Credential, error) {
+	var creds []Credential
+	err := s.forEachShard(func(sh *PebbleStore) error {
+		c, err := sh.ListCredentials(ctx)
+		if err != nil {
+			return err
+		}
+		creds = append(creds, c...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return creds, nil
+}
+
+func (s *ShardedStore) Authenticate(ctx context.Context, accessKey, secretKey string) (Principal, error) {
+	shard, err := s.GetShard(accessKey)
+	if err != nil {
+		return "", err
+	}
+	return shard.Authenticate(ctx, accessKey, secretKey)
+}
+
 // Compile-time interface check
 var _ MetadataService = (*ShardedStore)(nil)

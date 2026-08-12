@@ -775,3 +775,73 @@ func TestV2StoreFailStreakDrivesHealth(t *testing.T) {
 		t.Fatalf("expected writeTo to reject write to FAILED disk, but it succeeded")
 	}
 }
+
+// TestV2Store_DeleteShard_CleansShardDiskOf verifies that DeleteShard removes
+// the per-shard entry from shardDiskOf, and cleans up the parent map entry
+// when the last shard for a chunk is deleted.
+func TestV2Store_DeleteShard_CleansShardDiskOf(t *testing.T) {
+	v, _ := newTestShardMultiStore(t, 3)
+	cid := metadata.ChunkID(9001)
+
+	// Populate shardDiskOf manually (mimicking what WriteChunkEC does).
+	v.mu.Lock()
+	v.shardDiskOf[cid] = map[int]int{0: 0, 1: 1, 2: 2}
+	v.mu.Unlock()
+
+	// Delete shard 1 — inner map should still have entries 0 and 2.
+	if err := v.DeleteShard(cid, 1); err != nil {
+		t.Fatalf("DeleteShard: %v", err)
+	}
+	v.mu.Lock()
+	m := v.shardDiskOf[cid]
+	if len(m) != 2 {
+		t.Fatalf("after deleting shard 1: expected 2 entries, got %d", len(m))
+	}
+	if _, ok := m[1]; ok {
+		t.Fatal("shard 1 entry should have been removed")
+	}
+	v.mu.Unlock()
+
+	// Delete remaining shards — parent map entry should be cleaned up.
+	if err := v.DeleteShard(cid, 0); err != nil {
+		t.Fatalf("DeleteShard 0: %v", err)
+	}
+	if err := v.DeleteShard(cid, 2); err != nil {
+		t.Fatalf("DeleteShard 2: %v", err)
+	}
+	v.mu.Lock()
+	if _, ok := v.shardDiskOf[cid]; ok {
+		t.Fatal("shardDiskOf parent entry should have been removed after all shards deleted")
+	}
+	v.mu.Unlock()
+}
+
+// TestV2Store_Delete_CleansShardDiskOf verifies that Delete removes the
+// chunk's entire shardDiskOf entry alongside the locOf entry.
+func TestV2Store_Delete_CleansShardDiskOf(t *testing.T) {
+	v, _ := newTestMultiStore(t, 2)
+	cid := metadata.ChunkID(9002)
+	payload := []byte("delete-with-shard-cleanup")
+
+	if err := v.Write(cid, payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Manually add a shardDiskOf entry (simulating a chunk that was EC-encoded).
+	v.mu.Lock()
+	v.shardDiskOf[cid] = map[int]int{0: 0, 1: 1}
+	v.mu.Unlock()
+
+	if err := v.Delete(cid); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if _, ok := v.locOf[cid]; ok {
+		t.Fatal("locOf entry should have been removed")
+	}
+	if _, ok := v.shardDiskOf[cid]; ok {
+		t.Fatal("shardDiskOf entry should have been removed")
+	}
+}

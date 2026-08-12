@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
@@ -22,7 +23,10 @@ type HTTPClient struct {
 	baseURL    string
 	httpClient *http.Client
 	timeout    time.Duration
-	authToken  string
+	// authToken is set concurrently by the fuse token-refresh goroutine
+	// (SetAuthToken) and read on the data path (addHeaders), so it is an
+	// atomic pointer rather than a plain string field to avoid a data race.
+	authToken atomic.Pointer[string]
 
 	// Retry configuration
 	maxRetries    int           // Maximum number of retries (default: 3)
@@ -57,8 +61,64 @@ func NewHTTPClient(baseURL string, timeout time.Duration) *HTTPClient {
 }
 
 // SetAuthToken configures a bearer token sent with every metadata request.
+// It may be called from a background refresh goroutine while the data path is
+// issuing requests, so the token is stored atomically.
 func (c *HTTPClient) SetAuthToken(token string) {
-	c.authToken = token
+	c.authToken.Store(&token)
+}
+
+// ExchangeCredentialResult is the response from POST /api/v1/auth/token.
+type ExchangeCredentialResult struct {
+	Token      string `json:"token"`
+	Principal  string `json:"principal"`
+	Bucket     string `json:"bucket,omitempty"`
+	ExpiresAt  int64  `json:"expires_at"`
+	TTLSeconds int64  `json:"ttl_seconds"`
+}
+
+// ExchangeCredential presents an accessKey/secretKey to metad and receives a
+// short-lived, principal-bound signed bearer token plus the verified
+// principal. This is how a fuse mount establishes its identity: metad is the
+// only party that ever verifies the secret, and the returned principal is the
+// one bound to the credential — never a client-supplied claim. The returned
+// token should be passed to SetAuthToken for subsequent data-plane requests.
+func (c *HTTPClient) ExchangeCredential(ctx context.Context, accessKey, secretKey, bucket string) (*ExchangeCredentialResult, error) {
+	req := map[string]string{
+		"access_key": accessKey,
+		"secret_key": secretKey,
+		"bucket":     bucket,
+	}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/auth/token", req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read token response: %w", err)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		var errResp struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		_ = json.Unmarshal(data, &errResp)
+		if resp.StatusCode == http.StatusUnauthorized || errResp.Code == "access_denied" {
+			return nil, fmt.Errorf("%w: invalid credentials", ErrAccessDenied)
+		}
+		if errResp.Code == "token_signing_disabled" {
+			return nil, fmt.Errorf("metad has no --token-signing-key configured")
+		}
+		return nil, fmt.Errorf("metad: %s (status=%d)", string(data), resp.StatusCode)
+	}
+	var out ExchangeCredentialResult
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("unmarshal token response: %w", err)
+	}
+	if out.Token == "" || out.Principal == "" {
+		return nil, fmt.Errorf("metad returned incomplete token response")
+	}
+	return &out, nil
 }
 
 func (c *HTTPClient) SetRetryConfig(maxRetries int, baseWait time.Duration) {
@@ -207,7 +267,7 @@ func (c *HTTPClient) doRequestWithRetry(ctx context.Context, method, path string
 // and an error is returned.
 func (c *HTTPClient) doFollowRedirects(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
 	currentBase := c.baseURL
-	for hop := 0; hop <= leaderRedirectMaxHops; hop++ {
+	for hop := 0; hop < leaderRedirectMaxHops; hop++ {
 		resp, err := c.doRequestAt(ctx, method, path, body, currentBase)
 		if err != nil {
 			return nil, err
@@ -296,8 +356,8 @@ func (c *HTTPClient) doRequestAt(ctx context.Context, method, path string, body 
 }
 
 func (c *HTTPClient) addHeaders(req *http.Request) {
-	if c.authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	if tok := c.authToken.Load(); tok != nil && *tok != "" {
+		req.Header.Set("Authorization", "Bearer "+*tok)
 	}
 }
 

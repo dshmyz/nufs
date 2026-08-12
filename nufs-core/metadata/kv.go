@@ -57,6 +57,7 @@ func KVCatalogPrefixes() []string {
 		prefixRepair,
 		prefixAudit,
 		prefixACL,
+		prefixCredential,
 		prefixQuota,
 		prefixQuotaUsage,
 		prefixFreeList,

@@ -20,11 +20,15 @@ var (
 	}
 )
 
+const defaultUploadTTL = 24 * time.Hour
+
 type uploadTracker struct {
 	mu      sync.RWMutex
 	uploads map[string]*multipartUpload
 
-	partDir string // temp directory for part data on disk
+	partDir  string // temp directory for part data on disk
+	stopCh   chan struct{}
+	stopped  chan struct{}
 }
 
 func (t *uploadTracker) init(partDir string) error {
@@ -93,6 +97,58 @@ func (t *uploadTracker) list(bucket string) []*multipartUpload {
 		}
 	}
 	return result
+}
+
+// startCleanup launches a background goroutine that removes incomplete
+// multipart uploads older than maxAge. Safe to call multiple times;
+// any prior cleanup goroutine is stopped first.
+func (t *uploadTracker) startCleanup(maxAge time.Duration) {
+	// Stop any prior cleanup goroutine to avoid leaks.
+	t.stopCleanup()
+	t.stopCh = make(chan struct{})
+	t.stopped = make(chan struct{})
+	go func() {
+		defer close(t.stopped)
+		ticker := time.NewTicker(maxAge / 2)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-t.stopCh:
+				return
+			case <-ticker.C:
+				t.cleanupExpired(maxAge)
+			}
+		}
+	}()
+}
+
+// stopCleanup terminates the background cleanup goroutine and waits for it.
+// No-op if no cleanup goroutine is running.
+func (t *uploadTracker) stopCleanup() {
+	if t.stopCh != nil {
+		close(t.stopCh)
+	}
+	if t.stopped != nil {
+		<-t.stopped
+	}
+}
+
+// cleanupExpired removes uploads older than maxAge and their part data.
+func (t *uploadTracker) cleanupExpired(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge)
+	t.mu.Lock()
+	var expired []string
+	for id, u := range t.uploads {
+		if u.CreatedAt.Before(cutoff) {
+			expired = append(expired, id)
+		}
+	}
+	for _, id := range expired {
+		u := t.uploads[id]
+		delete(t.uploads, id)
+		cleanupUpload(u)
+	}
+	t.mu.Unlock()
 }
 
 // cleanupPart removes the temp file for a part, if any.

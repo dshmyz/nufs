@@ -509,9 +509,21 @@ func (v *V2Store) DeleteShard(chunkID metadata.ChunkID, shardIndex int) error {
 	if disk < 0 || disk >= len(v.shards) {
 		return storage.ErrExtentNotFound
 	}
-	return v.shards[disk].store.Delete(context.Background(), &storage.DeleteRequest{
+	if err := v.shards[disk].store.Delete(context.Background(), &storage.DeleteRequest{
 		ExtentID: storage.ExtentID(chunkID), Generation: shardGen(shardIndex),
-	})
+	}); err != nil {
+		return err
+	}
+	// Clean up the shardDiskOf mapping so deleted shard entries don't leak.
+	v.mu.Lock()
+	if m, ok := v.shardDiskOf[chunkID]; ok {
+		delete(m, shardIndex)
+		if len(m) == 0 {
+			delete(v.shardDiskOf, chunkID)
+		}
+	}
+	v.mu.Unlock()
+	return nil
 }
 
 // leastUsedShardDisk returns the shard disk with the fewest bytes across its
@@ -1262,6 +1274,7 @@ func (v *V2Store) Delete(chunkID metadata.ChunkID) error {
 	b.extCount.Add(-1)
 	v.mu.Lock()
 	delete(v.locOf, chunkID)
+	delete(v.shardDiskOf, chunkID)
 	v.mu.Unlock()
 	v.stateVersion.Add(1)
 	return nil

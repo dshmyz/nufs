@@ -27,6 +27,7 @@ const (
 	prefixRepair            = "/repair/"
 	prefixAudit             = "/audit/"
 	prefixACL               = "/acl/"
+	prefixCredential        = "/cred/"
 	prefixQuota             = "/quota/"
 	prefixQuotaUsage        = "/quota-usage/"
 	prefixFreeList          = "/freelist/" // Recycled inode IDs
