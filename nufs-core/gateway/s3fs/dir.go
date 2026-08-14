@@ -44,6 +44,7 @@ var (
 	_ fs.NodeRmdirer   = (*S3Dir)(nil)
 	_ fs.NodeSymlinker = (*S3Dir)(nil)
 	_ fs.NodeLinker    = (*S3Dir)(nil)
+	_ fs.NodeStatfser  = (*S3Dir)(nil)
 	_ fs.NodeGetattrer = (*S3Dir)(nil)
 	_ fs.NodeSetattrer = (*S3Dir)(nil)
 	_ fs.NodeAccesser  = (*S3Dir)(nil)
@@ -414,26 +415,26 @@ func (d *S3Dir) Symlink(ctx context.Context, target, name string, out *fuse.Entr
 	childID := d.mfs.cache.NextID()
 	now := time.Now()
 	sym := &S3Symlink{
-		mfs:    d.mfs,
-		dir:    d,
-		Path:   name,
-		Target: target,
-		InodeID:  childID,
-		Mode:   0777,
-		UID:    d.mfs.config.UID,
-		GID:    d.mfs.config.GID,
+		mfs:     d.mfs,
+		dir:     d,
+		Path:    name,
+		Target:  target,
+		InodeID: childID,
+		Mode:    0777,
+		UID:     d.mfs.config.UID,
+		GID:     d.mfs.config.GID,
 	}
 
 	inode := &CacheInode{
-		ID:             childID,
-		Name:           name,
-		Mode:           uint32(os.ModeSymlink | 0777),
-		UID:            d.mfs.config.UID,
-		GID:            d.mfs.config.GID,
-		Mtime:          now.UnixNano(),
-		Ctime:          now.UnixNano(),
-		Atime:          now.UnixNano(),
-		SymlinkTarget:  target,
+		ID:            childID,
+		Name:          name,
+		Mode:          uint32(os.ModeSymlink | 0777),
+		UID:           d.mfs.config.UID,
+		GID:           d.mfs.config.GID,
+		Mtime:         now.UnixNano(),
+		Ctime:         now.UnixNano(),
+		Atime:         now.UnixNano(),
+		SymlinkTarget: target,
 	}
 	if err := d.mfs.cache.PutInode(inode); err != nil {
 		return nil, syscall.EIO
@@ -507,6 +508,21 @@ func (d *S3Dir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrI
 
 // Access always returns 0 (allow-all).
 func (d *S3Dir) Access(ctx context.Context, mask uint32) syscall.Errno {
+	return 0
+}
+
+// Statfs returns filesystem statistics. S3 object storage has no fixed
+// capacity, so total/free blocks are reported as 0 (df shows "unknown").
+func (d *S3Dir) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	const blockSize = uint32(4096)
+	out.Bsize = blockSize
+	out.Frsize = blockSize
+	out.NameLen = 255
+	out.Blocks = 0
+	out.Bfree = 0
+	out.Bavail = 0
+	out.Files = 0
+	out.Ffree = 0
 	return 0
 }
 

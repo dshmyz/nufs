@@ -164,16 +164,19 @@ func main() {
 	case "s3":
 		s3Args := flag.Args()
 		runS3(log, &s3MountArgs{
-			target:      mountpointFromArgs(s3Args),
-			mountpoint:  s3Args[1],
-			cacheDir:    *cacheDir,
-			scanTTL:     *scanTTL,
-			metricsAddr: *metricsAddr,
-			readOnly:    *readOnly,
-			insecure:    *insecure,
-			debug:       *debug,
-			uid:         uint32(*uid),
-			gid:         uint32(*gid),
+			target:        mountpointFromArgs(s3Args),
+			mountpoint:    s3Args[1],
+			cacheDir:      *cacheDir,
+			readCacheMax:  *readCacheMax,
+			writeCacheMax: *writeCacheMax,
+			scanTTL:       *scanTTL,
+			metricsAddr:   *metricsAddr,
+			allowOther:    *allowOther,
+			readOnly:      *readOnly,
+			insecure:      *insecure,
+			debug:         *debug,
+			uid:           uint32(*uid),
+			gid:           uint32(*gid),
 		})
 	default:
 		fmt.Fprintf(os.Stderr, "unknown backend: %q (use nufs or s3)\n", *backend)
@@ -763,15 +766,18 @@ func startControlServer(log *slog.Logger, addr string, state *nufsMountState) {
 // in main() and passed to runS3 as a single value instead of a long flat
 // argument list.
 type s3MountArgs struct {
-	target      string // <endpoint/bucket/prefix> position arg
-	mountpoint  string
-	cacheDir    string
-	scanTTL     time.Duration
-	metricsAddr string
-	readOnly    bool
-	insecure    bool
-	debug       bool
-	uid, gid    uint32
+	target        string // <endpoint/bucket/prefix> position arg
+	mountpoint    string
+	cacheDir      string
+	readCacheMax  int64
+	writeCacheMax int64
+	scanTTL       time.Duration
+	metricsAddr   string
+	allowOther    bool
+	readOnly      bool
+	insecure      bool
+	debug         bool
+	uid, gid      uint32
 }
 
 // runS3 mounts an external S3 bucket via FUSE.
