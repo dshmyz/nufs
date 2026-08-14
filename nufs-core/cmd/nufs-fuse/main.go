@@ -77,6 +77,9 @@ func main() {
 		// DFS cache quota flag
 		dfsCacheQuota = flag.Int64("dfs-cache-quota", 1<<30, "DFS: Chunk cache byte quota (0=unlimited, default 1GiB)")
 
+		// DFS global dirty budget
+		globalDirtyBudget = flag.Int64("global-dirty-budget", 2<<30, "Global dirty memory budget across all open files (default 2GiB; 0=disabled)")
+
 		// DFS DirectIO flag
 		directIO = flag.Bool("direct-io", false, "DFS: Bypass kernel page cache (DirectIO)")
 
@@ -138,7 +141,7 @@ func main() {
 	switch *backend {
 	case "nufs":
 		mountpoint := mountpointFromArgs(flag.Args())
-		runNUFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir, *dfsCacheQuota, *dfsMetricsAddr, *directIO, *bucket, *accessKey, *secretKey, *credentialsDir, uint32(*uid), uint32(*gid), *allowOther, *readOnly, *debug)
+		runNUFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir, *dfsCacheQuota, *dfsMetricsAddr, *directIO, *bucket, *accessKey, *secretKey, *credentialsDir, uint32(*uid), uint32(*gid), *allowOther, *readOnly, *debug, *globalDirtyBudget)
 	case "s3":
 		runS3(log, flag.Args(), *cacheDir, *scanTTL, *readOnly, *cacheQuota, *metricsAddr, *insecure, *debug, uint32(*uid), uint32(*gid))
 	default:
@@ -182,7 +185,7 @@ func sanitizeForFilename(mountpoint string) string {
 }
 
 // runNUFS mounts the DFS distributed filesystem via FUSE.
-func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, cacheQuota int64, metricsAddr string, directIO bool, bucket string, accessKey, secretKey string, credentialsDir string, mountUID, mountGID uint32, allowOther, readOnly, debug bool) {
+func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, cacheQuota int64, metricsAddr string, directIO bool, bucket string, accessKey, secretKey string, credentialsDir string, mountUID, mountGID uint32, allowOther, readOnly, debug bool, globalDirtyBudget int64) {
 	if bucket == "" {
 		log.Error("DFS backend requires --bucket=<name>")
 		os.Exit(1)
@@ -217,18 +220,19 @@ func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, c
 	// mountState holds the mutable mount state for remount support.
 	state := &nufsMountState{
 		cfg: mountConfig{
-			log:        log,
-			mountpoint: mountpoint,
-			metaDir:    metaDir,
-			cacheDir:   cacheDir,
-			cacheQuota: cacheQuota,
-			directIO:   directIO,
-			bucket:     bucket,
-			mountUID:   mountUID,
-			mountGID:   mountGID,
-			allowOther: allowOther,
-			readOnly:   readOnly,
-			debug:      debug,
+			log:               log,
+			mountpoint:        mountpoint,
+			metaDir:           metaDir,
+			cacheDir:          cacheDir,
+			cacheQuota:        cacheQuota,
+			directIO:          directIO,
+			bucket:            bucket,
+			mountUID:          mountUID,
+			mountGID:          mountGID,
+			allowOther:        allowOther,
+			readOnly:          readOnly,
+			debug:             debug,
+			globalDirtyBudget: globalDirtyBudget,
 		},
 		metaAddr:  metaAddr,
 		accessKey: ak,
@@ -275,6 +279,7 @@ type mountConfig struct {
 	allowOther bool
 	readOnly   bool
 	debug      bool
+	globalDirtyBudget int64
 }
 
 // nufsMountState holds the mutable mount state for remount support. Config
@@ -364,18 +369,19 @@ func (s *nufsMountState) mount() error {
 	}
 
 	server, fsys, err := gofuse.Mount(gofuse.MountOptions{
-		Mountpoint:  s.cfg.mountpoint,
-		Meta:        meta,
-		ChunkStore:  chunkStore,
-		Cache:       s.cache,
-		Recorder:    s.recorder,
-		Reliability: reliability,
-		FUSEOpts:    &fuse.MountOptions{AllowOther: s.cfg.allowOther, Name: "dfs", FsName: "dfs"},
-		BucketName:  s.cfg.bucket,
-		Owner:       ownerForMount,
-		MountUID:    s.cfg.mountUID,
-		MountGID:    s.cfg.mountGID,
-		ReadOnly:    s.cfg.readOnly,
+		Mountpoint:       s.cfg.mountpoint,
+		Meta:             meta,
+		ChunkStore:       chunkStore,
+		Cache:            s.cache,
+		Recorder:         s.recorder,
+		Reliability:      reliability,
+		FUSEOpts:         &fuse.MountOptions{AllowOther: s.cfg.allowOther, Name: "dfs", FsName: "dfs"},
+		BucketName:       s.cfg.bucket,
+		Owner:            ownerForMount,
+		MountUID:         s.cfg.mountUID,
+		MountGID:         s.cfg.mountGID,
+		ReadOnly:         s.cfg.readOnly,
+		GlobalDirtyBudget: s.cfg.globalDirtyBudget,
 	})
 	if err != nil {
 		meta.Close()

@@ -445,7 +445,7 @@ func (dfs *DFSFileSystem) Create(ctx context.Context, name string, flags uint32,
 		dfs.applyMountOwner(ctx, metaInode, rootMeta)
 	}
 
-	file := &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability, logicalSize: metaInode.Size}
+	file := &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability, logicalSize: metaInode.Size, inline: len(metaInode.InlineData) > 0 && metaInode.Size <= int64(InlineThreshold)}
 	attr := inodeMetaToAttr(metaInode)
 	inode := dfs.NewInode(ctx, file, fs.StableAttr{Mode: fuse.S_IFREG, Ino: uint64(metaInode.ID)})
 	out.Attr = attr
