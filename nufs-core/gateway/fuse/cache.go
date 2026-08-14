@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru"
@@ -30,8 +31,11 @@ type chunkSliceKey struct {
 
 // ChunkCache 缓存 chunk 数据以减少 datanode 往返。
 // 支持两级缓存：内存 LRU + 磁盘文件；支持字节配额淘汰。
+// 所有 LRU 操作由 mu 保护：并发 Read (f.mu.RLock) 可同时调用 Get/Add，
+// 而 RemoveChunk（元数据失效循环）也会并发 Delete —— lru.Cache 本身不是线程安全的。
 type ChunkCache struct {
-	memory   *lru.Cache
+	mu     sync.Mutex
+	memory *lru.Cache
 	diskDir  string
 	stats    cacheStats
 	recorder MetricsRecorder // 方案1.4 起统一走 recorder；stats 保留兼容旧 HitRate()
@@ -108,17 +112,22 @@ func (c *ChunkCache) onEvict(key, value interface{}) {
 func (c *ChunkCache) Get(chunkID uint64, off int64) ([]byte, bool) {
 	k := chunkSliceKey{id: chunkID, off: off}
 	rec := recorderFor(c.recorder)
+	c.mu.Lock()
 	if v, ok := c.memory.Get(k); ok {
+		c.mu.Unlock()
 		atomic.AddUint64(&c.stats.hit, 1)
 		rec.IncCacheHit()
 		return v.([]byte), true
 	}
+	c.mu.Unlock()
 	if c.diskDir != "" {
 		data, err := os.ReadFile(c.diskPath(k))
 		if err == nil {
 			buf := make([]byte, len(data))
 			copy(buf, data)
+			c.mu.Lock()
 			c.addInternal(k, buf)
+			c.mu.Unlock()
 			atomic.AddUint64(&c.stats.hit, 1)
 			rec.IncCacheHit()
 			return data, true
@@ -134,6 +143,7 @@ func (c *ChunkCache) Add(chunkID uint64, off int64, data []byte) {
 	buf := make([]byte, len(data))
 	copy(buf, data)
 
+	c.mu.Lock()
 	// 如果 key 已存在，LRU.Add 会更新 value 但不调用 onEvict。
 	// 需要先手动扣减旧条目的字节数，避免 curBytes 重复累加。
 	if old, exists := c.memory.Peek(k); exists {
@@ -141,8 +151,8 @@ func (c *ChunkCache) Add(chunkID uint64, off int64, data []byte) {
 			atomic.AddInt64(&c.curBytes, -int64(len(oldData)))
 		}
 	}
-
 	c.addInternal(k, buf)
+	c.mu.Unlock()
 
 	if c.diskDir != "" {
 		_ = os.WriteFile(c.diskPath(k), buf, 0600)
@@ -177,8 +187,10 @@ func (c *ChunkCache) addInternal(k chunkSliceKey, buf []byte) {
 
 func (c *ChunkCache) Remove(chunkID uint64, off int64) {
 	k := chunkSliceKey{id: chunkID, off: off}
+	c.mu.Lock()
 	// c.memory.Remove 触发 onEvict（扣减 curBytes + 删除磁盘文件）。
 	c.memory.Remove(k)
+	c.mu.Unlock()
 	// 兜底：entry 不在内存 LRU 但磁盘文件仍存在的情况。
 	if c.diskDir != "" {
 		_ = os.Remove(c.diskPath(k))
@@ -189,11 +201,13 @@ func (c *ChunkCache) Remove(chunkID uint64, off int64) {
 // metadata change invalidation, which marks the whole chunk stale without
 // knowing which windows were cached.
 func (c *ChunkCache) RemoveChunk(chunkID uint64) {
+	c.mu.Lock()
 	for _, k := range c.memory.Keys() {
 		if sk, ok := k.(chunkSliceKey); ok && sk.id == chunkID {
 			c.memory.Remove(sk)
 		}
 	}
+	c.mu.Unlock()
 	if c.diskDir != "" {
 		matches, _ := filepath.Glob(c.diskPathPrefix(chunkID))
 		for _, m := range matches {

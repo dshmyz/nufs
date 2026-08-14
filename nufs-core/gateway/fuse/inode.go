@@ -538,6 +538,7 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 		result := make([]byte, 0, end-start)
 		pos := start
 		for pos < end {
+			prevPos := pos
 			// Find committed chunk overlapping [pos, end)
 			found := false
 			for _, cref := range metaInode.ChunkMap {
@@ -617,11 +618,20 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 				found = true
 				break
 			}
-			if !found {
+				if !found {
 				// Hole: no chunk covers this region
 				gap := end - pos
 				result = append(result, make([]byte, gap)...)
 				pos += gap
+			}
+			// Guard against infinite loop when pos didn't advance (empty range
+			// read due to stale ref — cref.Length says data exists but the
+			// actual stored extent is shorter).  Break with a zero-fill so
+			// the caller gets correct bytes without hanging.
+			if pos == prevPos {
+				remainder := end - pos
+				result = append(result, make([]byte, remainder)...)
+				pos = end
 			}
 		}
 		return result
