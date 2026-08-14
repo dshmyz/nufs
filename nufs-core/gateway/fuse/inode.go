@@ -52,7 +52,7 @@ const MaxChunkPayload = 64 * 1024 * 1024 // 64 MiB
 // stored inline in the inode metadata rather than allocated as a chunk.
 // Files at or below this threshold skip the chunk pipeline entirely:
 // no buffer allocation, no WriteChunk, no network round-trip.
-const InlineThreshold = 32 * 1024 // 32 KiB
+const InlineThreshold = 8 * 1024 // 8 KiB
 
 // fuseDefaultPolicy is the fallback placement policy used when Flush
 // cannot determine the parent bucket's policy (e.g., the inode has no
