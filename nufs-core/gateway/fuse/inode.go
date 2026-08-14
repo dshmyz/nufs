@@ -48,12 +48,6 @@ func SetDirectIO(enabled bool) { directIOEnabled.Store(enabled) }
 // and the inode's ChunkMap holds one ref per window.
 const MaxChunkPayload = 64 * 1024 * 1024 // 64 MiB
 
-// InlineThreshold is the maximum file size (in bytes) for which data is
-// stored inline in the inode metadata rather than allocated as a chunk.
-// Files at or below this threshold skip the chunk pipeline entirely:
-// no buffer allocation, no WriteChunk, no network round-trip.
-const InlineThreshold = 8 * 1024 // 8 KiB
-
 // fuseDefaultPolicy is the fallback placement policy used when Flush
 // cannot determine the parent bucket's policy (e.g., the inode has no
 // BucketRoot). This is a safe single-replica default for orphan files.
@@ -125,10 +119,6 @@ type DFSFile struct {
 	// untouched committed chunks in the ChunkMap.
 	mu        sync.RWMutex
 	dirty     bool
-	// inline is set when the file's committed data lives entirely in
-	// InodeMeta.InlineData (file ≤ InlineThreshold).  Writes that push
-	// the file beyond the threshold cause a transition to chunk mode.
-	inline    bool
 	chunkBufs map[int64][]byte // chunkBaseOffset → data buffer
 	dirtyMap  map[int64]bool   // chunkBaseOffset → has unflushed writes
 	// dirtyBytes tracks the current memory held by chunkBufs.
@@ -165,30 +155,17 @@ func chunkBase(off int64) int64 {
 	return (off / MaxChunkPayload) * MaxChunkPayload
 }
 
-// getChunk returns the chunk buffer at base.  When the buffer does not
-// yet exist, the allocation size is the minimum of the file's current
-// extent (so we never allocate more than committed data + pending write)
-// and MaxChunkPayload (the hard per-base cap).  The result is that a
-// fresh 5-byte file allocates 5 bytes instead of 64 MiB, while a large
-// file still gets the full64-MiB buffer.  If a subsequent write exceeds
-// the current buffer length the caller (writeLocked) grows it via append.
-// Must be called with f.mu held.
+// getChunk returns the chunk buffer at base, allocating a zero-filled
+// 64-MiB buffer if it doesn't exist yet. Must be called with f.mu held.
 func (f *DFSFile) getChunk(base int64) []byte {
 	if f.chunkBufs == nil {
 		f.chunkBufs = make(map[int64][]byte)
 	}
 	c, ok := f.chunkBufs[base]
 	if !ok {
-		alloc := int64(MaxChunkPayload)
-		if f.logicalSize > base {
-			alloc = f.logicalSize - base
-			if alloc > int64(MaxChunkPayload) {
-				alloc = int64(MaxChunkPayload)
-			}
-		}
-		c = make([]byte, alloc)
+		c = make([]byte, MaxChunkPayload)
 		f.chunkBufs[base] = c
-		f.dirtyBytes += alloc
+		f.dirtyBytes += int64(MaxChunkPayload)
 	}
 	return c
 }
@@ -553,13 +530,6 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 	// Fast path: empty ChunkMap + no dirty chunks = every byte is a hole.
 	if len(metaInode.ChunkMap) == 0 && len(f.chunkBufs) == 0 {
 		return fuse.ReadResultData(make([]byte, end-off)), 0
-	}
-
-	// Inline fast path: data is in InodeMeta.InlineData (small file).
-	if len(metaInode.InlineData) > 0 && end <= int64(len(metaInode.InlineData)) {
-		result := make([]byte, end-off)
-		copy(result, metaInode.InlineData[off:end])
-		return fuse.ReadResultData(result), 0
 	}
 
 	// readChunkRange reads committed data for [start, end) from the ChunkMap.
@@ -1003,47 +973,6 @@ func (f *DFSFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 		rec.IncOpError("flush")
 		return syscall.EIO
 	}
-
-	// ---------- Inline path: small file flush without chunk pipeline ----------
-	if f.inline && f.logicalSize <= int64(InlineThreshold) {
-		inlineData := make([]byte, f.logicalSize)
-		for base := range f.dirtyMap {
-			if buf, ok := f.chunkBufs[base]; ok {
-				n := int(f.logicalSize - base)
-				if n > len(buf) {
-					n = len(buf)
-				}
-				if n > 0 {
-					copy(inlineData[base:], buf[:n])
-				}
-			}
-		}
-		metaInode.InlineData = inlineData
-		metaInode.Size = f.logicalSize
-		metaInode.MTime = time.Now().UnixNano()
-		if err := f.reliability.DoMeta("flush", func() error {
-			return f.fs.Meta().UpdateInode(ctx, metaInode)
-		}); err != nil {
-			rec.IncOpError("flush")
-			return syscall.EIO
-		}
-		f.dirty = false
-		f.dirtyBytes = 0
-		f.logicalSize = 0
-		if f.chunkBufs != nil {
-			f.chunkBufs = nil
-		}
-		f.dirtyMap = nil
-		f.inline = true
-		return 0
-	}
-	// If we were inline but now exceed the threshold, transition to chunk mode.
-	if f.inline {
-		f.inline = false
-		metaInode.InlineData = nil
-	}
-	// ---------- End inline path ----------
-
 	oldRefs := make([]metadata.ChunkRef, len(metaInode.ChunkMap))
 	copy(oldRefs, metaInode.ChunkMap)
 

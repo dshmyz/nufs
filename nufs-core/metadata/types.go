@@ -58,9 +58,8 @@ type InodeMeta struct {
 	Rdev uint32 `json:"rdev,omitempty"`
 
 	// File-specific fields
-	ChunkMap   []ChunkRef `json:"chunks,omitempty"`  // Ordered chunk list
-	InlineData []byte     `json:"inline,omitempty"`   // Inline data for small files (< InlineThreshold)
-	Symlink    string     `json:"symlink,omitempty"` // Symlink target path
+	ChunkMap []ChunkRef `json:"chunks,omitempty"`  // Ordered chunk list
+	Symlink  string     `json:"symlink,omitempty"` // Symlink target path
 
 	// Extended attributes
 	XAttrs map[string][]byte `json:"xattrs,omitempty"`
