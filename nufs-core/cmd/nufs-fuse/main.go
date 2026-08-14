@@ -142,9 +142,39 @@ func main() {
 	switch *backend {
 	case "nufs":
 		mountpoint := mountpointFromArgs(flag.Args())
-		runNUFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir, *readCacheMax, *dfsMetricsAddr, *directIO, *bucket, *accessKey, *secretKey, *credentialsDir, uint32(*uid), uint32(*gid), *allowOther, *readOnly, *debug, *writeCacheMax)
+		runNUFS(log, &dfsMountArgs{
+			mountpoint:     mountpoint,
+			metaDir:        *metaDir,
+			metaAddr:       *metaAddr,
+			cacheDir:       *cacheDir,
+			readCacheMax:   *readCacheMax,
+			writeCacheMax:  *writeCacheMax,
+			metricsAddr:    *dfsMetricsAddr,
+			directIO:       *directIO,
+			bucket:         *bucket,
+			accessKey:      *accessKey,
+			secretKey:      *secretKey,
+			credentialsDir: *credentialsDir,
+			uid:            uint32(*uid),
+			gid:            uint32(*gid),
+			allowOther:     *allowOther,
+			readOnly:       *readOnly,
+			debug:          *debug,
+		})
 	case "s3":
-		runS3(log, flag.Args(), *cacheDir, *scanTTL, *readOnly, *metricsAddr, *insecure, *debug, uint32(*uid), uint32(*gid))
+		s3Args := flag.Args()
+		runS3(log, &s3MountArgs{
+			target:      mountpointFromArgs(s3Args),
+			mountpoint:  s3Args[1],
+			cacheDir:    *cacheDir,
+			scanTTL:     *scanTTL,
+			metricsAddr: *metricsAddr,
+			readOnly:    *readOnly,
+			insecure:    *insecure,
+			debug:       *debug,
+			uid:         uint32(*uid),
+			gid:         uint32(*gid),
+		})
 	default:
 		fmt.Fprintf(os.Stderr, "unknown backend: %q (use nufs or s3)\n", *backend)
 		os.Exit(1)
@@ -185,15 +215,37 @@ func sanitizeForFilename(mountpoint string) string {
 	return s
 }
 
+// dfsMountArgs are the DFS-backend mount parameters, assembled from CLI flags
+// in main() and passed to runNUFS as a single value instead of a long flat
+// argument list.
+type dfsMountArgs struct {
+	mountpoint     string
+	metaDir        string
+	metaAddr       string
+	cacheDir       string
+	readCacheMax   int64
+	writeCacheMax  int64
+	metricsAddr    string
+	directIO       bool
+	bucket         string
+	accessKey      string
+	secretKey      string
+	credentialsDir string
+	uid, gid       uint32
+	allowOther     bool
+	readOnly       bool
+	debug          bool
+}
+
 // runNUFS mounts the DFS distributed filesystem via FUSE.
-func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, readCacheMax int64, metricsAddr string, directIO bool, bucket string, accessKey, secretKey string, credentialsDir string, mountUID, mountGID uint32, allowOther, readOnly, debug bool, writeCacheMax int64) {
-	if bucket == "" {
+func runNUFS(log *slog.Logger, a *dfsMountArgs) {
+	if a.bucket == "" {
 		log.Error("DFS backend requires --bucket=<name>")
 		os.Exit(1)
 	}
-	if _, err := os.Stat(mountpoint); os.IsNotExist(err) {
-		if err := os.MkdirAll(mountpoint, 0755); err != nil {
-			log.Error("failed to create mountpoint", "mountpoint", mountpoint, "error", err)
+	if _, err := os.Stat(a.mountpoint); os.IsNotExist(err) {
+		if err := os.MkdirAll(a.mountpoint, 0755); err != nil {
+			log.Error("failed to create mountpoint", "mountpoint", a.mountpoint, "error", err)
 			os.Exit(1)
 		}
 	}
@@ -201,14 +253,14 @@ func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, r
 	// Credential source: explicit flags win; otherwise fall back to the
 	// gateway/fuse scaffold (credentials.json + META_* env) so a mount can
 	// authenticate purely from injected secrets without CLI flags.
-	ak, sk := accessKey, secretKey
-	if accessKey == "" || secretKey == "" {
-		useScaffold := credentialsDir != "" ||
+	ak, sk := a.accessKey, a.secretKey
+	if a.accessKey == "" || a.secretKey == "" {
+		useScaffold := a.credentialsDir != "" ||
 			os.Getenv("META_ACCESS_KEY") != "" ||
 			os.Getenv("META_SECRET_KEY") != "" ||
 			os.Getenv("META_ENDPOINT") != ""
 		if useScaffold {
-			cred := gofuse.LoadCredentials(credentialsDir)
+			cred := gofuse.LoadCredentials(a.credentialsDir)
 			if ak == "" {
 				ak = cred.AccessKey
 			}
@@ -222,20 +274,20 @@ func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, r
 	state := &nufsMountState{
 		cfg: mountConfig{
 			log:           log,
-			mountpoint:    mountpoint,
-			metaDir:       metaDir,
-			cacheDir:      cacheDir,
-			readCacheMax:  readCacheMax,
-			writeCacheMax: writeCacheMax,
-			directIO:      directIO,
-			bucket:        bucket,
-			mountUID:      mountUID,
-			mountGID:      mountGID,
-			allowOther:    allowOther,
-			readOnly:      readOnly,
-			debug:         debug,
+			mountpoint:    a.mountpoint,
+			metaDir:       a.metaDir,
+			cacheDir:      a.cacheDir,
+			readCacheMax:  a.readCacheMax,
+			writeCacheMax: a.writeCacheMax,
+			directIO:      a.directIO,
+			bucket:        a.bucket,
+			mountUID:      a.uid,
+			mountGID:      a.gid,
+			allowOther:    a.allowOther,
+			readOnly:      a.readOnly,
+			debug:         a.debug,
 		},
-		metaAddr:  metaAddr,
+		metaAddr:  a.metaAddr,
 		accessKey: ak,
 		secretKey: sk,
 	}
@@ -249,11 +301,11 @@ func runNUFS(log *slog.Logger, mountpoint, metaDir, metaAddr, cacheDir string, r
 	}
 
 	// Start control HTTP server for remount + status.
-	if metricsAddr != "" {
-		startControlServer(log, metricsAddr, state)
+	if a.metricsAddr != "" {
+		startControlServer(log, a.metricsAddr, state)
 	}
 
-	log.Info("mounted", "mountpoint", mountpoint, "bucket", bucket, "backend", "nufs")
+	log.Info("mounted", "mountpoint", a.mountpoint, "bucket", a.bucket, "backend", "nufs")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -707,16 +759,31 @@ func startControlServer(log *slog.Logger, addr string, state *nufsMountState) {
 	}()
 }
 
+// s3MountArgs are the S3-backend mount parameters, assembled from CLI flags
+// in main() and passed to runS3 as a single value instead of a long flat
+// argument list.
+type s3MountArgs struct {
+	target      string // <endpoint/bucket/prefix> position arg
+	mountpoint  string
+	cacheDir    string
+	scanTTL     time.Duration
+	metricsAddr string
+	readOnly    bool
+	insecure    bool
+	debug       bool
+	uid, gid    uint32
+}
+
 // runS3 mounts an external S3 bucket via FUSE.
-func runS3(log *slog.Logger, args []string, cacheDir string, scanTTL time.Duration, readOnly bool, metricsAddr string, insecure bool, debug bool, uid, gid uint32) {
-	if len(args) < 2 {
+func runS3(log *slog.Logger, args *s3MountArgs) {
+	if args.target == "" {
 		fmt.Fprintf(os.Stderr, "error: s3 backend requires <endpoint/bucket/prefix> <mountpoint>\n\n")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	target := args[0]
-	mountpoint := args[1]
+	target := args.target
+	mountpoint := args.mountpoint
 
 	u, bucket, basePath, err := s3fs.ParseTarget(target)
 	if err != nil {
@@ -728,14 +795,14 @@ func runS3(log *slog.Logger, args []string, cacheDir string, scanTTL time.Durati
 		Bucket:      bucket,
 		BasePath:    basePath,
 		Target:      u,
-		CacheDir:    cacheDir,
-		ScanTTL:     scanTTL,
-		MetricsAddr: metricsAddr,
-		ReadOnly:    readOnly,
-		UID:         uint32(uid),
-		GID:         uint32(gid),
-		Insecure:    insecure,
-		Debug:       debug,
+		CacheDir:    args.cacheDir,
+		ScanTTL:     args.scanTTL,
+		MetricsAddr: args.metricsAddr,
+		ReadOnly:    args.readOnly,
+		UID:         args.uid,
+		GID:         args.gid,
+		Insecure:    args.insecure,
+		Debug:       args.debug,
 	}
 	if cfg.CacheDir == "" {
 		cfg.CacheDir = "/var/lib/s3fs/cache"
