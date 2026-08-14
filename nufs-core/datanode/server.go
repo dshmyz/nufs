@@ -442,7 +442,36 @@ func (s *Server) handleReplicateECShard(header *Header, data []byte) *Response {
 // handleReadECShard reads one EC shard extent and returns its bytes. It is
 // the server side of the coordinator's cross-node verify (S3): the coordinator
 // fetches every shard from the node that owns it and decodes the aggregate.
+// When the header carries a non-zero offset/length, only that sub-range is
+// returned, reducing both network and disk I/O for small range reads.
 func (s *Server) handleReadECShard(header *Header) *Response {
+	// Range read path — when offset/length are provided, prefer the range
+	// method on stores that implement it (V2Store with segment-backed shards).
+	if header.Offset > 0 || header.Length > 0 {
+		type rangeReader interface {
+			ReadShardRange(metadata.ChunkID, int, int64, int32) ([]byte, uint32, error)
+		}
+		if rs, ok := s.store.(rangeReader); ok {
+			data, sum, err := rs.ReadShardRange(header.ChunkID, header.ShardIndex, header.Offset, header.Length)
+			if err != nil {
+				status := StatusError
+				if err == storage.ErrExtentNotFound {
+					status = StatusNotFound
+				}
+				return &Response{RequestID: header.RequestID, Status: status, Error: err.Error()}
+			}
+			return &Response{
+				RequestID: header.RequestID,
+				Status:    StatusOK,
+				Data:      data,
+				Length:    int32(len(data)),
+				Checksum:  sum,
+			}
+		}
+		// Fallback: store doesn't support range — fall through to full read
+	}
+
+	// Full shard read — original path for V1 legacy and zero-length requests.
 	rs, ok := s.store.(interface {
 		ReadShard(metadata.ChunkID, int) ([]byte, uint32, error)
 	})

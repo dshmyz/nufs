@@ -252,7 +252,7 @@ func (s *ECService) ConvertToEC(ctx context.Context, chunkID metadata.ChunkID, g
 					if !ok {
 						return nil, 0, fmt.Errorf("verify: no client for node %d (shard %d)", sh.NodeID, sh.Index)
 					}
-					resp, err := peer.ReadECShard(cid, sh.Index)
+					resp, err := peer.ReadECShard(cid, sh.Index, 0, 0)
 					if err != nil {
 						return nil, 0, fmt.Errorf("verify: read peer shard %d node %d: %w", sh.Index, sh.NodeID, err)
 					}

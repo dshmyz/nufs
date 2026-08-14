@@ -216,6 +216,14 @@ func (s *DatanodeChunkStore) writeECChunk(ctx context.Context, chunk *metadata.C
 
 // readECChunk reads shards from K+M datanodes in parallel, then
 // decodes the original data using erasure coding.
+//
+// When offset and length are provided (V2.1 ECStripeID path), only the data
+// shards whose byte ranges overlap [offset, offset+length) are read; the
+// remaining slots are marked absent and filled by parity during decode.  This
+// reduces both network I/O (fewer shards fetched) and disk I/O (the server
+// applies the range to each fetched shard via ReadRangeFrames).  The EC
+// decoder still reconstructs the full original payload, so memory
+// amplification remains; the win is on the transport layer.
 func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.ChunkMeta, offset int64, length int32) ([]byte, error) {
 	ec := chunk.ECGroup
 	totalShards := ec.DataShards + ec.ParityShards
@@ -228,8 +236,67 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 	}
 	ch := make(chan shardData, len(chunk.Replicas))
 
-	// Read all shards in parallel
+	// Determine which data shards overlap the requested window so we can
+	// skip fetching shards that carry no bytes in the window.  This is
+	// only meaningful for the V2.1 ECStripeID path; V1 legacy still reads
+	// full chunks (ReadChunk(id,0,0)) regardless.
+	shardSize := int64(0) // bytes per data shard (including padding)
+	if ec.DataShards > 0 {
+		shardSize = (int64(metadata.MaxChunkSize) + int64(ec.DataShards) - 1) / int64(ec.DataShards)
+	}
+	dataLen := shardSize * int64(ec.DataShards) // padded original length
+
+	wantWindow := chunk.ECStripeID != "" && length > 0 && offset >= 0 && offset < dataLen
+	needDataShards := make(map[int]struct{})   // data shard indices we need
+	needParityShards := make(map[int]struct{}) // parity shard indices we need
+
+	if wantWindow {
+		windowEnd := offset + int64(length)
+		if windowEnd > dataLen {
+			windowEnd = dataLen
+		}
+		for i := 0; i < ec.DataShards; i++ {
+			shardStart := shardSize * int64(i)
+			shardEnd := shardStart + shardSize
+			if shardEnd <= offset || shardStart >= windowEnd {
+				continue // no overlap — skip
+			}
+			needDataShards[i] = struct{}{}
+		}
+		// Decoder needs K = DataShards shards total.  We have len(needDataShards)
+		// data shards.  Read parity shards to fill the gap, prioritising the
+		// first parity shards for consistency.
+		parityNeed := ec.DataShards - len(needDataShards)
+		if parityNeed > ec.ParityShards {
+			parityNeed = ec.ParityShards
+		}
+		for p := 0; p < parityNeed; p++ {
+			needParityShards[ec.DataShards+p] = struct{}{}
+		}
+		slog.Debug("chunkstore: ec range read", "chunkID", chunk.ID, "window",
+			fmt.Sprintf("[%d,%d)", offset, offset+int64(length)),
+			"dataShards", len(needDataShards), "parityShards", len(needParityShards))
+	}
+
+	// Read shards in parallel.  Non-overlapping shards are skipped (not
+	// sent to the channel); the collector marks them absent.
 	for _, rep := range chunk.Replicas {
+		idx := rep.ShardIndex
+
+		// Decide whether to fetch this shard.
+		fetch := true
+		if wantWindow {
+			fetch = false
+			if _, ok := needDataShards[idx]; ok {
+				fetch = true
+			} else if _, ok := needParityShards[idx]; ok {
+				fetch = true
+			}
+		}
+		if !fetch {
+			continue // skip — not in window
+		}
+
 		go func(r metadata.ReplicaInfo) {
 			if r.Addr == "" {
 				ch <- shardData{r.ShardIndex, nil, fmt.Errorf("empty addr for node %d", r.NodeID)}
@@ -241,16 +308,28 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 				ch <- shardData{r.ShardIndex, nil, fmt.Errorf("connect %s: %w", r.Addr, err)}
 				return
 			}
-			// V2.1 converted chunks store each EC shard as an independent extent in a
-			// dedicated shard store keyed (chunkID, gen=shardIndex+1), readable only via
-			// ReadECShard — generic ReadChunk(chunk.ID) looks in the data store and finds
-			// nothing. The ECStripeID discriminator (Program 5) marks a V2.1-converted
-			// 6+3 chunk. Legacy V1 gateway EC (ECStripeID == "") keeps the original
-			// ReadChunk path: there each Replica is a whole shard file keyed by chunk.ID.
+			// V2.1 converted chunks store each EC shard as an independent
+			// extent.  When wantWindow, pass the shard-relative range so the
+			// server only reads intersecting frames via ReadRangeFrames.
 			var resp *datanode.Response
 			if chunk.ECStripeID != "" {
-				resp, err = client.ReadECShard(chunk.ID, r.ShardIndex)
+				var shOffset, shLen int32
+				if wantWindow && r.ShardIndex < ec.DataShards {
+					shardStart := shardSize * int64(r.ShardIndex)
+					overlapStart := offset - shardStart
+					if overlapStart < 0 {
+						overlapStart = 0
+					}
+					overlapEnd := offset + int64(length) - shardStart
+					if overlapEnd > shardSize {
+						overlapEnd = shardSize
+					}
+					shOffset = int32(overlapStart)
+					shLen = int32(overlapEnd - overlapStart)
+				}
+				resp, err = client.ReadECShard(chunk.ID, r.ShardIndex, int64(shOffset), shLen)
 			} else {
+				// Legacy V1 EC: whole-shard files, no range support.
 				resp, err = client.ReadChunk(chunk.ID, 0, 0)
 			}
 			s.pool.Put(r.Addr, client)
@@ -308,19 +387,19 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 	}
 
 	// Apply range slicing
-	dataLen := int64(len(fullData))
+	dataLen2 := int64(len(fullData))
 	if offset < 0 {
 		offset = 0
 	}
-	if offset >= dataLen {
+	if offset >= dataLen2 {
 		return []byte{}, nil
 	}
-	end := dataLen
+	end := dataLen2
 	if length > 0 {
 		end = offset + int64(length)
 	}
-	if end > dataLen {
-		end = dataLen
+	if end > dataLen2 {
+		end = dataLen2
 	}
 	return fullData[offset:end], nil
 }

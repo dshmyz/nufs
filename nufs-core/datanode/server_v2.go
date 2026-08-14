@@ -503,6 +503,30 @@ func (v *V2Store) ReadShard(chunkID metadata.ChunkID, shardIndex int) ([]byte, u
 	return res.Data, res.Checksum, nil
 }
 
+// ReadShardRange reads a sub-range [offset, offset+length) of one EC shard
+// extent. When offset=0 and length=0 the full shard is returned (equivalent
+// to ReadShard). The underlying segment store uses ReadRangeFrames which
+// authenticates only the intersecting frames, bounding read amplification.
+func (v *V2Store) ReadShardRange(chunkID metadata.ChunkID, shardIndex int, offset int64, length int32) ([]byte, uint32, error) {
+	if offset == 0 && length == 0 {
+		return v.ReadShard(chunkID, shardIndex)
+	}
+	disk := v.shardDisk(chunkID, shardIndex)
+	if disk < 0 || disk >= len(v.shards) {
+		return nil, 0, storage.ErrExtentNotFound
+	}
+	res, err := v.shards[disk].store.Read(context.Background(), &storage.ReadRequest{
+		ExtentID:      storage.ExtentID(chunkID),
+		Generation:    shardGen(shardIndex),
+		LogicalOffset: offset,
+		Length:        length,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return res.Data, res.Checksum, nil
+}
+
 // DeleteShard removes one EC shard extent from its owning disk.
 func (v *V2Store) DeleteShard(chunkID metadata.ChunkID, shardIndex int) error {
 	disk := v.shardDisk(chunkID, shardIndex)

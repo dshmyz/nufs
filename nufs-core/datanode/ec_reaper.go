@@ -468,7 +468,7 @@ func (h *ECSelfHealer) readShardFrom(addr string, cid metadata.ChunkID, idx int)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := client.ReadECShard(cid, idx)
+	resp, err := client.ReadECShard(cid, idx, 0, 0)
 	if err != nil {
 		return nil, err
 	}

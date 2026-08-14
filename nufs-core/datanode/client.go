@@ -120,15 +120,17 @@ func (c *Client) WriteChunkGen(chunkID metadata.ChunkID, generation uint64, data
 	return c.sendRequest(header, data)
 }
 
-// ReadECShard fetches one EC shard extent from a peer datanode (the read side
-// of the S3 cross-node coordination — the coordinator assembles shards from the
-// nodes that own them to verify an aggregate). Returns the shard bytes and the
-// peer's recorded checksum.
-func (c *Client) ReadECShard(chunkID metadata.ChunkID, shardIndex int) (*Response, error) {
+// ReadECShard fetches one EC shard extent from a peer datanode. When
+// offset=0 and length=0 the entire shard is returned; otherwise only the
+// bytes [offset, offset+length) within the shard are transferred, reducing
+// both network and disk I/O for small range reads on large EC chunks.
+func (c *Client) ReadECShard(chunkID metadata.ChunkID, shardIndex int, offset int64, length int32) (*Response, error) {
 	header := &Header{
 		Type:       ReqReadECShard,
 		ChunkID:    chunkID,
 		ShardIndex: shardIndex,
+		Offset:     offset,
+		Length:     length,
 		RequestID:  c.seq.Add(1),
 	}
 	return c.sendRequest(header, nil)
