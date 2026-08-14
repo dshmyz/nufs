@@ -479,7 +479,8 @@ func main() {
 		})
 	}
 	registerOpsHandlers(mux, store, dataStore, bundle, advertiseOpsURL, backupDeps...)
-	registerOpsAuthHandlers(mux, store, *tokenSigningKey)
+	stopAuthTokenLimiter := registerOpsAuthHandlers(mux, store, *tokenSigningKey)
+	defer stopAuthTokenLimiter()
 
 	admin := newAdminServer(store, bundle)
 	admin.RegisterRoutes(mux)
@@ -968,6 +969,14 @@ func runtimeMode(allowInsecureDev bool) metadata.RuntimeMode {
 // maxBodySizeMiddleware wraps POST/PUT/DELETE/PATCH request bodies with
 // http.MaxBytesReader to prevent unbounded memory allocation. GET/HEAD
 // requests pass through untouched.
+//
+// The limit is a deliberately modest 10 MiB, chosen because no metad route
+// today needs a larger request body: credential exchange and namespace/inode
+// mutations are small JSON, and chunk data is written to datanodes, never
+// through this API. If a future route (e.g. bulk metadata restore, batch
+// registration) legitimately requires a bigger body, it must be exempted here
+// EXPLICITLY — silently raising the global cap re-opens the unbounded-alloc
+// hole this middleware closes. See TestMaxBodySizeMiddleware_* for the contract.
 func maxBodySizeMiddleware(maxBytes int64, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {

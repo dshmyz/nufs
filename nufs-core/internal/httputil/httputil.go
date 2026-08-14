@@ -55,6 +55,16 @@ func extractBearer(header string) string {
 // mount secret into an admin secret. A mount only ever needs namespace, chunk,
 // inode, lock and bucket-read calls, so signed tokens are confined to those.
 //
+// Note what this does NOT do: the signed token's Principal and Bucket claims
+// identify the caller and are logged for audit, but are not themselves used as
+// a per-request RBAC/authorization decision here. Data-plane requests carry no
+// bucket identifier to compare a Bucket claim against, and the principal's
+// reach is checked where the filesystem's own access policy is enforced (the
+// mount's checkAccess), not at the HTTP layer. So cross-bucket and per-principal
+// isolation rest on the mount being pinned to one bucket and on the operator
+// trust boundary, not on BearerAuth. The operator/simple token is what gates the
+// admin surface.
+//
 // Requests whose path is listed in publicPaths bypass authentication entirely.
 // signingKeys is tried in order, so a caller can pass (current, previous) to
 // keep honoring tokens minted before a key rotation. Pass no keys to disable

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -25,8 +26,23 @@ import (
 // The signing key is only ever held here (metad); clients never learn it.
 // They read `principal` from the token response and present the opaque token
 // to metad on data-plane requests via SetAuthToken.
-func registerOpsAuthHandlers(mux *http.ServeMux, store *metadata.PebbleStore, signingKey string) {
-	s := &opsAuthHandlers{store: store, signingKey: signingKey}
+//
+// Because /api/v1/auth/token is public and self-authenticating, it gets its own
+// stricter per-IP limiter beyond the general ops limiter: a credential check is
+// a fast HMAC, so without this a burst of ~200 wrong-guess requests (the general
+// 100 req/s burst) could be tried before backoff. The token endpoint instead
+// allows ~10 requests then backs off to a couple per second per source IP,
+// which is ample for legitimate mounts (they exchange once per token TTL) while
+// throttling blind credential guessing.
+func registerOpsAuthHandlers(mux *http.ServeMux, store *metadata.PebbleStore, signingKey string) (stopAuthLimiter func()) {
+	s := &opsAuthHandlers{
+		store:      store,
+		signingKey: signingKey,
+		// Tight per-IP budget for credential-guess attempts. The general ops
+		// limiter (100/s) still applies on top; this is the first, stricter gate.
+		tokenLimiter: metadata.NewRateLimiter(2, 10),
+	}
+	stopAuthLimiter = s.tokenLimiter.StartCleanup(1 * time.Minute)
 
 	mut := func(fn http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -40,11 +56,13 @@ func registerOpsAuthHandlers(mux *http.ServeMux, store *metadata.PebbleStore, si
 	mux.HandleFunc("/api/v1/auth/token", s.handleAuthToken)
 	mux.HandleFunc("/api/v1/auth/creds", mut(s.handleCredsList))
 	mux.HandleFunc("/api/v1/auth/creds/", mut(s.handleCreds))
+	return stopAuthLimiter
 }
 
 type opsAuthHandlers struct {
-	store      *metadata.PebbleStore
-	signingKey string
+	store        *metadata.PebbleStore
+	signingKey   string
+	tokenLimiter *metadata.RateLimiter
 }
 
 type authTokenRequest struct {
@@ -67,6 +85,18 @@ type authTokenResponse struct {
 func (h *opsAuthHandlers) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// Per-IP credential-guess throttle (see registerOpsAuthHandlers). Rejecting
+	// with 429 and the same retry semantics as the general limiter both slows a
+	// brute-force attempt and makes it observable.
+	if !h.tokenLimiter.Allow(r.RemoteAddr) {
+		retryAfter := h.tokenLimiter.WaitTime(r.RemoteAddr)
+		if retryAfter < time.Second {
+			retryAfter = time.Second
+		}
+		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", retryAfter.Seconds()))
+		writeJSONErrorC(w, http.StatusTooManyRequests, "slow_down", "too many token requests from this address")
 		return
 	}
 	if h.signingKey == "" {

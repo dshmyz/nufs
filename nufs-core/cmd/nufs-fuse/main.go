@@ -34,6 +34,7 @@ import (
 	"github.com/dshmyz/nufs/nufs-core/gateway/s3fs"
 
 	"github.com/dshmyz/nufs/nufs-core/internal/config"
+	"github.com/dshmyz/nufs/nufs-core/internal/httputil"
 	"github.com/dshmyz/nufs/nufs-core/internal/logging"
 	"github.com/dshmyz/nufs/nufs-core/internal/resilience/breaker"
 	"github.com/dshmyz/nufs/nufs-core/internal/resilience/retry"
@@ -52,7 +53,7 @@ func main() {
 		// S3 backend flags
 		scanTTL     = flag.Duration("scan-ttl", 60*time.Second, "S3: Directory scan cache TTL")
 		cacheQuota  = flag.Int64("cache-quota", 0, "S3: Cache disk quota in bytes (0=unlimited)")
-		metricsAddr = flag.String("metrics-addr", ":9900", "S3: Metrics/health HTTP address")
+		metricsAddr = flag.String("metrics-addr", "127.0.0.1:9900", "S3: Metrics/health HTTP address")
 		insecure    = flag.Bool("insecure", false, "S3: Skip TLS verification")
 
 		// Shared flags
@@ -522,6 +523,24 @@ func (s *nufsMountState) remount(newMetaAddr string) error {
 	return nil
 }
 
+// controlAuthed reports whether a control-plane mutating request is authorized.
+//
+// The control server listens on the metrics address (default 127.0.0.1:9900) and
+// exposes /remount and /control/log-level, which can redirect the mount to an
+// attacker-controlled metadata authority (and re-mint a token there) or flip
+// logging off as an evasion. Those routes must not be reachable by an unrelated
+// local process, so they require the operator credential: the mount's
+// secretKey, compared in constant time. A mount with no credential (local-mode
+// DFS without remote auth) has nothing to redirect and denies mutating control
+// calls by default. Read-only /status and /healthz never call this.
+func controlAuthed(r *http.Request, state *nufsMountState) bool {
+	secret := state.secretKey
+	if secret == "" {
+		return false
+	}
+	return httputil.BearerTokenOK(r.Header.Get("Authorization"), secret)
+}
+
 // startControlServer starts the HTTP control server with /remount, /status and /healthz.
 func startControlServer(log *slog.Logger, addr string, state *nufsMountState) {
 	mux := http.NewServeMux()
@@ -548,6 +567,14 @@ func startControlServer(log *slog.Logger, addr string, state *nufsMountState) {
 				"level": logging.CurrentLevel(),
 			})
 		case http.MethodPost:
+			// Mutating a running daemon's log level requires the operator
+			// credential (the mount secretKey) so an unrelated local process
+			// that can reach the control port cannot flip logging off as an
+			// evasion. Read-only GET stays open.
+			if !controlAuthed(r, state) {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
 			var req struct {
 				Level string `json:"level"`
 			}
@@ -574,6 +601,14 @@ func startControlServer(log *slog.Logger, addr string, state *nufsMountState) {
 	mux.HandleFunc("/remount", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		// /remount redirects the mount to another metadata authority and re-mints
+		// a token for that destination. Whoever can reach this port can exfiltrate
+		// the mount to an attacker-controlled metad and capture its credentials, so
+		// it must require the operator credential even on loopback.
+		if !controlAuthed(r, state) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 

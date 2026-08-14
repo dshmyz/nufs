@@ -48,9 +48,9 @@ type NodeThrottleConfig struct {
 // DefaultNodeThrottleConfig returns production-safe defaults.
 func DefaultNodeThrottleConfig() NodeThrottleConfig {
 	return NodeThrottleConfig{
-		GlobalRate:  rate.Limit(100.0),
-		GlobalBurst: 200,
-		PerNodeRate: rate.Limit(10.0),
+		GlobalRate:   rate.Limit(100.0),
+		GlobalBurst:  200,
+		PerNodeRate:  rate.Limit(10.0),
 		PerNodeBurst: 20,
 	}
 }
@@ -61,7 +61,7 @@ type NodeRegistrationThrottle struct {
 	config atomic.Value // holds NodeThrottleConfig
 
 	mu       sync.Mutex
-	global   *rate.Limiter
+	global   atomic.Pointer[rate.Limiter] // replaced by Reconfigure; read lock-free on Allow/Wait
 	perNode  map[NodeID]*rate.Limiter
 	lastSeen map[NodeID]time.Time
 
@@ -86,7 +86,7 @@ func NewNodeRegistrationThrottle(cfg *NodeThrottleConfig) *NodeRegistrationThrot
 		lastSeen: make(map[NodeID]time.Time),
 	}
 	t.config.Store(c)
-	t.global = rate.NewLimiter(c.GlobalRate, c.GlobalBurst)
+	t.global.Store(rate.NewLimiter(c.GlobalRate, c.GlobalBurst))
 	return t
 }
 
@@ -95,8 +95,11 @@ func NewNodeRegistrationThrottle(cfg *NodeThrottleConfig) *NodeRegistrationThrot
 // limiters are lazily rebuilt with the new rate on next call.
 func (t *NodeRegistrationThrottle) Reconfigure(cfg NodeThrottleConfig) {
 	t.config.Store(cfg)
+	newGlobal := rate.NewLimiter(cfg.GlobalRate, cfg.GlobalBurst)
 	t.mu.Lock()
-	t.global = rate.NewLimiter(cfg.GlobalRate, cfg.GlobalBurst)
+	// Swap before clearing per-node state so a concurrently-running Allow/Wait
+	// keeps a stable *rate.Limiter the whole time (atomic pointer).
+	t.global.Store(newGlobal)
 	// Per-node limiters are rebuilt lazily on next Allow() to
 	// avoid iterating the map under lock.
 	t.perNode = make(map[NodeID]*rate.Limiter)
@@ -118,8 +121,9 @@ func (t *NodeRegistrationThrottle) Allow(nodeID NodeID) bool {
 
 	// Global check — consume a token first so a wave of
 	// concurrent requests can't double-count. rate.Limiter is
-	// internally synchronized.
-	if !t.global.Allow() {
+	// internally synchronized; the pointer is loaded atomically so
+	// a concurrent Reconfigure can't race the read.
+	if !t.global.Load().Allow() {
 		t.rejectedTotal.Add(1)
 		return false
 	}
@@ -149,7 +153,7 @@ func (t *NodeRegistrationThrottle) Allow(nodeID NodeID) bool {
 // pacing; HTTP handlers use Allow() and return 429.
 func (t *NodeRegistrationThrottle) Wait(ctx context.Context, nodeID NodeID) error {
 	cfg := t.config.Load().(NodeThrottleConfig)
-	if err := t.global.Wait(ctx); err != nil {
+	if err := t.global.Load().Wait(ctx); err != nil {
 		return err
 	}
 	t.mu.Lock()

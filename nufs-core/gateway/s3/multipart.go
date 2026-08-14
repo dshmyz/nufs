@@ -26,9 +26,9 @@ type uploadTracker struct {
 	mu      sync.RWMutex
 	uploads map[string]*multipartUpload
 
-	partDir  string // temp directory for part data on disk
-	stopCh   chan struct{}
-	stopped  chan struct{}
+	partDir string // temp directory for part data on disk
+	stopCh  chan struct{}
+	stopped chan struct{}
 }
 
 func (t *uploadTracker) init(partDir string) error {
@@ -134,21 +134,36 @@ func (t *uploadTracker) stopCleanup() {
 }
 
 // cleanupExpired removes uploads older than maxAge and their part data.
+//
+// Locking: the tracker map is guarded by t.mu, while each upload's Parts map is
+// guarded by that upload's own upload.mu (see writePart/cleanupUpload). We must
+// never iterate or delete part data while holding only t.mu, nor run disk I/O
+// (os.Remove) under the shared tracker lock — a slow disk would stall every
+// concurrent writePart for the duration. So this method does two passes:
+//
+//  1. Under t.mu, collect the expired upload IDs and drop them from the map so
+//     no new part PUT can reach them (get() returns false afterwards).
+//  2. Outside t.mu, for each evicted upload, take its own upload.mu while
+//     deleting its part files. This serializes against an in-flight writePart
+//     that already holds the upload pointer, and keeps disk deletion off the
+//     shared tracker lock.
 func (t *uploadTracker) cleanupExpired(maxAge time.Duration) {
 	cutoff := time.Now().Add(-maxAge)
 	t.mu.Lock()
-	var expired []string
+	expired := make([]*multipartUpload, 0, 4)
 	for id, u := range t.uploads {
 		if u.CreatedAt.Before(cutoff) {
-			expired = append(expired, id)
+			delete(t.uploads, id)
+			expired = append(expired, u)
 		}
 	}
-	for _, id := range expired {
-		u := t.uploads[id]
-		delete(t.uploads, id)
-		cleanupUpload(u)
-	}
 	t.mu.Unlock()
+
+	for _, u := range expired {
+		u.mu.Lock()
+		cleanupUpload(u)
+		u.mu.Unlock()
+	}
 }
 
 // cleanupPart removes the temp file for a part, if any.
@@ -289,43 +304,47 @@ func (gw *Gateway) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Verify all parts exist
+	// Verify all parts exist under the upload's own mutex. (The original handler
+	// interleaved Unlock/WriteXMLError/Lock around this loop; hoisting the check
+	// into a helper that returns the first missing part lets us hold upload.mu for
+	// the whole read and leave error handling to the caller.)
 	upload.mu.Lock()
-	defer upload.mu.Unlock()
+	missingPart := upload.missingPart(completeReq.Parts)
+	upload.mu.Unlock()
+	if missingPart > 0 {
+		WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidPart,
+			fmt.Sprintf("Part %d not found", missingPart), "/"+bucket+"/"+key, requestID)
+		return
+	}
 
-	var totalSize int64
-	sortedParts := make([]*uploadPart, 0, len(completeReq.Parts))
-	for _, cp := range completeReq.Parts {
-		part, ok := upload.Parts[cp.PartNumber]
-		if !ok {
-			upload.mu.Unlock()
-			WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidPart,
-				fmt.Sprintf("Part %d not found", cp.PartNumber), "/"+bucket+"/"+key, requestID)
-			upload.mu.Lock()
-			return
+	// CompleteMultipartUpload is currently a planned-but-unimplemented path: the
+	// parts have been persisted (in memory or to disk) but there is no data path
+	// that merges them into chunks, registers them in metadata, and creates the
+	// file inode. We must NOT swallow the upload and return success — a client
+	// would believe the object exists when it was silently discarded (and the
+	// TTL cleanup would delete the staged parts a day later). Fail loudly with
+	// NotImplemented so callers stop uploading through this route; the staged
+	// parts stay on disk for an operator to inspect. Returning 501 also frees
+	// the S3 client from assuming the post-condition (object present), which is
+	// what the previous 200-success stub violated.
+	WriteXMLError(w, http.StatusNotImplemented, ErrCodeNotImplemented,
+		"CompleteMultipartUpload is not implemented: part data will not be merged into an object. Abort the upload or use a non-multipart PUT.",
+		"/"+bucket+"/"+key, requestID)
+}
+
+// missingPart returns the first part number requested by a Complete upload that
+// is absent from the upload's Parts map, or 0 when every requested part exists.
+// The caller must hold upload.mu.
+func (u *multipartUpload) missingPart(parts []CompletePart) int {
+	if u == nil {
+		return 1
+	}
+	for _, cp := range parts {
+		if _, ok := u.Parts[cp.PartNumber]; !ok {
+			return cp.PartNumber
 		}
-		sortedParts = append(sortedParts, part)
-		totalSize += part.Size
 	}
-
-	// Sort by part number
-	sort.Slice(sortedParts, func(i, j int) bool {
-		return sortedParts[i].PartNumber < sortedParts[j].PartNumber
-	})
-
-	// In production: merge all part data into chunks, write to data nodes,
-	// register chunks in metadata, and create the file inode.
-	// For now, we just clean up the upload tracker.
-
-	activeUploads.remove(uploadID)
-
-	result := CompleteMultipartUploadResult{
-		Location: fmt.Sprintf("/%s/%s", bucket, key),
-		Bucket:   bucket,
-		Key:      key,
-		ETag:     FormatETag(crc32Checksum([]byte(uploadID))),
-	}
-	WriteXML(w, http.StatusOK, result)
+	return 0
 }
 
 // handleAbortMultipartUpload handles DELETE /{bucket}/{key}?uploadId=xxx
@@ -339,7 +358,12 @@ func (gw *Gateway) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Remove the upload from the tracker while holding its own mutex so we
+	// serialize against a concurrent writePart (which also holds upload.mu)
+	// that may already be writing part data into this upload's Parts map.
+	upload.mu.Lock()
 	cleanupUpload(upload)
+	upload.mu.Unlock()
 	activeUploads.remove(uploadID)
 	w.WriteHeader(http.StatusNoContent)
 }

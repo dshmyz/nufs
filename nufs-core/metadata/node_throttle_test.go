@@ -133,3 +133,51 @@ func TestNodeRegistrationThrottle_StartStopCleanup(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 	th.StopCleanup()
 }
+
+// TestNodeRegistrationThrottle_ConcurrentReconfigure races Allow/Wait against
+// Reconfigure, which swaps the global limiter pointer. Before the fix this was
+// an unsynchronized read (Allow/Wait read t.global with no lock) that -race
+// flagged. The global limiter must be swapped atomically so every concurrent
+// caller observes one stable *rate.Limiter.
+func TestNodeRegistrationThrottle_ConcurrentReconfigure(t *testing.T) {
+	th := NewNodeRegistrationThrottle(nil)
+	var wg sync.WaitGroup
+
+	// Reconfigurers: swap the limiter config on a tight loop.
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				cfg := DefaultNodeThrottleConfig()
+				cfg.GlobalBurst = 50 + seed
+				cfg.GlobalRate = rate.Limit(1000 + seed)
+				th.Reconfigure(cfg)
+			}
+		}(r)
+	}
+
+	// Allow callers: hammer the global limiter while it may be swapped.
+	for n := 0; n < 16; n++ {
+		wg.Add(1)
+		go func(id NodeID) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				th.Allow(id)
+			}
+		}(NodeID(n))
+	}
+
+	// A few Wait callers that block until the global bucket refills.
+	for n := 0; n < 4; n++ {
+		wg.Add(1)
+		go func(id NodeID) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			_ = th.Wait(ctx, id)
+		}(NodeID(200 + n))
+	}
+
+	wg.Wait()
+}

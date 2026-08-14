@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dshmyz/nufs/nufs-core/chunkstore"
 	"fmt"
+	"github.com/dshmyz/nufs/nufs-core/chunkstore"
 	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
@@ -1325,7 +1325,11 @@ func TestMultipartUpload(t *testing.T) {
 		t.Errorf("expected 2 parts, got %d", len(listParts.Parts))
 	}
 
-	// Complete multipart upload
+	// Complete multipart upload. CompleteMultipartUpload is currently
+	// unimplemented (part data is never merged into an object), so the gateway
+	// must reject it loudly with NotImplemented instead of returning a false
+	// success that a client would interpret as "object now exists". The upload
+	// and its staged parts are left intact for an operator (or client) to abort.
 	completeXML := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"etag1"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"etag2"</ETag></Part></CompleteMultipartUpload>`
 	url = ts.URL + "/mpbucket/bigfile.dat?uploadId=" + uploadID
 	req, _ = http.NewRequest(http.MethodPost, url, strings.NewReader(completeXML))
@@ -1334,8 +1338,21 @@ func TestMultipartUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("complete: expected 200, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("complete: expected 501 NotImplemented, got %d", resp.StatusCode)
+	}
+
+	// The upload must still exist and be abortable after a rejected Complete:
+	// a failed Complete must not have silently destroyed the staged parts.
+	url = ts.URL + "/mpbucket/bigfile.dat?uploadId=" + uploadID
+	req, _ = http.NewRequest(http.MethodDelete, url, nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("abort after complete: expected 204, got %d", resp.StatusCode)
 	}
 }
 

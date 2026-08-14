@@ -205,8 +205,15 @@ func DefaultTokenTTL() time.Duration { return defaultTokenTTL }
 type TokenClaims struct {
 	// Principal is the RBAC principal the token was issued to.
 	Principal Principal `json:"p"`
-	// Bucket is the bucket scope the token is restricted to. A token issued
-	// for one bucket cannot be replayed to act on another.
+	// Bucket is the bucket the token was minted for. It is signed into the
+	// token — a holder cannot forge a different bucket without the signing key —
+	// and is exposed in the token payload for audit/logging and any future
+	// server-side per-bucket enforcement. It is NOT currently enforced per
+	// request: data-plane requests (namespace/inodes/chunks) carry no bucket
+	// identifier in the path for the HTTP layer to compare this claim against,
+	// so cross-bucket isolation today relies on each mount being pinned to a
+	// single bucket by the FUSE and on the operator trust boundary (a mount
+	// secret does not reach the credential registry or other buckets).
 	Bucket string `json:"b,omitempty"`
 	// Exp is the Unix-nanosecond expiration time.
 	Exp int64 `json:"e"`
