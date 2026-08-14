@@ -52,7 +52,6 @@ func main() {
 
 		// S3 backend flags
 		scanTTL     = flag.Duration("scan-ttl", 60*time.Second, "S3: Directory scan cache TTL")
-		cacheQuota  = flag.Int64("cache-quota", 0, "S3: Cache disk quota in bytes (0=unlimited)")
 		metricsAddr = flag.String("metrics-addr", "127.0.0.1:9900", "S3: Metrics/health HTTP address")
 		insecure    = flag.Bool("insecure", false, "S3: Skip TLS verification")
 
@@ -145,7 +144,7 @@ func main() {
 		mountpoint := mountpointFromArgs(flag.Args())
 		runNUFS(log, mountpoint, *metaDir, *metaAddr, *cacheDir, *readCacheMax, *dfsMetricsAddr, *directIO, *bucket, *accessKey, *secretKey, *credentialsDir, uint32(*uid), uint32(*gid), *allowOther, *readOnly, *debug, *writeCacheMax)
 	case "s3":
-		runS3(log, flag.Args(), *cacheDir, *scanTTL, *readOnly, *cacheQuota, *metricsAddr, *insecure, *debug, uint32(*uid), uint32(*gid))
+		runS3(log, flag.Args(), *cacheDir, *scanTTL, *readOnly, *metricsAddr, *insecure, *debug, uint32(*uid), uint32(*gid))
 	default:
 		fmt.Fprintf(os.Stderr, "unknown backend: %q (use nufs or s3)\n", *backend)
 		os.Exit(1)
@@ -709,7 +708,7 @@ func startControlServer(log *slog.Logger, addr string, state *nufsMountState) {
 }
 
 // runS3 mounts an external S3 bucket via FUSE.
-func runS3(log *slog.Logger, args []string, cacheDir string, scanTTL time.Duration, readOnly bool, cacheQuota int64, metricsAddr string, insecure bool, debug bool, uid, gid uint32) {
+func runS3(log *slog.Logger, args []string, cacheDir string, scanTTL time.Duration, readOnly bool, metricsAddr string, insecure bool, debug bool, uid, gid uint32) {
 	if len(args) < 2 {
 		fmt.Fprintf(os.Stderr, "error: s3 backend requires <endpoint/bucket/prefix> <mountpoint>\n\n")
 		flag.Usage()
@@ -733,7 +732,6 @@ func runS3(log *slog.Logger, args []string, cacheDir string, scanTTL time.Durati
 		ScanTTL:     scanTTL,
 		MetricsAddr: metricsAddr,
 		ReadOnly:    readOnly,
-		CacheQuota:  cacheQuota,
 		UID:         uint32(uid),
 		GID:         uint32(gid),
 		Insecure:    insecure,
