@@ -72,6 +72,8 @@ func main() {
 		alertWebhook         = flag.String("alert-webhook", "", "Optional URL that receives capacity-alert events as JSON POSTs")
 		segmentSize          = flag.Int64("segment-size", 0, "V2.1 segment size in bytes (0 = DefaultDataSegmentSize, 4GiB); smaller values seal segments sooner so compaction can reclaim superseded bytes — useful for demos and CI")
 		compactInterval      = flag.Duration("compaction-interval", 30*time.Second, "Background compaction scan cadence for the V2.1 worker")
+		gcScanInterval       = flag.Duration("gc-scan-interval", 0, "Background orphan-chunk GC scan cadence (0 = disabled; uses only the manual POST /api/v1/gc/scan endpoint)")
+		gcGraceWindow        = flag.Duration("gc-grace-window", 10*time.Minute, "Minimum local chunk age before the background orphan scan will delete it (protects in-flight writes not yet committed to metadata)")
 		storageVersion       = flag.String("storage-version", "v1", "Storage engine version: v1 (legacy ChunkStore) or v2.1 (new engine)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON              = flag.Bool("log-json", false, "JSON log output")
@@ -151,6 +153,8 @@ func main() {
 		StorageVersion:     *storageVersion,
 		SegmentSize:        *segmentSize,
 		CompactionInterval: *compactInterval,
+		GCScanInterval:     *gcScanInterval,
+		GCGraceWindow:      *gcGraceWindow,
 		LogLevel:           *logLevel,
 	})
 }

@@ -147,6 +147,19 @@ type Config struct {
 	// V2.1 worker. 0 keeps the maintenance default (30s).
 	CompactionInterval time.Duration
 
+	// GCScanInterval is the cadence for the background orphan-chunk GC scan
+	// on the ops server. 0 disables the background scan (leaving only the
+	// manual POST /api/v1/gc/scan endpoint). Orphan scan deletes local chunks
+	// absent from metadata, so it is bounded by GCGraceWindow to avoid
+	// deleting in-flight writes whose metadata commit has not landed yet.
+	GCScanInterval time.Duration
+
+	// GCGraceWindow is how long a locally-written chunk must exist before the
+	// orphan GC scan will consider deleting it. Chunks this young are presumed
+	// to be in the "written locally but not yet committed to metadata"
+	// window, during which GetChunk legitimately reports not-found.
+	GCGraceWindow time.Duration
+
 	// LogLevel is the initial log level (debug/info/warn/error).
 	// Can be changed at runtime via SIGHUP signal.
 	LogLevel string
@@ -166,6 +179,11 @@ func DefaultConfig() Config {
 		Tier:                metadata.TierHot,
 		CapacityGB:          1000,
 		ClientTimeout:       30 * time.Second,
+		// Background orphan GC is off by default; operators opt in via the
+		// --gc-scan-interval flag. When enabled, default to a 10-minute grace
+		// window so in-flight writes are never swept.
+		GCScanInterval: 0,
+		GCGraceWindow:  10 * time.Minute,
 	}
 }
 

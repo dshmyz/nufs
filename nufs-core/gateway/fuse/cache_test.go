@@ -14,12 +14,12 @@ func TestChunkCacheMemoryOnly(t *testing.T) {
 		t.Fatalf("NewChunkCache: %v", err)
 	}
 
-	if _, ok := c.Get(1); ok {
+	if _, ok := c.Get(1, 0); ok {
 		t.Fatal("expected miss for empty cache")
 	}
 
-	c.Add(1, []byte("hello"))
-	got, ok := c.Get(1)
+	c.Add(1, 0, []byte("hello"))
+	got, ok := c.Get(1, 0)
 	if !ok {
 		t.Fatal("expected hit after add")
 	}
@@ -35,8 +35,8 @@ func TestChunkCacheDisk(t *testing.T) {
 		t.Fatalf("NewChunkCache: %v", err)
 	}
 
-	c.Add(1, []byte("disk-data"))
-	got, ok := c.Get(1)
+	c.Add(1, 0, []byte("disk-data"))
+	got, ok := c.Get(1, 0)
 	if !ok {
 		t.Fatal("expected hit")
 	}
@@ -62,9 +62,9 @@ func TestChunkCacheDiskPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewChunkCache 1: %v", err)
 	}
-	c1.Add(42, []byte("stays"))
-	c1.Add(99, []byte("goes"))
-	c1.Remove(99)
+	c1.Add(42, 0, []byte("stays"))
+	c1.Add(99, 0, []byte("goes"))
+	c1.Remove(99, 0)
 
 	c2, err := NewChunkCache(cacheDir)
 	if err != nil {
@@ -72,7 +72,7 @@ func TestChunkCacheDiskPersistence(t *testing.T) {
 	}
 
 	// 42 should still be on disk
-	got, ok := c2.Get(42)
+	got, ok := c2.Get(42, 0)
 	if !ok {
 		t.Fatal("expected hit for chunk 42 from disk")
 	}
@@ -81,7 +81,7 @@ func TestChunkCacheDiskPersistence(t *testing.T) {
 	}
 
 	// 99 should be gone (removed)
-	if _, ok := c2.Get(99); ok {
+	if _, ok := c2.Get(99, 0); ok {
 		t.Fatal("expected miss for removed chunk 99")
 	}
 }
@@ -90,10 +90,10 @@ func TestChunkCacheRemove(t *testing.T) {
 	dir := t.TempDir()
 	c, _ := NewChunkCache(path.Join(dir, "cache"))
 
-	c.Add(1, []byte("data"))
-	c.Remove(1)
+	c.Add(1, 0, []byte("data"))
+	c.Remove(1, 0)
 
-	if _, ok := c.Get(1); ok {
+	if _, ok := c.Get(1, 0); ok {
 		t.Fatal("expected miss after remove")
 	}
 
@@ -112,10 +112,10 @@ func TestChunkCacheHitRate(t *testing.T) {
 		t.Fatalf("expected 0 hit rate, got %f", r)
 	}
 
-	c.Get(1) // miss
-	c.Get(2) // miss
-	c.Add(1, []byte("x"))
-	c.Get(1) // hit
+	c.Get(1, 0) // miss
+	c.Get(2, 0) // miss
+	c.Add(1, 0, []byte("x"))
+	c.Get(1, 0) // hit
 
 	rate := c.HitRate()
 	if rate != 1.0/3.0 {
@@ -132,17 +132,17 @@ func TestChunkCacheEviction(t *testing.T) {
 	// Overwrite the default 1000-entry LRU with a 2-entry one manually.
 	memory.memory, _ = lru.New(2)
 
-	memory.Add(1, []byte("a"))
-	memory.Add(2, []byte("b"))
-	memory.Add(3, []byte("c")) // evicts 1
+	memory.Add(1, 0, []byte("a"))
+	memory.Add(2, 0, []byte("b"))
+	memory.Add(3, 0, []byte("c")) // evicts 1
 
-	if _, ok := memory.Get(1); ok {
+	if _, ok := memory.Get(1, 0); ok {
 		t.Fatal("expected chunk 1 to be evicted")
 	}
-	if _, ok := memory.Get(2); !ok {
+	if _, ok := memory.Get(2, 0); !ok {
 		t.Fatal("expected chunk 2 to still be present")
 	}
-	if _, ok := memory.Get(3); !ok {
+	if _, ok := memory.Get(3, 0); !ok {
 		t.Fatal("expected chunk 3 to be present")
 	}
 }
@@ -155,9 +155,9 @@ func TestChunkCacheDiskDataIntegrity(t *testing.T) {
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
-	c.Add(7, data)
+	c.Add(7, 0, data)
 
-	got, ok := c.Get(7)
+	got, ok := c.Get(7, 0)
 	if !ok {
 		t.Fatal("expected hit")
 	}
@@ -177,13 +177,13 @@ func TestChunkCacheConcurrent(t *testing.T) {
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			c.Add(uint64(i), []byte("data"))
+			c.Add(uint64(i), 0, []byte("data"))
 		}
 		done <- struct{}{}
 	}()
 	go func() {
 		for i := 0; i < 100; i++ {
-			c.Get(uint64(i))
+			c.Get(uint64(i), 0)
 		}
 		done <- struct{}{}
 	}()

@@ -1452,6 +1452,195 @@ func TestPebbleStore_ReportChunkState_EmptyBatch(t *testing.T) {
 	}
 }
 
+// newDegradeFixture builds a bucket/file and a committed, sealed (ChunkReady)
+// chunk with the given replication factor, registering nodes across racks so
+// placement succeeds.
+func newDegradeFixture(t *testing.T, rf int, spread TopologySpread) (*PebbleStore, *ChunkMeta) {
+	t.Helper()
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	if err := store.CreateBucket(ctx, "deg", PlacementPolicy{
+		ID: "default", ReplicationFactor: rf, TopologySpread: spread,
+	}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "deg")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	f, err := store.CreateFile(ctx, bucket.RootInode, "d.bin", 0644)
+	if err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+
+	for i := NodeID(1); i <= NodeID(rf+1); i++ {
+		if err := store.RegisterNode(ctx, &NodeInfo{
+			ID: i, Addr: fmt.Sprintf("n%d:9100", i),
+			Rack: fmt.Sprintf("r%d", i), Zone: "z1", Tier: TierHot,
+		}); err != nil {
+			t.Fatalf("RegisterNode: %v", err)
+		}
+	}
+
+	chunk, err := store.AllocateChunk(ctx, f.ID, 0, PlacementPolicy{
+		ReplicationFactor: rf, TopologySpread: spread,
+	})
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+	if err := store.CommitChunk(ctx, chunk.ID, 0xABCDEF); err != nil {
+		t.Fatalf("CommitChunk: %v", err)
+	}
+	if err := store.SealChunk(ctx, chunk.ID); err != nil {
+		t.Fatalf("SealChunk: %v", err)
+	}
+	return store, chunk
+}
+
+// reportEveryReady marks every replica of chunk on nodeIDs as ReplicaReady.
+func reportEveryReady(t *testing.T, store *PebbleStore, chunk *ChunkMeta, nodeIDs []NodeID) {
+	t.Helper()
+	for _, n := range nodeIDs {
+		if err := store.ReportChunkState(context.Background(), n,
+			map[ChunkID]ReplicaState{chunk.ID: ReplicaReady}); err != nil {
+			t.Fatalf("ReportChunkState ready node %d: %v", n, err)
+		}
+	}
+}
+
+func TestPebbleStore_ChunkState_DegradesOnReplicaFailed(t *testing.T) {
+	const rf = 3
+	store, chunk := newDegradeFixture(t, rf, SpreadRack)
+	ctx := context.Background()
+
+	// The sealed chunk is ChunkReady with rf syncing replicas.
+	got, err := store.GetChunk(ctx, chunk.ID)
+	if err != nil {
+		t.Fatalf("GetChunk: %v", err)
+	}
+	if got.State != ChunkReady {
+		t.Fatalf("expected ChunkReady after seal, got %d", got.State)
+	}
+	if len(got.Replicas) < rf {
+		t.Fatalf("expected at least %d replicas, got %d", rf, len(got.Replicas))
+	}
+
+	// Mark one replica failed → chunk degrades.
+	failingNode := got.Replicas[0].NodeID
+	if err := store.ReportChunkState(ctx, failingNode,
+		map[ChunkID]ReplicaState{chunk.ID: ReplicaFailed}); err != nil {
+		t.Fatalf("ReportChunkState failed: %v", err)
+	}
+
+	deg, err := store.GetChunk(ctx, chunk.ID)
+	if err != nil {
+		t.Fatalf("GetChunk failed: %v", err)
+	}
+	if deg.State != ChunkDegraded {
+		t.Fatalf("expected ChunkDegraded after replica failed, got %d", deg.State)
+	}
+	for _, r := range deg.Replicas {
+		if r.NodeID == failingNode && r.State != ReplicaFailed {
+			t.Fatalf("replica %d should be ReplicaFailed, got %d", failingNode, r.State)
+		}
+	}
+}
+
+func TestPebbleStore_ChunkState_RecoversWhenAllReady(t *testing.T) {
+	const rf = 2
+	store, chunk := newDegradeFixture(t, rf, SpreadRack)
+	ctx := context.Background()
+
+	got, err := store.GetChunk(ctx, chunk.ID)
+	if err != nil {
+		t.Fatalf("GetChunk: %v", err)
+	}
+	nodes := make([]NodeID, 0, len(got.Replicas))
+	for _, r := range got.Replicas {
+		nodes = append(nodes, r.NodeID)
+	}
+
+	// Bring every replica to Ready, then fail one → Degraded.
+	reportEveryReady(t, store, chunk, nodes)
+	if err := store.ReportChunkState(ctx, nodes[0],
+		map[ChunkID]ReplicaState{chunk.ID: ReplicaFailed}); err != nil {
+		t.Fatalf("ReportChunkState failed: %v", err)
+	}
+	deg, _ := store.GetChunk(ctx, chunk.ID)
+	if deg.State != ChunkDegraded {
+		t.Fatalf("expected ChunkDegraded, got %d", deg.State)
+	}
+
+	// Restore the failed replica → all Ready → chunk recovers to ChunkReady.
+	if err := store.ReportChunkState(ctx, nodes[0],
+		map[ChunkID]ReplicaState{chunk.ID: ReplicaReady}); err != nil {
+		t.Fatalf("ReportChunkState recovered: %v", err)
+	}
+	rec, _ := store.GetChunk(ctx, chunk.ID)
+	if rec.State != ChunkReady {
+		t.Fatalf("expected ChunkReady after all replicas ready, got %d", rec.State)
+	}
+}
+
+func TestPebbleStore_ChunkState_IgnoresCreated(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	if err := store.CreateBucket(ctx, "created", PlacementPolicy{
+		ID: "default", ReplicationFactor: 1, TopologySpread: SpreadNode,
+	}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, _ := store.GetBucket(ctx, "created")
+	f, _ := store.CreateFile(ctx, bucket.RootInode, "c.bin", 0644)
+	if err := store.RegisterNode(ctx, &NodeInfo{
+		ID: 1, Addr: "n1:9100", Rack: "r1", Zone: "z1", Tier: TierHot,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	chunk, err := store.AllocateChunk(ctx, f.ID, 0, PlacementPolicy{
+		ReplicationFactor: 1, TopologySpread: SpreadNode,
+	})
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+	// chunk remains ChunkCreated (no commit/seal).
+
+	if err := store.ReportChunkState(ctx, chunk.Replicas[0].NodeID,
+		map[ChunkID]ReplicaState{chunk.ID: ReplicaFailed}); err != nil {
+		t.Fatalf("ReportChunkState: %v", err)
+	}
+	got, _ := store.GetChunk(ctx, chunk.ID)
+	if got.State != ChunkCreated {
+		t.Fatalf("expected ChunkCreated to stay, got %d", got.State)
+	}
+}
+
+func TestPebbleStore_ChunkState_IdempotentRepeatedFailed(t *testing.T) {
+	const rf = 2
+	store, chunk := newDegradeFixture(t, rf, SpreadRack)
+	ctx := context.Background()
+
+	got, _ := store.GetChunk(ctx, chunk.ID)
+	failingNode := got.Replicas[0].NodeID
+
+	// Fail once → Degraded.
+	if err := store.ReportChunkState(ctx, failingNode,
+		map[ChunkID]ReplicaState{chunk.ID: ReplicaFailed}); err != nil {
+		t.Fatalf("ReportChunkState 1: %v", err)
+	}
+	// Fail again → still Degraded, no error, no churn.
+	if err := store.ReportChunkState(ctx, failingNode,
+		map[ChunkID]ReplicaState{chunk.ID: ReplicaFailed}); err != nil {
+		t.Fatalf("ReportChunkState 2: %v", err)
+	}
+	deg, _ := store.GetChunk(ctx, chunk.ID)
+	if deg.State != ChunkDegraded {
+		t.Fatalf("expected ChunkDegraded after repeated failed, got %d", deg.State)
+	}
+}
+
 func TestPebbleStore_ChunksByNode(t *testing.T) {
 	store := newTestPebbleStore(t)
 	ctx := context.Background()

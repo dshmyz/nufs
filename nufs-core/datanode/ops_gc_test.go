@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
@@ -27,7 +28,7 @@ func TestGCScan_OnlyDeletesOnChunkNotFound(t *testing.T) {
 		meta:  mock,
 	}
 
-	orphanCount, err := s.triggerGCScan(context.Background())
+	orphanCount, err := s.triggerGCScan(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("triggerGCScan: %v", err)
 	}
@@ -60,7 +61,7 @@ func TestGCScan_DeletesOnChunkNotFound(t *testing.T) {
 		meta:  mock,
 	}
 
-	orphanCount, err := s.triggerGCScan(context.Background())
+	orphanCount, err := s.triggerGCScan(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("triggerGCScan: %v", err)
 	}
@@ -121,7 +122,7 @@ func TestGCScan_SkipsOnContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	orphanCount, err := s.triggerGCScan(ctx)
+	orphanCount, err := s.triggerGCScan(ctx, 0)
 	if err != nil {
 		t.Fatalf("triggerGCScan: %v", err)
 	}
@@ -129,6 +130,71 @@ func TestGCScan_SkipsOnContextCancelled(t *testing.T) {
 	if orphanCount != 0 {
 		t.Errorf("expected 0 orphans deleted with cancelled context, got %d", orphanCount)
 	}
+}
+
+func TestGCScan_RespectsGraceWindow(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+
+	chunkID := metadata.ChunkID(88992)
+	if err := cs.Write(chunkID, []byte("young chunk")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	mock := newMockMetadataService() // GetChunk → ErrChunkNotFound
+
+	s := &OpsServer{store: cs, meta: mock}
+
+	// A large grace window protects the freshly-written chunk: its WrittenAt is
+	// within grace, so it is presumed to be an in-flight write, not an orphan.
+	count, err := s.triggerGCScan(context.Background(), time.Hour)
+	if err != nil {
+		t.Fatalf("triggerGCScan(with grace): %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 deleted within grace window, got %d", count)
+	}
+	if _, _, rerr := cs.Read(chunkID, 0, 0); rerr != nil {
+		t.Errorf("chunk deleted inside grace window: %v", rerr)
+	}
+
+	// Zero grace (manual trigger) deletes it.
+	count, err = s.triggerGCScan(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("triggerGCScan(no grace): %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 deleted with no grace, got %d", count)
+	}
+}
+
+func TestGCScan_BackgroundTicker(t *testing.T) {
+	cs, _ := newTestChunkStore(t)
+
+	chunkID := metadata.ChunkID(88993)
+	if err := cs.Write(chunkID, []byte("background orphan")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	mock := newMockMetadataService() // GetChunk → ErrChunkNotFound
+
+	s := &OpsServer{
+		store: cs,
+		meta:  mock,
+		cfg:   Config{GCScanInterval: 20 * time.Millisecond, GCGraceWindow: 0},
+	}
+	s.startGCScanner(s.cfg.GCScanInterval)
+	defer func() {
+		close(s.gcStop)
+		s.gcWg.Wait()
+	}()
+
+	// Wait until the background scan deletes the orphan chunk.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, rerr := cs.Read(chunkID, 0, 0); rerr != nil {
+			return // deleted by background GC
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Errorf("orphan chunk was not deleted by background GC within deadline")
 }
 
 func TestIsChunkNotFound(t *testing.T) {

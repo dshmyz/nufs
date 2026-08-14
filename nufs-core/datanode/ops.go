@@ -65,6 +65,12 @@ type OpsServer struct {
 	// on first use so servers that never set a webhook don't leak a worker.
 	alertDispatch    chan capacityAlertEvent
 	alertDispatchOne sync.Once
+
+	// Background orphan GC ticker (enabled when cfg.GCScanInterval > 0).
+	// Lived on the server so both the V1 and V2.1 engines get it for free
+	// through Start()/Stop() with zero main.go changes.
+	gcStop chan struct{}
+	gcWg   sync.WaitGroup
 }
 
 // NewOpsServer creates the operations HTTP server.
@@ -230,13 +236,49 @@ func (s *OpsServer) Start() error {
 			scheme = "https"
 		}
 		slog.Info("ops: management API ready", "addr", s.cfg.OpsListenAddr, "scheme", scheme)
+
+		// Start the optional background orphan GC scan.
+		if s.cfg.GCScanInterval > 0 {
+			s.startGCScanner(s.cfg.GCScanInterval)
+		}
 	}
 	return nil
+}
+
+// startGCScanner launches the background orphan-chunk GC ticker with the
+// configured cadence and grace window. Stopped by Stop(). Safe to call once
+// per Start (guarded by running flag in the caller).
+func (s *OpsServer) startGCScanner(interval time.Duration) {
+	s.gcStop = make(chan struct{})
+	s.gcWg.Add(1)
+	grace := s.cfg.GCGraceWindow
+	go func() {
+		defer s.gcWg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if _, err := s.triggerGCScan(context.Background(), grace); err != nil {
+					slog.Warn("ops: background gc scan error", "error", err)
+				}
+			case <-s.gcStop:
+				return
+			}
+		}
+	}()
+	slog.Info("ops: background orphan scan started",
+		"interval", interval, "grace", grace)
 }
 
 // Stop shuts down the operations server.
 func (s *OpsServer) Stop() {
 	if s.running.Swap(false) {
+		if s.gcStop != nil {
+			close(s.gcStop)
+			s.gcWg.Wait()
+			s.gcStop = nil
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		s.listener.Shutdown(ctx)
@@ -473,8 +515,9 @@ func (s *OpsServer) handleGCScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Trigger orphan chunk scan
-	orphanCount, err := s.triggerGCScan(r.Context())
+	// Manual scan is immediate: no grace window (the operator is explicitly
+	// asking for it). The background ticker applies cfg.GCGraceWindow.
+	orphanCount, err := s.triggerGCScan(r.Context(), 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -485,7 +528,13 @@ func (s *OpsServer) handleGCScan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *OpsServer) triggerGCScan(ctx context.Context) (int, error) {
+// triggerGCScan deletes local chunks that no longer exist in metadata.
+// grace is a minimum local chunk age before it may be deleted; a chunk this
+// young (WrittenAt within grace) is presumed to be an in-flight write whose
+// metadata commit has not landed yet — GetChunk legitimately reports
+// not-found for it, and deleting it would destroy valid data. Pass 0 to
+// disable the guard (manual operator trigger).
+func (s *OpsServer) triggerGCScan(ctx context.Context, grace time.Duration) (int, error) {
 	// Iterate local chunks and check if each exists in metadata.
 	// Chunks not found in metadata are orphans and should be deleted.
 	localChunks := s.store.ListChunks()
@@ -504,6 +553,15 @@ func (s *OpsServer) triggerGCScan(ctx context.Context) (int, error) {
 		// trigger deletion — that would destroy valid data.
 		if !isChunkNotFound(err) {
 			slog.Warn("gc: skipping chunk due to metadata error", "chunkID", lc.ChunkID, "error", err)
+			continue
+		}
+		// Grace window: a very recently written local chunk is likely an
+		// in-flight write (data on disk, metadata commit pending), for which
+		// not-found is expected and NOT an orphan signal. Skip it rather than
+		// racing the writer to delete data it still needs.
+		if grace > 0 && time.Since(lc.WrittenAt) < grace {
+			slog.Debug("gc: skipping young chunk within grace window",
+				"chunkID", lc.ChunkID, "writtenAt", lc.WrittenAt)
 			continue
 		}
 		slog.Info("gc: orphan chunk not in metadata, deleting", "chunkID", lc.ChunkID, "size", lc.Size)

@@ -545,14 +545,52 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 				if cEnd <= pos || cref.Offset >= end {
 					continue
 				}
-				// Fetch committed payload
-				var payload []byte
+				// Compute the window of this cref that overlaps [pos, end).
+				// Precompute it before fetching so a cache miss can issue an
+				// exact range read instead of pulling the whole 64 MiB chunk.
+				relStart := pos - cref.Offset
+				if relStart < 0 {
+					relStart = 0
+				}
+				relEnd := end - cref.Offset
+				if relEnd > int64(cref.Length) {
+					relEnd = int64(cref.Length)
+				}
+				if relEnd > relStart+int64(MaxChunkPayload) {
+					relEnd = relStart + int64(MaxChunkPayload)
+				}
+				if relEnd <= relStart {
+					// This cref is entirely behind pos; nothing to read here.
+					found = true
+					break
+				}
+				// Zero-fill any gap before this cref (in-memory only, never
+				// fetched from the chunkstore).
+				if cref.Offset > pos {
+					gap := cref.Offset - pos
+					if gap > end-pos {
+						gap = end - pos
+					}
+					result = append(result, make([]byte, gap)...)
+					pos += gap
+				}
+				// Fetch the needed window: prefer a cache hit, otherwise do a
+				// precise range read of exactly [relStart, relEnd). The cache
+				// is keyed by (chunkID, offset) so each window is cached
+				// independently — a later read of the same window hits, and we
+				// never let a partial window masquerade as the whole chunk.
+				var window []byte
 				if f.cache != nil {
-					if p, ok := f.cache.Get(uint64(cref.ID)); ok {
-						payload = p
+					if p, ok := f.cache.Get(uint64(cref.ID), relStart); ok {
+						if relEnd > relStart+int64(len(p)) {
+							relEnd = relStart + int64(len(p))
+						}
+						if relEnd > relStart {
+							window = p[:relEnd-relStart]
+						}
 					}
 				}
-				if payload == nil {
+				if window == nil {
 					var chunk *metadata.ChunkMeta
 					if err := f.reliability.DoMeta("read", func() error {
 						var gerr error
@@ -563,35 +601,18 @@ func (f *DFSFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off i
 					}
 					if err := f.reliability.DoChunk("read", func() error {
 						var gerr error
-						payload, gerr = f.chunkStore.ReadChunk(ctx, chunk)
+						window, gerr = f.chunkStore.ReadChunkRange(ctx, chunk, relStart, int32(relEnd-relStart))
 						return gerr
 					}); err != nil {
 						return nil
 					}
-					if f.cache != nil {
-						f.cache.Add(uint64(cref.ID), payload)
+					if f.cache != nil && len(window) > 0 {
+						f.cache.Add(uint64(cref.ID), relStart, window)
 					}
 				}
-				// Zero-fill gap before this chunk
-				if cref.Offset > pos {
-					gap := cref.Offset - pos
-					if gap > end-pos {
-						gap = end - pos
-					}
-					result = append(result, make([]byte, gap)...)
-					pos += gap
-				}
-				relStart := pos - cref.Offset
-				relEnd := end - cref.Offset
-				if relEnd > int64(cref.Length) {
-					relEnd = int64(cref.Length)
-				}
-				if relEnd > int64(len(payload)) {
-					relEnd = int64(len(payload))
-				}
-				if relStart < relEnd {
-					result = append(result, payload[relStart:relEnd]...)
-					pos += relEnd - relStart
+				if len(window) > 0 {
+					result = append(result, window...)
+					pos += int64(len(window))
 				}
 				found = true
 				break
@@ -847,45 +868,48 @@ func (f *DFSFile) loadCommittedChunkLocked(ctx context.Context, base int64, rec 
 		return overlaps[i].ID < overlaps[j].ID
 	})
 	for _, cref := range overlaps {
-		var payload []byte
-		if f.cache != nil {
-			if p, ok := f.cache.Get(uint64(cref.ID)); ok {
-				payload = p
-			}
-		}
-		if payload == nil {
-			var chunk *metadata.ChunkMeta
-			if err := f.reliability.DoMeta("read", func() error {
-				var gerr error
-				chunk, gerr = f.fs.Meta().GetChunk(ctx, cref.ID)
-				return gerr
-			}); err != nil {
-				continue
-			}
-			if err := f.reliability.DoChunk("read", func() error {
-				var gerr error
-				payload, gerr = f.chunkStore.ReadChunk(ctx, chunk)
-				return gerr
-			}); err != nil {
-				continue
-			}
-			if f.cache != nil {
-				f.cache.Add(uint64(cref.ID), payload)
-			}
-		}
 		buf := f.getChunk(base)
 		rel := cref.Offset - base
 		// Cap at the ref's declared live length: the payload may hold stale
 		// bytes beyond cref.Length (e.g. a reused/legacy chunk), and copying
 		// them would resurrect data outside the ref's extent.
 		n := int64(cref.Length)
-		if n > int64(len(payload)) {
-			n = int64(len(payload))
-		}
 		if rel+n > int64(len(buf)) {
 			n = int64(len(buf)) - rel
 		}
-		copy(buf[rel:rel+n], payload[:n])
+		if n <= 0 {
+			continue
+		}
+		// Water the committed bytes for this base in by reading the complete
+		// [rel, rel+n) extent directly from the chunkstore. We deliberately do
+		// NOT consult the sliced read cache here: readChunkRange caches partial
+		// windows of a chunk, and treating such a short entry as the complete
+		// committed image would silently zero-fill the remainder of the chunk's
+		// real data on flush (its actual extent can exceed the cached window).
+		// A full extent read is semantically identical to the old whole-chunk
+		// hydration and guarantees no committed byte is lost.
+		var chunk *metadata.ChunkMeta
+		if err := f.reliability.DoMeta("read", func() error {
+			var gerr error
+			chunk, gerr = f.fs.Meta().GetChunk(ctx, cref.ID)
+			return gerr
+		}); err != nil {
+			continue
+		}
+		var window []byte
+		if err := f.reliability.DoChunk("read", func() error {
+			var gerr error
+			window, gerr = f.chunkStore.ReadChunkRange(ctx, chunk, rel, int32(n))
+			return gerr
+		}); err != nil {
+			continue
+		}
+		if int64(len(window)) > n {
+			window = window[:n]
+		}
+		if len(window) > 0 {
+			copy(buf[rel:rel+int64(len(window))], window)
+		}
 	}
 }
 
@@ -1398,44 +1422,46 @@ func (f *DFSFile) zeroRange(ctx context.Context, rec MetricsRecorder, metaInode 
 			if cEnd <= base || cref.Offset >= base+MaxChunkPayload {
 				continue
 			}
-			// Load this committed chunk into the buffer
-			var payload []byte
-			if f.cache != nil {
-				if p, ok := f.cache.Get(uint64(cref.ID)); ok {
-					payload = p
-				}
-			}
-			if payload == nil {
-				var chunk *metadata.ChunkMeta
-				if err := f.reliability.DoMeta("flush", func() error {
-					var gerr error
-					chunk, gerr = f.fs.Meta().GetChunk(ctx, cref.ID)
-					return gerr
-				}); err != nil {
-					f.mu.Unlock()
-					rec.IncOpError("allocate")
-					return syscall.EIO
-				}
-				if err := f.reliability.DoChunk("flush", func() error {
-					var gerr error
-					payload, gerr = f.chunkStore.ReadChunk(ctx, chunk)
-					return gerr
-				}); err != nil {
-					f.mu.Unlock()
-					rec.IncOpError("allocate")
-					return syscall.EIO
-				}
-				if f.cache != nil {
-					f.cache.Add(uint64(cref.ID), payload)
-				}
-			}
+			// Load the committed bytes of this chunk into the buffer so the
+			// non-zeroed portion is preserved.
 			buf := f.getChunk(base)
 			rel := cref.Offset - base
-			n := int64(len(payload))
-			if rel+n > int64(len(buf)) {
-				n = int64(len(buf)) - rel
+			// Preserve the complete committed extent of this chunk by reading it
+			// directly from the chunkstore. We deliberately skip the sliced read
+			// cache here: readChunkRange may have cached a short window as this
+			// chunk's image, and treating it as complete would zero committed
+			// data beyond the window, which a ZERO_RANGE/punch would then
+			// persist as holes.
+			var chunk *metadata.ChunkMeta
+			if err := f.reliability.DoMeta("flush", func() error {
+				var gerr error
+				chunk, gerr = f.fs.Meta().GetChunk(ctx, cref.ID)
+				return gerr
+			}); err != nil {
+				f.mu.Unlock()
+				rec.IncOpError("allocate")
+				return syscall.EIO
 			}
-			copy(buf[rel:rel+n], payload[:n])
+			n := int64(len(buf)) - rel
+			if n < 0 {
+				n = 0
+			}
+			var window []byte
+			if err := f.reliability.DoChunk("flush", func() error {
+				var gerr error
+				window, gerr = f.chunkStore.ReadChunkRange(ctx, chunk, rel, int32(n))
+				return gerr
+			}); err != nil {
+				f.mu.Unlock()
+				rec.IncOpError("allocate")
+				return syscall.EIO
+			}
+			if int64(len(window)) > n {
+				window = window[:n]
+			}
+			if len(window) > 0 {
+				copy(buf[rel:rel+int64(len(window))], window)
+			}
 			break
 		}
 	}

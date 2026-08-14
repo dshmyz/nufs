@@ -78,7 +78,7 @@ func TestMetadataTombstoneRetainsRealDataNodePayloadUntilPurge(t *testing.T) {
 		t.Fatalf("metadata after purge = %v, want ErrChunkNotFound", err)
 	}
 	gc := &OpsServer{store: chunks, meta: meta}
-	deleted, err := gc.triggerGCScan(ctx)
+	deleted, err := gc.triggerGCScan(ctx, 0)
 	if err != nil || deleted != 1 {
 		t.Fatalf("datanode orphan GC = (%d, %v), want (1, nil)", deleted, err)
 	}

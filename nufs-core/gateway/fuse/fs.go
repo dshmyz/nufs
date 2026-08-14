@@ -202,7 +202,7 @@ func (fsys *DFSFileSystem) runCacheInvalidationLoop(ctx context.Context, w chunk
 	for e := range w.WatchEventsStream(ctx, "chunk:") {
 		chunkID, err := parseChunkID(e.Key)
 		if err == nil {
-			fsys.chunkCache.Remove(chunkID)
+			fsys.chunkCache.RemoveChunk(chunkID)
 		}
 	}
 }

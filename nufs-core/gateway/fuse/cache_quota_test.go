@@ -22,15 +22,15 @@ func TestChunkCache_ByteQuotaEvictsOldest(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		data := make([]byte, chunkSize)
 		data[0] = byte(i)
-		cache.Add(uint64(i), data)
+		cache.Add(uint64(i), 0, data)
 	}
 
 	// chunk 1（最旧）应该被淘汰
-	if _, ok := cache.Get(1); ok {
+	if _, ok := cache.Get(1, 0); ok {
 		t.Errorf("chunk 1 should have been evicted (oldest), but got cache hit")
 	}
 	// chunk 5（最新）应该还在
-	if _, ok := cache.Get(5); !ok {
+	if _, ok := cache.Get(5, 0); !ok {
 		t.Errorf("chunk 5 should still be cached (newest)")
 	}
 	// curBytes 不应超过 maxBytes
@@ -50,7 +50,7 @@ func TestChunkCache_ByteQuotaDeletesDiskFile(t *testing.T) {
 	chunkSize := 256 * 1024
 	for i := 1; i <= 5; i++ {
 		data := make([]byte, chunkSize)
-		cache.Add(uint64(i), data)
+		cache.Add(uint64(i), 0, data)
 	}
 
 	// chunk 1 的磁盘文件应该被删除
@@ -70,12 +70,12 @@ func TestChunkCache_QuotaZeroMeansUnlimited(t *testing.T) {
 	// Add 远超 100 条目容量的数据（但 LRU 条数会淘汰，这里测字节配额不触发）
 	for i := 0; i < 50; i++ {
 		data := make([]byte, 1024) // 1KB each
-		cache.Add(uint64(i+1), data)
+		cache.Add(uint64(i+1), 0, data)
 	}
 
 	// 所有 chunk 应该可读到（条数 50 < 100，字节 50KB，无配额限制）
 	for i := 1; i <= 50; i++ {
-		if _, ok := cache.Get(uint64(i)); !ok {
+		if _, ok := cache.Get(uint64(i), 0); !ok {
 			t.Errorf("chunk %d should be cached (unlimited quota)", i)
 		}
 	}
@@ -90,10 +90,10 @@ func TestChunkCache_LargeChunkExceedsQuota(t *testing.T) {
 
 	// 单个 chunk 2KB > 1KB quota
 	bigData := make([]byte, 2048)
-	cache.Add(1, bigData)
+	cache.Add(1, 0, bigData)
 
 	// 应该能读回
-	if data, ok := cache.Get(1); !ok || len(data) != 2048 {
+	if data, ok := cache.Get(1, 0); !ok || len(data) != 2048 {
 		t.Errorf("large chunk should be cached despite exceeding quota, got ok=%v len=%d", ok, len(data))
 	}
 }
@@ -109,7 +109,7 @@ func TestChunkCache_EvictionIncrementsCounter(t *testing.T) {
 	chunkSize := 256 * 1024
 	for i := 1; i <= 5; i++ {
 		data := make([]byte, chunkSize)
-		cache.Add(uint64(i), data)
+		cache.Add(uint64(i), 0, data)
 	}
 
 	// 至少淘汰了 1 个（1.25MB → 1MB，淘汰 1 个 256KB）
@@ -129,13 +129,13 @@ func TestChunkCache_Bytes_Accurate(t *testing.T) {
 		t.Errorf("initial Bytes() = %d, want 0", got)
 	}
 
-	cache.Add(1, make([]byte, 1024))
-	cache.Add(2, make([]byte, 2048))
+	cache.Add(1, 0, make([]byte, 1024))
+	cache.Add(2, 0, make([]byte, 2048))
 	if got := cache.Bytes(); got != 3072 {
 		t.Errorf("after 2 adds: Bytes() = %d, want 3072", got)
 	}
 
-	cache.Remove(1)
+	cache.Remove(1, 0)
 	if got := cache.Bytes(); got != 2048 {
 		t.Errorf("after remove chunk 1: Bytes() = %d, want 2048", got)
 	}
@@ -151,7 +151,7 @@ func TestChunkCache_EvictCallback_NotPanics(t *testing.T) {
 
 	// Add 10 chunks to trigger LRU eviction (capacity 5)
 	for i := 1; i <= 10; i++ {
-		cache.Add(uint64(i), make([]byte, 100))
+		cache.Add(uint64(i), 0, make([]byte, 100))
 	}
 
 	// 只要没 panic 即通过
