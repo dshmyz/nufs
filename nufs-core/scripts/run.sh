@@ -34,10 +34,13 @@ LOAD_WORKERS="${NUFS_LOAD_WORKERS:-8}"
 LOAD_OBJ_SIZE="${NUFS_LOAD_OBJ_SIZE:-65536}"
 
 run_smoke() {
-    echo "=== 冒烟测试: S3 PUT/GET + kill datanode + JBOD (~30s) ==="
+    echo "=== 冒烟测试: S3 PUT/GET + kill datanode + JBOD + repair (~40s) ==="
+    # TestFullStack = 主路径 + JBOD 多盘；TestRepair = 副本 repair + EC 修复。
+    # TestRepair_EndToEnd_EC 特意用 4+2（6 节点）：验证分配尊重桶 ECConfig，
+    # 非 6+3 桶有真实容错（kill 1 节点 → 5≥K=4 重建）。
     go test -v -count=1 \
-        -run "TestFullStack" \
-        -timeout=60s \
+        -run "TestFullStack|TestRepair" \
+        -timeout=90s \
         ./tests/smoke/
 }
 
