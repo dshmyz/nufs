@@ -401,19 +401,18 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 	}
 
 	// Apply range slicing
-	dataLen2 := int64(len(fullData))
 	if offset < 0 {
 		offset = 0
 	}
-	if offset >= dataLen2 {
+	if offset >= int64(decodeLen) {
 		return []byte{}, nil
 	}
-	end := dataLen2
+	end := int64(decodeLen)
 	if length > 0 {
 		end = offset + int64(length)
 	}
-	if end > dataLen2 {
-		end = dataLen2
+	if end > int64(decodeLen) {
+		end = int64(decodeLen)
 	}
 	return fullData[offset:end], nil
 }
