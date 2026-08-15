@@ -217,105 +217,75 @@ func (s *DatanodeChunkStore) writeECChunk(ctx context.Context, chunk *metadata.C
 // readECChunk reads shards from K+M datanodes in parallel, then
 // decodes the original data using erasure coding.
 //
-// When offset and length are provided (V2.1 ECStripeID path), only the data
-// shards whose byte ranges overlap [offset, offset+length) are read; the
-// remaining slots are marked absent and filled by parity during decode.  This
-// reduces both network I/O (fewer shards fetched) and disk I/O (the server
-// applies the range to each fetched shard via ReadRangeFrames).  The EC
-// decoder still reconstructs the full original payload, so memory
-// amplification remains; the win is on the transport layer.
+// Two paths:
+//
+//   - V2.1 window read: when the chunk carries an ECStripeID and chunk.Size
+//     is a trustworthy literal length (converted chunks — ConvertToEC keeps
+//     the literal size), readECWindow serves exactly [offset, offset+length)
+//     from the data shard(s) that own its bytes: ~1× transport amplification
+//     on the healthy path, and a window-sized reconstruction from peers when
+//     an owner is unreachable.  The MaxChunkSize allocation cap is NOT a
+//     length, so a cap-sized metadata record falls back to the full read.
+//   - Full read (V1 legacy EC, plain chunks, or unknown literal length):
+//     every shard is fetched in full and the whole stripe is decoded, then
+//     the requested range is trimmed.
 func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.ChunkMeta, offset int64, length int32) ([]byte, error) {
 	ec := chunk.ECGroup
 	totalShards := ec.DataShards + ec.ParityShards
 	encoder := GetECEncoder(ec.DataShards, ec.ParityShards)
 
+	// shardSize below is the maximum possible per-shard size (allocation
+	// cap); it only bounds the window guard.  The true per-shard size is
+	// derived from the chunk's literal length in readECWindow.
+	shardSize := int64(0)
+	if ec.DataShards > 0 {
+		shardSize = (int64(metadata.MaxChunkSize) + int64(ec.DataShards) - 1) / int64(ec.DataShards)
+	}
+	dataLen := shardSize * int64(ec.DataShards) // padded original length at the cap
+
+	// Window path: the codec is contiguous (byte p lives in data shard
+	// p/shardSize), so a range read only needs the shard(s) that own its
+	// bytes.  It requires a trustworthy literal length.  Today only
+	// ConvertToEC produces ECStripeID chunks and it keeps the literal size;
+	// the direct-EC write path's metadata record is not yet served, so a
+	// cap-sized Size with ECStripeID cannot occur in production.  Anything
+	// ambiguous falls through to the full read below, which is always
+	// correct regardless of Size.
+	literalSize := int64(chunk.Size)
+	if chunk.ECStripeID != "" && length > 0 && offset >= 0 && offset < dataLen &&
+		literalSize > 0 && literalSize <= dataLen {
+		return s.readECWindow(ctx, chunk, offset, length, literalSize)
+	}
+
+	// ---- Full-read path: fetch all K+M shards in parallel, decode, trim. ----
 	type shardData struct {
 		index int
 		data  []byte
 		err   error
 	}
 	ch := make(chan shardData, len(chunk.Replicas))
-
-	// Determine which data shards overlap the requested window so we can
-	// skip fetching shards that carry no bytes in the window.  This is
-	// only meaningful for the V2.1 ECStripeID path; V1 legacy still reads
-	// full chunks (ReadChunk(id,0,0)) regardless.
-	shardSize := int64(0) // bytes per data shard (including padding)
-	if ec.DataShards > 0 {
-		shardSize = (int64(metadata.MaxChunkSize) + int64(ec.DataShards) - 1) / int64(ec.DataShards)
-	}
-	dataLen := shardSize * int64(ec.DataShards) // padded original length
-
-	wantWindow := chunk.ECStripeID != "" && length > 0 && offset >= 0 && offset < dataLen
-	needDataShards := make(map[int]struct{})   // data shard indices we need
-	needParityShards := make(map[int]struct{}) // parity shard indices we need
-
-	if wantWindow {
-		// Reed-Solomon requires K data shards for decode.  We must read
-		// ALL K data shards (not just overlapping ones) but can optimize
-		// by passing a small offset/length to ReadECShard for each shard,
-		// so the server only reads intersecting frames.
-		for i := 0; i < ec.DataShards; i++ {
-			needDataShards[i] = struct{}{}
-		}
-		// Read minimum parity for redundancy (M shards).
-		for p := 0; p < ec.ParityShards; p++ {
-			needParityShards[ec.DataShards+p] = struct{}{}
-		}
-		slog.Debug("chunkstore: ec range read", "chunkID", chunk.ID, "window",
-			fmt.Sprintf("[%d,%d)", offset, offset+int64(length)),
-			"dataShards", len(needDataShards), "parityShards", len(needParityShards))
-	}
-
-	// Read shards in parallel.  Non-overlapping shards are skipped (not
-	// sent to the channel); the collector marks them absent.
-	launched := 0
 	for _, rep := range chunk.Replicas {
-		idx := rep.ShardIndex
-
-		// Decide whether to fetch this shard.
-		fetch := true
-		if wantWindow {
-			fetch = false
-			if _, ok := needDataShards[idx]; ok {
-				fetch = true
-			} else if _, ok := needParityShards[idx]; ok {
-				fetch = true
-			}
-		}
-		if !fetch {
-			continue // skip — not in window
-		}
-		launched++
-
 		go func(r metadata.ReplicaInfo) {
 			if r.Addr == "" {
 				ch <- shardData{r.ShardIndex, nil, fmt.Errorf("empty addr for node %d", r.NodeID)}
 				return
 			}
-
 			client, err := s.pool.Get(r.Addr)
 			if err != nil {
 				ch <- shardData{r.ShardIndex, nil, fmt.Errorf("connect %s: %w", r.Addr, err)}
 				return
 			}
-			// V2.1 converted chunks store each EC shard as an independent
-// extent.  Always full read — range reads on individual shards
-// produce partial data that breaks reedsolomon reconstruction,
-// since the decoder needs complete shard-sized inputs.  Range
-// Range reads on shards are not feasible with Reed-Solomon: each
-				// original byte depends on all K data shards, so decoding a range
-				// requires reading the same range from all K data shards — the full
-				// shard is the smallest granularity that can be decoded.
-var resp *datanode.Response
-if chunk.ECStripeID != "" {
-    resp, err = client.ReadECShard(chunk.ID, r.ShardIndex, 0, 0)
+			var resp *datanode.Response
+			if chunk.ECStripeID != "" {
+				// V2.1 converted chunks store each EC shard as an independent
+				// extent keyed (chunkID, gen=shardIndex+1), readable only via
+				// ReadECShard.
+				resp, err = client.ReadECShard(chunk.ID, r.ShardIndex, 0, 0)
 			} else {
 				// Legacy V1 EC: whole-shard files, no range support.
 				resp, err = client.ReadChunk(chunk.ID, 0, 0)
 			}
 			s.pool.Put(r.Addr, client)
-
 			if err != nil {
 				ch <- shardData{r.ShardIndex, nil, fmt.Errorf("read shard from %s: %w", r.Addr, err)}
 				return
@@ -328,10 +298,10 @@ if chunk.ECStripeID != "" {
 		}(rep)
 	}
 
-	// Collect shards — exactly as many as goroutines were launched.
+	// Collect shards.
 	shards := make([][]byte, totalShards)
 	present := make([]bool, totalShards)
-	for i := 0; i < launched; i++ {
+	for i := 0; i < len(chunk.Replicas); i++ {
 		select {
 		case sd := <-ch:
 			if sd.err == nil && sd.index >= 0 && sd.index < totalShards {
@@ -345,56 +315,27 @@ if chunk.ECStripeID != "" {
 		}
 	}
 
-	// EC decode
-	// chunk.Size is set to MaxChunkSize at allocation time and never updated
-	// by the committer. For chunks allocated via S3 gateway, Size is wrong.
-	// For chunks created directly (tests), Size is the actual data length.
-	// Use shard sizes to compute the padded length, then trim to chunk.Size
-	// if it's smaller (actual data) or use padded length if chunk.Size is
-	// MaxChunkSize (allocation placeholder).
+	// EC decode.  The padded length implied by the shard sizes is
+	// authoritative (chunk.Size may be the MaxChunkSize allocation cap, which
+	// exceeds the true padded length); chunk.Size trims it when it is the
+	// smaller literal length.
 	paddedLen := 0
-	for i, s := range shards {
-		if present[i] && len(s) > paddedLen {
-			paddedLen = len(s)
+	for i, sh := range shards {
+		if present[i] && len(sh) > paddedLen {
+			paddedLen = len(sh)
 		}
 	}
 	paddedLen *= ec.DataShards // K * shardSize = padded original length
 	decodeLen := paddedLen
 	if chunk.Size > 0 && int64(chunk.Size) < int64(paddedLen) {
-		decodeLen = int(chunk.Size) // actual data length (tests set this correctly)
-	}
-
-	// Pad all present shards to the same size: reedsolomon.Reconstruct
-	// requires uniform shard sizes.  For range reads some shards may be
-	// partial, so we pad them to the maximum observed size.
-	// NOTE: Reed-Solomon requires all present shards to be the same
-	// length.  Full shard reads are always used (partial shard reads
-	// are infeasible with RS — each original byte depends on all K
-	// shards), so this padding is only reached if shards are
-	// inconsistently sized due to disk corruption.
-	if wantWindow {
-		maxShardLen := 0
-		for i, s := range shards {
-			if present[i] && len(s) > maxShardLen {
-				maxShardLen = len(s)
-			}
-		}
-		if maxShardLen > 0 {
-			for i := 0; i < totalShards; i++ {
-				if present[i] && len(shards[i]) < maxShardLen {
-					padded := make([]byte, maxShardLen)
-					copy(padded, shards[i])
-					shards[i] = padded
-				}
-			}
-		}
+		decodeLen = int(chunk.Size) // actual data length
 	}
 	fullData, err := encoder.Decode(shards, present, decodeLen)
 	if err != nil {
 		return nil, fmt.Errorf("chunkstore: ec decode chunk %d: %w", chunk.ID, err)
 	}
 
-	// Apply range slicing
+	// Apply range slicing.
 	if offset < 0 {
 		offset = 0
 	}
@@ -409,4 +350,207 @@ if chunk.ECStripeID != "" {
 		end = int64(decodeLen)
 	}
 	return fullData[offset:end], nil
+}
+
+// readECWindow serves the sub-range [offset, offset+length) of a V2.1 EC
+// chunk directly from the data shard(s) that own its bytes.
+//
+// The codec is systematic and contiguous (ec_encoder.Encode places original
+// byte p in data shard p/shardSize at in-shard offset p%shardSize, padded so
+// every shard is exactly shardSize bytes).  A window therefore overlaps only
+// the shards whose byte ranges intersect it — one shard for any window up to
+// shardSize.  When those shards are reachable, their window bytes ARE the
+// requested data: no decode, no parity, ~1× transport amplification.
+//
+// When an owning shard is unreachable, its window is reconstructed from
+// peers: Reed-Solomon is linear per in-shard byte position, so the missing
+// shard's window can be rebuilt from the same in-shard range fetched from any
+// K other shards (data or parity, all sliced to the same window length).  The
+// reconstruction is window-sized (K × window bytes), never shard-sized.
+func (s *DatanodeChunkStore) readECWindow(ctx context.Context, chunk *metadata.ChunkMeta, offset int64, length int32, literalSize int64) ([]byte, error) {
+	ec := chunk.ECGroup
+	k := ec.DataShards
+	totalShards := k + ec.ParityShards
+	encoder := GetECEncoder(k, ec.ParityShards)
+
+	// True per-shard size implied by the literal data length (the encoder
+	// padded to ceil(literal/K) per shard).
+	shardSize := (literalSize + int64(k) - 1) / int64(k)
+
+	end := offset + int64(length)
+	if end > literalSize {
+		end = literalSize
+	}
+	if end <= offset {
+		return []byte{}, nil
+	}
+
+	// Overlapping data shards and the local [start, end) window in each.
+	type window struct {
+		shard      int
+		start, end int32
+	}
+	var wins []window
+	for i := 0; i < k; i++ {
+		shardStart := shardSize * int64(i)
+		shardEnd := shardStart + shardSize
+		if shardEnd <= offset || shardStart >= end {
+			continue
+		}
+		ws := offset - shardStart
+		if ws < 0 {
+			ws = 0
+		}
+		we := end - shardStart
+		if we > shardSize {
+			we = shardSize
+		}
+		wins = append(wins, window{i, int32(ws), int32(we)})
+	}
+
+	byIndex := make(map[int]metadata.ReplicaInfo, len(chunk.Replicas))
+	for _, rep := range chunk.Replicas {
+		byIndex[rep.ShardIndex] = rep
+	}
+
+	// Phase 1: fetch each owning shard's window directly, in parallel.
+	got := make([][]byte, len(wins))
+	type windowResult struct {
+		idx  int
+		data []byte
+		err  error
+	}
+	resCh := make(chan windowResult, len(wins))
+	launched := 0
+	for wi, w := range wins {
+		rep, ok := byIndex[w.shard]
+		if !ok {
+			continue // no replica recorded — reconstructed in phase 2
+		}
+		launched++
+		go func(wi int, w window, r metadata.ReplicaInfo) {
+			data, err := s.readECShardRange(ctx, chunk, r, w.shard, w.start, w.end)
+			resCh <- windowResult{wi, data, err}
+		}(wi, w, rep)
+	}
+	missing := false
+	for i := 0; i < launched; i++ {
+		select {
+		case res := <-resCh:
+			if res.err == nil {
+				got[res.idx] = res.data
+			} else {
+				slog.Warn("chunkstore: ec window read failed", "chunkID", chunk.ID,
+					"shard", wins[res.idx].shard, "error", res.err)
+			}
+		case <-ctx.Done():
+			return nil, fmt.Errorf("chunkstore: ec window read context cancelled: %w", ctx.Err())
+		}
+	}
+	for _, d := range got {
+		if d == nil {
+			missing = true
+			break
+		}
+	}
+	if !missing {
+		var out []byte
+		for _, d := range got {
+			out = append(out, d...)
+		}
+		return out, nil
+	}
+
+	// Phase 2: reconstruct each missing owning shard's window from peers.
+	for wi, w := range wins {
+		if got[wi] != nil {
+			continue
+		}
+		winLen := w.end - w.start
+		if winLen <= 0 {
+			continue
+		}
+		var others []int
+		for i := 0; i < totalShards; i++ {
+			if i != w.shard {
+				others = append(others, i)
+			}
+		}
+		// Fetch the same local window from every other shard (data and
+		// parity) in parallel; the collector takes what arrives.
+		slices := make([][]byte, totalShards)
+		valid := 0
+		type peerResult struct {
+			idx  int
+			data []byte
+			err  error
+		}
+		peerCh := make(chan peerResult, len(others))
+		pl := 0
+		for _, oi := range others {
+			rep, ok := byIndex[oi]
+			if !ok {
+				continue
+			}
+			pl++
+			go func(oi int, r metadata.ReplicaInfo) {
+				data, err := s.readECShardRange(ctx, chunk, r, oi, w.start, w.end)
+				peerCh <- peerResult{oi, data, err}
+			}(oi, rep)
+		}
+		for i := 0; i < pl; i++ {
+			select {
+			case res := <-peerCh:
+				if res.err == nil && len(res.data) == int(winLen) {
+					slices[res.idx] = res.data
+					valid++
+				} else if res.err != nil {
+					slog.Warn("chunkstore: ec window peer read failed", "chunkID", chunk.ID,
+						"shard", res.idx, "error", res.err)
+				}
+			case <-ctx.Done():
+				return nil, fmt.Errorf("chunkstore: ec window reconstruct context cancelled: %w", ctx.Err())
+			}
+		}
+		if valid < k {
+			return nil, fmt.Errorf("chunkstore: ec window read: shard %d unavailable, only %d/%d peer windows available",
+				w.shard, valid, k)
+		}
+		// Reconstruct just the window: equal-length slices decode exactly
+		// like a full stripe of that size (no padding is fabricated — every
+		// slice is the shard's own bytes at that in-shard range).
+		if err := encoder.enc.Reconstruct(slices); err != nil {
+			return nil, fmt.Errorf("chunkstore: ec window reconstruct shard %d: %w", w.shard, err)
+		}
+		if len(slices[w.shard]) != int(winLen) {
+			return nil, fmt.Errorf("chunkstore: ec window reconstruct shard %d: bad length %d", w.shard, len(slices[w.shard]))
+		}
+		got[wi] = slices[w.shard]
+	}
+
+	var out []byte
+	for _, d := range got {
+		out = append(out, d...)
+	}
+	return out, nil
+}
+
+// readECShardRange fetches [start, end) of one EC shard extent from its owner.
+func (s *DatanodeChunkStore) readECShardRange(ctx context.Context, chunk *metadata.ChunkMeta, rep metadata.ReplicaInfo, shardIndex int, start, end int32) ([]byte, error) {
+	if rep.Addr == "" {
+		return nil, fmt.Errorf("empty addr for node %d", rep.NodeID)
+	}
+	client, err := s.pool.Get(rep.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("connect %s: %w", rep.Addr, err)
+	}
+	resp, err := client.ReadECShard(chunk.ID, shardIndex, int64(start), end-start)
+	s.pool.Put(rep.Addr, client)
+	if err != nil {
+		return nil, fmt.Errorf("read shard %d from %s: %w", shardIndex, rep.Addr, err)
+	}
+	if resp.Status != datanode.StatusOK {
+		return nil, fmt.Errorf("node %d status=%d: %s", rep.NodeID, resp.Status, resp.Error)
+	}
+	return resp.Data, nil
 }

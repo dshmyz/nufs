@@ -32,22 +32,46 @@ type v21Node struct {
 // datanode buildClusterN helper, replicated here so the gateway (chunkstore)
 // test can drive real servers without an import cycle.
 func buildV21GatewayCluster(t *testing.T, n, disksPerNode int) ([]*v21Node, *metadata.PebbleStore) {
+	nodes, pb, _ := buildV21GatewayClusterWith(t, n, disksPerNode, nil)
+	return nodes, pb
+}
+
+// buildV21GatewayClusterWith is buildV21GatewayCluster plus an optional store
+// wrapper applied to every data/shard store, so tests can observe or modify
+// the underlying I/O (e.g. count bytes served by Read).
+func buildV21GatewayClusterWith(t *testing.T, n, disksPerNode int, wrap func(s storage.Store) storage.Store) ([]*v21Node, *metadata.PebbleStore, []storage.Store) {
 	t.Helper()
 	var dataStoresAll, shardStoresAll []storage.Store
+	var all []storage.Store
 	for i := 0; i < n*disksPerNode; i++ {
 		d := t.TempDir()
-		ds, err := segment.New(segment.Config{Dir: d, UseMemIndex: true, StreamID: 1})
+		var ds, ss storage.Store
+		var err error
+		ds, err = segment.New(segment.Config{Dir: d, UseMemIndex: true, StreamID: 1})
 		if err != nil {
 			t.Fatalf("segment.New data %d: %v", i, err)
 		}
-		ss, err := segment.New(segment.Config{Dir: d, UseMemIndex: true, StreamID: 2})
+		ss, err = segment.New(segment.Config{Dir: d, UseMemIndex: true, StreamID: 2})
 		if err != nil {
 			t.Fatalf("segment.New shard %d: %v", i, err)
 		}
+		if wrap != nil {
+			ds = wrap(ds)
+			ss = wrap(ss)
+		}
 		dataStoresAll = append(dataStoresAll, ds)
 		shardStoresAll = append(shardStoresAll, ss)
-		t.Cleanup(func() { _ = ss.Close() })
-		t.Cleanup(func() { _ = ds.Close() })
+		all = append(all, ds, ss)
+		t.Cleanup(func() {
+			if c, ok := ss.(interface{ Close() error }); ok {
+				_ = c.Close()
+			}
+		})
+		t.Cleanup(func() {
+			if c, ok := ds.(interface{ Close() error }); ok {
+				_ = c.Close()
+			}
+		})
 	}
 	nodes := make([]*v21Node, n)
 	for i := 0; i < n; i++ {
@@ -75,7 +99,7 @@ func buildV21GatewayCluster(t *testing.T, n, disksPerNode int) ([]*v21Node, *met
 		t.Fatalf("NewPebbleStore: %v", err)
 	}
 	t.Cleanup(func() { _ = pb.Close() })
-	return nodes, pb
+	return nodes, pb, all
 }
 
 // v21Topology builds the cluster's real candidate disks: n nodes x disksPerNode,
