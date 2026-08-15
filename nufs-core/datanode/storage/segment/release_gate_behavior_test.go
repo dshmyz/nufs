@@ -190,10 +190,10 @@ func testGateConcurrentClose(t *testing.T) {
 func newGateStore(t *testing.T, dir string) *Store {
 	t.Helper()
 	s, err := New(Config{
-		Dir:              dir,
-		SegmentSize:      256 << 20,
-		UseMemIndex:      true,
-		FlushInterval:    time.Hour, // effectively never; crash seam is manual
+		Dir:               dir,
+		SegmentSize:       256 << 20,
+		UseMemIndex:       true,
+		FlushInterval:     time.Hour, // effectively never; crash seam is manual
 		disableAsyncApply: true,
 	})
 	if err != nil {

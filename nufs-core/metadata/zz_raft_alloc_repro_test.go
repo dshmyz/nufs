@@ -21,8 +21,8 @@ func TestReproRealRaftAllocateChunks(t *testing.T) {
 		BindAddr:           unusedRaftAddress(t),
 		RaftDir:            t.TempDir(),
 		Bootstrap:          true,
-		HeartbeatTimeout:   1 * time.Second,  // cmd/metad default
-		ElectionTimeout:    1 * time.Second,  // cmd/metad default
+		HeartbeatTimeout:   1 * time.Second, // cmd/metad default
+		ElectionTimeout:    1 * time.Second, // cmd/metad default
 		LeaderLeaseTimeout: 500 * time.Millisecond,
 		SnapshotThreshold:  8192,
 		SnapshotInterval:   2 * time.Minute,

@@ -63,12 +63,12 @@ func ScanSegmentRecords(path string, rd *Reader) ([]ScannedRecord, error) {
 		stored := data[firstFrame : firstFrame+totalStored]
 		if frameCount > 0 {
 			out = append(out, ScannedRecord{
-				ExtentID:   h.ExtentID,
-				Generation: h.Generation,
-				Offset:     off,
-				StoredLen:  h.StoredLen,
-				LogicalLen: h.LogicalLen,
-				Codec:      h.Codec,
+				ExtentID:    h.ExtentID,
+				Generation:  h.Generation,
+				Offset:      off,
+				StoredLen:   h.StoredLen,
+				LogicalLen:  h.LogicalLen,
+				Codec:       h.Codec,
 				StoredBytes: append([]byte(nil), stored...),
 				ReadPayload: func() ([]byte, error) { return append([]byte(nil), stored...), nil },
 			})

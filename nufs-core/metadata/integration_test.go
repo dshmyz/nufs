@@ -52,7 +52,7 @@ func TestIntegrationCluster(t *testing.T) {
 	// Test 1: Create bucket via leader
 	t.Run("CreateBucket", func(t *testing.T) {
 		err := leader.Store.CreateBucket(ctx, "test-bucket", PlacementPolicy{
-			ID:               "default",
+			ID:                "default",
 			ReplicationFactor: 2,
 		})
 		if err != nil {
@@ -214,7 +214,7 @@ func TestIntegrationHTTP(t *testing.T) {
 	// Test bucket operations via store
 	t.Run("BucketOps", func(t *testing.T) {
 		err := store.CreateBucket(ctx, "test-bucket", PlacementPolicy{
-			ID:               "default",
+			ID:                "default",
 			ReplicationFactor: 1,
 		})
 		if err != nil {

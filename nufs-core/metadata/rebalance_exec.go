@@ -9,10 +9,10 @@ import (
 
 // RebalanceExecutor executes chunk migration plans for decommission and rebalance.
 // It manages the full lifecycle:
-//   1. Plan migration (using RebalancePlanner)
-//   2. Push migration tasks to repair queue
-//   3. Wait for completion
-//   4. Update chunk metadata (remove source replica, add target replica)
+//  1. Plan migration (using RebalancePlanner)
+//  2. Push migration tasks to repair queue
+//  3. Wait for completion
+//  4. Update chunk metadata (remove source replica, add target replica)
 type RebalanceExecutor struct {
 	store MetadataService
 }
@@ -24,10 +24,10 @@ func NewRebalanceExecutor(store MetadataService) *RebalanceExecutor {
 
 // ExecuteDecommission migrates all chunks off a node and marks it offline.
 // Steps:
-//   1. List all chunks on the draining node
-//   2. Plan target nodes for each chunk
-//   3. Push repair tasks for each chunk migration
-//   4. After each chunk is repaired, update its replica set
+//  1. List all chunks on the draining node
+//  2. Plan target nodes for each chunk
+//  3. Push repair tasks for each chunk migration
+//  4. After each chunk is repaired, update its replica set
 func (e *RebalanceExecutor) ExecuteDecommission(ctx context.Context, nodeID NodeID) error {
 	slog.Info("rebalance: starting decommission", "node_id", nodeID)
 

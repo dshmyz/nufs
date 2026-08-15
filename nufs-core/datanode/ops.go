@@ -86,7 +86,6 @@ func NewOpsServerWithRepair(cfg Config, store OpsStore, meta OpsMetadata, repair
 		repair: repair,
 	}
 
-
 	// Cluster status
 	// Disk lifecycle management (HTTP endpoints)
 	mux.HandleFunc("/api/v1/disks", s.handleDisks)

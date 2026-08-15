@@ -34,9 +34,9 @@ type diskCompactStore interface {
 // generations leave dead bytes in sealed segments. It is a local,
 // per-disk transaction — no cross-node coordination.
 type CompressionWorker struct {
-	stores  []diskCompactStore
-	sched   *Scheduler
-	interval time.Duration
+	stores     []diskCompactStore
+	sched      *Scheduler
+	interval   time.Duration
 	maxPerTick int
 }
 

@@ -14,14 +14,14 @@ import (
 type S3Symlink struct {
 	fs.Inode
 
-	mfs    *S3FileSystem
-	dir    *S3Dir
-	Path   string
-	Target string
+	mfs     *S3FileSystem
+	dir     *S3Dir
+	Path    string
+	Target  string
 	InodeID uint64
 	Mode    os.FileMode
-	UID    uint32
-	GID    uint32
+	UID     uint32
+	GID     uint32
 }
 
 var (

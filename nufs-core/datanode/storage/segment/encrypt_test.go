@@ -62,7 +62,7 @@ func TestEncryptionRoundtrip(t *testing.T) {
 // unlike LocalKMS, which only works because the same in-memory key is reused.
 func TestEncryptionRoundtripFileKMS(t *testing.T) {
 	root := t.TempDir()
-	dir := filepath.Join(root, "seg")      // segment store data dir
+	dir := filepath.Join(root, "seg")     // segment store data dir
 	keyFile := filepath.Join(root, "kek") // KEK file (0600, created on first start)
 
 	// First "process": a FileKMS that generates + persists a DEK.

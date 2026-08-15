@@ -56,15 +56,15 @@ func (s PGState) String() string {
 // stored epoch and may consult both source and target while its
 // inventory partition is migrating.
 type PGMigration struct {
-	PGID     uint32 `json:"pg_id"`
-	SourceEpoch uint64 `json:"source_epoch"`
-	TargetEpoch uint64 `json:"target_epoch"`
-	CutoverSeq  uint64 `json:"cutover_sequence"`
-	SourceReplicas []NodeID `json:"source_replicas"`
-	TargetReplicas []NodeID `json:"target_replicas"`
-	InventoryPartition uint32 `json:"inventory_partition"`
-	MigrationCursor uint64 `json:"migration_cursor"`
-	State MigrationState `json:"state"`
+	PGID               uint32         `json:"pg_id"`
+	SourceEpoch        uint64         `json:"source_epoch"`
+	TargetEpoch        uint64         `json:"target_epoch"`
+	CutoverSeq         uint64         `json:"cutover_sequence"`
+	SourceReplicas     []NodeID       `json:"source_replicas"`
+	TargetReplicas     []NodeID       `json:"target_replicas"`
+	InventoryPartition uint32         `json:"inventory_partition"`
+	MigrationCursor    uint64         `json:"migration_cursor"`
+	State              MigrationState `json:"state"`
 }
 
 // MigrationState is the PG migration lifecycle.
@@ -172,14 +172,14 @@ func (s *PlacementGroupStore) Rebalance(pgID uint32, newReplicas []NodeID, cutov
 	}
 	// Persist the migration record for resumable progress.
 	mig := &PGMigration{
-		PGID:     pgID,
-		SourceEpoch: pg.PrevEpoch,
-		TargetEpoch: pg.Epoch,
-		CutoverSeq:  cutoverSeq,
-		SourceReplicas: pg.PrevReplicas,
-		TargetReplicas: newReplicas,
+		PGID:               pgID,
+		SourceEpoch:        pg.PrevEpoch,
+		TargetEpoch:        pg.Epoch,
+		CutoverSeq:         cutoverSeq,
+		SourceReplicas:     pg.PrevReplicas,
+		TargetReplicas:     newReplicas,
 		InventoryPartition: inventoryPartition,
-		State:     MigInProgress,
+		State:              MigInProgress,
 	}
 	if err := s.store.putMsgpack(migrationKey(pgID), mig); err != nil {
 		return nil, err

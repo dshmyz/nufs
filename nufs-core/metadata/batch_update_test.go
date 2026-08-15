@@ -113,10 +113,10 @@ func TestPebbleStore_BatchUpdateChunkStates_PartialFailure(t *testing.T) {
 
 	// Mix real and non-existent chunk IDs
 	states := map[ChunkID]ReplicaState{
-		chunk1.ID:        ReplicaReady,
-		ChunkID(999999):  ReplicaReady, // doesn't exist
-		chunk2.ID:        ReplicaReady,
-		ChunkID(888888):  ReplicaFailed, // doesn't exist
+		chunk1.ID:       ReplicaReady,
+		ChunkID(999999): ReplicaReady, // doesn't exist
+		chunk2.ID:       ReplicaReady,
+		ChunkID(888888): ReplicaFailed, // doesn't exist
 	}
 
 	if err := store.batchUpdateChunkStates(NodeID(1), states); err != nil {

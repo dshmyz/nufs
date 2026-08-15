@@ -203,7 +203,7 @@ func TestPebbleStore_BucketPolicy(t *testing.T) {
 
 	// Set policy
 	policy := BucketPolicy{
-		Owner:  "alice",
+		Owner: "alice",
 		Statements: []Statement{
 			{Effect: "allow", Principal: "bob", Permissions: []Permission{PermRead}, Resource: "mybucket"},
 		},

@@ -8,7 +8,7 @@ import (
 type circuitBreakerState int
 
 const (
-	stateClosed   circuitBreakerState = iota
+	stateClosed circuitBreakerState = iota
 	stateOpen
 	stateHalfOpen
 )

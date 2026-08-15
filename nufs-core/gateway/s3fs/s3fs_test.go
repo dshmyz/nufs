@@ -16,40 +16,40 @@ import (
 
 func TestParseTarget(t *testing.T) {
 	tests := []struct {
-		name      string
-		target    string
-		wantHost  string
+		name       string
+		target     string
+		wantHost   string
 		wantBucket string
-		wantBase  string
-		wantErr   bool
+		wantBase   string
+		wantErr    bool
 	}{
 		{
-			name:      "simple bucket",
-			target:    "https://s3.amazonaws.com/my-bucket",
-			wantHost:  "s3.amazonaws.com",
+			name:       "simple bucket",
+			target:     "https://s3.amazonaws.com/my-bucket",
+			wantHost:   "s3.amazonaws.com",
 			wantBucket: "my-bucket",
-			wantBase:  "",
+			wantBase:   "",
 		},
 		{
-			name:      "bucket with prefix",
-			target:    "https://s3.amazonaws.com/my-bucket/prefix",
-			wantHost:  "s3.amazonaws.com",
+			name:       "bucket with prefix",
+			target:     "https://s3.amazonaws.com/my-bucket/prefix",
+			wantHost:   "s3.amazonaws.com",
 			wantBucket: "my-bucket",
-			wantBase:  "prefix",
+			wantBase:   "prefix",
 		},
 		{
-			name:      "deep prefix",
-			target:    "https://s3.amazonaws.com/bucket/a/b/c",
-			wantHost:  "s3.amazonaws.com",
+			name:       "deep prefix",
+			target:     "https://s3.amazonaws.com/bucket/a/b/c",
+			wantHost:   "s3.amazonaws.com",
 			wantBucket: "bucket",
-			wantBase:  "a/b/c",
+			wantBase:   "a/b/c",
 		},
 		{
-			name:      "http scheme",
-			target:    "http://localhost:9000/mybucket",
-			wantHost:  "localhost:9000",
+			name:       "http scheme",
+			target:     "http://localhost:9000/mybucket",
+			wantHost:   "localhost:9000",
 			wantBucket: "mybucket",
-			wantBase:  "",
+			wantBase:   "",
 		},
 		{
 			name:    "no host",

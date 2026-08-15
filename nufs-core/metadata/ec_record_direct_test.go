@@ -33,6 +33,7 @@ func buildDirectChunk(t *testing.T, store *PebbleStore, cid ChunkID, nodes []Nod
 }
 
 func groupIDFor(cid ChunkID) string { return "ec-" + itoa(int(cid)) }
+
 // TestECRecordDirect_LiftsAllocatedChunkToEC verifies the write-path direct-EC
 // authority registers a directly-written chunk: it records a durably Complete
 // ECStripe (keyed by the chunk's allocation group ID) and atomically joins
@@ -155,7 +156,7 @@ func TestECRecordDirect_IdempotentComplete(t *testing.T) {
 	buildDirectChunk(t, store, cid, []NodeID{1, 2, 3, 1, 2, 3, 1, 2, 3})
 	plan := make([]ECShard, 0, 9)
 	for i := 0; i < 9; i++ {
-		plan = append(plan, ECShard{Index: i, NodeID: uint64([]int{1, 2, 3}[i%3]), DiskID: uint64([]int{1, 2, 3}[i%3]) * 1000 + uint64(i/3)})
+		plan = append(plan, ECShard{Index: i, NodeID: uint64([]int{1, 2, 3}[i%3]), DiskID: uint64([]int{1, 2, 3}[i%3])*1000 + uint64(i/3)})
 	}
 	if _, _, err := ec.RecordDirect(context.Background(), cid, plan, 7); err != nil {
 		t.Fatalf("first record: %v", err)

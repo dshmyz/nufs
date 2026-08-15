@@ -202,35 +202,35 @@ func DefaultConfig() Config {
 type RequestType uint8
 
 const (
-	ReqWriteChunk     RequestType = iota // Write chunk data
-	ReqReadChunk                         // Read chunk data
-	ReqDeleteChunk                       // Delete a chunk
-	ReqReplicateChunk                    // Replicate chunk from peer
-	ReqChunkInfo                         // Get chunk metadata
-	ReqListChunks                        // List local chunks
-	ReqHealth                            // Health check
-	ReqReplicateECShard                  // Replicate a single EC shard to a peer datanode
-	ReqReadECShard                       // Read a single EC shard from a peer datanode
+	ReqWriteChunk       RequestType = iota // Write chunk data
+	ReqReadChunk                           // Read chunk data
+	ReqDeleteChunk                         // Delete a chunk
+	ReqReplicateChunk                      // Replicate chunk from peer
+	ReqChunkInfo                           // Get chunk metadata
+	ReqListChunks                          // List local chunks
+	ReqHealth                              // Health check
+	ReqReplicateECShard                    // Replicate a single EC shard to a peer datanode
+	ReqReadECShard                         // Read a single EC shard from a peer datanode
 )
 
 // Header is the wire protocol header for all data node messages.
 // Wire format: [4-byte header_len][Header JSON][body]
 type Header struct {
-	Type      RequestType       `json:"type"`
-	ChunkID   metadata.ChunkID  `json:"chunk_id"`
-	Offset    int64             `json:"offset"`     // byte offset within chunk
-	Length    int32             `json:"length"`     // data length (0 = entire chunk)
-	Checksum  uint32            `json:"checksum"`   // CRC32C of body data
-	RequestID uint64            `json:"request_id"` // for request/response correlation
+	Type      RequestType      `json:"type"`
+	ChunkID   metadata.ChunkID `json:"chunk_id"`
+	Offset    int64            `json:"offset"`     // byte offset within chunk
+	Length    int32            `json:"length"`     // data length (0 = entire chunk)
+	Checksum  uint32           `json:"checksum"`   // CRC32C of body data
+	RequestID uint64           `json:"request_id"` // for request/response correlation
 	// Generation is the metadata-issued write generation (Metadata V2
 	// fencing). 0 = unspecified → the receiving datanode keeps its own local
 	// generation (legacy V1 behavior). Obsolete (idempotent) writes are fenced
 	// on receipt.
-	Generation uint64            `json:"generation,omitempty"`
+	Generation uint64 `json:"generation,omitempty"`
 	// ShardIndex is the EC shard index within a stripe, used for EC shard
 	// replication (ReqReplicateECShard). 0 = unspecified (whole-chunk op).
 	ShardIndex int               `json:"shard_index,omitempty"`
-	Extra     map[string]string `json:"extra,omitempty"`
+	Extra      map[string]string `json:"extra,omitempty"`
 }
 
 // Response is the standard response from a data node.

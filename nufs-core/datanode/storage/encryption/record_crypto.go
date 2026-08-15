@@ -38,9 +38,9 @@ const FrameHeaderSize = NonceSize + AEADOverhead
 // caches decrypted keys for the process lifetime, and maintains the
 // numeric-ID ↔ string-ID mapping stored in record headers.
 type KeyRegistry struct {
-	kms    crypto.KMS
-	mu     sync.RWMutex
-	cache  map[crypto.KeyID][]byte
+	kms   crypto.KMS
+	mu    sync.RWMutex
+	cache map[crypto.KeyID][]byte
 	// numericToID maps the numeric key ID stored in record headers to
 	// the string KeyID used by the KMS.
 	numericToID map[uint64]crypto.KeyID

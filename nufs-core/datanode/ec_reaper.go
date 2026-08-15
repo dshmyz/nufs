@@ -74,12 +74,12 @@ type ECOrphanResolver interface {
 // datanode. It runs a periodic sweep (Enumerate) so an operator can also drive
 // a single pass manually and assert on the result, or in tests.
 type ECSelfHealer struct {
-	v        *V2Store
-	resolver ECChunkResolver
-	landing  ECLandingResolver
-	orphan   ECOrphanResolver
+	v         *V2Store
+	resolver  ECChunkResolver
+	landing   ECLandingResolver
+	orphan    ECOrphanResolver
 	orphanAge time.Duration
-	interval time.Duration
+	interval  time.Duration
 
 	// peerDial makes repair cross-node (Program 13 / soak evidence): when set,
 	// a degraded stripe is repaired from the cluster-wide shard view — reading

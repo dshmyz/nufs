@@ -361,12 +361,12 @@ type nufsMountState struct {
 	// nil when no refresh is running (local mode or no credentials).
 	tokenRefreshCancel context.CancelFunc
 
-	server   *fuse.Server
-	fsys     *gofuse.DFSFileSystem
-	meta     metadata.MetadataService
+	server     *fuse.Server
+	fsys       *gofuse.DFSFileSystem
+	meta       metadata.MetadataService
 	chunkStore *chunkstore.DatanodeChunkStore
-	cache    *gofuse.ChunkCache
-	recorder gofuse.MetricsRecorder
+	cache      *gofuse.ChunkCache
+	recorder   gofuse.MetricsRecorder
 }
 
 // mount creates a new FUSE mount. Caller must hold mu.

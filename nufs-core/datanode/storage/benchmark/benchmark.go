@@ -28,21 +28,21 @@ const (
 	// TargetNVMEReadRate is the NVMe random small-read target.
 	TargetNVMEReadRate = 20000
 	// GroupCommitP99 / ExtentWriteP99 / RangeReadP99 targets (ms).
-	GroupCommitP99MS  = 10
-	ExtentWriteP99MS  = 30
-	RangeReadP99MS    = 20
+	GroupCommitP99MS = 10
+	ExtentWriteP99MS = 30
+	RangeReadP99MS   = 20
 )
 
 // Result is one benchmark measurement.
 type Result struct {
-	Name     string
-	Ops      int64
-	Bytes    int64
-	Elapsed  time.Duration
-	OpPerSec float64
+	Name        string
+	Ops         int64
+	Bytes       int64
+	Elapsed     time.Duration
+	OpPerSec    float64
 	BytesPerSec float64
-	P99MS    float64
-	Target   float64
+	P99MS       float64
+	Target      float64
 	// Pass is true if the target is met.
 	Pass bool
 }
@@ -112,15 +112,15 @@ func SmallWriteBenchmark(dir string, writers int, totalOps int, extentSize int) 
 	latMu.Unlock()
 	rate := float64(ops.Load()) / elapsed.Seconds()
 	res := Result{
-		Name:      "small-write",
-		Ops:       ops.Load(),
-		Bytes:     ops.Load() * int64(extentSize),
-		Elapsed:   elapsed,
-		OpPerSec:  rate,
+		Name:        "small-write",
+		Ops:         ops.Load(),
+		Bytes:       ops.Load() * int64(extentSize),
+		Elapsed:     elapsed,
+		OpPerSec:    rate,
 		BytesPerSec: float64(ops.Load()*int64(extentSize)) / elapsed.Seconds(),
-		P99MS:     p,
-		Target:    TargetSmallWriteRate,
-		Pass:      rate >= TargetSmallWriteRate && p <= GroupCommitP99MS,
+		P99MS:       p,
+		Target:      TargetSmallWriteRate,
+		Pass:        rate >= TargetSmallWriteRate && p <= GroupCommitP99MS,
 	}
 	return []Result{res}, nil
 }
@@ -175,15 +175,15 @@ func RandomReadBenchmark(dir string, readers int, totalOps int, populated int, e
 	latMu.Unlock()
 	rate := float64(ops.Load()) / elapsed.Seconds()
 	res := Result{
-		Name:      "random-read",
-		Ops:       ops.Load(),
-		Bytes:     ops.Load() * int64(extentSize),
-		Elapsed:   elapsed,
-		OpPerSec:  rate,
+		Name:        "random-read",
+		Ops:         ops.Load(),
+		Bytes:       ops.Load() * int64(extentSize),
+		Elapsed:     elapsed,
+		OpPerSec:    rate,
 		BytesPerSec: float64(ops.Load()*int64(extentSize)) / elapsed.Seconds(),
-		P99MS:     p,
-		Target:    TargetCachedReadRate,
-		Pass:      rate >= TargetCachedReadRate && p <= RangeReadP99MS,
+		P99MS:       p,
+		Target:      TargetCachedReadRate,
+		Pass:        rate >= TargetCachedReadRate && p <= RangeReadP99MS,
 	}
 	return []Result{res}, nil
 }

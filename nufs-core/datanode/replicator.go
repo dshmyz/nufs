@@ -54,9 +54,9 @@ type Replicator struct {
 	// Each addr has a stack of idle *Client connections; workers pop
 	// one off, use it, and push it back. If the stack is empty, a new
 	// connection is dialed.
-	pool        *connPool
-	poolDialCount  atomic.Int64 // total dials (for testing/diagnostics)
-	poolOpenConns  atomic.Int64 // currently open connections in pool
+	pool          *connPool
+	poolDialCount atomic.Int64 // total dials (for testing/diagnostics)
+	poolOpenConns atomic.Int64 // currently open connections in pool
 }
 
 // connPool maintains per-address idle connection stacks.

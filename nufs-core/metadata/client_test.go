@@ -495,11 +495,11 @@ func TestHTTPClientDoesNotReplayAllocationAfterServerOrTransportAmbiguity(t *tes
 func TestHTTPClientCreateNodeRoundTrip(t *testing.T) {
 	var gotPath string
 	var gotBody struct {
-		Parent InodeID `json:"parent"`
-		Name   string  `json:"name"`
+		Parent InodeID  `json:"parent"`
+		Name   string   `json:"name"`
 		Type   FileType `json:"type"`
-		Mode   uint32  `json:"mode"`
-		Rdev   uint32  `json:"rdev"`
+		Mode   uint32   `json:"mode"`
+		Rdev   uint32   `json:"rdev"`
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/namespace/create-node" {

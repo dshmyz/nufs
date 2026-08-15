@@ -18,7 +18,7 @@ import (
 // 0 means unlimited (the limiter is disabled).
 var (
 	backgroundBandwidthMu sync.RWMutex
-	backgroundLimiter    *rate.Limiter
+	backgroundLimiter     *rate.Limiter
 )
 
 // SetBackgroundBandwidthMBps sets the global bandwidth limit for all background

@@ -65,7 +65,7 @@ type RepairBatchTask struct {
 	// BatchID uniquely identifies the task.
 	BatchID uint64 `json:"batch_id"`
 	// PGID and epochs scope the task.
-	PGID       uint32 `json:"pg_id"`
+	PGID        uint32 `json:"pg_id"`
 	SourceEpoch uint64 `json:"source_epoch"`
 	TargetEpoch uint64 `json:"target_epoch"`
 	// InventoryPartition is the next partition to advance through

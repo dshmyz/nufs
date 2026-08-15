@@ -40,7 +40,7 @@ type idleEntry struct {
 type ClientPool struct {
 	mu          sync.Mutex
 	maxPerAddr  int
-	maxTotal    int           // total connection limit across all addresses
+	maxTotal    int // total connection limit across all addresses
 	idleTimeout time.Duration
 	dialTimeout time.Duration
 	tlsCfg      tlsutil.Config

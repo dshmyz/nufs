@@ -972,7 +972,6 @@ func TestPebbleStore_ConcurrentSameNameRmDir(t *testing.T) {
 	}
 }
 
-
 func TestPebbleStore_PerfWrite10K(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping perf test in short mode")

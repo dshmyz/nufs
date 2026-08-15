@@ -124,4 +124,3 @@ func (c *Compactor) Compact(srcID storage.SegmentID, records []ScannedRecord, is
 }
 
 var _ = index.Key // reserved
-

@@ -10,8 +10,8 @@ import (
 
 // DFSXAttr provides extended attribute support for S3 files/dirs.
 type DFSXAttr struct {
-	mfs    *S3FileSystem
-	inode  *CacheInode
+	mfs   *S3FileSystem
+	inode *CacheInode
 }
 
 // OpenXAttr returns an xattr handle for a file.
@@ -27,9 +27,9 @@ func (d *S3Dir) OpenXAttr() *DFSXAttr {
 }
 
 var (
-	_ fs.NodeGetxattrer  = (*DFSXAttr)(nil)
-	_ fs.NodeSetxattrer  = (*DFSXAttr)(nil)
-	_ fs.NodeListxattrer = (*DFSXAttr)(nil)
+	_ fs.NodeGetxattrer    = (*DFSXAttr)(nil)
+	_ fs.NodeSetxattrer    = (*DFSXAttr)(nil)
+	_ fs.NodeListxattrer   = (*DFSXAttr)(nil)
 	_ fs.NodeRemovexattrer = (*DFSXAttr)(nil)
 )
 

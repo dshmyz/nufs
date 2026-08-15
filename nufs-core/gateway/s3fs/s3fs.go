@@ -5,12 +5,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path"
 	"sync"
-	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -49,10 +49,10 @@ type S3FileSystem struct {
 	// Probed lazily and retried with a cooldown (see statfs.go); shares
 	// the S3 client's transport so --insecure TLS and proxy settings
 	// apply to the admin path too.
-	adm        *madmin.AdminClient
-	admMu      sync.Mutex
-	admOK      bool
-	admProbeAt time.Time
+	adm         *madmin.AdminClient
+	admMu       sync.Mutex
+	admOK       bool
+	admProbeAt  time.Time
 	statfsCache statfsUsage
 }
 
@@ -192,10 +192,10 @@ func (fsys *S3FileSystem) Serve(mountpoint string) error {
 
 	opts := &fs.Options{
 		MountOptions: fuse.MountOptions{
-			Name:        "s3fs",
-			FsName:      "s3fs",
-			AllowOther:  true,
-			SyncRead:    true, // Disable async read for remote storage
+			Name:       "s3fs",
+			FsName:     "s3fs",
+			AllowOther: true,
+			SyncRead:   true, // Disable async read for remote storage
 		},
 		EntryTimeout: &fsys.config.ScanTTL,
 		AttrTimeout:  &fsys.config.ScanTTL,

@@ -74,10 +74,10 @@ func TestFullStack_S3PutGetDatnode(t *testing.T) {
 	defer cs.Close()
 
 	gw := s3.NewGateway(s3.GatewayConfig{
-		MetaService:          leader.Store,
-		ChunkStore:           cs,
-		RejectEmptyReplicas:  true,
-		MaxObjectSize:        10 * 1024 * 1024,
+		MetaService:         leader.Store,
+		ChunkStore:          cs,
+		RejectEmptyReplicas: true,
+		MaxObjectSize:       10 * 1024 * 1024,
 	})
 	ts := httptest.NewServer(gw.Handler())
 	defer ts.Close()

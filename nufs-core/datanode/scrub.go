@@ -25,8 +25,8 @@ import (
 // This is the V2.1 replacement for the V1 AntiEntropy scanner.
 
 const (
-	scrubDefaultInterval  = 6 * time.Hour
-	scrubDefaultBatchSize = 100
+	scrubDefaultInterval   = 6 * time.Hour
+	scrubDefaultBatchSize  = 100
 	scrubDefaultBatchDelay = 10 * time.Millisecond
 )
 
@@ -222,7 +222,7 @@ func (s *ScrubWorker) appendScrubFinding(chunkID metadata.ChunkID) {
 		journal.EventScrubFinding,
 		storage.ExtentID(chunkID),
 		loc.gen,
-		0,       // no segment-level association
+		0, // no segment-level association
 		"crc_mismatch",
 	); err != nil {
 		slog.Error("scrub: failed to append journal event", "chunk_id", chunkID, "error", err)

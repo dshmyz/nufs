@@ -20,8 +20,8 @@ import (
 type transientErr struct{ msg string }
 
 func (e transientErr) Error() string   { return e.msg }
-func (e transientErr) Timeout() bool    { return true }
-func (e transientErr) Temporary() bool  { return true }
+func (e transientErr) Timeout() bool   { return true }
+func (e transientErr) Temporary() bool { return true }
 
 var _ net.Error = transientErr{}
 
@@ -37,8 +37,8 @@ func fastRetryCfg() retry.Config {
 // fastBreakerCfg 返回快速熔断配置。
 func fastBreakerCfg(onChange func(string, breaker.State, breaker.State)) breaker.Config {
 	return breaker.Config{
-		Threshold:    3,
-		Timeout:      100 * time.Millisecond,
+		Threshold:     3,
+		Timeout:       100 * time.Millisecond,
 		OnStateChange: onChange,
 	}
 }

@@ -12,14 +12,14 @@ import (
 // ============================================================
 
 type clusterStatsResponse struct {
-	Mode         string `json:"mode"`
-	Buckets      int    `json:"buckets"`
-	TotalCapacityGB int64 `json:"total_capacity_gb"`
-	UsedGB       int64  `json:"used_gb"`
-	FreeGB       int64  `json:"free_gb"`
-	UsagePct     float64 `json:"usage_pct"`
-	NodesOnline  int    `json:"nodes_online"`
-	NodesTotal   int    `json:"nodes_total"`
+	Mode            string  `json:"mode"`
+	Buckets         int     `json:"buckets"`
+	TotalCapacityGB int64   `json:"total_capacity_gb"`
+	UsedGB          int64   `json:"used_gb"`
+	FreeGB          int64   `json:"free_gb"`
+	UsagePct        float64 `json:"usage_pct"`
+	NodesOnline     int     `json:"nodes_online"`
+	NodesTotal      int     `json:"nodes_total"`
 }
 
 // handleClusterStats handles GET /admin/cluster/stats
@@ -63,14 +63,14 @@ func (gw *Gateway) handleClusterStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := clusterStatsResponse{
-		Mode:           "online",
-		Buckets:        len(buckets),
+		Mode:            "online",
+		Buckets:         len(buckets),
 		TotalCapacityGB: totalCap,
-		UsedGB:         usedCap,
-		FreeGB:         freeGB,
-		UsagePct:       pct,
-		NodesOnline:    online,
-		NodesTotal:     len(nodes),
+		UsedGB:          usedCap,
+		FreeGB:          freeGB,
+		UsagePct:        pct,
+		NodesOnline:     online,
+		NodesTotal:      len(nodes),
 	}
 
 	writeJSON(w, http.StatusOK, resp)

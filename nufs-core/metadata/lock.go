@@ -53,10 +53,10 @@ const (
 // from AdvisoryListLocks for diagnostics; not used internally for
 // coordination.
 type LockInfo struct {
-	Inode InodeID    `json:"inode"`
-	Owner string     `json:"owner"`
-	Mode  LockMode   `json:"mode"`
-	Since int64      `json:"since_unix_nano"`
+	Inode InodeID  `json:"inode"`
+	Owner string   `json:"owner"`
+	Mode  LockMode `json:"mode"`
+	Since int64    `json:"since_unix_nano"`
 }
 
 // lockHolder tracks a single (owner, mode) acquisition. The same

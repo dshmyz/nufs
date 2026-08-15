@@ -435,4 +435,3 @@ func TestECSelfHeal_RepairsDirectECWithCapSize(t *testing.T) {
 		t.Fatalf("post-repair checksum = %#x, want %#x", sum, want)
 	}
 }
-

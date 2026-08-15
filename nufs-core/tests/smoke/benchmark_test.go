@@ -33,12 +33,12 @@ func TestBenchmark_S3Workload(t *testing.T) {
 	}
 
 	const (
-		duration     = 60 * time.Second
-		workers      = 8
-		writeRatio   = 0.10 // 10% writes, 90% reads
-		minObjSize   = 4096
-		maxObjSize   = 256 * 1024
-		numObjects   = 200  // pre-seed object pool for reads
+		duration   = 60 * time.Second
+		workers    = 8
+		writeRatio = 0.10 // 10% writes, 90% reads
+		minObjSize = 4096
+		maxObjSize = 256 * 1024
+		numObjects = 200 // pre-seed object pool for reads
 	)
 
 	ctx := context.Background()
@@ -94,7 +94,7 @@ func TestBenchmark_S3Workload(t *testing.T) {
 	t.Logf("pre-seeding %d objects...", numObjects)
 	objectPool := make([]string, numObjects)
 	for i := 0; i < numObjects; i++ {
-		size := minObjSize + (i*173)%((maxObjSize - minObjSize))
+		size := minObjSize + (i*173)%(maxObjSize-minObjSize)
 		data := make([]byte, size)
 		rand.Read(data)
 		key := fmt.Sprintf("bench/obj-%04d", i)
@@ -184,7 +184,9 @@ func TestBenchmark_S3Workload(t *testing.T) {
 					if err != nil || resp.StatusCode != http.StatusOK {
 						totalErrors.Add(1)
 						putOps.Add(1)
-						if resp != nil { resp.Body.Close() }
+						if resp != nil {
+							resp.Body.Close()
+						}
 						continue
 					}
 					resp.Body.Close()
@@ -207,7 +209,9 @@ func TestBenchmark_S3Workload(t *testing.T) {
 					if err != nil || resp.StatusCode != http.StatusOK {
 						totalErrors.Add(1)
 						getOps.Add(1)
-						if resp != nil { resp.Body.Close() }
+						if resp != nil {
+							resp.Body.Close()
+						}
 						continue
 					}
 					body, _ := io.ReadAll(resp.Body)

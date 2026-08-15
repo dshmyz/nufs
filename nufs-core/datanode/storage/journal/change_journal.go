@@ -94,9 +94,9 @@ type ChangeJournal struct {
 	bytes int64
 
 	// Retention bounds.
-	MaxBytes       int64
-	RetainMinNs    int64
-	MaxPerHeartbeat int
+	MaxBytes          int64
+	RetainMinNs       int64
+	MaxPerHeartbeat   int
 	MaxHeartbeatBytes int
 }
 
@@ -115,11 +115,11 @@ func OpenChangeJournal(opts JournalOptions) (*ChangeJournal, error) {
 		return nil, err
 	}
 	j := &ChangeJournal{
-		dir:                opts.Dir,
-		MaxBytes:           opts.MaxBytes,
-		RetainMinNs:        opts.RetainMinDuration.Nanoseconds(),
-		MaxPerHeartbeat:    opts.MaxPerHeartbeat,
-		MaxHeartbeatBytes:  opts.MaxHeartbeatBytes,
+		dir:               opts.Dir,
+		MaxBytes:          opts.MaxBytes,
+		RetainMinNs:       opts.RetainMinDuration.Nanoseconds(),
+		MaxPerHeartbeat:   opts.MaxPerHeartbeat,
+		MaxHeartbeatBytes: opts.MaxHeartbeatBytes,
 	}
 	if j.MaxBytes == 0 {
 		j.MaxBytes = 8 << 30 // §16: journal_max_bytes 8GiB

@@ -1,8 +1,8 @@
 package metadata
 
 import (
-	"math/rand"
 	"fmt"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -130,12 +130,12 @@ func (p *PlacementEngine) RemoveNode(nodeID NodeID) {
 
 // NodeMetrics holds per-node runtime metrics tracked by the placement engine.
 type NodeMetrics struct {
-	NodeID      NodeID
-	ErrorRate   float64 // 0.0 - 1.0
-	LoadIndex   float64 // 0.0 - 1.0
-	CapacityGB  int64
-	UsedGB      int64
-	ChunkCount  int64
+	NodeID     NodeID
+	ErrorRate  float64 // 0.0 - 1.0
+	LoadIndex  float64 // 0.0 - 1.0
+	CapacityGB int64
+	UsedGB     int64
+	ChunkCount int64
 }
 
 // GetNodeMetrics returns runtime metrics for all known nodes.

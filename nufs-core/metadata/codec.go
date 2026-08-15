@@ -20,8 +20,8 @@ type codecFormat uint8
 
 const (
 	codecAuto    codecFormat = iota // Auto-detect on read
-	codecMsgpack                     // msgpack (hot path)
-	codecJSON                        // JSON (cold path / admin)
+	codecMsgpack                    // msgpack (hot path)
+	codecJSON                       // JSON (cold path / admin)
 )
 
 // marshalValue serializes v using the specified codec format.

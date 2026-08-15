@@ -59,7 +59,6 @@ func TestLoad_SustainedS3Ops(t *testing.T) {
 	}
 	defer metaStore.Close()
 
-
 	const numDatanodes = 3
 	addrs := make([]string, numDatanodes)
 	for i := 0; i < numDatanodes; i++ {
@@ -299,7 +298,6 @@ func maxUint64(vals []uint64) uint64 {
 	}
 	return max
 }
-
 
 func parseDurationEnv(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {

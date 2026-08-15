@@ -9,9 +9,9 @@ import (
 )
 
 const (
-	ecDataShards  = 6
+	ecDataShards   = 6
 	ecParityShards = 3
-	ecTotalShards = ecDataShards + ecParityShards
+	ecTotalShards  = ecDataShards + ecParityShards
 )
 
 // BenchmarkECStripeSizeCompare measures EC decode latency and memory for

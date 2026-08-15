@@ -258,7 +258,6 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 		}
 	}
 
-
 	var (
 		newChunkRefs             []metadata.ChunkRef
 		allAllocatedChunkRefs    []metadata.ChunkRef
@@ -269,22 +268,22 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 
 	// Batch allocation: skip if CreateObjectWithChunks already allocated
 	// (new object path), otherwise allocate for overwrite.
-	
-		if numChunks, useBatch := batchAllocationChunkCount(contentLength); useBatch {
-			offsets := make([]int64, numChunks)
-			for i := 0; i < numChunks; i++ {
-				offsets[i] = int64(i) * metadata.MaxChunkSize
-			}
 
-			preAllocChunks, err := c.writer.AllocateRanges(ctx, inode.ID, b.Policy, offsets)
-			tAllocate = time.Now()
-			if err != nil {
-				primaryErr := fmt.Errorf("%w: failed to batch allocate chunks: %v", ErrObjectMetadataFailed, err)
-				return PutObjectResult{}, c.compensateFailedWrite(
-					ctx, attemptID, req, inode, b.RootInode, newObject, oldInodeSnapshot, allAllocatedChunkRefs, primaryErr,
-				)
-			}
-			tAllocate = time.Now()
+	if numChunks, useBatch := batchAllocationChunkCount(contentLength); useBatch {
+		offsets := make([]int64, numChunks)
+		for i := 0; i < numChunks; i++ {
+			offsets[i] = int64(i) * metadata.MaxChunkSize
+		}
+
+		preAllocChunks, err := c.writer.AllocateRanges(ctx, inode.ID, b.Policy, offsets)
+		tAllocate = time.Now()
+		if err != nil {
+			primaryErr := fmt.Errorf("%w: failed to batch allocate chunks: %v", ErrObjectMetadataFailed, err)
+			return PutObjectResult{}, c.compensateFailedWrite(
+				ctx, attemptID, req, inode, b.RootInode, newObject, oldInodeSnapshot, allAllocatedChunkRefs, primaryErr,
+			)
+		}
+		tAllocate = time.Now()
 		for i, chunk := range preAllocChunks {
 			allAllocatedChunkRefs = append(allAllocatedChunkRefs, metadata.ChunkRef{
 				ID:      chunk.ID,

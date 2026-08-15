@@ -61,10 +61,10 @@ func TestECService_ServingPath_ConvertThenRead(t *testing.T) {
 		t.Fatalf("convert code=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
 	var resp struct {
-		StripeID        string `json:"stripe_id"`
-		State           string `json:"state"`
+		StripeID         string `json:"stripe_id"`
+		State            string `json:"state"`
 		OriginalChecksum uint32 `json:"original_checksum"`
-		Shards          int    `json:"shards"`
+		Shards           int    `json:"shards"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal convert resp: %v", err)

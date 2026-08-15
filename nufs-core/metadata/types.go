@@ -20,10 +20,10 @@ const (
 	// socket nodes are identity-only stubs), so only their type bit and Rdev
 	// are material. Appended after FileSymlink so byte values stay backward
 	// compatible with existing on-disk InodeMeta rows.
-	FileFIFO       // Named pipe (FIFO)
-	FileCharDevice // Character device
+	FileFIFO        // Named pipe (FIFO)
+	FileCharDevice  // Character device
 	FileBlockDevice // Block device
-	FileSocket     // Unix-domain socket
+	FileSocket      // Unix-domain socket
 )
 
 // InodeID is a unique identifier for an inode in the namespace tree.
@@ -320,8 +320,8 @@ type NodeInfo struct {
 	// including superseded (not-yet-compacted) record generations. Distinct
 	// from UsedGB (logical live bytes): both are persisted from the heartbeat
 	// so consoles can show honest logical-vs-physical divergence.
-	OnDiskGB  int64       `json:"on_disk_gb,omitempty"`
-	ChunkCount int64      `json:"chunk_count"`
+	OnDiskGB   int64 `json:"on_disk_gb,omitempty"`
+	ChunkCount int64 `json:"chunk_count"`
 
 	// Byte-accurate counterparts persisted from the heartbeat. UsedBytes is
 	// the logical live footprint; OnDiskBytes the physical on-disk footprint
@@ -330,11 +330,11 @@ type NodeInfo struct {
 	// admin console render honest logical-vs-physical side by side at any
 	// scale — the GB fields round sub-GB movements to 0. Omitempty keeps
 	// legacy/registered-only nodes (no heartbeat yet) zero-valued.
-	UsedBytes     int64 `json:"used_bytes,omitempty"`
-	OnDiskBytes   int64 `json:"on_disk_bytes,omitempty"`
-	CapacityBytes int64 `json:"capacity_bytes,omitempty"`
-	State      NodeState   `json:"state"`
-	LastSeen   int64       `json:"last_seen"`
+	UsedBytes     int64     `json:"used_bytes,omitempty"`
+	OnDiskBytes   int64     `json:"on_disk_bytes,omitempty"`
+	CapacityBytes int64     `json:"capacity_bytes,omitempty"`
+	State         NodeState `json:"state"`
+	LastSeen      int64     `json:"last_seen"`
 
 	// ChangeAck is the highest change-journal sequence the metadata authority
 	// has reconciled for this node (persisted, monotonic). The node polls it
@@ -383,7 +383,7 @@ func (s NodeState) String() string {
 
 // NodeReport is sent by data nodes during heartbeat.
 type NodeReport struct {
-	UsedGB         int64                    `json:"used_gb"`
+	UsedGB int64 `json:"used_gb"`
 	// UsedBytes is the node's logical live bytes (exact; supersedes the
 	// GB-rounded UsedGB for byte-accurate admin rendering). Metadata persists
 	// it into NodeInfo.UsedBytes.

@@ -150,7 +150,7 @@ func TestRecoverStreaming_TruncatesTornRecordAndCommitTails(t *testing.T) {
 		"header":  tornRecordBytes(t, 0),
 		"payload": tornRecordBytes(t, RecordHeaderSize),
 		"trailer": tornRecordBytes(t, RecordHeaderSize+FrameIndexEntrySize+1),
-		"commit":  []byte{'B', 'C', 'O', 'M'},
+		"commit":  {'B', 'C', 'O', 'M'},
 	} {
 		t.Run(name, func(t *testing.T) {
 			path, _, committedEnd := writeRecoveryFixture(t, 0, 1, nil)

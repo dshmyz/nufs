@@ -37,23 +37,23 @@ type config struct {
 }
 
 type result struct {
-	Duration      string        `json:"duration"`
-	Workers       int           `json:"workers"`
-	ObjSize       int           `json:"obj_size_bytes"`
-	WriteRatio    float64       `json:"write_ratio"`
-	TotalOps      int64         `json:"total_ops"`
-	PutOps        int64         `json:"put_ops"`
-	GetOps        int64         `json:"get_ops"`
-	Errors        int64         `json:"errors"`
-	ErrorRate     float64       `json:"error_rate_pct"`
-	ThroughputMBs float64       `json:"throughput_mbps"`
-	IOPS          float64       `json:"iops"`
-	LatP50        string        `json:"latency_p50"`
-	LatP90        string        `json:"latency_p90"`
-	LatP95        string        `json:"latency_p95"`
-	LatP99        string        `json:"latency_p99"`
-	LatP999       string        `json:"latency_p999"`
-	Goroutines    int           `json:"goroutines_delta"`
+	Duration      string  `json:"duration"`
+	Workers       int     `json:"workers"`
+	ObjSize       int     `json:"obj_size_bytes"`
+	WriteRatio    float64 `json:"write_ratio"`
+	TotalOps      int64   `json:"total_ops"`
+	PutOps        int64   `json:"put_ops"`
+	GetOps        int64   `json:"get_ops"`
+	Errors        int64   `json:"errors"`
+	ErrorRate     float64 `json:"error_rate_pct"`
+	ThroughputMBs float64 `json:"throughput_mbps"`
+	IOPS          float64 `json:"iops"`
+	LatP50        string  `json:"latency_p50"`
+	LatP90        string  `json:"latency_p90"`
+	LatP95        string  `json:"latency_p95"`
+	LatP99        string  `json:"latency_p99"`
+	LatP999       string  `json:"latency_p999"`
+	Goroutines    int     `json:"goroutines_delta"`
 }
 
 func main() {

@@ -20,7 +20,7 @@ type CapacityGuard struct {
 	WarnFreePct float64
 
 	// Stats hook, injected by the store so the guard stays testable.
-	FreeBytes func() int64
+	FreeBytes  func() int64
 	TotalBytes func() int64
 	// WriteRate returns bytes/sec of recent allocation (for time_to_full).
 	WriteRate func() float64

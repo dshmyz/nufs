@@ -393,7 +393,6 @@ func TestChunkIDGenerator_BumpAbove(t *testing.T) {
 	}
 }
 
-
 func makeTestNodeWithMachine(id NodeID, rack, zone, machineID string, capGB, usedGB int64, state NodeState) *NodeInfo {
 	n := makeTestNode(id, rack, zone, TierHot, capGB, usedGB, state)
 	n.MachineID = machineID

@@ -108,7 +108,7 @@ func TestHeartbeat_ShipsChangeJournalEventsAndAcks(t *testing.T) {
 // emptyHeartbeatStore satisfies HeartbeatStore with no chunks.
 type emptyHeartbeatStore struct{}
 
-func (e *emptyHeartbeatStore) Stats() (int64, int64)     { return 0, 0 }
+func (e *emptyHeartbeatStore) Stats() (int64, int64) { return 0, 0 }
 func (e *emptyHeartbeatStore) ChunkStateSnapshot() map[metadata.ChunkID]metadata.ReplicaState {
 	return map[metadata.ChunkID]metadata.ReplicaState{}
 }

@@ -23,10 +23,10 @@ var (
 // Info returns a structured snapshot of all version fields.
 func Info() map[string]string {
 	return map[string]string{
-		"version":    Version,
-		"gitCommit":  GitCommit,
-		"buildTime":  BuildTime,
-		"goVersion":  runtime.Version(),
-		"platform":   runtime.GOOS + "/" + runtime.GOARCH,
+		"version":   Version,
+		"gitCommit": GitCommit,
+		"buildTime": BuildTime,
+		"goVersion": runtime.Version(),
+		"platform":  runtime.GOOS + "/" + runtime.GOARCH,
 	}
 }

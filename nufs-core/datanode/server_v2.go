@@ -1830,7 +1830,6 @@ func (v *V2Store) QuiesceWrites(ctx context.Context) (func(), error) {
 	}
 }
 
-
 // ReadWriteBytes returns the cumulative bytes read and written on the
 // serving path since startup, across all disks. The heartbeat samples
 // these to compute a live DiskIO utilization — something the legacy

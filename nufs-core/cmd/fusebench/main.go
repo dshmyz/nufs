@@ -23,15 +23,15 @@ import (
 )
 
 type config struct {
-	dir        string
-	duration   time.Duration
-	workers    int
-	blockSize  int
-	fileSize   int
-	numFiles   int
-	jsonOut    bool
-	randSeed   int64
-	directIO   bool
+	dir       string
+	duration  time.Duration
+	workers   int
+	blockSize int
+	fileSize  int
+	numFiles  int
+	jsonOut   bool
+	randSeed  int64
+	directIO  bool
 }
 
 type result struct {

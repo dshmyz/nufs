@@ -126,20 +126,20 @@ const ManifestVersion = 1
 // Active segments are not in the manifest; their safe offsets live in
 // the checkpoint (§7.3).
 type SegmentRecord struct {
-	ID        storage.SegmentID
-	Class     storage.SegmentClass
-	Path      string // relative path under segments/
-	SizeBytes int64
-	SealedAt  int64
+	ID          storage.SegmentID
+	Class       storage.SegmentClass
+	Path        string // relative path under segments/
+	SizeBytes   int64
+	SealedAt    int64
 	RecordCount uint64
 }
 
 // Manifest is an immutable, complete snapshot of all sealed segments on
 // a disk at a point in time.
 type Manifest struct {
-	Version    uint8 // ManifestVersion
-	Generation uint64
-	Segments   []SegmentRecord
+	Version        uint8 // ManifestVersion
+	Generation     uint64
+	Segments       []SegmentRecord
 	PrevGeneration uint64 // 0 if none
 }
 

@@ -44,7 +44,7 @@ func NewAllocator(segmentID storage.SegmentID, class storage.SegmentClass, maxSe
 		maxSegmentBytes = storage.DefaultDataSegmentSize
 	}
 	return &Allocator{
-		segmentID:       segmentID,
+		segmentID: segmentID,
 		// Records start right after the segment header. The footer is
 		// appended at seal time, not pre-reserved (V2.1 §7.2).
 		offset:          int64(storage.SegmentHeaderSize),
@@ -154,16 +154,16 @@ func (a *Allocator) State() AllocatorState {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return AllocatorState{
-		SegmentID:      a.segmentID,
-		NextOffset:     a.offset,
-		PayloadBytes:   a.payloadBytes,
-		RecordCount:    a.recordCount,
-		MinExtent:      a.minExtent,
-		MaxExtent:      a.maxExtent,
-		HasRecord:      a.hasRecord,
-		CreatedAt:      a.createdAt,
-		Class:          a.class,
-		LastCommitSeq:  a.lastCommitSeq,
+		SegmentID:     a.segmentID,
+		NextOffset:    a.offset,
+		PayloadBytes:  a.payloadBytes,
+		RecordCount:   a.recordCount,
+		MinExtent:     a.minExtent,
+		MaxExtent:     a.maxExtent,
+		HasRecord:     a.hasRecord,
+		CreatedAt:     a.createdAt,
+		Class:         a.class,
+		LastCommitSeq: a.lastCommitSeq,
 	}
 }
 

@@ -19,9 +19,9 @@ func TestSmallFile_IsSmallFile(t *testing.T) {
 	}{
 		{0, true},
 		{1, true},
-		{64 * 1024, true},       // exactly 64KB
-		{64*1024 + 1, false},    // just over 64KB
-		{1024 * 1024, false},    // 1MB
+		{64 * 1024, true},         // exactly 64KB
+		{64*1024 + 1, false},      // just over 64KB
+		{1024 * 1024, false},      // 1MB
 		{64 * 1024 * 1024, false}, // 64MB
 	}
 	for _, tt := range tests {
@@ -66,13 +66,13 @@ func TestSmallFileBlock_AddAndFind(t *testing.T) {
 
 func TestSmallFileBlock_MaxFiles(t *testing.T) {
 	block := &SmallFileBlockMeta{
-		BlockID:   1,
-		Sealed:    false,
+		BlockID: 1,
+		Sealed:  false,
 	}
 
 	// Fill up to max
 	for i := 0; i < MaxSmallFilesPerBlock; i++ {
-		name := string(rune('a' + i%26)) + string(rune('0'+i/26))
+		name := string(rune('a'+i%26)) + string(rune('0'+i/26))
 		ok := block.AddSmallFile(name, uint32(i*100), 100, 0)
 		if !ok {
 			t.Fatalf("AddSmallFile failed at index %d (max=%d)", i, MaxSmallFilesPerBlock)

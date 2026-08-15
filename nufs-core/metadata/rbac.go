@@ -111,7 +111,7 @@ func stmtMatches(stmt Statement, principal Principal, perm Permission) bool {
 
 // AccessController manages bucket policies and performs authorization checks.
 type AccessController struct {
-	mu      sync.RWMutex
+	mu       sync.RWMutex
 	policies map[string]*BucketPolicy // bucket -> policy
 }
 

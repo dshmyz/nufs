@@ -94,7 +94,7 @@ func TestChunkIDNoReuseAfterStoreReopen(t *testing.T) {
 	// 60s ahead of now, on this same node (node=1, seq=0) — the exact tuple a
 	// naive fresh generator would re-issue the moment the wall clock catches up.
 	futureMS := uint64(time.Now().UnixMilli()+60000) & 0x1FFFFFFFFFF
-	floorID := ChunkID(futureMS<<23 | (uint64(1) & 0x3FF) << 13)
+	floorID := ChunkID(futureMS<<23 | (uint64(1)&0x3FF)<<13)
 	if err := firstStore.putMsgpack(chunkMetadataKey(floorID), &ChunkMeta{ID: floorID, Size: 1}); err != nil {
 		firstStore.Close()
 		t.Fatalf("seed future floor: %v", err)

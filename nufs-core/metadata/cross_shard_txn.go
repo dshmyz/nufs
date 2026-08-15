@@ -96,16 +96,16 @@ func (s *CrossShardTxnStore) Put(txn *CrossShardRename) error {
 // source/target identity; nothing is moved yet.
 func (s *CrossShardTxnStore) Begin(txnID uint64, srcShard, tgtShard uint32, srcDir InodeID, srcName string, tgtDir InodeID, tgtName string, child InodeID) (*CrossShardRename, error) {
 	txn := &CrossShardRename{
-		TxnID:        txnID,
-		State:        TxnPreparing,
-		SourceShard:  srcShard,
-		TargetShard:  tgtShard,
-		SourceDir:    srcDir,
-		SourceName:   srcName,
-		TargetDir:    tgtDir,
-		TargetName:   tgtName,
-		ChildInode:   child,
-		Prepared:     false,
+		TxnID:          txnID,
+		State:          TxnPreparing,
+		SourceShard:    srcShard,
+		TargetShard:    tgtShard,
+		SourceDir:      srcDir,
+		SourceName:     srcName,
+		TargetDir:      tgtDir,
+		TargetName:     tgtName,
+		ChildInode:     child,
+		Prepared:       false,
 		CommitDecision: false,
 	}
 	if err := s.Put(txn); err != nil {

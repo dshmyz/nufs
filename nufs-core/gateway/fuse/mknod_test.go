@@ -40,7 +40,7 @@ func TestInodeMetaToAttr_SpecialNodes(t *testing.T) {
 		rdev  uint32
 	}{
 		{metadata.FileFIFO, fuse.S_IFIFO, 0},
-		{metadata.FileCharDevice, syscall.S_IFCHR, 0x0103}, // mknod c 1 3
+		{metadata.FileCharDevice, syscall.S_IFCHR, 0x0103},  // mknod c 1 3
 		{metadata.FileBlockDevice, syscall.S_IFBLK, 0x0801}, // mknod b 8 1
 		{metadata.FileSocket, syscall.S_IFSOCK, 0},
 	}

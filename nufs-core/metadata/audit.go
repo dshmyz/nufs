@@ -16,35 +16,35 @@ import (
 type AuditAction string
 
 const (
-	AuditCreateBucket   AuditAction = "create_bucket"
-	AuditDeleteBucket   AuditAction = "delete_bucket"
-	AuditCreateFile     AuditAction = "create_file"
-	AuditUnlink         AuditAction = "unlink"
-	AuditMkDir          AuditAction = "mkdir"
-	AuditRmDir          AuditAction = "rmdir"
-	AuditRename         AuditAction = "rename"
-	AuditWriteChunk     AuditAction = "write_chunk"
-	AuditDeleteChunk    AuditAction = "delete_chunk"
-	AuditSealChunk      AuditAction = "seal_chunk"
-	AuditRegisterNode   AuditAction = "register_node"
-	AuditDecommission   AuditAction = "decommission_node"
-	AuditTriggerRepair  AuditAction = "trigger_repair"
+	AuditCreateBucket     AuditAction = "create_bucket"
+	AuditDeleteBucket     AuditAction = "delete_bucket"
+	AuditCreateFile       AuditAction = "create_file"
+	AuditUnlink           AuditAction = "unlink"
+	AuditMkDir            AuditAction = "mkdir"
+	AuditRmDir            AuditAction = "rmdir"
+	AuditRename           AuditAction = "rename"
+	AuditWriteChunk       AuditAction = "write_chunk"
+	AuditDeleteChunk      AuditAction = "delete_chunk"
+	AuditSealChunk        AuditAction = "seal_chunk"
+	AuditRegisterNode     AuditAction = "register_node"
+	AuditDecommission     AuditAction = "decommission_node"
+	AuditTriggerRepair    AuditAction = "trigger_repair"
 	AuditTriggerRebalance AuditAction = "trigger_rebalance"
-	AuditMigrateReplica AuditAction = "migrate_replica"
-	AuditSetPolicy      AuditAction = "set_policy"
-	AuditSetQuota       AuditAction = "set_quota"
-	AuditScrub          AuditAction = "scrub"
-	AuditGC             AuditAction = "gc"
+	AuditMigrateReplica   AuditAction = "migrate_replica"
+	AuditSetPolicy        AuditAction = "set_policy"
+	AuditSetQuota         AuditAction = "set_quota"
+	AuditScrub            AuditAction = "scrub"
+	AuditGC               AuditAction = "gc"
 )
 
 // AuditRecord is a single audit log entry.
 type AuditRecord struct {
 	ID        string      `json:"id"`
-	Timestamp int64       `json:"ts"`           // Unix nanoseconds
+	Timestamp int64       `json:"ts"` // Unix nanoseconds
 	Action    AuditAction `json:"action"`
-	Actor     string      `json:"actor"`        // Who performed the action (access key / node ID)
-	Resource  string      `json:"resource"`     // What was acted upon (bucket / inode / chunk)
-	Result    string      `json:"result"`       // "ok" or "error"
+	Actor     string      `json:"actor"`    // Who performed the action (access key / node ID)
+	Resource  string      `json:"resource"` // What was acted upon (bucket / inode / chunk)
+	Result    string      `json:"result"`   // "ok" or "error"
 	Error     string      `json:"error,omitempty"`
 	Details   any         `json:"details,omitempty"` // Arbitrary structured details
 	RequestID string      `json:"request_id,omitempty"`
@@ -66,7 +66,7 @@ type AuditLogger struct {
 
 // AuditConfig controls audit logger behaviour.
 type AuditConfig struct {
-	BufferSize   int           // Ring buffer capacity (default: 4096)
+	BufferSize    int           // Ring buffer capacity (default: 4096)
 	FlushInterval time.Duration // How often to flush to Pebble (default: 5s)
 }
 

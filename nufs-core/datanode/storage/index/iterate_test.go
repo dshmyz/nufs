@@ -48,7 +48,10 @@ func TestIterateLatestGeneration(t *testing.T) {
 		t.Fatalf("ApplyBatch: %v", err)
 	}
 
-	got := map[storage.ExtentID]struct{ gen storage.Generation; sz uint32 }{}
+	got := map[storage.ExtentID]struct {
+		gen storage.Generation
+		sz  uint32
+	}{}
 	if err := ix.Iterate(func(id storage.ExtentID, gen storage.Generation, v Value) error {
 		got[id] = struct {
 			gen storage.Generation

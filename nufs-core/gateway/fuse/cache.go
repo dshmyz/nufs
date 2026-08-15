@@ -34,8 +34,8 @@ type chunkSliceKey struct {
 // 所有 LRU 操作由 mu 保护：并发 Read (f.mu.RLock) 可同时调用 Get/Add，
 // 而 RemoveChunk（元数据失效循环）也会并发 Delete —— lru.Cache 本身不是线程安全的。
 type ChunkCache struct {
-	mu     sync.Mutex
-	memory *lru.Cache
+	mu       sync.Mutex
+	memory   *lru.Cache
 	diskDir  string
 	stats    cacheStats
 	recorder MetricsRecorder // 方案1.4 起统一走 recorder；stats 保留兼容旧 HitRate()

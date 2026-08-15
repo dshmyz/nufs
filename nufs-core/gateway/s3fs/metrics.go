@@ -72,7 +72,7 @@ type Metrics struct {
 	OpsFlush                               uint64
 
 	S3Get, S3Put, S3Copy, S3Remove, S3List uint64
-	S3Errors, S3Retries                     uint64
+	S3Errors, S3Retries                    uint64
 
 	ActiveHandles uint64
 
@@ -167,7 +167,10 @@ func prometheusHandler() http.HandlerFunc {
 			atomic.LoadUint64(&globalMetrics.ActiveHandles))
 
 		fmt.Fprintf(&sb, "# TYPE s3fs_ops_total counter\n")
-		for _, o := range []struct{ n string; v *uint64 }{
+		for _, o := range []struct {
+			n string
+			v *uint64
+		}{
 			{"open", &globalMetrics.OpsOpen}, {"read", &globalMetrics.OpsRead},
 			{"write", &globalMetrics.OpsWrite}, {"release", &globalMetrics.OpsRelease},
 			{"lookup", &globalMetrics.OpsLookup}, {"readdir", &globalMetrics.OpsReadDir},
@@ -180,7 +183,10 @@ func prometheusHandler() http.HandlerFunc {
 		sb.WriteString("\n")
 
 		fmt.Fprintf(&sb, "# TYPE s3fs_s3_ops_total counter\n")
-		for _, o := range []struct{ n string; v *uint64 }{
+		for _, o := range []struct {
+			n string
+			v *uint64
+		}{
 			{"get", &globalMetrics.S3Get}, {"put", &globalMetrics.S3Put},
 			{"copy", &globalMetrics.S3Copy}, {"remove", &globalMetrics.S3Remove},
 			{"list", &globalMetrics.S3List}, {"errors", &globalMetrics.S3Errors},

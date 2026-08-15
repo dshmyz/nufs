@@ -12,8 +12,8 @@ import (
 // CrossZoneTransferer implements metadata.DataTransferer for cross-zone replication.
 // It reuses the existing Replicator to transfer chunk data between datanodes.
 type CrossZoneTransferer struct {
-	localAddr   string
-	replicator  *Replicator
+	localAddr  string
+	replicator *Replicator
 }
 
 // NewCrossZoneTransferer creates a new CrossZoneTransferer.

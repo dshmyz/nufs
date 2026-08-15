@@ -35,10 +35,10 @@ type capacityAlertEvent struct {
 // derives it from the DiskManager; V2.1 derives it by summing each disk's
 // UsedBytes and detecting each disk dir's filesystem total via Statfs.
 type capacityOverview struct {
-	UsedBytes  int64   `json:"used_bytes"`
-	OnDiskBytes int64  `json:"on_disk_bytes,omitempty"`
-	TotalBytes int64   `json:"total_bytes"`
-	UsagePct   float64 `json:"usage_pct"`
+	UsedBytes   int64   `json:"used_bytes"`
+	OnDiskBytes int64   `json:"on_disk_bytes,omitempty"`
+	TotalBytes  int64   `json:"total_bytes"`
+	UsagePct    float64 `json:"usage_pct"`
 }
 
 // embed the single-page admin UI.

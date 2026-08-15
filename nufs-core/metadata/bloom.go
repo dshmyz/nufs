@@ -24,7 +24,7 @@ func NewBloomFilter(expectedElements int, fpRate float64) *BloomFilter {
 	p := fpRate
 	lnP := ln(p)
 	ln2 := ln(2.0)
-	m := -n*lnP / (ln2 * ln2)
+	m := -n * lnP / (ln2 * ln2)
 	numBits := uint64(m)
 	if numBits < 64 {
 		numBits = 64

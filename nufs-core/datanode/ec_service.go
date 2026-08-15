@@ -51,8 +51,8 @@ type ECAuthority interface {
 // production deployment injects an HTTP authority and filters each shard to
 // the node's own (NodeID,DiskID) as /S2.
 type ECService struct {
-	v    *V2Store
-	ec   ECAuthority
+	v  *V2Store
+	ec ECAuthority
 	// resolveDisk maps a planned (NodeID,DiskID) to a local shard-store index.
 	resolveDisk func(metadata.ECDisk) int
 	// candidateDisks returns the disk set handed to PlanShards. Defaults to a

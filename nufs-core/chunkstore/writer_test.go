@@ -18,8 +18,8 @@ type fakeLifecycle struct {
 	commitCalls   int
 	sealCalls     int
 
-	allocErr   error
-	commitErr  error
+	allocErr  error
+	commitErr error
 	// failBatchAlloc makes the n-th (0-based) AllocateChunksBatch call fail
 	// with allocErr, returning nil chunks.
 	failBatchAlloc int // -1 = never

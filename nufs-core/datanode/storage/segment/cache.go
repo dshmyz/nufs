@@ -13,16 +13,16 @@ import (
 // active descriptors remain pinned). Each entry holds an open *Reader
 // so reads avoid os.Open on every call.
 type SegmentDescriptorCache struct {
-	mu       sync.Mutex
-	maxSize  int
-	entries  map[string]*list.Element // segPath → lru entry
-	lru      *list.List               // *cacheEntry, front=most recent
+	mu      sync.Mutex
+	maxSize int
+	entries map[string]*list.Element // segPath → lru entry
+	lru     *list.List               // *cacheEntry, front=most recent
 }
 
 // cacheEntry is one entry in the descriptor LRU.
 type cacheEntry struct {
-	path  string
-	rd    *Reader
+	path   string
+	rd     *Reader
 	pinned bool
 }
 

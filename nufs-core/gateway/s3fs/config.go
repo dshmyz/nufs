@@ -16,9 +16,9 @@ type Config struct {
 	BasePath string
 	Target   *url.URL
 
-	AccessKey    string // explicit credential; overrides env/file via LoadCredentials
-	SecretKey    string // explicit credential; overrides env/file via LoadCredentials
-	SecretToken  string // STS session token (optional)
+	AccessKey   string // explicit credential; overrides env/file via LoadCredentials
+	SecretKey   string // explicit credential; overrides env/file via LoadCredentials
+	SecretToken string // STS session token (optional)
 	CacheDir    string
 	ScanTTL     time.Duration
 	MetricsAddr string
@@ -76,23 +76,23 @@ func SaveCredentials(cacheDir string, ac *AccessConfig) error {
 // Option is a functional option for Config.
 type Option func(*Config)
 
-func WithBucket(bucket string) Option  { return func(c *Config) { c.Bucket = bucket } }
-func WithBasePath(p string) Option     { return func(c *Config) { c.BasePath = p } }
-func WithCacheDir(d string) Option     { return func(c *Config) { c.CacheDir = d } }
+func WithBucket(bucket string) Option { return func(c *Config) { c.Bucket = bucket } }
+func WithBasePath(p string) Option    { return func(c *Config) { c.BasePath = p } }
+func WithCacheDir(d string) Option    { return func(c *Config) { c.CacheDir = d } }
 func WithScanTTL(ttl time.Duration) Option {
 	return func(c *Config) { c.ScanTTL = ttl }
 }
 func WithMetricsAddr(addr string) Option {
 	return func(c *Config) { c.MetricsAddr = addr }
 }
-func WithReadOnly() Option       { return func(c *Config) { c.ReadOnly = true } }
+func WithReadOnly() Option { return func(c *Config) { c.ReadOnly = true } }
 func WithCacheQuota(n int64) Option {
 	return func(c *Config) { c.CacheQuota = n }
 }
-func WithUID(uid uint32) Option  { return func(c *Config) { c.UID = uid } }
-func WithGID(gid uint32) Option  { return func(c *Config) { c.GID = gid } }
-func WithInsecure() Option       { return func(c *Config) { c.Insecure = true } }
-func WithDebug() Option          { return func(c *Config) { c.Debug = true } }
+func WithUID(uid uint32) Option { return func(c *Config) { c.UID = uid } }
+func WithGID(gid uint32) Option { return func(c *Config) { c.GID = gid } }
+func WithInsecure() Option      { return func(c *Config) { c.Insecure = true } }
+func WithDebug() Option         { return func(c *Config) { c.Debug = true } }
 
 // ParseTarget parses an S3 endpoint URL like "https://s3.amazonaws.com/bucket/prefix".
 func ParseTarget(target string) (*url.URL, string, string, error) {

@@ -17,9 +17,9 @@ import (
 
 // Default limits used by the helper.
 const (
-	DefaultMaxRetries   = 3
-	DefaultBaseDelay    = 500 * time.Millisecond
-	DefaultMaxDelay     = 5 * time.Second
+	DefaultMaxRetries = 3
+	DefaultBaseDelay  = 500 * time.Millisecond
+	DefaultMaxDelay   = 5 * time.Second
 )
 
 // Config controls Do.
