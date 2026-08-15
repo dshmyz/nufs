@@ -251,26 +251,15 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 	needParityShards := make(map[int]struct{}) // parity shard indices we need
 
 	if wantWindow {
-		windowEnd := offset + int64(length)
-		if windowEnd > dataLen {
-			windowEnd = dataLen
-		}
+		// Reed-Solomon requires K data shards for decode.  We must read
+		// ALL K data shards (not just overlapping ones) but can optimize
+		// by passing a small offset/length to ReadECShard for each shard,
+		// so the server only reads intersecting frames.
 		for i := 0; i < ec.DataShards; i++ {
-			shardStart := shardSize * int64(i)
-			shardEnd := shardStart + shardSize
-			if shardEnd <= offset || shardStart >= windowEnd {
-				continue // no overlap — skip
-			}
 			needDataShards[i] = struct{}{}
 		}
-		// Decoder needs K = DataShards shards total.  We have len(needDataShards)
-		// data shards.  Read parity shards to fill the gap, prioritising the
-		// first parity shards for consistency.
-		parityNeed := ec.DataShards - len(needDataShards)
-		if parityNeed > ec.ParityShards {
-			parityNeed = ec.ParityShards
-		}
-		for p := 0; p < parityNeed; p++ {
+		// Read minimum parity for redundancy (M shards).
+		for p := 0; p < ec.ParityShards; p++ {
 			needParityShards[ec.DataShards+p] = struct{}{}
 		}
 		slog.Debug("chunkstore: ec range read", "chunkID", chunk.ID, "window",
@@ -311,25 +300,13 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 				return
 			}
 			// V2.1 converted chunks store each EC shard as an independent
-			// extent.  When wantWindow, pass the shard-relative range so the
-			// server only reads intersecting frames via ReadRangeFrames.
-			var resp *datanode.Response
-			if chunk.ECStripeID != "" {
-				var shOffset, shLen int32
-				if wantWindow && r.ShardIndex < ec.DataShards {
-					shardStart := shardSize * int64(r.ShardIndex)
-					overlapStart := offset - shardStart
-					if overlapStart < 0 {
-						overlapStart = 0
-					}
-					overlapEnd := offset + int64(length) - shardStart
-					if overlapEnd > shardSize {
-						overlapEnd = shardSize
-					}
-					shOffset = int32(overlapStart)
-					shLen = int32(overlapEnd - overlapStart)
-				}
-				resp, err = client.ReadECShard(chunk.ID, r.ShardIndex, int64(shOffset), shLen)
+// extent.  Always full read — range reads on individual shards
+// produce partial data that breaks reedsolomon reconstruction,
+// since the decoder needs complete shard-sized inputs.  Range
+// optimization is deferred to decoder-level partial reconstruction.
+var resp *datanode.Response
+if chunk.ECStripeID != "" {
+    resp, err = client.ReadECShard(chunk.ID, r.ShardIndex, 0, 0)
 			} else {
 				// Legacy V1 EC: whole-shard files, no range support.
 				resp, err = client.ReadChunk(chunk.ID, 0, 0)
@@ -384,14 +361,30 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 		decodeLen = int(chunk.Size) // actual data length (tests set this correctly)
 	}
 
-	// Pad partial data shards to shardSize so all present shards have the
-	// same length — reedsolomon.Reconstruct requires uniform shard sizes.
-	if wantWindow && shardSize > 0 {
-		for i := 0; i < ec.DataShards; i++ {
-			if present[i] && int64(len(shards[i])) < shardSize {
-				padded := make([]byte, shardSize)
-				copy(padded, shards[i])
-				shards[i] = padded
+	// Pad all present shards to the same size: reedsolomon.Reconstruct
+	// requires uniform shard sizes.  For range reads some shards may be
+	// partial, so we pad them to the maximum observed size.
+	// NOTE: partial shard padding is a lossy approximation — zeros are
+	// appended which the decoder treats as real data.  This can cause
+	// verification failures for small ranges.  The proper fix requires
+	// decoder-level partial reconstruction support (out of scope).
+	// For now, range reads on V2.1 EC chunks read full shards (the
+	// range optimization is deferred to decoder support), so this
+	// padding is only reached if shards are inconsistently sized.
+	if wantWindow {
+		maxShardLen := 0
+		for i, s := range shards {
+			if present[i] && len(s) > maxShardLen {
+				maxShardLen = len(s)
+			}
+		}
+		if maxShardLen > 0 {
+			for i := 0; i < totalShards; i++ {
+				if present[i] && len(shards[i]) < maxShardLen {
+					padded := make([]byte, maxShardLen)
+					copy(padded, shards[i])
+					shards[i] = padded
+				}
 			}
 		}
 	}
