@@ -101,11 +101,12 @@ func main() {
 
 		// DFS TLS flags — mirror metad's TLS configuration so the FUSE
 		// client can connect to a TLS-enabled metadata and datanode.
+		// --insecure (shared with S3) skips server certificate verification;
+		// --tls-cert/key/ca enable mutual TLS for full mTLS.
 		tlsCert              = flag.String("tls-cert", "", "DFS: TLS certificate file (enables HTTPS for metadata + datanode)")
 		tlsKey               = flag.String("tls-key", "", "DFS: TLS private key file")
 		tlsCA                = flag.String("tls-ca", "", "DFS: CA certificate for mutual TLS (client verification)")
 		tlsRequireClientCert = flag.Bool("tls-require-client-cert", false, "DFS: Require client certificate signed by --tls-ca")
-		tlsSkipVerify        = flag.Bool("tls-skip-verify", false, "DFS: Skip TLS server certificate verification (dev only)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
@@ -168,7 +169,7 @@ func main() {
 				CertFile:          *tlsCert,
 				KeyFile:           *tlsKey,
 				CAFile:            *tlsCA,
-				SkipVerify:        *tlsSkipVerify,
+				SkipVerify:        *insecure,
 				RequireClientCert: *tlsRequireClientCert,
 			},
 			uid:        uint32(*uid),
