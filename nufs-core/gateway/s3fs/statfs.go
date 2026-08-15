@@ -54,6 +54,12 @@ func (s *statfsUsage) refreshLocked(ctx context.Context, fsys *S3FileSystem) {
 				if bq, qerr := adm.GetBucketQuota(ctx, fsys.config.Bucket); qerr == nil {
 					q = bq.Size
 				}
+				// Same anti-poisoning rule as the sweep: a canceled call
+				// (e.g. quota query aborted) must not be cached - the
+				// quota would read as "unbounded" for a full TTL.
+				if ctx.Err() != nil {
+					return
+				}
 				s.usage = u.Size
 				s.quota = q
 				s.at = time.Now()
@@ -66,13 +72,23 @@ func (s *statfsUsage) refreshLocked(ctx context.Context, fsys *S3FileSystem) {
 
 	// Standard-S3 fallback: one-shot full-bucket sweep.
 	var total uint64
+	var sweepErr error
 	ch := fsys.api.ListObjects(ctx, fsys.config.Bucket, minio.ListObjectsOptions{
 		Recursive: true,
 	})
 	for obj := range ch {
-		if obj.Err == nil {
-			total += uint64(obj.Size)
+		if obj.Err != nil {
+			sweepErr = obj.Err
+			break
 		}
+		total += uint64(obj.Size)
+	}
+	// A canceled or failed sweep must not be cached as truth for a full
+	// TTL - a df interrupted mid-sweep would otherwise report a partial
+	// total (or zero) for ScanTTL. Leave the cache stale so the next
+	// statfs retries.
+	if sweepErr != nil || ctx.Err() != nil {
+		return
 	}
 	s.usage = total
 	s.quota = 0
