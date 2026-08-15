@@ -74,7 +74,7 @@ func main() {
 		compactInterval      = flag.Duration("compaction-interval", 30*time.Second, "Background compaction scan cadence for the V2.1 worker")
 		gcScanInterval       = flag.Duration("gc-scan-interval", 0, "Background orphan-chunk GC scan cadence (0 = disabled; uses only the manual POST /api/v1/gc/scan endpoint)")
 		gcGraceWindow        = flag.Duration("gc-grace-window", 10*time.Minute, "Minimum local chunk age before the background orphan scan will delete it (protects in-flight writes not yet committed to metadata)")
-		storageVersion       = flag.String("storage-version", "v1", "Storage engine version: v1 (legacy ChunkStore) or v2.1 (new engine)")
+		storageVersion       = flag.String("storage-version", "v1", "Storage engine version: v1 (DEPRECATED, legacy ChunkStore, retirement per docs/v1-retirement-roadmap.md) or v2.1 (new segment engine, recommended)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON              = flag.Bool("log-json", false, "JSON log output")
 	)

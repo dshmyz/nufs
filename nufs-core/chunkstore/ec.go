@@ -56,6 +56,10 @@ func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *meta
 	// back to V1 whole-shard replication before touching any shard store.
 	plan, err := s.ecWrite.PlanECWrite(ctx, chunk.ID, ec.DataShards, ec.ParityShards)
 	if err != nil || len(plan) != totalShards {
+		// DEPRECATED (V1 EC): fallback to writeECChunk. Per
+		// docs/v1-retirement-roadmap.md stage 3 this becomes a hard error —
+		// an ECConfig bucket with an unavailable authority must fail the
+		// write, not silently downgrade to V1 whole-shard EC.
 		slog.Warn("chunkstore: ec direct plan unavailable, falling back to V1 writeECChunk",
 			"chunkID", chunk.ID, "planned", len(plan), "want", totalShards, "error", err)
 		return s.writeECChunk(ctx, chunk, data)
@@ -134,6 +138,12 @@ func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *meta
 // writeECChunk encodes data into K+M shards and writes each shard
 // to its assigned datanode concurrently. Returns success once K
 // shards (the write quorum) are acknowledged.
+//
+// DEPRECATED (V1 EC): whole-shard EC files, no range-read support. Retained
+// only as the fallback when the V2.1 direct-EC authority is unavailable
+// (see writeECShardDirect). Per docs/v1-retirement-roadmap.md stage 3, this
+// fallback becomes a hard error and this function is deleted. Do NOT add
+// features here.
 func (s *DatanodeChunkStore) writeECChunk(ctx context.Context, chunk *metadata.ChunkMeta, data []byte) error {
 	ec := chunk.ECGroup
 	encoder := GetECEncoder(ec.DataShards, ec.ParityShards)

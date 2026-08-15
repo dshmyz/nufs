@@ -1,5 +1,12 @@
 package datanode
 
+// DEPRECATED (V1): this legacy ChunkStore engine is scheduled for retirement
+// per docs/v1-retirement-roadmap.md. The V2.1 segment engine is the
+// replacement (--storage-version=v2.1, V2Store). Do NOT add new features,
+// protocol methods, or optimization work here — implement against the V2.1
+// engine instead. Retained only as the current default engine until the
+// roadmap's stage 2 (parity audit + default flip) completes.
+
 import (
 	"context"
 	"encoding/binary"

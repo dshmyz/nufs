@@ -40,6 +40,12 @@ type NodeID uint64
 // InodeMeta represents metadata for a file or directory (legacy V1
 // layout, still used until V2.1 reaches feature parity).
 // Stored at key: /inode/{inode_id}
+//
+// DEPRECATED (V1): the unbounded ChunkMap layout is scheduled for retirement
+// per docs/v1-retirement-roadmap.md stage 1 — the V2.1 InodeStoreV2
+// (LayoutEmpty/LayoutInlineExtent/LayoutExtentPages) is the replacement.
+// The gateway (FUSE/S3) still serves on this model; new inode/ref features
+// should target InodeMetaV2, not this struct.
 type InodeMeta struct {
 	ID         InodeID  `json:"id"`
 	Type       FileType `json:"type"`
