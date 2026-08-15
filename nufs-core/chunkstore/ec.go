@@ -303,7 +303,10 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 // extent.  Always full read — range reads on individual shards
 // produce partial data that breaks reedsolomon reconstruction,
 // since the decoder needs complete shard-sized inputs.  Range
-// optimization is deferred to decoder-level partial reconstruction.
+// Range reads on shards are not feasible with Reed-Solomon: each
+				// original byte depends on all K data shards, so decoding a range
+				// requires reading the same range from all K data shards — the full
+				// shard is the smallest granularity that can be decoded.
 var resp *datanode.Response
 if chunk.ECStripeID != "" {
     resp, err = client.ReadECShard(chunk.ID, r.ShardIndex, 0, 0)
@@ -364,13 +367,11 @@ if chunk.ECStripeID != "" {
 	// Pad all present shards to the same size: reedsolomon.Reconstruct
 	// requires uniform shard sizes.  For range reads some shards may be
 	// partial, so we pad them to the maximum observed size.
-	// NOTE: partial shard padding is a lossy approximation — zeros are
-	// appended which the decoder treats as real data.  This can cause
-	// verification failures for small ranges.  The proper fix requires
-	// decoder-level partial reconstruction support (out of scope).
-	// For now, range reads on V2.1 EC chunks read full shards (the
-	// range optimization is deferred to decoder support), so this
-	// padding is only reached if shards are inconsistently sized.
+	// NOTE: Reed-Solomon requires all present shards to be the same
+	// length.  Full shard reads are always used (partial shard reads
+	// are infeasible with RS — each original byte depends on all K
+	// shards), so this padding is only reached if shards are
+	// inconsistently sized due to disk corruption.
 	if wantWindow {
 		maxShardLen := 0
 		for i, s := range shards {
