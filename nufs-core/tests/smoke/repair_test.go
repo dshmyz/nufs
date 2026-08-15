@@ -120,16 +120,16 @@ func newReadCloser(data []byte) *readCloser {
 }
 
 // TestRepair_EndToEnd_EC verifies the EC repair path: write data with
-// K=6 M=3 erasure coding across 9 datanodes, kill one datanode, trigger
+// K=4 M=2 erasure coding across 6 datanodes, kill one datanode, trigger
 // repair, and verify the chunk is still readable via EC reconstruction.
 //
-// NOTE: the scheme must be 6+3. The metadata allocator materializes every
-// EC chunk's group from the shared 6+3 profile (ECGroupFromProfile defaults
-// to the canonical 6+3), so a bucket configured with any other K/M writes
-// only the first K data shards of the 6+3 codec and gains zero fault
-// tolerance — one lost shard makes the object unreadable. All other EC
-// tests (ec_record_direct_*, zz_raft_alloc_repro) use 6+3 for the same
-// reason.
+// The scheme is deliberately 4+2 (not the canonical 6+3): this exercises the
+// allocation fix where a bucket's ECConfig K/M is honored. Before the fix,
+// every EC chunk materialized the shared 6+3 profile regardless of the bucket
+// config (ECGroupFromProfile defaults to the canonical 6+3), so a 4+2 bucket
+// wrote only the 6 data shards of the 9-shard codec and gained zero fault
+// tolerance — one lost shard dropped available below K=6 and decode failed. A
+// 4+2 bucket that survives a node kill proves the configured scheme is real.
 func TestRepair_EndToEnd_EC(t *testing.T) {
 	if os.Getenv("NUFS_RUN_SMOKE") != "1" {
 		t.Skip("set NUFS_RUN_SMOKE=1 to run")
@@ -138,7 +138,7 @@ func TestRepair_EndToEnd_EC(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// Start metadata + 9 datanodes (K=6 + M=3)
+	// Start metadata + 6 datanodes (K=4 + M=2)
 	metaDir := t.TempDir()
 	metaStore, err := metadata.NewPebbleStore(metadata.PebbleStoreConfig{
 		Dir: metaDir, NodeID: 1,
@@ -148,7 +148,7 @@ func TestRepair_EndToEnd_EC(t *testing.T) {
 	}
 	defer metaStore.Close()
 
-	const numNodes = 9 // K+M for EC(6,3)
+	const numNodes = 6 // K+M for EC(4,2)
 	servers := make([]*datanode.Server, numNodes)
 	addrs := make([]string, numNodes)
 	for i := 0; i < numNodes; i++ {
@@ -171,10 +171,10 @@ func TestRepair_EndToEnd_EC(t *testing.T) {
 	ts := httptest.NewServer(gw.Handler())
 	defer ts.Close()
 
-	// Create bucket with EC policy (K=6, M=3)
+	// Create bucket with EC policy (K=4, M=2)
 	metaStore.CreateBucket(ctx, "ec-repair-test", metadata.PlacementPolicy{
 		ReplicationFactor: 1,
-		ECConfig:          &metadata.ECConfig{DataShards: 6, ParityShards: 3},
+		ECConfig:          &metadata.ECConfig{DataShards: 4, ParityShards: 2},
 		StorageTier:       metadata.TierHot,
 	})
 
@@ -191,19 +191,19 @@ func TestRepair_EndToEnd_EC(t *testing.T) {
 		t.Fatalf("PUT: %d", resp.StatusCode)
 	}
 
-	// Verify data readable (K=6 shards present)
+	// Verify data readable (K=4 shards present)
 	body := doGet(t, ctx, ts.URL+"/ec-repair-test/data.txt", http.StatusOK)
 	if string(body) != string(payload) {
 		t.Fatal("initial GET mismatch")
 	}
-	t.Log("EC data written and verified (K=6, M=3)")
+	t.Log("EC data written and verified (K=4, M=2)")
 
 	// Kill datanode 0 (losing shard 0)
 	t.Log("killing datanode 0 (shard 0)...")
 	servers[0].Stop()
 	time.Sleep(200 * time.Millisecond)
 
-	// Verify data still readable via EC reconstruction (8 shards >= K=6)
+	// Verify data still readable via EC reconstruction (5 shards >= K=4)
 	body = doGet(t, ctx, ts.URL+"/ec-repair-test/data.txt", http.StatusOK)
 	if string(body) != string(payload) {
 		t.Fatal("GET after EC node failure: data mismatch")

@@ -2280,11 +2280,18 @@ func (s *PebbleStore) buildAllocatedChunks(ctx context.Context, offsets []int64,
 		if groupID != "" {
 			// Reference the shared ECProfile (config lives in the profile row,
 			// not repeated per chunk) while retaining the embedded
-			// DataShards/ParityShards for read-compatible consumers. No
+			// DataShards/ParityShards for read-compatible consumers. The profile
+			// derives from the bucket's ECConfig, NOT the canonical 6+3 default:
+			// the codec must match the K/M the user configured. Previously a
+			// non-6+3 ECConfig bucket wrote only the first K shards of the 6+3
+			// codec (zero fault tolerance — one shard loss drops below K and
+			// decode fails); sizing the group from the bucket's config makes the
+			// configured scheme real. For 6+3 the derived profile equals
+			// DefaultECProfile, so the canonical path is unchanged. No
 			// ECStripeID yet: the durable stripe is only created at
 			// conversion time (ECStore.BeginConversion), after which the
 			// landing pointer is set by the publish step.
-			chunk.ECGroup = ECGroupFromProfile(nil, groupID)
+			chunk.ECGroup = ECGroupFromProfile(profileFromECConfig(policy.ECConfig), groupID)
 		}
 		chunks[i] = chunk
 	}

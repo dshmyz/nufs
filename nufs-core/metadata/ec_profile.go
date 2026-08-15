@@ -43,6 +43,29 @@ func DefaultECProfile() *ECProfile {
 	}
 }
 
+// profileFromECConfig derives the EC profile for a bucket's ECConfig. This is
+// what makes a non-6+3 ECConfig bucket actually tolerate failures: the codec
+// (K/M) is sized from the configured scheme, not the canonical 6+3 default,
+// so the full K+M stripe (data + parity) is written and any scheme's M-fault
+// tolerance holds. The profile ID derives deterministically from K/M
+// ("ec-4-2"), so every chunk of the same scheme references the same profile.
+// For 6+3 the result equals DefaultECProfile (same ID "ec-6-3" and values), so
+// the canonical path is byte-for-byte unchanged. The fault-domain bounds reuse
+// the §14 constants, which stay coherent for any scheme: 4+2's six shards land
+// 2+2+2 across ≥3 machines, ≤3 per machine.
+func profileFromECConfig(cfg *ECConfig) *ECProfile {
+	if cfg == nil {
+		return DefaultECProfile()
+	}
+	return &ECProfile{
+		ID:            fmt.Sprintf("ec-%d-%d", cfg.DataShards, cfg.ParityShards),
+		DataShards:    cfg.DataShards,
+		ParityShards:  cfg.ParityShards,
+		MinMachines:   ECMinMachines,
+		MaxPerMachine: ECMaxShardsPerMachine,
+	}
+}
+
 // ecProfileKey formats a profile key.
 func ecProfileKey(id string) string {
 	return "ec-profile/" + id
