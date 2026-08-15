@@ -42,9 +42,11 @@ run_smoke() {
 }
 
 run_regression() {
-    echo "=== 全量回归测试 (~90s) ==="
+    echo "=== 全量回归测试 (~3min) ==="
     echo "--- datanode ---"
-    go test -count=1 -timeout=120s ./datanode/... && echo "  ✅ datanode"
+    # datanode/storage/segment 单包即需 ~150s（隔离跑实测），预算给足避免
+    # ./datanode/... 并行时被 120s 误杀。
+    go test -count=1 -timeout=300s ./datanode/... && echo "  ✅ datanode"
     echo "--- chunkstore ---"
     go test -count=1 -timeout=30s ./chunkstore/... && echo "  ✅ chunkstore"
     echo "--- gateway/s3 ---"
@@ -94,8 +96,10 @@ run_ec() {
 }
 
 run_multidisk() {
-    echo "=== 多盘测试 ==="
-    go test -count=1 -v -run "TestMultiDisk" -timeout=30s ./datanode/... 2>&1 | grep -E "^(=== RUN|--- PASS|--- FAIL|PASS|ok)"
+    echo "=== 多盘测试 (V2.1 JBOD) ==="
+    # V1 的 TestMultiDisk 已随 V1 引擎退役；V2.1 多盘端到端覆盖在 smoke 的
+    # TestFullStack_MultiDiskJBOD（单节点双盘，S3 PUT/GET + 逐盘计数）。
+    go test -count=1 -v -run "TestFullStack_MultiDiskJBOD" -timeout=60s ./tests/smoke/ 2>&1 | grep -E "^(=== RUN|--- PASS|--- FAIL|PASS|ok)"
 }
 
 run_full() {
