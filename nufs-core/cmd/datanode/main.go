@@ -74,7 +74,7 @@ func main() {
 		compactInterval      = flag.Duration("compaction-interval", 30*time.Second, "Background compaction scan cadence for the V2.1 worker")
 		gcScanInterval       = flag.Duration("gc-scan-interval", 0, "Background orphan-chunk GC scan cadence (0 = disabled; uses only the manual POST /api/v1/gc/scan endpoint)")
 		gcGraceWindow        = flag.Duration("gc-grace-window", 10*time.Minute, "Minimum local chunk age before the background orphan scan will delete it (protects in-flight writes not yet committed to metadata)")
-		storageVersion       = flag.String("storage-version", "v1", "Storage engine version: v1 (DEPRECATED, legacy ChunkStore, retirement per docs/v1-retirement-roadmap.md) or v2.1 (new segment engine, recommended)")
+		scrubInterval        = flag.Duration("scrub-interval", 0, "Background data integrity scan cadence (0 = disabled; the scrub reads every local chunk and verifies its CRC32C checksum)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON              = flag.Bool("log-json", false, "JSON log output")
 	)
@@ -150,11 +150,11 @@ func main() {
 		KMSKeyHex:          *kmsKeyHex,
 		AllowInsecureDev:   *allowInsecureDev,
 		AlertWebhook:       *alertWebhook,
-		StorageVersion:     *storageVersion,
 		SegmentSize:        *segmentSize,
 		CompactionInterval: *compactInterval,
 		GCScanInterval:     *gcScanInterval,
 		GCGraceWindow:      *gcGraceWindow,
+		ScrubInterval:      *scrubInterval,
 		LogLevel:           *logLevel,
 	})
 }
@@ -298,7 +298,7 @@ func runDataNode(cfg datanode.Config) {
 		os.Exit(1)
 	}
 
-	_, traceShutdown, err := tracing.Init(tracing.Config{
+	_, _, err := tracing.Init(tracing.Config{
 		Enabled:  cfg.TraceEnabled,
 		Endpoint: cfg.TraceEndpoint,
 		Service:  "datanode",
@@ -316,234 +316,12 @@ func runDataNode(cfg datanode.Config) {
 		dataDirs = []string{cfg.DataDir}
 	}
 
-	if cfg.StorageVersion == "v2.1" {
-		runDataNodeV21(cfg, dataDirs, log)
-		return
-	}
-
-	// === V1 (legacy ChunkStore) path ===
-
-	// One WAL per disk (each lives on its own disk for crash-recovery isolation).
-	wals := make([]*datanode.WriteAheadLog, len(dataDirs))
-	for i, dir := range dataDirs {
-		w, err := datanode.NewWriteAheadLog(filepath.Join(dir, "wal"))
-		if err != nil {
-			log.Error("failed to init WAL", "disk", dir, "error", err)
-			os.Exit(1)
-		}
-		wals[i] = w
-	}
-
-	chunkStore, err := datanode.NewMultiDiskChunkStore(dataDirs, cfg.MaxConcurrentWrites, cfg.MaxConcurrentReads, wals)
-	if err != nil {
-		log.Error("failed to init chunk store", "error", err)
-		os.Exit(1)
-	}
-
-	// Configure at-rest encryption if enabled. A production FileKMS (file/
-	// env/hex KEK) is used when configured and does not require the dev-only
-	// --allow-local-kms opt-in. Otherwise it is intentionally fail-closed
-	// unless the operator explicitly opts into the dev-only LocalKMS.
-	if cfg.EncryptAtRest {
-		kms, err := buildAtRestKMS(cfg)
-		if err != nil {
-			log.Error("failed to configure at-rest encryption", "error", err)
-			os.Exit(1)
-		}
-		chunkStore.SetEncryptor(crypto.NewEncryptor(kms))
-	}
-
-	totalBytes, chunkCount := chunkStore.Stats()
-	log.Info("chunk store ready", "disks", len(dataDirs), "chunks", chunkCount, "bytes", totalBytes)
-
-	// Per-disk capacity: apply CapacityGB uniformly (0 = auto-detect via Statfs).
-	capacities := make([]int64, len(dataDirs))
-	for i := range dataDirs {
-		capacities[i] = cfg.CapacityGB
-	}
-	diskManager, err := datanode.NewMultiDiskManager(dataDirs, chunkStore, capacities, wals)
-	if err != nil {
-		log.Error("failed to init disk manager", "error", err)
-		os.Exit(1)
-	}
-	diskManager.Start()
-
-	// Wire disk health into chunk store so writes are rejected on disk failure
-	chunkStore.SetDiskManager(diskManager)
-
-	// Start the management socket for status/adopt/retire CLI commands.
-	stopMgmt, err := startManagementServer(chunkStore, diskManager, dataDirs)
-	if err != nil {
-		log.Warn("failed to start management socket", "error", err)
-	}
-	if stopMgmt != nil {
-		defer stopMgmt()
-	}
-
-	// Determine scheme for metadata service based on our TLS config.
-	// If the cluster uses TLS, metad should also be accessed over HTTPS.
-	metaScheme := "http"
-	if cfg.TLS.Enabled() {
-		metaScheme = "https"
-	}
-	if cfg.TLS.CAFile != "" && !cfg.TLS.RequireClientCert {
-		log.Warn("tls CA configured but client certificates are optional; set --tls-require-client-cert for strict mTLS")
-	}
-	metaSvcAddr := fmt.Sprintf("%s://%s", metaScheme, cfg.MetadataAddr)
-	metaStore := metadata.NewHTTPClient(metaSvcAddr, 30*time.Second)
-	metaStore.SetAuthToken(cfg.MetadataAuthToken)
-
-	// When connecting to a TLS-enabled metad, configure the HTTP
-	// client transport to use our TLS client config.
-	if cfg.TLS.Enabled() {
-		if err := metaStore.EnableTLS(cfg.TLS); err != nil {
-			log.Error("failed to configure TLS for metadata client", "error", err)
-			os.Exit(1)
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err = metaStore.RegisterNode(ctx, &metadata.NodeInfo{
-		ID:         cfg.NodeID,
-		Addr:       registerAddr(cfg),
-		DataDir:    cfg.DataDir,
-		Rack:       cfg.Rack,
-		Zone:       cfg.Zone,
-		MachineID:  cfg.MachineID,
-		Tier:       cfg.Tier,
-		CapacityGB: cfg.CapacityGB,
-	})
-	cancel()
-	if err != nil && err != metadata.ErrNodeAlreadyExists {
-		log.Error("failed to register node", "error", err)
-		os.Exit(1)
-	}
-	log.Info("registered with metadata service", "addr", cfg.MetadataAddr)
-
-	server := datanode.NewServer(cfg, chunkStore)
-	if err := server.Start(); err != nil {
-		log.Error("failed to start server", "error", err)
-		os.Exit(1)
-	}
-
-	replicator := datanode.NewReplicator(cfg.ListenAddr, 4)
-	replicator.SetTLS(cfg.TLS)
-	replicator.Start()
-
-	chainRepl := datanode.NewParallelReplicator(cfg.ListenAddr, cfg.NodeID, 5*time.Second)
-	chainRepl.SetTLS(cfg.TLS)
-
-	repairWorker := datanode.NewRepairWorker(datanode.RepairConfig{
-		Meta:       metaStore,
-		NodeID:     cfg.NodeID,
-		Interval:   30 * time.Second,
-		Replicator: replicator,
-		LocalAddr:  cfg.ListenAddr,
-	})
-	repairWorker.Start(context.Background())
-
-	antiEntropy := datanode.NewAntiEntropy(chunkStore, metaStore, cfg.NodeID)
-	antiEntropy.SetTLS(cfg.TLS)
-	antiEntropy.Start(30 * time.Minute)
-
-	heartbeat := datanode.NewHeartbeatReporter(cfg, metaStore, chunkStore)
-	heartbeat.Start()
-
-	opsServer := datanode.NewOpsServerWithRepair(cfg, chunkStore, metaStore, diskManager, chainRepl, antiEntropy, repairWorker)
-	opsServer.SetAlertWebhook(cfg.AlertWebhook)
-	// Register the V1 DiskManager's capacity-alert callback so transitions are
-	// recorded in the admin ring and delivered to the webhook (the DiskManager
-	// already de-dups by level change).
-	diskManager.SetOnCapacityAlert(func(level datanode.AlertLevel, usagePct float64, dm *datanode.DiskManager) {
-		st := dm.Stats()
-		opsServer.NotifyCapacityAlert(level, st.UsagePct, st.UsedBytes, st.TotalBytes)
-	})
-	if err := opsServer.Start(); err != nil {
-		log.Error("failed to start ops server", "error", err)
-		os.Exit(1)
-	}
-
-	log.Info("all components started successfully")
-
-	// SIGHUP handler for config hot-reload (log level changes)
-	hupCh := make(chan os.Signal, 1)
-	signal.Notify(hupCh, syscall.SIGHUP)
-	go func() {
-		for range hupCh {
-			log.Info("received SIGHUP, reloading log level")
-			logging.SetLevel(cfg.LogLevel)
-		}
-	}()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigCh
-	log.Info("received signal, shutting down", "signal", sig)
-
-	// Phase 1: Stop accepting new client and ops connections.
-	log.Info("shutdown phase 1: stopping ops and data servers")
-	opsServer.Stop()
-	server.Stop()
-
-	// Phase 2: Stop background workers that generate writes.
-	log.Info("shutdown phase 2: stopping background workers")
-	repairWorker.Stop()
-	antiEntropy.Stop()
-	heartbeat.Stop()
-	replicator.Stop()
-
-	// Phase 3: Wait for in-flight writes to complete.
-	log.Info("shutdown phase 3: draining in-flight writes")
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	releaseDrain, err := chunkStore.DrainWrites(drainCtx)
-	if err != nil {
-		log.Warn("drain timeout, some writes may be in-flight", "error", err)
-	} else {
-		log.Info("all in-flight writes drained")
-	}
-	if releaseDrain != nil {
-		releaseDrain()
-	}
-	drainCancel()
-
-	// Phase 4: Stop disk manager and close chunk-store resources.
-	log.Info("shutdown phase 4: stopping disk manager and closing chunk store")
-	diskManager.Stop()
-	if err := chunkStore.Close(); err != nil {
-		log.Warn("chunk store close error", "error", err)
-	}
-
-	// Phase 5: Flush and close WAL — ensures all committed writes are durable.
-	log.Info("shutdown phase 5: flushing WAL")
-	for _, w := range wals {
-		if err := w.Close(); err != nil {
-			log.Warn("WAL close error", "error", err)
-		}
-	}
-
-	// Phase 6: Deregister from metadata service.
-	log.Info("shutdown phase 6: deregistering from metadata service")
-	deregCtx, deregCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := metaStore.RegisterNode(deregCtx, &metadata.NodeInfo{
-		ID:    cfg.NodeID,
-		State: metadata.NodeOffline,
-	}); err != nil {
-		log.Warn("failed to mark node offline", "error", err)
-	}
-	deregCancel()
-
-	traceCtx, traceCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := traceShutdown(traceCtx); err != nil {
-		log.Warn("tracing shutdown error", "error", err)
-	}
-	traceCancel()
-
-	log.Info("shutdown complete")
+	// V2.1 is the only engine; delegate to the V2.1 path.
+	runDataNodeV21(cfg, dataDirs, log)
 }
 
-// runDataNodeV21 initializes the V2.1 storage engine for each disk and
-// starts the metadata client. It is the V2.1 replacement for the legacy
-// ChunkStore path, activated by --storage-version=v2.1.
+// runDataNode initializes the V2.1 storage engine for each disk and
+// starts the metadata client.
 func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// Initialize one V2.1 segment.Store per disk.
 	//
@@ -554,6 +332,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// run at all on the os.Exit paths.
 	stores := make([]storage.Store, 0, len(dataDirs))
 	shardStores := make([]storage.Store, 0, len(dataDirs))
+	smallStores := make([]storage.Store, 0, len(dataDirs))
 	closeStores := func() {
 		// EC shard stores first (they piggyback on the same per-disk dir and
 		// share the change journal); closing order among independent stores
@@ -562,6 +341,13 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 			if closer, ok := st.(interface{ Close() error }); ok {
 				if err := closer.Close(); err != nil {
 					log.Warn("V2.1 shard store close error", "error", err)
+				}
+			}
+		}
+		for _, st := range smallStores {
+			if closer, ok := st.(interface{ Close() error }); ok {
+				if err := closer.Close(); err != nil {
+					log.Warn("V2.1 small store close error", "error", err)
 				}
 			}
 		}
@@ -658,6 +444,24 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		}
 		stores = append(stores, s)
 		shardStores = append(shardStores, ss)
+
+		// Per-disk small-file stream (StreamID 0): chunks ≤
+		// SmallFileThreshold are written as single records here. Its index is
+		// separate from the data stream's (default Dir/index) to avoid two
+		// stores sharing one index DB.
+		sm, err := segment.NewSmallStore(segment.Config{
+			Dir:           dir,
+			IndexDir:      filepath.Join(dir, "index-small"),
+			UseMemIndex:   false,
+			ChangeJournal: changeJournal,
+			Enc:           enc,
+		})
+		if err != nil {
+			log.Error("failed to init V2.1 small store", "disk", dir, "error", err)
+			closeStores()
+			os.Exit(1)
+		}
+		smallStores = append(smallStores, sm)
 	}
 	log.Info("V2.1 storage engine ready", "disks", len(dataDirs))
 
@@ -704,6 +508,11 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// stripes (ConvertToEC will fail cleanly on an under-provisioned node).
 	if err := v2Store.AttachShardStores(shardStores); err != nil {
 		log.Error("failed to attach EC shard stores", "error", err)
+		closeStores()
+		os.Exit(1)
+	}
+	if err := v2Store.AttachSmallStores(smallStores); err != nil {
+		log.Error("failed to attach small-file streams", "error", err)
 		closeStores()
 		os.Exit(1)
 	}
@@ -759,14 +568,14 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// via the change journal), so those capability handlers answer
 	// "unsupported"/not-rewired and diskManager/chainRepl/antiEntropy stay nil;
 	// the repair worker is wired above.
-	stopMgmt, err := startManagementServer(v2Store, nil, dataDirs)
+	stopMgmt, err := startManagementServer(v2Store, dataDirs)
 	if err != nil {
 		log.Error("failed to start management socket", "error", err)
 		closeStores()
 		os.Exit(1)
 	}
 	defer stopMgmt()
-	opsServer := datanode.NewOpsServerWithRepair(cfg, v2Store, metaStore, nil, nil, nil, repairWorker)
+	opsServer := datanode.NewOpsServerWithRepair(cfg, v2Store, metaStore, repairWorker)
 
 	// Program A / S2: EC conversion authority + serving-path driver. The V2.1
 	// serving path drives the replication→6+3 conversion transaction against
@@ -946,6 +755,16 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	compactionWorker := maintenance.NewCompressionWorker(v2Store.DataStores(), compactOpts...)
 	go compactionWorker.Run(compactionCtx)
 
+	// Background data integrity scan (scrub worker). Reads every local chunk
+	// and verifies its CRC32C checksum; corruption is reported via the change
+	// journal so the heartbeat ships it to the metadata authority.
+	var scrubWorker *datanode.ScrubWorker
+	if cfg.ScrubInterval > 0 {
+		scrubWorker = datanode.NewScrubWorker(v2Store, datanode.WithScrubInterval(cfg.ScrubInterval))
+		scrubWorker.SetChangeJournal(changeJournal)
+		scrubWorker.Start(ctx)
+	}
+
 	if err := opsServer.Start(); err != nil {
 		log.Error("failed to start ops HTTP server", "error", err)
 		closeStores()
@@ -980,6 +799,10 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	replicator.Stop()
 	heartbeat.Stop()
 	healer.Stop()
+	// Stop the scrub worker (it reads store data) before draining.
+	if scrubWorker != nil {
+		scrubWorker.Stop()
+	}
 	// Stop the proactive disk monitor FIRST (it probes the stores), then drain
 	// in-flight writes before closing the stores (mirrors the V1 shutdown
 	// Phase 3). The barrier quiesces writes without blocking reads.

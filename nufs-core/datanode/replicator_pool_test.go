@@ -6,8 +6,29 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
+	"github.com/dshmyz/nufs/nufs-core/datanode/storage/segment"
 	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
+
+func startTestServer(t *testing.T, nodeID metadata.NodeID) (*Server, *V2Store, string) {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 1})
+	if err != nil {
+		t.Fatalf("segment.New (node %d): %v", nodeID, err)
+	}
+	v := NewMultiV2Store([]storage.Store{storage.Store(s)}, dir)
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.NodeID = nodeID
+	srv := NewServer(cfg, v)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Server.Start (node %d): %v", nodeID, err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return srv, v, srv.listener.Addr().String()
+}
 
 // TestReplicator_ConnectionReuse verifies that multiple replication
 // tasks to the same target reuse a single TCP connection rather than

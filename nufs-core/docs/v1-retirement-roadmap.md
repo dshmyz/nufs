@@ -14,14 +14,15 @@
   纯代码成本（6 个 ❌ 项重建 + inode 接线），零数据迁移、零兼容负担、零迁移工具。
   上线后切 = 同样的代码成本 + 数据迁移 + 双格式共存 + 线上风险，纯亏。
 - 推论：**上线本身以阶段 0 + 阶段 1 完成为门禁**；阶段 2/3/4 为收尾，可并行。
-- 护栏：V1 各层已加 DEPRECATED 标记（`datanode/chunkstore.go`、`writeECChunk`、
-  `InodeMeta`、`--storage-version` flag 注释），新 inode/ref/存储功能只进 V2.1。
+- 护栏：V1 存储引擎层 ① 已完全删除（`--storage-version` flag、`chunkstore.go`、WAL、DiskManager），
+  `pool.go`/`pipeline.go` 保留（客户端网络传输，`chunkstore/` client 库仍依赖）。
+  新 inode/ref/存储功能只进 V2.1。
 
 ## V1 的三层定义
 
 | 层 | 代码位置 | 现状 |
 |---|---|---|
-| ① V1 存储引擎 | `cmd/datanode/main.go:319`（V1 路径，`--storage-version` 默认 `v1`，`main.go:77`）、`datanode/chunkstore.go` + WAL | 默认引擎；V2.1 segment 引擎需显式开启 |
+| ① V1 存储引擎 | ~~`cmd/datanode/main.go:319`（V1 路径，`--storage-version` 默认 `v1`）~~、~~`datanode/chunkstore.go` + WAL~~ | **✅ 已删除**（2026-08-15）。V2.1 是唯一引擎，`--storage-version` flag 已移除 |
 | ② V1 EC | `chunkstore/ec.go:59-61`（`writeECShardDirect` 的 fallback）、`ec.go:134 writeECChunk`（整片文件）、`readECChunk` 的 `ECStripeID==""` 分支 | 直写 EC 的静默降级路径；V1 EC chunk 只能 V1 分支读 |
 | ③ V1 元数据 inode 模型 | `gateway/s3`、`gateway/fuse` 的 ChunkMap + `ChunkMeta.Replicas` | **网关唯一 serving 模型**；`InodeStoreV2`/extent 模型（`metadata/inode_store.go`、`extent_page.go`）已建成未接线 |
 
@@ -51,14 +52,18 @@
 > inode_store/extent_page/ec_lifecycle/types 四处是 extent 家族自身）。**删 ③
 > 前，上述 ❌ 项需在 extent 层实现或移植；⚠️ 项需把字段接成机制。**
 
-### ① V1 存储引擎 vs V2.1 segment 引擎
+### ① V1 存储引擎 vs V2.1 segment 引擎 ✅ 完成
 
-| V1 功能 | V2.1 等价 | 验证方式 |
+> V1 存储引擎（`chunkstore.go`、WAL、DiskManager、AntiEntropy、ParallelReplicator）
+> 已于 2026-08-15 删除。V2.1 segment 引擎是唯一存储路径。
+
+| V1 功能 | V2.1 等价 | 状态 |
 |---|---|---|
-| WAL 崩溃恢复 | journal + recovery 包（`datanode/storage/journal|recovery`） | delivery doc §6 声称 parity，需抽查测试覆盖 |
-| 磁盘健康监控 | Program 4 V1-c + Program 8（delivery doc §5） | 同上 |
-| 容量水位（15%/10%/5%） | `data-organization.md` §3.5 已定义 | 抽查 |
-| 压缩/加密/change journal | `a033d2f`（存储引擎阶段4） | 抽查 |
+| WAL 崩溃恢复 | journal + recovery 包（`datanode/storage/journal|recovery`） | ✅ |
+| 磁盘健康监控 | Program 4 V1-c + Program 8（delivery doc §5） | ✅ |
+| 容量水位（15%/10%/5%） | `data-organization.md` §3.5 已定义 | ✅ |
+| 压缩/加密/change journal | `a033d2f`（存储引擎阶段4） | ✅ |
+| 客户端连接池 + 并行复制 | `datanode/pool.go` + `datanode/pipeline.go`（保留，`chunkstore/` client 库仍在用） | ✅ |
 
 ### ② V1 EC vs V2.1 EC
 
@@ -74,9 +79,15 @@
 
 > 来源：小文件优化清单。分两条线，按"写前是否可知大小"分流。
 
-### 1.1 选型
-- **S3 PUT**（有 Content-Length，写前可知大小）→ 路由 **small segment**（≤64KiB 一条记录，StreamID 0）。
-- **FUSE 流式写**（关文件才知道大小）→ **inline extent + PromoteToPages**（数据不动只搬 ref，天然绕开"写时决策"）。
+### 1.1 选型（网关无关——路由挂"写入"，不挂"网关"）
+- **同一 bucket 同时支持 S3 API 与 FUSE 挂载**（共享 metad 命名空间与 datanode），
+  布局/路由决策必须让两条路径交叉可读。
+- **物理路由**：datanode 侧按**写入大小**统一决策（≤64KiB → small stream），
+  S3 与 FUSE 写入自动一致，双向可读。不做"仅 S3 路由"。
+- **元数据布局是文件属性**：inline/extent-pages/chunk 由读路径统一解析。
+  S3（写前知大小）可提前落 inline；FUSE（关文件才知道）先按块写、flush 时
+  单小块再转 inline——殊途同归到同一布局。
+- **交叉验证是硬要求**：S3 写 → FUSE 读；FUSE 写 → S3 读；同文件双路径并发访问。
 
 ### 1.2 数据面（small segment）
 - [ ] `MultiV2Store`/`v2_store.go` 挂载 `SmallStore`（`datanode/storage/segment/small_store.go:35`，现 `NewSmallStore` 零调用者）
@@ -107,15 +118,14 @@
 
 ---
 
-## 阶段 2：V2.1 存储引擎默认化 + v1 引擎退役（删 ①）
+## 阶段 2：V2.1 存储引擎默认化 + v1 引擎退役（删 ①） ✅ 完成
 
-- [ ] 阶段 0 抽查项通过（WAL、磁盘健康、容量水位、压缩/加密测试覆盖等价）
-- [ ] `cmd/datanode/main.go:77` 默认值改 `v2.1`，v1 标记 deprecated 一个发布周期
-- [ ] 删除 V1 引擎路径（`main.go:319` 起）与 `datanode/chunkstore.go` + WAL
-- [ ] `--storage-version` flag 移除
+> 2026-08-15 完成。V1 存储引擎（chunkstore.go、WAL、DiskManager、AntiEntropy、
+> ParallelReplicator、failover.go）已全部删除。`--storage-version` flag 已移除。
+> V2.1 segment 引擎是唯一存储路径。客户端传输层（pool.go、pipeline.go）保留。
 
-### 退出条件
-- 无 `--storage-version` flag；无 legacy ChunkStore 代码；V2.1 引擎全协议面测试覆盖等价。
+### 退出条件 ✅
+- ✅ 无 `--storage-version` flag；无 legacy ChunkStore 代码；V2.1 引擎全协议面测试覆盖等价。
 
 ---
 

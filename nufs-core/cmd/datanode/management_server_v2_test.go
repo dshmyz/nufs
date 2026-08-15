@@ -40,7 +40,7 @@ func newV2StoreForTest(t *testing.T) (*datanode.V2Store, string) {
 // does for V1.
 func TestManagementServer_V2StoreStatus(t *testing.T) {
 	v, dir := newV2StoreForTest(t)
-	stop, err := startManagementServer(v, nil, []string{dir})
+	stop, err := startManagementServer(v, []string{dir})
 	if err != nil {
 		t.Fatalf("startManagementServer: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestManagementServer_V2StoreStatus(t *testing.T) {
 // the factory, which is exercised end-to-end in datanode/ops_v2store_test.go.
 func TestManagementServer_V2StoreLifecycleUnsupported(t *testing.T) {
 	v, dir := newV2StoreForTest(t)
-	stop, err := startManagementServer(v, nil, []string{dir})
+	stop, err := startManagementServer(v, []string{dir})
 	if err != nil {
 		t.Fatalf("startManagementServer: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestManagementServer_V2StoreLifecycleUnsupported(t *testing.T) {
 // this engine".
 func TestManagementServer_V2StoreDrain(t *testing.T) {
 	v, dir := newV2StoreForTest(t)
-	stop, err := startManagementServer(v, nil, []string{dir})
+	stop, err := startManagementServer(v, []string{dir})
 	if err != nil {
 		t.Fatalf("startManagementServer: %v", err)
 	}

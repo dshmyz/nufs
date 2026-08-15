@@ -8,8 +8,7 @@ import (
 
 // OpsStore is the read/inspect/verify/status subset of the storage backend
 // that the management channel (OpsServer HTTP + management unix socket)
-// requires. Both the legacy ChunkStore and the V2.1 V2Store implement it, so
-// either engine can drive the same operational API surface.
+// requires.
 //
 // Replication / anti-entropy / repair are NOT part of this interface — those
 // sit on the Metadata V2 placement/EC serving path (task #56) and have their
@@ -22,42 +21,32 @@ type OpsStore interface {
 	// VerifyChunkData re-reads a chunk and reports whether its on-disk content
 	// still matches the recorded checksum (integrity check).
 	VerifyChunkData(chunkID metadata.ChunkID) (bool, uint32, error)
-	// PerfSnapshot returns engine performance counters (V2.1 reports a zero
-	// snapshot for the V1-only fsync/semaphore metrics).
+	// PerfSnapshot returns engine performance counters.
 	PerfSnapshot() ChunkStorePerfSnapshot
 	Delete(chunkID metadata.ChunkID) error
 }
 
 // DiskLifecycleOps is the optional hot-add/remove/migrate capability of a
-// storage backend. Both the V1 ChunkStore and the V2.1 V2Store implement it;
-// the management servers advertise these commands only when the backend
-// implements the capability. V2Store.AddDisk additionally requires a disk
-// factory (SetDiskFactory) to have been injected by the datanode main —
-// without one it degrades to an "unsupported" error.
+// storage backend. V2Store implements it; the management servers advertise
+// these commands only when the backend implements the capability.
+// V2Store.AddDisk additionally requires a disk factory (SetDiskFactory) to
+// have been injected by the datanode main — without one it degrades to an
+// "unsupported" error.
 type DiskLifecycleOps interface {
-	AddDisk(dir string, maxWrites, maxReads int, wal *WriteAheadLog) (int, error)
+	AddDisk(dir string, maxWrites, maxReads int) (int, error)
 	RemoveDisk(idx int) error
 	MigrateDisk(srcIdx int) (int, error)
 }
 
-// DrainOps is the optional graceful-shutdown drain capability. Both the V1
-// ChunkStore and the V2.1 V2Store expose it; the management/ops channel
-// advertises /drain when a backend implements the capability. V2Store's
-// DrainWrites delegates to its internal QuiesceWrites write barrier.
+// DrainOps is the optional graceful-shutdown drain capability. V2Store
+// exposes it; the management/ops channel advertises /drain when a backend
+// implements the capability. V2Store's DrainWrites delegates to its internal
+// QuiesceWrites write barrier.
 type DrainOps interface {
 	DrainWrites(ctx context.Context) (func(), error)
 }
 
-// Compile-time: both storage engines satisfy the OpsStore operations surface.
-var _ OpsStore = (*ChunkStore)(nil)
+// Compile-time: V2Store satisfies all ops interfaces.
 var _ OpsStore = (*V2Store)(nil)
-
-// Compile-time: both storage engines expose the disk-lifecycle and drain
-// capabilities, so the management/ops channel can advertise
-// adopt/retire/decommission/migrate/drain for either engine. V2Store exposes
-// drain via DrainWrites, which delegates to its internal QuiesceWrites write
-// barrier.
-var _ DiskLifecycleOps = (*ChunkStore)(nil)
 var _ DiskLifecycleOps = (*V2Store)(nil)
-var _ DrainOps = (*ChunkStore)(nil)
 var _ DrainOps = (*V2Store)(nil)

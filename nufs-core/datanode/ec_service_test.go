@@ -47,7 +47,7 @@ func TestECService_ServingPath_ConvertThenRead(t *testing.T) {
 
 	// Wire the same ops surface runDataNodeV21 serves, with the EC driver
 	// attached, and drive the conversion through the real endpoint.
-	s := NewOpsServerWithRepair(Config{NodeID: 7}, v, newMockMetadataService(), nil, nil, nil, nil)
+	s := NewOpsServerWithRepair(Config{NodeID: 7}, v, newMockMetadataService(), nil)
 	s.SetECService(svc)
 	dispatch := func(method, path string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, nil)
@@ -126,7 +126,7 @@ func TestECService_ServingPath_UnderProvisionedFailsCleanly(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	s := NewOpsServerWithRepair(Config{NodeID: 7}, v, newMockMetadataService(), nil, nil, nil, nil)
+	s := NewOpsServerWithRepair(Config{NodeID: 7}, v, newMockMetadataService(), nil)
 	s.SetECService(svc)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/ec/convert?chunk_id=21002", nil)
 	rec := httptest.NewRecorder()

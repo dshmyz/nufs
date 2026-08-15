@@ -187,7 +187,7 @@ func TestV2StoreAddDiskGrowsStoreAndRoutesNewChunks(t *testing.T) {
 	writeChunks(t, v, metadata.ChunkID(400), 6)
 
 	dir := t.TempDir()
-	idx, err := v.AddDisk(dir, 8, 8, nil)
+	idx, err := v.AddDisk(dir, 8, 8)
 	if err != nil {
 		t.Fatalf("AddDisk: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestV2StoreAddDiskGrowsStoreAndRoutesNewChunks(t *testing.T) {
 
 func TestV2StoreAddDiskWithoutFactoryDegrades(t *testing.T) {
 	v, _ := newTestMultiStore(t, 1)
-	if _, err := v.AddDisk(t.TempDir(), 8, 8, nil); err == nil {
+	if _, err := v.AddDisk(t.TempDir(), 8, 8); err == nil {
 		t.Fatal("AddDisk without a disk factory should degrade to unsupported")
 	}
 }
@@ -354,7 +354,7 @@ func TestV2StoreReAdoptSameDirAfterRetire(t *testing.T) {
 	// the dir; the re-adopt must tear that backend down first (the fix) so it
 	// can reopen the same dir instead of failing with "lock held by current
 	// process".
-	idx, err := v.AddDisk(target, 8, 8, nil)
+	idx, err := v.AddDisk(target, 8, 8)
 	if err != nil {
 		t.Fatalf("adopt: %v", err)
 	}
@@ -372,7 +372,7 @@ func TestV2StoreReAdoptSameDirAfterRetire(t *testing.T) {
 	if got := v.retiredDiskIndexFor(target); got != idx {
 		t.Fatalf("retiredDiskIndexFor(%s) = %d, want %d", target, got, idx)
 	}
-	reIdx, err := v.AddDisk(target, 8, 8, nil)
+	reIdx, err := v.AddDisk(target, 8, 8)
 	if err != nil {
 		t.Fatalf("re-adopt same dir after retire: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestV2StoreDiskLifecycleSurvivesRestart(t *testing.T) {
 		s, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 1})
 		return s, s, err
 	})
-	if _, err := v.AddDisk(dir2, 8, 8, nil); err != nil {
+	if _, err := v.AddDisk(dir2, 8, 8); err != nil {
 		t.Fatalf("AddDisk: %v", err)
 	}
 	// Record where each chunk lives before the simulated restart.

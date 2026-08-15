@@ -43,17 +43,15 @@ type sockResp struct {
 type managementServer struct {
 	sockPath string
 	store    datanode.OpsStore
-	disk     *datanode.DiskManager
 	listener net.Listener
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 }
 
-func newManagementServer(sockPath string, store datanode.OpsStore, dm *datanode.DiskManager) *managementServer {
+func newManagementServer(sockPath string, store datanode.OpsStore) *managementServer {
 	return &managementServer{
 		sockPath: sockPath,
 		store:    store,
-		disk:     dm,
 		stopCh:   make(chan struct{}),
 	}
 }
@@ -177,7 +175,7 @@ func (ms *managementServer) handleAdopt(conn net.Conn, dir string) {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: "disk lifecycle unsupported by this engine"})
 		return
 	}
-	idx, err := lc.AddDisk(dir, 8, 8, nil)
+	idx, err := lc.AddDisk(dir, 8, 8)
 	if err != nil {
 		json.NewEncoder(conn).Encode(sockResp{Status: "error", Error: err.Error()})
 		return
@@ -435,9 +433,9 @@ func findSockPath(args []string) string {
 	return ""
 }
 
-func startManagementServer(store datanode.OpsStore, dm *datanode.DiskManager, dataDirs []string) (func(), error) {
+func startManagementServer(store datanode.OpsStore, dataDirs []string) (func(), error) {
 	sockPath := filepath.Join(dataDirs[0], ".datanode.sock")
-	ms := newManagementServer(sockPath, store, dm)
+	ms := newManagementServer(sockPath, store)
 	if err := ms.Start(); err != nil {
 		return nil, err
 	}

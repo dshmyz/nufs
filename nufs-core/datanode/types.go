@@ -4,7 +4,13 @@
 package datanode
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
 	"github.com/dshmyz/nufs/nufs-core/metadata"
@@ -134,10 +140,6 @@ type Config struct {
 	// still land in the admin ring buffer + logs.
 	AlertWebhook string
 
-	// StorageVersion selects the storage engine: "v1" (legacy ChunkStore)
-	// or "v2.1" (new segment/commit-log engine).
-	StorageVersion string
-
 	// SegmentSize is the V2.1 per-stream segment size in bytes. 0 keeps the
 	// storage default (4GiB); a smaller value seals segments sooner so the
 	// compaction worker reclaims superseded bytes faster (demos/CI).
@@ -159,6 +161,13 @@ type Config struct {
 	// to be in the "written locally but not yet committed to metadata"
 	// window, during which GetChunk legitimately reports not-found.
 	GCGraceWindow time.Duration
+
+	// ScrubInterval is the cadence for the background data integrity scan
+	// (scrub worker). The scrub reads every local chunk and verifies its
+	// CRC32C checksum; corruption is reported via the change journal so the
+	// heartbeat ships it to the metadata authority. 0 disables the scan.
+	// Default in the scrub worker: 6h.
+	ScrubInterval time.Duration
 
 	// LogLevel is the initial log level (debug/info/warn/error).
 	// Can be changed at runtime via SIGHUP signal.
@@ -299,4 +308,196 @@ const (
 	LocalWritten                        // Write complete, pending seal
 	LocalSealed                         // Sealed and verified
 	LocalCorrupt                        // Checksum mismatch detected
+)
+
+// ========== Shared types (extracted from deleted V1 files) ==========
+
+// DiskState represents the operational health of a disk.
+type DiskState int
+
+const (
+	DiskOnline   DiskState = iota // Healthy
+	DiskDegraded                  // I/O errors detected, below threshold
+	DiskFailed                    // Too many I/O errors, read-only
+)
+
+func (s DiskState) String() string {
+	switch s {
+	case DiskOnline:
+		return "online"
+	case DiskDegraded:
+		return "degraded"
+	case DiskFailed:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+// AlertLevel represents capacity alert severity.
+type AlertLevel int32
+
+const (
+	AlertNone     AlertLevel = iota // No alert
+	AlertWarn                       // Usage above warn threshold
+	AlertCritical                   // Usage above critical threshold
+)
+
+func (l AlertLevel) String() string {
+	switch l {
+	case AlertWarn:
+		return "warn"
+	case AlertCritical:
+		return "critical"
+	default:
+		return "none"
+	}
+}
+
+// ChunkStorePerfSnapshot holds performance counters for the store.
+type ChunkStorePerfSnapshot struct {
+	WriteSemWaitNs     int64 `json:"write_sem_wait_ns"`
+	ReadSemWaitNs      int64 `json:"read_sem_wait_ns"`
+	FsyncNs            int64 `json:"fsync_ns"`
+	FsyncCount         int64 `json:"fsync_count"`
+	ReadRequestedBytes int64 `json:"read_requested_bytes"`
+	ReadAmplifiedBytes int64 `json:"read_amplified_bytes"`
+	FdCacheHits        int64 `json:"fd_cache_hits"`
+	FdCacheMisses      int64 `json:"fd_cache_misses"`
+	FdCacheEvictions   int64 `json:"fd_cache_evictions"`
+	ListChunksNs       int64 `json:"list_chunks_ns"`
+	ListChunksCalls    int64 `json:"list_chunks_calls"`
+	ListChunksItems    int64 `json:"list_chunks_items"`
+}
+
+// DiskStatsItem holds per-disk usage and health, used by the heartbeat
+// reporter and the management interface.
+type DiskStatsItem struct {
+	Index      int
+	UsedBytes  int64
+	TotalBytes int64
+	// OnDiskBytes is the physical bytes occupied by the store's data files
+	// on this disk, including superseded record generations not yet
+	// reclaimed by seal+compaction. Distinct from UsedBytes (logical live
+	// bytes); a console can show both honestly.
+	OnDiskBytes int64
+	ChunkCount  int64
+	Failed      bool
+	// State is the derived 3-tier health (DiskOnline/DiskDegraded/DiskFailed).
+	State DiskState
+}
+
+// DiskInfo is a read-only snapshot of one disk shard's metadata, returned
+// by DiskInfos for the management interface.
+type DiskInfo struct {
+	Index       int
+	Dir         string
+	UsedBytes   int64
+	OnDiskBytes int64
+	ChunkCount  int64
+	Failed      bool
+	// State is the derived 3-tier health (DiskOnline/DiskDegraded/DiskFailed).
+	// Zero value = DiskOnline.
+	State DiskState
+}
+
+// DiskIndexByDir resolves a directory to its disk index, preferring the first
+// HEALTHY (non-Failed) entry that claims that dir and falling back to a Failed
+// entry only when no healthy one matches.
+func DiskIndexByDir(infos []DiskInfo, dir string) int {
+	firstAny := -1
+	for _, d := range infos {
+		if d.Dir != dir {
+			continue
+		}
+		if firstAny < 0 {
+			firstAny = d.Index
+		}
+		if !d.Failed {
+			return d.Index
+		}
+	}
+	return firstAny
+}
+
+// DiskStatsSnapshot is a point-in-time copy of DiskStats without atomic fields
+// (safe to copy).
+type DiskStatsSnapshot struct {
+	TotalBytes  int64     `json:"total_bytes"`
+	UsedBytes   int64     `json:"used_bytes"`
+	OnDiskBytes int64     `json:"on_disk_bytes,omitempty"`
+	AvailBytes  int64     `json:"avail_bytes"`
+	UsagePct    float64   `json:"usage_pct"`
+	ChunkCount  int64     `json:"chunk_count"`
+	ReadIOPS    int64     `json:"read_iops"`
+	WriteIOPS   int64     `json:"write_iops"`
+	ReadBytes   int64     `json:"read_bytes"`
+	WriteBytes  int64     `json:"write_bytes"`
+	IOErrors    int64     `json:"io_errors"`
+	DiskState   string    `json:"disk_state"`
+	LastUpdated time.Time `json:"last_updated"`
+}
+
+// detectCapacityBytes returns the filesystem total bytes for dir via Statfs,
+// or 0 if it cannot be determined.
+func detectCapacityBytes(dir string) int64 {
+	var s unix.Statfs_t
+	if err := unix.Statfs(dir, &s); err != nil {
+		return 0
+	}
+	return int64(s.Blocks) * int64(s.Bsize)
+}
+
+// dataFilesOnDiskBytes sums the logical sizes of all files under root whose
+// name ends in one of the given extensions.
+func dataFilesOnDiskBytes(root string, exts ...string) int64 {
+	if root == "" {
+		return 0
+	}
+	var total int64
+	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		found := false
+		for _, e := range exts {
+			if strings.HasSuffix(d.Name(), e) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+		if fi, err := os.Stat(path); err == nil {
+			total += fi.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// ========== Metadata interfaces (shared by V2.1 heartbeat/repair) ==========
+
+// HeartbeatMeta is the metadata surface used by HeartbeatReporter.
+type HeartbeatMeta interface {
+	Heartbeat(ctx context.Context, nodeID metadata.NodeID, report *metadata.NodeReport) error
+	AckChangeEvents(ctx context.Context, nodeID metadata.NodeID, seq uint64) (uint64, error)
+}
+
+// RepairMeta is the metadata surface used by RepairWorker.
+type RepairMeta interface {
+	GetChunk(ctx context.Context, id metadata.ChunkID) (*metadata.ChunkMeta, error)
+	UpdateChunk(ctx context.Context, chunk *metadata.ChunkMeta) error
+	GetRepairQueue(ctx context.Context) ([]metadata.RepairTask, error)
+	RemoveRepairTask(ctx context.Context, chunkID metadata.ChunkID) error
+	ReportChunkState(ctx context.Context, nodeID metadata.NodeID, states map[metadata.ChunkID]metadata.ReplicaState) error
+	ListNodes(ctx context.Context) ([]metadata.NodeInfo, error)
+	ChunksByNode(ctx context.Context, nodeID metadata.NodeID) ([]metadata.ChunkMeta, error)
+	TriggerRepair(ctx context.Context, chunkID metadata.ChunkID) error
+}
+
+var (
+	_ HeartbeatMeta = (*metadata.PebbleStore)(nil)
+	_ RepairMeta    = (*metadata.PebbleStore)(nil)
 )

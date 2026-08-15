@@ -355,6 +355,17 @@ func TestV2StoreImplementsDiskIOProvider(t *testing.T) {
 	var _ diskIOProvider = (*V2Store)(nil)
 }
 
+// mockHeartbeatMeta is a minimal HeartbeatMeta for tests that only need
+// the sampler path (no real metadata round-trip).
+type mockHeartbeatMeta struct{}
+
+func (m *mockHeartbeatMeta) Heartbeat(_ context.Context, _ metadata.NodeID, _ *metadata.NodeReport) error {
+	return nil
+}
+func (m *mockHeartbeatMeta) AckChangeEvents(_ context.Context, _ metadata.NodeID, _ uint64) (uint64, error) {
+	return 0, nil
+}
+
 // TestHeartbeatSamplerDiskIO_V2Store verifies the heartbeat's disk-I/O
 // sampling path feeds a real (nonzero) utilization from a V2Store that
 // exposes ReadWriteBytes — closing the parity gap where ChunkStore's

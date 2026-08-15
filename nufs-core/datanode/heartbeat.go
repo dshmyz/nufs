@@ -15,7 +15,6 @@ import (
 // heartbeated and stay online for placement selection.
 type HeartbeatStore interface {
 	Stats() (totalBytes int64, chunkCount int64)
-	DiskManager() *DiskManager
 	ChunkStateSnapshot() map[metadata.ChunkID]metadata.ReplicaState
 	StateVersion() uint64
 	DiskStats() []DiskStatsItem
@@ -318,9 +317,6 @@ func (h *HeartbeatReporter) sampleDiskIO() float64 {
 	if p, ok := h.chunkSt.(diskIOProvider); ok {
 		r, w := p.ReadWriteBytes()
 		currentIO = r + w
-	} else if dm := h.chunkSt.DiskManager(); dm != nil {
-		stats := dm.Stats()
-		currentIO = stats.ReadBytes + stats.WriteBytes
 	}
 	delta := currentIO - h.lastIOBytes
 	h.lastIOBytes = currentIO

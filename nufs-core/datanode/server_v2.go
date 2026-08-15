@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,6 +60,9 @@ type diskBackend struct {
 type chunkLoc struct {
 	disk int
 	gen  storage.Generation
+	// small marks a chunk whose extent lives in the small-file stream
+	// (StreamID 0, ≤ SmallFileThreshold) instead of the data stream.
+	small bool
 }
 
 // V2Store implements the LocalChunkStore and HeartbeatStore interfaces
@@ -85,6 +89,14 @@ type V2Store struct {
 	// it is just not accounted in disks/Stats/DiskStats nor reported as a
 	// replica, because a shard is a fragment, not a whole-chunk replica.
 	shards []*diskBackend
+
+	// small holds the small-file commit streams, one per data disk (parallel
+	// to disks: small[i] is the StreamID 0 store on the same physical disk
+	// as disks[i]). Chunks ≤ SmallFileThreshold are written here as a single
+	// record (chunkLoc.small); an overwrite that outgrows the threshold
+	// migrates to a data-stream disk. Empty when the node has no small
+	// streams attached — the V2Store then behaves exactly as before.
+	small []*diskBackend
 
 	// caps holds one capacity guard per physical disk root, parallel to
 	// disks (index i guards the disk hosting data store i and shard store
@@ -200,11 +212,15 @@ func NewMultiV2Store(stores []storage.Store, dirs ...string) *V2Store {
 
 // DataStores returns the per-disk data-stream segment stores (the same
 // backing storage.Store instances passed to NewV2Store/NewMultiV2Store),
-// in disk order. EC-shard stores are excluded. The background compaction
-// worker drives these to reclaim superseded record bytes.
+// in disk order, plus the small-file streams when attached. EC-shard stores
+// are excluded. The background compaction worker drives these to reclaim
+// superseded record bytes.
 func (v *V2Store) DataStores() []storage.Store {
-	out := make([]storage.Store, 0, len(v.disks))
+	out := make([]storage.Store, 0, len(v.disks)+len(v.small))
 	for _, b := range v.disks {
+		out = append(out, b.store)
+	}
+	for _, b := range v.small {
 		out = append(out, b.store)
 	}
 	return out
@@ -214,7 +230,23 @@ func (v *V2Store) DataStores() []storage.Store {
 // owning disk at the next generation, place a new chunk on the
 // least-used disk at generation 1, then durably write and update
 // accounting.
+//
+// Small-chunk routing: a new chunk ≤ SmallFileThreshold goes to the small
+// stream (when attached); an overwrite of a small chunk stays in the small
+// stream while it fits and migrates to a data-stream disk when it outgrows
+// the threshold.
 func (v *V2Store) Write(chunkID metadata.ChunkID, data []byte) error {
+	loc, ok := v.currentLoc(chunkID)
+	if ok && loc.small {
+		gen := loc.gen + 1
+		if len(data) <= storage.SmallFileThreshold {
+			return v.writeSmallTo(chunkID, loc.disk, gen, data)
+		}
+		return v.migrateSmallToData(chunkID, loc, gen, data)
+	}
+	if !ok && len(v.small) > 0 && len(data) <= storage.SmallFileThreshold {
+		return v.writeSmallTo(chunkID, v.leastUsedSmall(), storage.Generation(1), data)
+	}
 	disk, gen := v.nextLoc(chunkID)
 	return v.writeTo(chunkID, disk, gen, data)
 }
@@ -229,9 +261,16 @@ func (v *V2Store) Write(chunkID metadata.ChunkID, data []byte) error {
 // authoritative generation instead of each datanode bumping its own counter.
 func (v *V2Store) WriteGen(chunkID metadata.ChunkID, generation uint64, data []byte) error {
 	gen := storage.Generation(generation)
-	v.mu.RLock()
-	loc, ok := v.locOf[chunkID]
-	v.mu.RUnlock()
+	loc, ok := v.currentLoc(chunkID)
+	if ok && loc.small {
+		if len(data) <= storage.SmallFileThreshold {
+			return v.writeSmallTo(chunkID, loc.disk, gen, data)
+		}
+		return v.migrateSmallToData(chunkID, loc, gen, data)
+	}
+	if !ok && len(v.small) > 0 && len(data) <= storage.SmallFileThreshold {
+		return v.writeSmallTo(chunkID, v.leastUsedSmall(), gen, data)
+	}
 	if ok {
 		// Overwrite existing chunk: keep disk locality, honor metadata gen.
 		return v.writeTo(chunkID, loc.disk, gen, data)
@@ -239,6 +278,35 @@ func (v *V2Store) WriteGen(chunkID metadata.ChunkID, generation uint64, data []b
 	// New chunk: least-used disk at the metadata-issued generation.
 	best, _ := v.nextLoc(chunkID)
 	return v.writeTo(chunkID, best, gen, data)
+}
+
+// currentLoc returns the recorded location of a chunk (ok=false when the
+// chunk is unknown to this store).
+func (v *V2Store) currentLoc(chunkID metadata.ChunkID) (chunkLoc, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	loc, ok := v.locOf[chunkID]
+	return loc, ok
+}
+
+// leastUsedSmall picks the small stream with the fewest used bytes, skipping
+// streams whose paired data disk is FAILED (same physical disk). Falls back
+// to 0 when every disk is failed (the failure surfaces through the health
+// admission in writeSmallTo).
+func (v *V2Store) leastUsedSmall() int {
+	best, bestUsed := -1, int64(1<<63-1)
+	for i, b := range v.small {
+		if v.diskFailed(i) {
+			continue
+		}
+		if used := b.usedByts.Load(); used < bestUsed {
+			bestUsed, best = used, i
+		}
+	}
+	if best < 0 {
+		best = 0
+	}
+	return best
 }
 
 // writeTo durably writes data for chunkID to a specific disk under a specific
@@ -301,6 +369,96 @@ func (v *V2Store) writeTo(chunkID metadata.ChunkID, disk int, gen storage.Genera
 	v.locOf[chunkID] = chunkLoc{disk: disk, gen: gen}
 	v.mu.Unlock()
 	v.stateVersion.Add(1)
+	return nil
+}
+
+// writeSmallTo durably writes data for chunkID to the i-th small stream under
+// gen, with the same health/capacity admissions as writeTo (the small stream
+// shares the physical disk with data store i) and mirrored accounting. When
+// no small stream is attached it falls back to the data stream, so a mixed
+// topology (some nodes with small stores) stays correct.
+func (v *V2Store) writeSmallTo(chunkID metadata.ChunkID, i int, gen storage.Generation, data []byte) error {
+	if len(v.small) == 0 {
+		disk, g := v.nextLoc(chunkID)
+		return v.writeTo(chunkID, disk, g, data)
+	}
+	if i < 0 || i >= len(v.small) {
+		i = 0
+	}
+	// Write barrier: hold drainMu.RLock for the whole write so DrainWrites
+	// cannot race an in-flight write (mirror writeTo).
+	v.drainMu.RLock()
+	defer v.drainMu.RUnlock()
+	if v.diskFailed(i) {
+		return fmt.Errorf("datanode: disk %d is FAILED, refusing small write", i)
+	}
+	if err := v.admitDiskWrite(i, int64(len(data))); err != nil {
+		return err
+	}
+	newChunk := gen == 1
+	b := v.small[i]
+	b.writeOps.Add(1)
+	if _, err := b.store.Write(context.Background(), &storage.WriteRequest{
+		ExtentID:   storage.ExtentID(chunkID),
+		Generation: gen,
+		Data:       data,
+	}); err != nil {
+		b.writeErr.Add(1)
+		b.failCount.Add(1)
+		return err
+	}
+	b.failCount.Store(0)
+	b.writeByts.Add(int64(len(data)))
+	if newChunk {
+		b.usedByts.Add(int64(len(data)))
+		b.extCount.Add(1)
+	} else {
+		if gen > 1 {
+			if old, err := b.store.Stat(context.Background(), &storage.StatRequest{
+				ExtentID: storage.ExtentID(chunkID), Generation: gen - 1,
+			}); err == nil {
+				b.usedByts.Add(-int64(old.LogicalLen))
+			}
+		}
+		b.usedByts.Add(int64(len(data)))
+	}
+	v.mu.Lock()
+	v.locOf[chunkID] = chunkLoc{disk: i, gen: gen, small: true}
+	v.mu.Unlock()
+	v.stateVersion.Add(1)
+	return nil
+}
+
+// migrateSmallToData moves a small-stream chunk that outgrew
+// SmallFileThreshold onto a data-stream disk: the new payload is written to a
+// data disk first (reads resolve through locOf immediately), then the stale
+// small extent is tombstoned best-effort. A failed tombstone leaves an
+// unreferenced small record that compaction reclaims; correctness never
+// depends on it.
+func (v *V2Store) migrateSmallToData(chunkID metadata.ChunkID, loc chunkLoc, gen storage.Generation, data []byte) error {
+	best, _ := v.nextLoc(chunkID) // least-used data disk, skips FAILED disks
+	if err := v.writeTo(chunkID, best, gen, data); err != nil {
+		return err
+	}
+	// writeTo already re-pointed locOf at (best, gen) — reads now serve the
+	// grown payload. Tombstone the stale small record best-effort.
+	if i := loc.disk; i >= 0 && i < len(v.small) {
+		b := v.small[i]
+		if old, err := b.store.Stat(context.Background(), &storage.StatRequest{
+			ExtentID: storage.ExtentID(chunkID), Generation: loc.gen,
+		}); err == nil {
+			b.usedByts.Add(-int64(old.LogicalLen))
+		}
+		if err := b.store.Delete(context.Background(), &storage.DeleteRequest{
+			ExtentID:   storage.ExtentID(chunkID),
+			Generation: loc.gen,
+		}); err == nil {
+			b.extCount.Add(-1)
+		} else {
+			slog.Warn("datanode: small extent tombstone failed after growth migration",
+				"chunkID", chunkID, "error", err)
+		}
+	}
 	return nil
 }
 
@@ -369,6 +527,37 @@ func (v *V2Store) AttachShardStores(shardStores []storage.Store) error {
 			}
 		}
 		v.shards = append(v.shards, b)
+	}
+	return nil
+}
+
+// AttachSmallStores attaches the per-disk small-file commit streams
+// (StreamID 0, ≤ SmallFileThreshold records). stores[i] is the small stream
+// on the same physical disk as the i-th data store in disks. After
+// attachment, new chunks ≤ SmallFileThreshold are routed to the small stream
+// and existing small extents are enumerated into the location map, so reads,
+// stats, heartbeats and the orphan GC resolve them across restarts. Without
+// attachment the V2Store keeps routing everything to the data stream. Returns
+// an error if the count does not match the data disks.
+func (v *V2Store) AttachSmallStores(stores []storage.Store) error {
+	if len(stores) > 0 && len(stores) != len(v.disks) {
+		return fmt.Errorf("attach small stores: got %d stores for %d disks", len(stores), len(v.disks))
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for i, s := range stores {
+		b := &diskBackend{store: s, index: i}
+		if lister, ok := s.(extentLister); ok {
+			b.lister = lister
+			if extents, err := lister.ListExtents(); err == nil {
+				for _, e := range extents {
+					v.locOf[metadata.ChunkID(e.ExtentID)] = chunkLoc{disk: i, gen: e.Generation, small: true}
+					b.usedByts.Add(int64(e.Value.LogicalLen))
+					b.extCount.Add(1)
+				}
+			}
+		}
+		v.small = append(v.small, b)
 	}
 	return nil
 }
@@ -1132,13 +1321,12 @@ func (v *V2Store) RemoveDisk(idx int) error {
 // AddDisk adopts a new data dir by asking the injected disk factory to build
 // its paired data-stream and EC-shard segment stores, then appends both (plus
 // a capacity guard) to the V2Store and enumerates the new data/shards into
-// the location maps. Returns the new disk's index. maxWrites/maxReads/wal are
-// legacy-ChunkStore disk constraints with no V2.1 analogue and are ignored.
+// the location maps. Returns the new disk's index.
 //
 // Without a configured diskFactory (SetDiskFactory never called) AddDisk is
 // unsupported and returns an error — the single-disk/test construction path
 // has no way to build an engine backend for an arbitrary new dir.
-func (v *V2Store) AddDisk(dir string, maxWrites, maxReads int, wal *WriteAheadLog) (int, error) {
+func (v *V2Store) AddDisk(dir string, maxWrites, maxReads int) (int, error) {
 	if v.diskFactory == nil {
 		return 0, fmt.Errorf("add disk: not configured (no disk factory); disk lifecycle unsupported by this engine")
 	}
@@ -1264,7 +1452,7 @@ func (v *V2Store) loc(chunkID metadata.ChunkID) chunkLoc {
 // Read implements LocalChunkStore.Read.
 func (v *V2Store) Read(chunkID metadata.ChunkID, offset int64, length int32) ([]byte, uint32, error) {
 	loc := v.loc(chunkID)
-	b := v.disks[loc.disk]
+	b := v.backendAt(loc)
 	res, err := b.store.Read(context.Background(), &storage.ReadRequest{
 		ExtentID:      storage.ExtentID(chunkID),
 		Generation:    loc.gen,
@@ -1278,10 +1466,24 @@ func (v *V2Store) Read(chunkID metadata.ChunkID, offset int64, length int32) ([]
 	return res.Data, res.Checksum, nil
 }
 
+// backendAt returns the diskBackend owning a chunk's extent: the small
+// stream when the chunk lives there, otherwise the data stream.
+func (v *V2Store) backendAt(loc chunkLoc) *diskBackend {
+	if loc.small && len(v.small) > 0 {
+		if loc.disk >= 0 && loc.disk < len(v.small) {
+			return v.small[loc.disk]
+		}
+	}
+	if loc.disk < 0 || loc.disk >= len(v.disks) {
+		loc.disk = 0
+	}
+	return v.disks[loc.disk]
+}
+
 // Delete implements LocalChunkStore.Delete.
 func (v *V2Store) Delete(chunkID metadata.ChunkID) error {
 	loc := v.loc(chunkID)
-	b := v.disks[loc.disk]
+	b := v.backendAt(loc)
 	// Capture the live size before the fenced delete so used-bytes reflects
 	// the freed space (a post-delete stat would return the tombstone).
 	if ext, err := b.store.Stat(context.Background(), &storage.StatRequest{
@@ -1315,7 +1517,7 @@ func (v *V2Store) Seal(chunkID metadata.ChunkID) (uint32, error) {
 // owning backend's stat.
 func (v *V2Store) Info(chunkID metadata.ChunkID) (*LocalChunkInfo, bool) {
 	loc := v.loc(chunkID)
-	res, err := v.disks[loc.disk].store.Stat(context.Background(), &storage.StatRequest{
+	res, err := v.backendAt(loc).store.Stat(context.Background(), &storage.StatRequest{
 		ExtentID:   storage.ExtentID(chunkID),
 		Generation: loc.gen,
 	})
@@ -1339,10 +1541,10 @@ func (v *V2Store) Info(chunkID metadata.ChunkID) (*LocalChunkInfo, bool) {
 }
 
 // ListChunks returns all locally stored chunk information by enumerating
-// every backend's committed extents.
+// every backend's committed extents (data stream + small stream).
 func (v *V2Store) ListChunks() []LocalChunkInfo {
 	var out []LocalChunkInfo
-	for _, b := range v.disks {
+	for _, b := range append(append([]*diskBackend{}, v.disks...), v.small...) {
 		if b.lister == nil {
 			continue
 		}
@@ -1370,7 +1572,7 @@ func (v *V2Store) ListChunks() []LocalChunkInfo {
 
 // Stats returns aggregate storage statistics across all disks.
 func (v *V2Store) Stats() (totalBytes int64, chunkCount int64) {
-	for _, b := range v.disks {
+	for _, b := range append(append([]*diskBackend{}, v.disks...), v.small...) {
 		totalBytes += b.usedByts.Load()
 		chunkCount += b.extCount.Load()
 	}
@@ -1388,7 +1590,7 @@ func (v *V2Store) StateVersion() uint64 {
 // locally stored chunk, mapped to the ReplicaState heartbeat reports.
 func (v *V2Store) ChunkStateSnapshot() map[metadata.ChunkID]metadata.ReplicaState {
 	out := make(map[metadata.ChunkID]metadata.ReplicaState)
-	for _, b := range v.disks {
+	for _, b := range append(append([]*diskBackend{}, v.disks...), v.small...) {
 		if b.lister == nil {
 			continue
 		}
@@ -1628,12 +1830,6 @@ func (v *V2Store) QuiesceWrites(ctx context.Context) (func(), error) {
 	}
 }
 
-// DiskManager returns nil — the V2.1 engine manages per-disk layout
-// itself; the heartbeat falls back to not sampling disk I/O (DiskStats
-// provides the per-disk breakdown instead).
-func (v *V2Store) DiskManager() *DiskManager {
-	return nil
-}
 
 // ReadWriteBytes returns the cumulative bytes read and written on the
 // serving path since startup, across all disks. The heartbeat samples

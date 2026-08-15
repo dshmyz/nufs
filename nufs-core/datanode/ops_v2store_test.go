@@ -26,7 +26,7 @@ func newV2OpsServer(t *testing.T) (*OpsServer, func(method, path string) *httpte
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
-	s := NewOpsServerWithRepair(Config{NodeID: 7}, v, newMockMetadataService(), nil, nil, nil, nil)
+	s := NewOpsServerWithRepair(Config{NodeID: 7}, v, newMockMetadataService(), nil)
 	dispatch := func(method, path string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, nil)
 		rec := httptest.NewRecorder()
@@ -113,7 +113,7 @@ func TestOpsServer_V2StoreVerifyChunk(t *testing.T) {
 		chunks: map[metadata.ChunkID]*metadata.ChunkMeta{
 			metadata.ChunkID(100): {},
 		},
-	}, nil, nil, nil, nil)
+	}, nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/chunks/100/verify", nil)
 	rec := httptest.NewRecorder()
 	s.listener.Handler.ServeHTTP(rec, req)

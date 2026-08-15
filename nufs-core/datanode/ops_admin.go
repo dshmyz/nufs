@@ -195,21 +195,10 @@ func (s *OpsServer) alertRingSnapshot() []capacityAlertEvent {
 	return out
 }
 
-// capacityOverview computes the aggregated used/total/usage across all disks.
-// V1 uses the DiskManager's live snapshot; V2.1 (no DiskManager) sums each
-// disk's UsedBytes and detects each disk dir's filesystem total via Statfs.
+// capacityOverview computes the aggregated used/total/usage across all disks
+// by summing each disk's UsedBytes and detecting each disk dir's filesystem
+// total via Statfs.
 func (s *OpsServer) capacityOverview() capacityOverview {
-	if s.disk != nil {
-		st := s.disk.Stats()
-		ov := capacityOverview{
-			UsedBytes:  st.UsedBytes,
-			TotalBytes: st.TotalBytes,
-		}
-		if st.TotalBytes > 0 {
-			ov.UsagePct = float64(st.UsedBytes) / float64(st.TotalBytes)
-		}
-		return ov
-	}
 	// V2.1 path: aggregate per-disk DiskInfo usage + Statfs totals. The
 	// physical OnDiskBytes (compressed .seg footprint) is summed alongside so
 	// an admin can show logical live vs physical on-disk side by side.
@@ -242,14 +231,9 @@ func capacityLevelForUsage(usagePct float64) AlertLevel {
 	}
 }
 
-// currentAlertLevel derives the alert level from the live capacity overview,
-// applying the V1 DiskManager's fired level when present (it has its own
-// change-detection), else computing from usage thresholds (V2.1). It does not
-// mutate ring/webhook state.
+// currentAlertLevel derives the alert level from the live capacity overview
+// using usage thresholds. It does not mutate ring/webhook state.
 func (s *OpsServer) currentAlertLevel() AlertLevel {
-	if s.disk != nil {
-		return AlertLevel(s.disk.alertFired.Load())
-	}
 	return capacityLevelForUsage(s.capacityOverview().UsagePct)
 }
 

@@ -44,9 +44,6 @@ type OpsServer struct {
 	cfg        Config
 	store      OpsStore
 	meta       OpsMetadata
-	disk       *DiskManager
-	repl       *ParallelReplicator
-	ae         *AntiEntropy
 	repair     *RepairWorker
 	ec         *ECService
 	listener   *http.Server
@@ -74,35 +71,21 @@ type OpsServer struct {
 }
 
 // NewOpsServer creates the operations HTTP server.
-func NewOpsServer(cfg Config, store OpsStore, meta OpsMetadata,
-	disk *DiskManager, repl *ParallelReplicator, ae *AntiEntropy) *OpsServer {
-	return NewOpsServerWithRepair(cfg, store, meta, disk, repl, ae, nil)
+func NewOpsServer(cfg Config, store OpsStore, meta OpsMetadata) *OpsServer {
+	return NewOpsServerWithRepair(cfg, store, meta, nil)
 }
 
 // NewOpsServerWithRepair creates an ops server with repair worker integration.
-func NewOpsServerWithRepair(cfg Config, store OpsStore, meta OpsMetadata,
-	disk *DiskManager, repl *ParallelReplicator, ae *AntiEntropy, repair *RepairWorker) *OpsServer {
+func NewOpsServerWithRepair(cfg Config, store OpsStore, meta OpsMetadata, repair *RepairWorker) *OpsServer {
 	mux := http.NewServeMux()
 
 	s := &OpsServer{
 		cfg:    cfg,
 		store:  store,
 		meta:   meta,
-		disk:   disk,
-		repl:   repl,
-		ae:     ae,
 		repair: repair,
 	}
 
-	// Wire disk failure callback to trigger repair for chunks on failed disk
-	if repair != nil && disk != nil {
-		disk.SetOnDiskFailed(func(diskID string) {
-			slog.Warn("ops: disk failed, triggering chunk repairs", "diskID", diskID)
-			if err := repair.RepairChunksForDiskFailure(context.Background(), diskID); err != nil {
-				slog.Error("ops: disk failure repair failed", "error", err)
-			}
-		})
-	}
 
 	// Cluster status
 	// Disk lifecycle management (HTTP endpoints)
@@ -288,22 +271,14 @@ func (s *OpsServer) Stop() {
 
 // --- Handlers ---
 
-// replStats returns replication counters, defaulting to zero when the V1
-// replicator is absent (V2.1 passes nil).
+// replStats returns replication counters (V1 removed, always zero).
 func (s *OpsServer) replStats() (writes, errors, avgLatency int64) {
-	if s.repl == nil {
-		return 0, 0, 0
-	}
-	return s.repl.Stats()
+	return 0, 0, 0
 }
 
-// aeStats returns anti-entropy counters, defaulting to zero when absent
-// (V2.1 passes nil).
+// aeStats returns anti-entropy counters (V1 removed, always zero).
 func (s *OpsServer) aeStats() (scanned, mismatches, repaired int64) {
-	if s.ae == nil {
-		return 0, 0, 0
-	}
-	return s.ae.Stats()
+	return 0, 0, 0
 }
 
 // diskStats returns the disk-capacity/IO snapshot for the ops dashboard.
@@ -340,60 +315,47 @@ func stateRank(name string) int {
 }
 
 func (s *OpsServer) diskStats() DiskStatsSnapshot {
-	if s.disk == nil {
-		// V2.1 path: no legacy DiskManager, so synthesize the snapshot from the
-		// engine's per-disk DiskInfos + aggregate Stats. This is what makes
-		// /api/v1/metrics (and the admin dashboard's telemetry) reflect real
-		// capacity/chunk-count on a V2.1 node instead of all-zero fields
-		// (V2.1 previously had no capacity/metrics source here).
-		totalBytes, chunkCount := s.store.Stats()
-		var readBytes, writeBytes int64
-		if rw, ok := s.store.(interface{ ReadWriteBytes() (int64, int64) }); ok {
-			readBytes, writeBytes = rw.ReadWriteBytes()
+	totalBytes, chunkCount := s.store.Stats()
+	var readBytes, writeBytes int64
+	if rw, ok := s.store.(interface{ ReadWriteBytes() (int64, int64) }); ok {
+		readBytes, writeBytes = rw.ReadWriteBytes()
+	}
+	var used, total, onDisk int64
+	state := "online"
+	for _, d := range s.store.DiskInfos() {
+		used += d.UsedBytes
+		onDisk += d.OnDiskBytes
+		if cap := detectCapacityBytes(d.Dir); cap > 0 {
+			total += cap
 		}
-		var used, total, onDisk int64
-		state := "online"
-		for _, d := range s.store.DiskInfos() {
-			used += d.UsedBytes
-			onDisk += d.OnDiskBytes
-			if cap := detectCapacityBytes(d.Dir); cap > 0 {
-				total += cap
-			}
-			// Use the worst state observed across disks for the node-level state.
-			if st := diskStateName(d.State); stateRank(st) > stateRank(state) {
-				state = st
-			}
-		}
-		if totalBytes > used {
-			used = totalBytes
-		}
-		usage := 0.0
-		if total > 0 {
-			usage = float64(used) / float64(total)
-		}
-		return DiskStatsSnapshot{
-			TotalBytes:  total,
-			UsedBytes:   used,
-			OnDiskBytes: onDisk,
-			AvailBytes:  total - used,
-			UsagePct:    usage,
-			ChunkCount:  chunkCount,
-			ReadBytes:   readBytes,
-			WriteBytes:  writeBytes,
-			DiskState:   state,
-			LastUpdated: time.Now(),
+		if st := diskStateName(d.State); stateRank(st) > stateRank(state) {
+			state = st
 		}
 	}
-	return s.disk.Stats()
+	if totalBytes > used {
+		used = totalBytes
+	}
+	usage := 0.0
+	if total > 0 {
+		usage = float64(used) / float64(total)
+	}
+	return DiskStatsSnapshot{
+		TotalBytes:  total,
+		UsedBytes:   used,
+		OnDiskBytes: onDisk,
+		AvailBytes:  total - used,
+		UsagePct:    usage,
+		ChunkCount:  chunkCount,
+		ReadBytes:   readBytes,
+		WriteBytes:  writeBytes,
+		DiskState:   state,
+		LastUpdated: time.Now(),
+	}
 }
 
-// diskAlertLevel returns the V1 disk manager's fired alert level, or
-// AlertNone when the disk manager is absent (V2.1).
+// diskAlertLevel returns the current alert level (V1 disk manager removed).
 func (s *OpsServer) diskAlertLevel() AlertLevel {
-	if s.disk == nil {
-		return AlertNone
-	}
-	return AlertLevel(s.disk.alertFired.Load())
+	return AlertNone
 }
 
 type ClusterStatus struct {
@@ -850,7 +812,7 @@ func (s *OpsServer) handleHTTPAdopt(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotImplemented, "disk lifecycle unsupported by this engine")
 		return
 	}
-	idx, err := lc.AddDisk(dir, 8, 8, nil)
+	idx, err := lc.AddDisk(dir, 8, 8)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
