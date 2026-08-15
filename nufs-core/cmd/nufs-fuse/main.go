@@ -90,12 +90,6 @@ func main() {
 		accessKey = flag.String("access-key", "", "DFS: access key to authenticate the mount with metad")
 		secretKey = flag.String("secret-key", "", "DFS: secret key to authenticate the mount with metad")
 
-		// Optional credential source: a directory holding credentials.json
-		// (0600). Env vars META_ACCESS_KEY/META_SECRET_KEY/META_ENDPOINT are
-		// always read as a supplement when the corresponding --access-key
-		// etc. is unset. LoadCredentials in gateway/fuse implements this.
-		credentialsDir = flag.String("credentials-dir", "", "DFS: directory containing credentials.json; env META_* fall back when flags are unset")
-
 		// DFS TLS flags — mirror metad's TLS configuration so the FUSE
 		// client can connect to a TLS-enabled metadata and datanode.
 		// --insecure (shared with S3) skips server certificate verification;
@@ -115,7 +109,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  s3   Mount an external S3 bucket\n\n")
 		fmt.Fprintf(os.Stderr, "Configuration:\n")
 		fmt.Fprintf(os.Stderr, "  --config loads a YAML/JSON/TOML file; CLI flags override file values.\n")
-		fmt.Fprintf(os.Stderr, "  Credential precedence: --access-key > credentials-dir/META_* env > --config.\n")
+		fmt.Fprintf(os.Stderr, "  Credential precedence: --access-key > --config file > META_* env.\n")
 		fmt.Fprintf(os.Stderr, "  Secrets should NOT be passed via CLI (visible in ps(1)); use env or --config.\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
@@ -150,18 +144,17 @@ func main() {
 	case "nufs":
 		mountpoint := mountpointFromArgs(flag.Args())
 		runNUFS(log, &dfsMountArgs{
-			mountpoint:     mountpoint,
-			metaDir:        *metaDir,
-			metaAddr:       *metaAddr,
-			cacheDir:       *cacheDir,
-			readCacheMax:   *readCacheMax,
-			writeCacheMax:  *writeCacheMax,
-			metricsAddr:    *metricsAddr,
-			directIO:       *directIO,
-			bucket:         *bucket,
-			accessKey:      *accessKey,
-			secretKey:      *secretKey,
-			credentialsDir: *credentialsDir,
+			mountpoint:    mountpoint,
+			metaDir:       *metaDir,
+			metaAddr:      *metaAddr,
+			cacheDir:      *cacheDir,
+			readCacheMax:  *readCacheMax,
+			writeCacheMax: *writeCacheMax,
+			metricsAddr:   *metricsAddr,
+			directIO:      *directIO,
+			bucket:        *bucket,
+			accessKey:     *accessKey,
+			secretKey:     *secretKey,
 			tls: tlsutil.Config{
 				CertFile:          *tlsCert,
 				KeyFile:           *tlsKey,
@@ -184,6 +177,8 @@ func main() {
 			readCacheMax:  *readCacheMax,
 			writeCacheMax: *writeCacheMax,
 			scanTTL:       *scanTTL,
+			accessKey:     *accessKey,
+			secretKey:     *secretKey,
 			metricsAddr:   *metricsAddr,
 			allowOther:    *allowOther,
 			readOnly:      *readOnly,
@@ -236,23 +231,22 @@ func sanitizeForFilename(mountpoint string) string {
 // in main() and passed to runNUFS as a single value instead of a long flat
 // argument list.
 type dfsMountArgs struct {
-	mountpoint     string
-	metaDir        string
-	metaAddr       string
-	cacheDir       string
-	readCacheMax   int64
-	writeCacheMax  int64
-	metricsAddr    string
-	directIO       bool
-	bucket         string
-	accessKey      string
-	secretKey      string
-	credentialsDir string
-	tls            tlsutil.Config
-	uid, gid       uint32
-	allowOther     bool
-	readOnly       bool
-	debug          bool
+	mountpoint    string
+	metaDir       string
+	metaAddr      string
+	cacheDir      string
+	readCacheMax  int64
+	writeCacheMax int64
+	metricsAddr   string
+	directIO      bool
+	bucket        string
+	accessKey     string
+	secretKey     string
+	tls           tlsutil.Config
+	uid, gid      uint32
+	allowOther    bool
+	readOnly      bool
+	debug         bool
 }
 
 // runNUFS mounts the DFS distributed filesystem via FUSE.
@@ -268,24 +262,14 @@ func runNUFS(log *slog.Logger, a *dfsMountArgs) {
 		}
 	}
 
-	// Credential source: explicit flags win; otherwise fall back to the
-	// gateway/fuse scaffold (credentials.json + META_* env) so a mount can
-	// authenticate purely from injected secrets without CLI flags.
+	// Credential source: explicit flags/config are primary; environment
+	// variables serve as a fallback for k8s Secret injection.
 	ak, sk := a.accessKey, a.secretKey
-	if a.accessKey == "" || a.secretKey == "" {
-		useScaffold := a.credentialsDir != "" ||
-			os.Getenv("META_ACCESS_KEY") != "" ||
-			os.Getenv("META_SECRET_KEY") != "" ||
-			os.Getenv("META_ENDPOINT") != ""
-		if useScaffold {
-			cred := gofuse.LoadCredentials(a.credentialsDir)
-			if ak == "" {
-				ak = cred.AccessKey
-			}
-			if sk == "" {
-				sk = cred.SecretKey
-			}
-		}
+	if ak == "" {
+		ak = os.Getenv("META_ACCESS_KEY")
+	}
+	if sk == "" {
+		sk = os.Getenv("META_SECRET_KEY")
 	}
 
 	// mountState holds the mutable mount state for remount support.
@@ -816,6 +800,8 @@ type s3MountArgs struct {
 	readCacheMax  int64
 	writeCacheMax int64
 	scanTTL       time.Duration
+	accessKey     string
+	secretKey     string
 	metricsAddr   string
 	allowOther    bool
 	readOnly      bool
@@ -849,6 +835,8 @@ func runS3(log *slog.Logger, args *s3MountArgs) {
 		ScanTTL:     args.scanTTL,
 		MetricsAddr: args.metricsAddr,
 		ReadOnly:    args.readOnly,
+		AccessKey:   args.accessKey,
+		SecretKey:   args.secretKey,
 		UID:         args.uid,
 		GID:         args.gid,
 		Insecure:    args.insecure,

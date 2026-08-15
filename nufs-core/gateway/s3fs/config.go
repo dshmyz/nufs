@@ -16,6 +16,9 @@ type Config struct {
 	BasePath string
 	Target   *url.URL
 
+	AccessKey    string // explicit credential; overrides env/file via LoadCredentials
+	SecretKey    string // explicit credential; overrides env/file via LoadCredentials
+	SecretToken  string // STS session token (optional)
 	CacheDir    string
 	ScanTTL     time.Duration
 	MetricsAddr string

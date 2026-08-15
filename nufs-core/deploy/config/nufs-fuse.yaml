@@ -33,13 +33,9 @@ meta_addr:      ""                    # metad address, e.g. "10.0.0.1:8091"
 meta_dir:       "/var/lib/dfs/metadata"  # local Pebble directory (for single-node dev)
 
 # ── DFS authentication ─────────────────────────────────────────────
-# Credential flow (recommended): metad exchanges these for a short-lived
-# signed token at mount time. Token auto-refreshes at 50% of TTL.
+# Credential precedence: --access-key > --config file > META_* env vars.
 access_key:     ""                    # metad access key (or set via META_ACCESS_KEY env)
 secret_key:     ""                    # metad secret key (or set via META_SECRET_KEY env)
-
-# Optional: directory containing credentials.json (loaded when flags unset).
-# credentials_dir: ""
 
 # ── DFS cache & memory limits ──────────────────────────────────────
 # read_cache_max: Chunk read-cache memory limit (ChunkCache). Evicts

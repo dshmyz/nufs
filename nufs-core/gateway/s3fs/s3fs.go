@@ -76,8 +76,14 @@ func New(cfg *Config, options ...Option) (*S3FileSystem, error) {
 		return nil, fmt.Errorf("open cache: %w", err)
 	}
 
-	// Load credentials.
-	ac := LoadCredentials(cfg.CacheDir)
+	// Load credentials: explicit Config fields take precedence over
+	// environment/file (LoadCredentials).
+	var ac *AccessConfig
+	if cfg.AccessKey != "" && cfg.SecretKey != "" {
+		ac = &AccessConfig{AccessKey: cfg.AccessKey, SecretKey: cfg.SecretKey, SecretToken: cfg.SecretToken}
+	} else {
+		ac = LoadCredentials(cfg.CacheDir)
+	}
 
 	// Create S3 client.
 	var transport http.RoundTripper = &http.Transport{
