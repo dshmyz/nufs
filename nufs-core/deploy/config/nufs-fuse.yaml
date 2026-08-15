@@ -39,10 +39,24 @@ secret_key:     ""                    # metad secret key (or set via META_SECRET
 # Optional: directory containing credentials.json (loaded when flags unset).
 # credentials_dir: ""
 
-# ── DFS cache & I/O ────────────────────────────────────────────────
-cache_dir:      ""                    # chunk cache directory (empty = memory only)
-dfs_cache_quota: 1073741824           # chunk cache byte quota (default 1 GiB, 0 = unlimited)
-direct_io:      false                 # bypass kernel page cache (DirectIO)
+# ── DFS cache & memory limits ──────────────────────────────────────
+cache_dir:          ""                # chunk cache directory (empty = memory only)
+read_cache_max:     1073741824        # read cache memory limit in bytes (default 1 GiB; 0 = disabled)
+write_cache_max:    2147483648        # dirty write buffer memory limit in bytes (default 2 GiB; 0 = disabled)
+direct_io:          false             # bypass kernel page cache (DirectIO)
+
+# ── DFS TLS ────────────────────────────────────────────────────────
+# Connect to TLS-enabled metad/datanode.  When any of tls_cert or
+# insecure is set, the metadata and datanode channels use HTTPS;
+# otherwise plain HTTP.
+# insecure:           false             # skip TLS server certificate verification (dev only)
+# tls_cert:           ""                # TLS certificate file (PEM)
+# tls_key:            ""                # TLS private key file (PEM)
+# tls_ca:             ""                # CA certificate for mutual TLS (client verification)
+# tls_require_client_cert: false        # require client cert signed by tls_ca
+
+# ── DFS metrics & monitoring ──────────────────────────────────────
+dfs_metrics_addr: ":9901"             # DFS metrics/health HTTP address (empty = disabled)
 
 # ── FUSE mount options (shared) ───────────────────────────────────
 uid:            0                     # file owner UID (0 = caller's uid)
@@ -51,12 +65,8 @@ allow_other:    false                 # allow other users to access the mount
 read_only:      false                 # read-only mount (deny all writes with EROFS)
 debug:          false                 # verbose FUSE + metadata traces
 
-# ── DFS metrics & monitoring ──────────────────────────────────────
-dfs_metrics_addr: ":9901"             # DFS metrics/health HTTP address (empty = disabled)
-
 # ── S3 backend ────────────────────────────────────────────────────
 # (used when backend=s3; all DFS fields above are ignored)
 scan_ttl:       "60s"                 # directory scan cache TTL
-cache_quota:    0                     # S3 cache disk quota in bytes (0 = unlimited)
 metrics_addr:   ":9900"               # S3 metrics/health HTTP address
-insecure:       false                 # skip TLS verification
+insecure:       false                 # skip TLS verification (shared flag, also used by DFS)
