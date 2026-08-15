@@ -9,7 +9,8 @@ import (
 // Tests for the PebbleStore serving surface of the V2.1 extent-layout inode
 // model (ExtentInodeService in inode_v2_serving.go, roadmap stage 1 §1.3a):
 // inline round-trip, promote+append pages round-trip, the V1 UpdateInode
-// collision guard, and the error sentinels.
+// collision guard, the error sentinels, and the read dual-model resolver
+// ResolveFileChunks (§1.3b).
 
 func TestExtentInodeService_InlineRoundTrip(t *testing.T) {
 	store := newV2TestPebbleStore(t)
@@ -219,5 +220,214 @@ func TestExtentInodeService_ShardedGetExtentMeta(t *testing.T) {
 	}
 	if m.PGID != 9 || m.LogicalLen != 4096 || m.StorageClass != StorageClassHotReplica {
 		t.Fatalf("sharded extent meta = %+v", m)
+	}
+}
+
+// ========== Read dual-model resolver (§1.3b) ==========
+
+// v2ResolveTestPolicy is a single-replica policy for in-memory allocation.
+var v2ResolveTestPolicy = PlacementPolicy{
+	ID:                "resolve-test",
+	ReplicationFactor: 1,
+	TopologySpread:    SpreadNode,
+}
+
+// newResolveTestStore creates an in-memory PebbleStore with one healthy
+// node, ready for AllocateChunk.
+func newResolveTestStore(t *testing.T) *PebbleStore {
+	t.Helper()
+	store := newV2TestPebbleStore(t)
+	if err := store.RegisterNode(context.Background(), &NodeInfo{ID: 1, Addr: "127.0.0.1:9001", CapacityGB: 100}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	return store
+}
+
+// newResolveTestInode creates an empty regular inode on the store.
+func newResolveTestInode(t *testing.T, store *PebbleStore, id InodeID) {
+	t.Helper()
+	if _, err := NewInodeStoreV2(store).CreateEmpty(id, FileRegular, 1, 0, 0, 0644); err != nil {
+		t.Fatalf("CreateEmpty: %v", err)
+	}
+}
+
+func TestResolveFileChunks_V1Passthrough(t *testing.T) {
+	store := newResolveTestStore(t)
+	ctx := context.Background()
+	id := InodeID(2001)
+	newResolveTestInode(t, store, id)
+
+	chunk, err := store.AllocateChunk(ctx, id, 0, v2ResolveTestPolicy)
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+	inode, err := store.GetInode(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inode.ChunkMap) == 0 {
+		t.Fatal("fixture: expected a V1 ChunkMap after AllocateChunk")
+	}
+
+	// A V1 inode with chunks is returned verbatim — the extent surface is
+	// never probed.
+	got, err := ResolveFileChunks(ctx, store, inode)
+	if err != nil {
+		t.Fatalf("ResolveFileChunks: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != chunk.ID {
+		t.Fatalf("resolved chunks = %+v, want [id=%d]", got, chunk.ID)
+	}
+}
+
+func TestResolveFileChunks_V2Inline(t *testing.T) {
+	store := newResolveTestStore(t)
+	ctx := context.Background()
+	id := InodeID(2002)
+	newResolveTestInode(t, store, id)
+
+	// AllocateChunk writes a real chunk row; SetInlineExtent then promotes
+	// the inode to V2 inline layout (drops the V1 ChunkMap). The extent ID
+	// mirrors the chunk ID, honoring the extent==chunk-ID invariant.
+	chunk, err := store.AllocateChunk(ctx, id, 0, v2ResolveTestPolicy)
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+	ext := &ExtentMetaV2{ID: ExtentIDV2(chunk.ID), Generation: 1, LogicalLen: 4096, PGID: 2}
+	if err := store.SetInlineExtent(ctx, id, ext, 4096); err != nil {
+		t.Fatalf("SetInlineExtent: %v", err)
+	}
+
+	inode, err := store.GetInode(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inode.ChunkMap) != 0 {
+		t.Fatalf("fixture: expected ChunkMap to be dropped, got %d refs", len(inode.ChunkMap))
+	}
+
+	got, err := ResolveFileChunks(ctx, store, inode)
+	if err != nil {
+		t.Fatalf("ResolveFileChunks: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("resolved chunks = %+v, want 1", got)
+	}
+	if got[0].ID != chunk.ID || got[0].Offset != 0 || got[0].Length != 4096 {
+		t.Fatalf("resolved inline ref = %+v, want id=%d offset=0 length=4096", got[0], chunk.ID)
+	}
+}
+
+func TestResolveFileChunks_V2Pages(t *testing.T) {
+	store := newResolveTestStore(t)
+	ctx := context.Background()
+	id := InodeID(2003)
+	newResolveTestInode(t, store, id)
+
+	chunk1, err := store.AllocateChunk(ctx, id, 0, v2ResolveTestPolicy)
+	if err != nil {
+		t.Fatalf("AllocateChunk(1): %v", err)
+	}
+	first := &ExtentMetaV2{ID: ExtentIDV2(chunk1.ID), Generation: 1, LogicalLen: 4096, PGID: 1}
+	if err := store.SetInlineExtent(ctx, id, first, 4096); err != nil {
+		t.Fatalf("SetInlineExtent: %v", err)
+	}
+	if err := store.PromoteToPages(ctx, id); err != nil {
+		t.Fatalf("PromoteToPages: %v", err)
+	}
+	// The second extent is synthetic: ResolveFileChunks only reads the extent
+	// surface (page refs + /extent-meta), never the chunk row, so no second
+	// AllocateChunk is needed (and one would clobber the pages layout, since
+	// AllocateChunk is a V1-model write).
+	second := &ExtentMetaV2{ID: ExtentIDV2(0x8000000000000002), Generation: 1, LogicalLen: 8192, PGID: 2}
+	if _, err := store.AppendExtent(ctx, id, second, MaxChunkSize); err != nil {
+		t.Fatalf("AppendExtent: %v", err)
+	}
+
+	inode, err := store.GetInode(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ResolveFileChunks(ctx, store, inode)
+	if err != nil {
+		t.Fatalf("ResolveFileChunks: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("resolved chunks = %+v, want 2", got)
+	}
+	if got[0].ID != chunk1.ID || got[0].Offset != 0 || got[0].Length != 4096 {
+		t.Fatalf("first page ref = %+v", got[0])
+	}
+	if got[1].ID != ChunkID(second.ID) || got[1].Offset != MaxChunkSize || got[1].Length != 8192 {
+		t.Fatalf("second page ref = %+v", got[1])
+	}
+}
+
+func TestResolveFileChunks_V1EmptyAndNilSurface(t *testing.T) {
+	store := newResolveTestStore(t)
+	ctx := context.Background()
+
+	// Empty inode: no chunks, and the extent probe correctly finds no V2
+	// layout either. (Allocation and the V1 check below use a separate
+	// inode: AllocateChunk does not invalidate the inode cache, so a cached
+	// pre-allocation GetInode would shadow the new ChunkMap.)
+	newResolveTestInode(t, store, InodeID(2004))
+	inode, err := store.GetInode(ctx, InodeID(2004))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ResolveFileChunks(ctx, store, inode)
+	if err != nil {
+		t.Fatalf("ResolveFileChunks: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("empty file resolved = %+v, want none", got)
+	}
+	if got, err := ResolveFileChunks(ctx, nil, inode); err != nil || len(got) != 0 {
+		t.Fatalf("nil surface empty file = %+v, %v, want none/nil", got, err)
+	}
+
+	// A nil surface on a V1 file with chunks must fall back to the V1
+	// verdict (passthrough), not panic and not lose the chunks.
+	newResolveTestInode(t, store, InodeID(2005))
+	chunk, err := store.AllocateChunk(ctx, InodeID(2005), 0, v2ResolveTestPolicy)
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+	v1inode, err := store.GetInode(ctx, InodeID(2005))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ResolveFileChunks(ctx, nil, v1inode); err != nil || len(got) != 1 || got[0].ID != chunk.ID {
+		t.Fatalf("nil surface V1 file = %+v, %v, want [%d]/nil", got, err, chunk.ID)
+	}
+}
+
+// TestResolveFileChunks_ErrorPropagation uses the internal InodeStoreV2
+// SetInlineExtent (which, unlike the serving surface, does NOT persist the
+// /extent-meta row) to fabricate a V2 inline inode whose extent has no
+// metadata row. Resolving must surface ErrExtentNotFound, proving the probe
+// fails loudly rather than silently reading the file as empty.
+func TestResolveFileChunks_ErrorPropagation(t *testing.T) {
+	store := newResolveTestStore(t)
+	ctx := context.Background()
+	id := InodeID(2005)
+	newResolveTestInode(t, store, id)
+
+	chunk, err := store.AllocateChunk(ctx, id, 0, v2ResolveTestPolicy)
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+	ext := &ExtentMetaV2{ID: ExtentIDV2(chunk.ID), Generation: 1, LogicalLen: 4096, PGID: 2}
+	if err := NewInodeStoreV2(store).SetInlineExtent(id, ext, 4096); err != nil {
+		t.Fatalf("internal SetInlineExtent: %v", err)
+	}
+
+	inode, err := store.GetInode(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveFileChunks(ctx, store, inode); !errors.Is(err, ErrExtentNotFound) {
+		t.Fatalf("ResolveFileChunks missing extent meta = %v, want ErrExtentNotFound", err)
 	}
 }

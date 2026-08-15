@@ -621,9 +621,23 @@ func (b *BufferedFile) incStagingLoad() {
 // corrupted — only a pre-flush read can see stale data under memory pressure.
 func (b *BufferedFile) ReadView(ctx context.Context, off, n int64) ([]byte, error) {
 	var metaInode *metadata.InodeMeta
+	// chunks is the file's committed chunk references under either storage
+	// model (V1 ChunkMap or V2 extent layout, roadmap §1.3b). Resolved in
+	// the same doMeta critical section as GetInode so both see one snapshot.
+	// The read discriminator probes the V2 extent surface only for inodes
+	// with an empty ChunkMap, so V1 files pay nothing and metas without the
+	// extent surface (es == nil) keep their unchanged V1 behavior. The probe
+	// re-reads the inode row per call; amortize later by caching the resolved
+	// view in BufferedFile and invalidating it on Flush (roadmap 1.3c+).
+	var chunks []metadata.ChunkRef
 	if err := b.exec.doMeta("read", func() error {
 		var gerr error
 		metaInode, gerr = b.meta().GetInode(ctx, b.inodeID)
+		if gerr != nil {
+			return gerr
+		}
+		es, _ := b.meta().(metadata.ExtentInodeService)
+		chunks, gerr = metadata.ResolveFileChunks(ctx, es, metaInode)
 		return gerr
 	}); err != nil {
 		return nil, err
@@ -646,13 +660,13 @@ func (b *BufferedFile) ReadView(ctx context.Context, off, n int64) ([]byte, erro
 		end = size
 	}
 
-	// Fast path: empty ChunkMap + no dirty chunks = every byte is a hole.
-	if len(metaInode.ChunkMap) == 0 && len(b.chunkBufs) == 0 {
+	// Fast path: no committed chunks + no dirty chunks = every byte is a hole.
+	if len(chunks) == 0 && len(b.chunkBufs) == 0 {
 		return make([]byte, end-off), nil
 	}
 
-	// readChunkRange reads committed data for [start, end) from the ChunkMap.
-	// Returns the bytes and advances next. Caller holds b.mu.
+	// readChunkRange reads committed data for [start, end) from the resolved
+	// chunk references. Returns the bytes and advances next. Caller holds b.mu.
 	readChunkRange := func(start, end int64) []byte {
 		result := make([]byte, 0, end-start)
 		pos := start
@@ -660,7 +674,7 @@ func (b *BufferedFile) ReadView(ctx context.Context, off, n int64) ([]byte, erro
 			prevPos := pos
 			// Find committed chunk overlapping [pos, end)
 			found := false
-			for _, cref := range metaInode.ChunkMap {
+			for _, cref := range chunks {
 				cEnd := cref.Offset + int64(cref.Length)
 				if cEnd <= pos || cref.Offset >= end {
 					continue

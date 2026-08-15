@@ -116,3 +116,53 @@ func (s *PebbleStore) AppendExtent(ctx context.Context, id InodeID, extent *Exte
 	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", id)})
 	return root, nil
 }
+
+// ResolveFileChunks maps a file's inode to the flat list of chunk
+// references holding its data, under either storage model (roadmap §1.3b
+// read dual-model).
+//
+// Read discriminator: a V1 inode (ChunkMap non-empty) is returned verbatim;
+// an empty ChunkMap is probed through the V2 extent serving surface
+// (ResolveExtents + GetExtentMeta). V1 empty files and V2 empty inodes both
+// resolve to nil, which read paths already treat as "no chunks". es may be
+// nil (e.g. a MetadataService mock without the extent surface): the probe is
+// skipped and the V1 verdict stands, so readers keep working unchanged for
+// services that never produce V2 layouts.
+//
+// Each V2 extent's data lives in the chunk whose numeric ID equals the
+// extent ID (see ECStore.SwitchChunkToEC), so a reference is the extent's
+// ID, its file offset, and its authoritative logical length from
+// /extent-meta. The probe is a per-call store read; for a hot path that
+// already holds a resolved view, amortize by caching the result across
+// calls rather than re-probing.
+func ResolveFileChunks(ctx context.Context, es ExtentInodeService, inode *InodeMeta) ([]ChunkRef, error) {
+	if inode == nil {
+		return nil, nil
+	}
+	if len(inode.ChunkMap) > 0 {
+		return inode.ChunkMap, nil
+	}
+	if es == nil {
+		return nil, nil
+	}
+	refs, err := es.ResolveExtents(ctx, inode.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	chunks := make([]ChunkRef, 0, len(refs))
+	for _, ref := range refs {
+		meta, err := es.GetExtentMeta(ctx, ref.ExtentID)
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, ChunkRef{
+			ID:     ChunkID(ref.ExtentID),
+			Offset: ref.LogicalOffset,
+			Length: int32(meta.LogicalLen),
+		})
+	}
+	return chunks, nil
+}

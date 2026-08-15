@@ -121,6 +121,19 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 		}
 	}()
 
+	// Resolve the file's chunk references under either storage model (V1
+	// ChunkMap or V2 extent layout, roadmap §1.3b). The read discriminator
+	// probes the V2 extent surface only for inodes with an empty ChunkMap,
+	// so V1 files pay nothing, and services without the extent surface
+	// (es == nil) keep their unchanged V1 behavior.
+	es, _ := gw.meta.(metadata.ExtentInodeService)
+	chunks, err := metadata.ResolveFileChunks(ctx, es, inode)
+	if err != nil {
+		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"Failed to resolve file chunks: "+err.Error(), "/"+bucket+"/"+key, requestID)
+		return
+	}
+
 	// Handle range request
 	start, end := parseRange(r.Header.Get("Range"), inode.Size)
 	contentLen := end - start + 1
@@ -139,7 +152,7 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 	}
 
 	// Read chunks from data nodes and stream to client
-	for _, cref := range inode.ChunkMap {
+	for _, cref := range chunks {
 		chunkEnd := cref.Offset + int64(cref.Length) - 1
 		// Skip chunks outside the requested range
 		if chunkEnd < start || cref.Offset > end {
@@ -388,7 +401,14 @@ func (gw *Gateway) handleCopyObject(w http.ResponseWriter, r *http.Request, buck
 }
 
 func (gw *Gateway) streamCopySource(ctx context.Context, dst io.Writer, inode *metadata.InodeMeta) error {
-	for _, ref := range inode.ChunkMap {
+	// Model-aware chunk resolution (roadmap §1.3b): V1 ChunkMap passthrough,
+	// V2 extent layout resolved via the extent surface.
+	es, _ := gw.meta.(metadata.ExtentInodeService)
+	chunks, err := metadata.ResolveFileChunks(ctx, es, inode)
+	if err != nil {
+		return fmt.Errorf("resolve source chunks: %w", err)
+	}
+	for _, ref := range chunks {
 		chunk, err := gw.meta.GetChunk(ctx, ref.ID)
 		if err != nil {
 			return fmt.Errorf("get source chunk %d: %w", ref.ID, err)

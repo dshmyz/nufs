@@ -562,3 +562,54 @@ func TestBufferedFile_InvariantSpillAware(t *testing.T) {
 		t.Fatalf("Write B: %v", err)
 	}
 }
+
+// TestBufferedFile_ReadViewV2ExtentLayout drives the read dual-model
+// (roadmap §1.3b): a file whose inode is a V2 inline extent (no ChunkMap)
+// must still be readable. The file is seeded the way 1.3c will produce it —
+// AllocateChunk for a real chunk row + payload, then SetInlineExtent to
+// promote the inode, with the extent ID mirroring the chunk ID.
+func TestBufferedFile_ReadViewV2ExtentLayout(t *testing.T) {
+	pb, inodeID, policy := newWriterTestMeta(t)
+	mem := NewMemoryChunkStore()
+	ctx := context.Background()
+
+	payload := []byte("v2 fuse extent read")
+	chunk, err := pb.AllocateChunk(ctx, inodeID, 0, policy)
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+	if err := mem.WriteChunk(ctx, chunk, payload); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	ext := &metadata.ExtentMetaV2{
+		ID:         metadata.ExtentIDV2(chunk.ID),
+		Generation: 1,
+		LogicalLen: int64(len(payload)),
+		PGID:       1,
+	}
+	if err := pb.SetInlineExtent(ctx, inodeID, ext, int64(len(payload))); err != nil {
+		t.Fatalf("SetInlineExtent: %v", err)
+	}
+
+	b := newTestBuffered(pb, mem, inodeID)
+
+	// Full read: the resolver maps the extent back to the chunk and the
+	// buffered reader streams the committed payload.
+	got, err := b.ReadView(ctx, 0, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("ReadView: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("ReadView body = %q, want %q", got, payload)
+	}
+
+	// A windowed read lands on the same extent-backed chunk.
+	want := payload[4:14]
+	got, err = b.ReadView(ctx, 4, int64(len(want)))
+	if err != nil {
+		t.Fatalf("ReadView window: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("ReadView window = %q, want %q", got, want)
+	}
+}
