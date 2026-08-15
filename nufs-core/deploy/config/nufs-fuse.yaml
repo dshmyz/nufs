@@ -27,7 +27,9 @@ log_max_backups:  7                   # max rotated log files to keep
 bucket:     ""                        # bucket to mount (REQUIRED for DFS)
 
 # Metadata source: remote (mutually exclusive with meta_dir).
-meta_addr:      ""                    # metad HTTP address, e.g. "10.0.0.1:8091"
+# When TLS flags are set the scheme is auto-detected as https://;
+# plain http:// is used otherwise.
+meta_addr:      ""                    # metad address, e.g. "10.0.0.1:8091"
 meta_dir:       "/var/lib/dfs/metadata"  # local Pebble directory (for single-node dev)
 
 # ── DFS authentication ─────────────────────────────────────────────
@@ -40,15 +42,29 @@ secret_key:     ""                    # metad secret key (or set via META_SECRET
 # credentials_dir: ""
 
 # ── DFS cache & memory limits ──────────────────────────────────────
+# read_cache_max: Chunk read-cache memory limit (ChunkCache). Evicts
+#                 via LRU when the limit is reached. 0 = disabled.
+# write_cache_max: Dirty write buffer memory limit (per-file buffers).
+#                  Exceeding this throttles writes with ENOSPC. 0 = disabled.
 cache_dir:          ""                # chunk cache directory (empty = memory only)
-read_cache_max:     1073741824        # read cache memory limit in bytes (default 1 GiB; 0 = disabled)
-write_cache_max:    2147483648        # dirty write buffer memory limit in bytes (default 2 GiB; 0 = disabled)
-direct_io:          false             # bypass kernel page cache (DirectIO)
+read_cache_max:     1073741824        # bytes (default 1 GiB; 0 = disabled)
+write_cache_max:    2147483648        # bytes (default 2 GiB; 0 = disabled)
+direct_io:          false             # DFS: bypass kernel page cache
 
 # ── DFS TLS ────────────────────────────────────────────────────────
-# Connect to TLS-enabled metad/datanode.  When any of tls_cert or
-# insecure is set, the metadata and datanode channels use HTTPS;
-# otherwise plain HTTP.
+# When any of tls_cert or insecure is set, the metadata and datanode
+# channels use HTTPS with the configured transport; otherwise plain
+# HTTP.  --insecure is shared with the S3 backend (see below).
+#
+# For a TLS-enabled cluster:
+#   tls_cert:           "/etc/nufs/client.pem"
+#   tls_key:            "/etc/nufs/client-key.pem"
+#   tls_ca:             "/etc/nufs/ca.pem"
+#   tls_require_client_cert: true
+#
+# For dev / self-signed certs (skip verification only):
+#   insecure:           true
+#
 # insecure:           false             # skip TLS server certificate verification (dev only)
 # tls_cert:           ""                # TLS certificate file (PEM)
 # tls_key:            ""                # TLS private key file (PEM)
@@ -68,5 +84,5 @@ debug:          false                 # verbose FUSE + metadata traces
 # ── S3 backend ────────────────────────────────────────────────────
 # (used when backend=s3; all DFS fields above are ignored)
 scan_ttl:       "60s"                 # directory scan cache TTL
-metrics_addr:   ":9900"               # S3 metrics/health HTTP address
-insecure:       false                 # skip TLS verification (shared flag, also used by DFS)
+metrics_addr:   ":9900"               # S3 metrics/health HTTP address (empty = disabled)
+insecure:       false                 # skip TLS verification for S3 endpoint
