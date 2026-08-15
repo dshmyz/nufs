@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -514,6 +515,104 @@ func (s *ECStore) RecordDirect(ctx context.Context, chunkID ChunkID, shards []EC
 	}
 	s.store.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("chunk:%d", chunkID)})
 	return layout, st, nil
+}
+
+// --- Write-path direct-EC authority (Program 10, §14) ---
+//
+// PlanECWrite and RecordDirectEC make *PebbleStore satisfy the chunkstore
+// ECWriteAuthority seam in-process — the mirror of *HTTPClient, which implements
+// the same authority over the metad HTTP surface. A PebbleStore-backed gateway
+// (local dev mode, smoke tests) therefore runs the exact same §14 placement and
+// durable-record transaction as the remote metad topology, and the metad ops
+// handlers delegate to these so the placement logic lives once.
+
+// EC plan-write sentinel errors. The ops handler maps them to HTTP statuses;
+// callers that do not care about the wire code just see the error.
+var (
+	// ErrECPlanChunkNotFound: the chunk the plan would place shards for is absent.
+	ErrECPlanChunkNotFound = errors.New("ec: plan-write: chunk not found")
+	// ErrECPlanShardMismatch: chunk.Replicas does not match the requested K+M layout.
+	ErrECPlanShardMismatch = errors.New("ec: plan-write: chunk replicas/EC shard count mismatch")
+	// ErrECPlanTopology: a shard's owning node is not an online V2.1 node with
+	// registered shard disks, so §14 placement cannot be met.
+	ErrECPlanTopology = errors.New("ec: plan-write: node not online/no shard disks for direct EC write")
+)
+
+// PlanECWrite is the write-path direct-EC placement authority (§14, Program 10).
+// It answers "which disk on which node does each shard of a direct EC write land
+// on" for a chunk whose allocation already fixed Replicas[i].NodeID + Addr per
+// shard index (so shard i is pushed to Replicas[i].Addr). Pure placement — no
+// state is mutated; the durable stripe is only recorded by RecordDirectEC after
+// the shards actually land.
+//
+// It is the in-process form of the metad /api/v1/ec/plan-write endpoint. Per-node
+// candidate disks come from the live node registry's ShardDiskCount (only V2.1
+// nodes report >0 shard stores; DiskID encodes NodeID*1000 + local disk), and each
+// shard is assigned a disk on its *owning* node via a deterministic per-node
+// round-robin so consecutive shards on the same node hit distinct disks.
+//
+// Fault isolation (§14) is a placement goal, not a hard gate: the gateway pushes
+// each shard to exactly the node the allocation chose, so the plan is only free to
+// pick *which disk* on that node. A real multi-node cluster spreads shards across
+// ≥3 fault domains because the allocation did; a single-node V2.1 testbed
+// legitimately hosts all K+M shards on its one node's disks (user-selected —
+// single-node must support write-path direct EC). The round-robin guarantees no
+// node is asked to hold more shards than it has registered shard disks. When a
+// node is missing from the topology (offline or no shard disks) it fails with
+// ErrECPlanTopology: V1 whole-shard EC is retired, so the caller must fail the
+// write rather than degrade to a layout the V2.1 serving path cannot range-read.
+func (s *PebbleStore) PlanECWrite(ctx context.Context, chunkID ChunkID, dataShards, parityShards int) ([]ECShard, error) {
+	if s.closed.Load() {
+		return nil, ErrServiceClosed
+	}
+	chunk, err := s.GetChunk(ctx, chunkID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrECPlanChunkNotFound, err)
+	}
+	total := dataShards + parityShards
+	if total <= 0 || len(chunk.Replicas) != total {
+		return nil, fmt.Errorf("%w: chunk %d has %d replicas, want %d+%d", ErrECPlanShardMismatch, chunkID, len(chunk.Replicas), dataShards, parityShards)
+	}
+	nodes, err := s.ListNodes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ec: plan-write: list nodes: %w", err)
+	}
+	nodeDisks := make(map[uint64][]ECDisk)
+	for _, n := range nodes {
+		if n.State != NodeOnline || n.ShardDiskCount <= 0 {
+			continue
+		}
+		id := uint64(n.ID)
+		for d := 0; d < n.ShardDiskCount; d++ {
+			nodeDisks[id] = append(nodeDisks[id], ECDisk{NodeID: id, DiskID: id*1000 + uint64(d)})
+		}
+	}
+	nextDisk := make(map[uint64]int, len(nodeDisks))
+	plan := make([]ECShard, 0, total)
+	for i, rep := range chunk.Replicas {
+		node := uint64(rep.NodeID)
+		disks := nodeDisks[node]
+		if len(disks) == 0 {
+			return nil, fmt.Errorf("%w: node %d", ErrECPlanTopology, node)
+		}
+		j := nextDisk[node] % len(disks)
+		nextDisk[node] = nextDisk[node] + 1
+		plan = append(plan, ECShard{Index: i, NodeID: node, DiskID: disks[j].DiskID})
+	}
+	return plan, nil
+}
+
+// RecordDirectEC records a landed write-path direct EC write on the authority
+// (§14, Program 10): after the gateway has pushed every shard to its owning
+// node's shard store, it reports the plan + original checksum here so the chunk
+// is durably lifted into EC (Complete stripe + ChunkMeta.ECStripeID), preserving
+// the allocated Replicas the read path dials. It delegates to ECStore.RecordDirect
+// — the same write-once transaction the metad /api/v1/ec/record-direct endpoint
+// runs. dataShards/parityShards are carried for wire symmetry with the HTTP form;
+// the authoritative K+M layout comes from the chunk's ECGroup.
+func (s *PebbleStore) RecordDirectEC(ctx context.Context, chunkID ChunkID, dataShards, parityShards int, shards []ECShard, checksum uint32) error {
+	_, _, err := NewECStore(s).RecordDirect(ctx, chunkID, shards, checksum)
+	return err
 }
 
 func (s *ECStore) MarkExtentColdEC(id InodeID, extentID ExtentIDV2, stripeID string) error {

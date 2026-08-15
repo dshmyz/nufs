@@ -47,17 +47,20 @@ type DatanodeChunkStore struct {
 	ecMu sync.Mutex
 	// ecWrite is the write-path direct-EC authority (Program 10, §14). When
 	// set, an ECConfig chunk's write routes to writeECShardDirect (encode K+M
-	// and push each shard to its owning node's shard store); when nil, it falls
-	// back to V1 writeECChunk. Wired from the S3 layer (gateway) as the
-	// *metadata.HTTPClient authority, and re-pointed on a FUSE remount.
+	// and push each shard to its owning node's shard store); when nil, an
+	// ECConfig write fails (ErrECUnavailable) rather than degrade to V1
+	// whole-shard EC (retired, docs/v1-retirement-roadmap.md stage 3). Wired
+	// from the S3 layer (gateway) as the *metadata.HTTPClient authority, and
+	// re-pointed on a FUSE remount.
 	ecWrite ECWriteAuthority
 }
 
 // SetECWriteAuthority injects the write-path direct-EC authority (Program 10).
-// A nil value keeps V1 writeECChunk semantics; a real authority (the metadata
-// HTTPClient) enables V2.1 direct EC writes for ECConfig buckets. The production
-// gateway wires this at construction; the FUSE remount handler re-points it at a
-// new client after a metadata hot-swap. Unit-test / in-memory stores omit it.
+// A nil value makes ECConfig writes fail (ErrECUnavailable); a real authority
+// (the metadata HTTPClient) enables V2.1 direct EC writes for ECConfig buckets.
+// The production gateway wires this at construction; the FUSE remount handler
+// re-points it at a new client after a metadata hot-swap. Unit-test / in-memory
+// stores omit it.
 func (s *DatanodeChunkStore) SetECWriteAuthority(a ECWriteAuthority) {
 	s.ecMu.Lock()
 	s.ecWrite = a
@@ -124,11 +127,14 @@ func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.Chu
 		// V2.1 write-path direct EC (Program 10, §14): with a wired authority,
 		// encode K+M shards and push each directly to its owning node's shard
 		// store (no intermediate replica). Without one (unwired store, or the
-		// authority not present in this engine) fall back to V1 writeECChunk.
-		if s.ECWriteEnabled() {
-			return s.writeECShardDirect(ctx, chunk, data)
+		// authority cleared by a remount) the write fails: V1 whole-shard EC is
+		// retired (docs/v1-retirement-roadmap.md stage 3), so an ECConfig bucket
+		// must never silently degrade to a layout the V2.1 read path cannot
+		// range-read.
+		if !s.ECWriteEnabled() {
+			return fmt.Errorf("%w: chunk %d", ErrECUnavailable, chunk.ID)
 		}
-		return s.writeECChunk(ctx, chunk, data)
+		return s.writeECShardDirect(ctx, chunk, data)
 	}
 
 	// Replication path: fan out the same data to all replicas

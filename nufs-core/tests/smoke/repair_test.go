@@ -159,6 +159,10 @@ func TestRepair_EndToEnd_EC(t *testing.T) {
 			ID: metadata.NodeID(i + 1), Addr: addrs[i],
 			State: metadata.NodeOnline, CapacityGB: 10000,
 			Tier: metadata.TierHot, Zone: "z", Rack: "r", MachineID: "m",
+			// One V2.1 shard store per node (each dir hosts StreamID 2). The
+			// direct-EC plan authority (PebbleStore.PlanECWrite) skips nodes with
+			// ShardDiskCount==0, so a V2.1 node must report its shard store.
+			ShardDiskCount: 1,
 		})
 	}
 

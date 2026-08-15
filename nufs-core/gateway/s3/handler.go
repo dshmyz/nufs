@@ -102,11 +102,13 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		gw.chunkStore = chunkstore.NewDatanodeChunkStore()
 	}
 	// Wire the write-path direct-EC authority (Program 10, §14): a configured
-	// DatanodeChunkStore over a metadata HTTPClient can direct-write EC shards
-	// (encode K+M and push each to its owning node's shard store) for ECConfig
-	// buckets. The authority is the metadata service (structural ECWriteAuthority);
-	// in-memory/test stores or non-datanode backends skip this and keep V1
-	// semantics.
+	// DatanodeChunkStore over a metadata authority (HTTPClient in production,
+	// or a PebbleStore — both structurally satisfy ECWriteAuthority) can
+	// direct-write EC shards (encode K+M and push each to its owning node's
+	// shard store) for ECConfig buckets. A store left unwired makes an ECConfig
+	// write fail with ErrECUnavailable: V1 whole-shard EC is retired
+	// (docs/v1-retirement-roadmap.md stage 3), so an ECConfig bucket must never
+	// silently degrade to the replication path.
 	if cs, ok := gw.chunkStore.(*chunkstore.DatanodeChunkStore); ok {
 		if auth, ok := gw.meta.(chunkstore.ECWriteAuthority); ok {
 			cs.SetECWriteAuthority(auth)

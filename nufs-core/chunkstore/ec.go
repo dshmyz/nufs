@@ -2,6 +2,7 @@ package chunkstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -17,27 +18,36 @@ import (
 // RPCs to the metadata service); a test stub satisfies it in unit tests. It is
 // the mirror of the ECAuthority (Program 3) and ECLandingResolver /
 // ECOrphanResolver (Program 7) structural-interface seams. When it is nil the
-// write path falls back to V1 semantics (writeECChunk), so unwired stores keep
-// today's behavior.
+// write fails with ErrECUnavailable: V1 whole-shard EC (writeECChunk) is
+// retired (docs/v1-retirement-roadmap.md stage 3), so an unwired store can no
+// longer silently degrade an ECConfig write.
 type ECWriteAuthority interface {
 	PlanECWrite(ctx context.Context, chunkID metadata.ChunkID, dataShards, parityShards int) ([]metadata.ECShard, error)
 	RecordDirectEC(ctx context.Context, chunkID metadata.ChunkID, dataShards, parityShards int, shards []metadata.ECShard, checksum uint32) error
 }
 
+// ErrECUnavailable is returned when an ECConfig chunk is written through a
+// store whose direct-EC authority is unavailable (never wired, or cleared by a
+// remount). V1 whole-shard EC is retired, so an ECConfig bucket must fail the
+// write rather than silently degrade to a layout the V2.1 serving path cannot
+// range-read.
+var ErrECUnavailable = errors.New("chunkstore: ec write unavailable: no direct-EC authority")
+
 // writeECShardDirect is the V2.1 write-path direct-EC write (Program 10, §14,
-// aligning with V1 writeECChunk): it encodes data into K+M shards and pushes
-// each shard *directly* to its owning node's shard store via ReplicateECShard —
-// no intermediate replica, exactly like V1 but landing in the shard store. The
-// §14 per-shard (NodeID, DiskID) placement is decided by the metadata authority
-// (PlanECWrite), not the gateway. Once ≥K shards (the write quorum) land, the
-// landed write is recorded as a durable Complete stripe + ChunkMeta.ECStripeID
-// (RecordDirectEC) so the serving read (ReadECShard), self-heal (landing
-// resolve) and orphan-GC paths recognize it exactly as they do a converted
-// chunk.
+// aligning with the retired V1 writeECChunk): it encodes data into K+M shards
+// and pushes each shard *directly* to its owning node's shard store via
+// ReplicateECShard — no intermediate replica, exactly like V1 but landing in
+// the shard store. The §14 per-shard (NodeID, DiskID) placement is decided by
+// the metadata authority (PlanECWrite), not the gateway. Once ≥K shards (the
+// write quorum) land, the landed write is recorded as a durable Complete stripe
+// + ChunkMeta.ECStripeID (RecordDirectEC) so the serving read (ReadECShard),
+// self-heal (landing resolve) and orphan-GC paths recognize it exactly as they
+// do a converted chunk.
 //
-// If the authority is unavailable or the plan cannot meet §14 (e.g. a V1-only
-// cluster with no V2.1 shard disks), it falls back to V1 writeECChunk *before
-// writing anything* so the write still lands via legacy whole-shard replication.
+// If the authority is unavailable or the plan cannot meet §14, the write fails
+// (ErrECUnavailable) *before touching any shard store*: an ECConfig bucket must
+// not silently degrade to V1 whole-shard EC (docs/v1-retirement-roadmap.md
+// stage 3).
 func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *metadata.ChunkMeta, data []byte) error {
 	ec := chunk.ECGroup
 	encoder := GetECEncoder(ec.DataShards, ec.ParityShards)
@@ -48,9 +58,9 @@ func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *meta
 	auth := s.ecAuthority()
 	if auth == nil {
 		// Authority cleared between the WriteChunk enabled-check and here
-		// (e.g. a remount to a store without the authority); fall back to V1
-		// writeECChunk rather than dereferencing a nil interface.
-		return s.writeECChunk(ctx, chunk, data)
+		// (e.g. a remount to a store without the authority). V1 EC is retired:
+		// an ECConfig chunk with no direct-EC authority must fail, not degrade.
+		return fmt.Errorf("%w: authority cleared mid-write", ErrECUnavailable)
 	}
 
 	result, err := encoder.Encode(data)
@@ -63,17 +73,20 @@ func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *meta
 	copy(allShards[ec.DataShards:], result.ParityShards)
 
 	// The metadata authority (not the gateway) decides the §14 placement. If it
-	// is unreachable or cannot place all shards across a V2.1 topology, fall
-	// back to V1 whole-shard replication before touching any shard store.
+	// is unreachable or cannot place all shards across a V2.1 topology, the
+	// write fails before touching any shard store (V1 EC retirement, stage 3).
 	plan, err := auth.PlanECWrite(ctx, chunk.ID, ec.DataShards, ec.ParityShards)
-	if err != nil || len(plan) != totalShards {
-		// DEPRECATED (V1 EC): fallback to writeECChunk. Per
-		// docs/v1-retirement-roadmap.md stage 3 this becomes a hard error —
-		// an ECConfig bucket with an unavailable authority must fail the
-		// write, not silently downgrade to V1 whole-shard EC.
-		slog.Warn("chunkstore: ec direct plan unavailable, falling back to V1 writeECChunk",
-			"chunkID", chunk.ID, "planned", len(plan), "want", totalShards, "error", err)
-		return s.writeECChunk(ctx, chunk, data)
+	if err != nil {
+		slog.Error("chunkstore: ec direct plan unavailable, write failed",
+			"chunkID", chunk.ID, "error", err)
+		return fmt.Errorf("%w: plan for %d+%d: %v",
+			ErrECUnavailable, ec.DataShards, ec.ParityShards, err)
+	}
+	if len(plan) != totalShards {
+		slog.Error("chunkstore: ec direct plan returned wrong shard count, write failed",
+			"chunkID", chunk.ID, "planned", len(plan), "want", totalShards)
+		return fmt.Errorf("%w: plan for %d+%d returned %d shards, want %d",
+			ErrECUnavailable, ec.DataShards, ec.ParityShards, len(plan), totalShards)
 	}
 
 	type shardResult struct {
@@ -146,95 +159,6 @@ func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *meta
 	return nil
 }
 
-// writeECChunk encodes data into K+M shards and writes each shard
-// to its assigned datanode concurrently. Returns success once K
-// shards (the write quorum) are acknowledged.
-//
-// DEPRECATED (V1 EC): whole-shard EC files, no range-read support. Retained
-// only as the fallback when the V2.1 direct-EC authority is unavailable
-// (see writeECShardDirect). Per docs/v1-retirement-roadmap.md stage 3, this
-// fallback becomes a hard error and this function is deleted. Do NOT add
-// features here.
-func (s *DatanodeChunkStore) writeECChunk(ctx context.Context, chunk *metadata.ChunkMeta, data []byte) error {
-	ec := chunk.ECGroup
-	encoder := GetECEncoder(ec.DataShards, ec.ParityShards)
-
-	result, err := encoder.Encode(data)
-	if err != nil {
-		return fmt.Errorf("chunkstore: ec encode chunk %d: %w", chunk.ID, err)
-	}
-
-	// Collect all shards (data + parity) indexed by ShardIndex
-	allShards := make([][]byte, ec.DataShards+ec.ParityShards)
-	copy(allShards[:ec.DataShards], result.DataShards)
-	copy(allShards[ec.DataShards:], result.ParityShards)
-
-	type shardResult struct {
-		nodeID metadata.NodeID
-		err    error
-	}
-	ch := make(chan shardResult, len(chunk.Replicas))
-
-	for _, rep := range chunk.Replicas {
-		go func(r metadata.ReplicaInfo) {
-			if r.ShardIndex < 0 || r.ShardIndex >= len(allShards) {
-				ch <- shardResult{r.NodeID, fmt.Errorf("invalid shard index %d", r.ShardIndex)}
-				return
-			}
-			if r.Addr == "" {
-				ch <- shardResult{r.NodeID, fmt.Errorf("empty addr for node %d", r.NodeID)}
-				return
-			}
-
-			client, err := s.pool.Get(r.Addr)
-			if err != nil {
-				ch <- shardResult{r.NodeID, fmt.Errorf("connect %s: %w", r.Addr, err)}
-				return
-			}
-			resp, err := client.WriteChunk(chunk.ID, allShards[r.ShardIndex])
-			s.pool.Put(r.Addr, client)
-
-			if err != nil {
-				ch <- shardResult{r.NodeID, fmt.Errorf("write shard %d to %s: %w", r.ShardIndex, r.Addr, err)}
-				return
-			}
-			if resp.Status != datanode.StatusOK {
-				ch <- shardResult{r.NodeID, fmt.Errorf("node %d status=%d: %s", r.NodeID, resp.Status, resp.Error)}
-				return
-			}
-			ch <- shardResult{r.NodeID, nil}
-		}(rep)
-	}
-
-	quorum := ec.DataShards // K shards must succeed
-	successes := 0
-	var lastErr error
-	for i := 0; i < len(chunk.Replicas); i++ {
-		select {
-		case r := <-ch:
-			if r.err != nil {
-				lastErr = r.err
-				slog.Warn("chunkstore: ec shard write failed", "chunkID", chunk.ID, "nodeID", r.nodeID, "error", r.err)
-			} else {
-				successes++
-			}
-		case <-ctx.Done():
-			return fmt.Errorf("chunkstore: ec write context cancelled: %w", ctx.Err())
-		}
-	}
-
-	if successes < quorum {
-		if lastErr != nil {
-			return fmt.Errorf("chunkstore: ec write only %d/%d shards succeeded for chunk %d: %w",
-				successes, quorum, chunk.ID, lastErr)
-		}
-		return fmt.Errorf("chunkstore: ec write only %d/%d shards succeeded for chunk %d",
-			successes, quorum, chunk.ID)
-	}
-
-	return nil
-}
-
 // readECChunk reads shards from K+M datanodes in parallel, then
 // decodes the original data using erasure coding.
 //
@@ -247,9 +171,11 @@ func (s *DatanodeChunkStore) writeECChunk(ctx context.Context, chunk *metadata.C
 //     on the healthy path, and a window-sized reconstruction from peers when
 //     an owner is unreachable.  The MaxChunkSize allocation cap is NOT a
 //     length, so a cap-sized metadata record falls back to the full read.
-//   - Full read (V1 legacy EC, plain chunks, or unknown literal length):
-//     every shard is fetched in full and the whole stripe is decoded, then
-//     the requested range is trimmed.
+//   - Full read (window not attempted, window read failed, or an unknown
+//     literal length): every shard is fetched in full and the whole stripe is
+//     decoded, then the requested range is trimmed. The V1 whole-shard
+//     (ECStripeID == "") read form was retired in stage 3; every EC chunk is
+//     read through the shard extents.
 func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.ChunkMeta, offset int64, length int32) ([]byte, error) {
 	ec := chunk.ECGroup
 	totalShards := ec.DataShards + ec.ParityShards
@@ -302,16 +228,10 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 				ch <- shardData{r.ShardIndex, nil, fmt.Errorf("connect %s: %w", r.Addr, err)}
 				return
 			}
-			var resp *datanode.Response
-			if chunk.ECStripeID != "" {
-				// V2.1 converted chunks store each EC shard as an independent
-				// extent keyed (chunkID, gen=shardIndex+1), readable only via
-				// ReadECShard.
-				resp, err = client.ReadECShard(chunk.ID, r.ShardIndex, 0, 0)
-			} else {
-				// Legacy V1 EC: whole-shard files, no range support.
-				resp, err = client.ReadChunk(chunk.ID, 0, 0)
-			}
+			// V2.1 EC shards are independent extents keyed (chunkID,
+			// gen=shardIndex+1), readable only via ReadECShard. The V1
+			// whole-shard ReadChunk form was retired in stage 3.
+			resp, err := client.ReadECShard(chunk.ID, r.ShardIndex, 0, 0)
 			s.pool.Put(r.Addr, client)
 			if err != nil {
 				ch <- shardData{r.ShardIndex, nil, fmt.Errorf("read shard from %s: %w", r.Addr, err)}

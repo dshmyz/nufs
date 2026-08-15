@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/dshmyz/nufs/nufs-core/chunkstore"
@@ -218,10 +219,12 @@ func TestGatewayDirectECWrite_DegradedRead(t *testing.T) {
 	}
 }
 
-// TestGatewayDirectECWrite_V1Fallback proves a DatanodeChunkStore without a
-// wired ECWriteAuthority keeps V1 fallback semantics: an ECGroup chunk routes to
-// the V1 writeECChunk path (ReplicateECShard not involved), unchanged.
-func TestGatewayDirectECWrite_V1Fallback(t *testing.T) {
+// TestGatewayDirectECWrite_NoAuthorityFails proves an ECConfig chunk written
+// through a DatanodeChunkStore without a wired ECWriteAuthority fails with
+// ErrECUnavailable — V1 whole-shard EC is retired (docs/v1-retirement-roadmap.md
+// stage 3), so an ECConfig bucket must never silently degrade to the legacy
+// write path.
+func TestGatewayDirectECWrite_NoAuthorityFails(t *testing.T) {
 	const (
 		nNodes   = 6
 		disksPer = 3
@@ -230,13 +233,13 @@ func TestGatewayDirectECWrite_V1Fallback(t *testing.T) {
 	pb := cl.pb
 
 	ctx := context.Background()
-	if err := pb.CreateBucket(ctx, "gw-v1fallback", metadata.PlacementPolicy{
+	if err := pb.CreateBucket(ctx, "gw-noauth", metadata.PlacementPolicy{
 		ReplicationFactor: 1,
 		ECConfig:          &metadata.ECConfig{DataShards: 6, ParityShards: 3},
 	}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-	bucket, _ := pb.GetBucket(ctx, "gw-v1fallback")
+	bucket, _ := pb.GetBucket(ctx, "gw-noauth")
 	inode, _ := pb.CreateFile(ctx, bucket.RootInode, "obj", 0644)
 	alloc, err := pb.AllocateChunk(ctx, inode.ID, 0, metadata.PlacementPolicy{
 		ReplicationFactor: 1,
@@ -246,7 +249,8 @@ func TestGatewayDirectECWrite_V1Fallback(t *testing.T) {
 		t.Fatalf("AllocateChunk: %v", err)
 	}
 
-	// No ECWriteAuthority wired — WriteChunk must take the V1 writeECChunk branch.
+	// No ECWriteAuthority wired — WriteChunk must fail with ErrECUnavailable
+	// and write nothing.
 	cs := chunkstore.NewDatanodeChunkStore()
 	defer cs.Close()
 
@@ -254,7 +258,11 @@ func TestGatewayDirectECWrite_V1Fallback(t *testing.T) {
 	for i := 0; i < 600; i++ {
 		payload = append(payload, byte(i*5))
 	}
-	if err := cs.WriteChunk(ctx, alloc, payload); err != nil {
-		t.Fatalf("WriteChunk (V1 fallback): %v", err)
+	err = cs.WriteChunk(ctx, alloc, payload)
+	if err == nil {
+		t.Fatal("WriteChunk on an unwired store: want ErrECUnavailable, got nil")
+	}
+	if !errors.Is(err, chunkstore.ErrECUnavailable) {
+		t.Fatalf("WriteChunk error = %v, want ErrECUnavailable", err)
 	}
 }

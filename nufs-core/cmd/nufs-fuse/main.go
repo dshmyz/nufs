@@ -420,7 +420,8 @@ func (s *nufsMountState) mount() error {
 	// write ECConfig-bucket chunks straight to their owning shard stores and
 	// skip the generic CommitChunk (which would 500 on a direct-EC chunk).
 	// Only the remote metadata HTTP client implements the authority; local
-	// (PebbleStore) mode leaves it unset, which keeps V1 commit semantics.
+	// (PebbleStore) mode leaves it unset, so an ECConfig write fails instead of
+	// degrading to the retired V1 whole-shard path.
 	if auth, ok := meta.(chunkstore.ECWriteAuthority); ok {
 		chunkStore.SetECWriteAuthority(auth)
 	}
@@ -623,7 +624,8 @@ func (s *nufsMountState) remount(newMetaAddr string) error {
 	// authority references the pre-swap client, whose PlanECWrite/RecordDirectEC
 	// would keep hitting the old metad address after a failover remount,
 	// failing (or mis-routing) every EC write. A new client without the
-	// authority clears it so EC chunks fall back to the generic commit path.
+	// authority clears it so ECConfig writes fail explicitly (V1 whole-shard EC
+	// is retired) rather than silently degrade.
 	if auth, ok := any(newMeta).(chunkstore.ECWriteAuthority); ok {
 		s.chunkStore.SetECWriteAuthority(auth)
 	} else {

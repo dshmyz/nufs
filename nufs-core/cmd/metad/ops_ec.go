@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"time"
 
@@ -263,16 +263,18 @@ func (h *opsHandlers) handleECResolveLanding(w http.ResponseWriter, r *http.Requ
 // each shard straight to the owning node's shard store — no intermediate
 // replica. It needs to know *which disk on which node* each shard lands on,
 // and that decision is the metadata authority's (§14 fault-domain diversity),
-// not the gateway's. This endpoint computes it: it loads the chunk (whose
-// allocation already fixed Replicas[i].NodeID + Addr for each shard index) and
-// the current cluster topology, then assigns each shard a disk on its owning
-// node via a deterministic per-node round-robin. No state is mutated — this is
-// a pure placement query; the durable stripe is only recorded after the shards
-// actually land (record-direct).
+// not the gateway's. This endpoint computes it via PebbleStore.PlanECWrite: it
+// loads the chunk (whose allocation already fixed Replicas[i].NodeID + Addr for
+// each shard index) and the current cluster topology, then assigns each shard a
+// disk on its owning node via a deterministic per-node round-robin. No state is
+// mutated — this is a pure placement query; the durable stripe is only recorded
+// after the shards actually land (record-direct).
 //
 // When the topology cannot meet §14 bounds (too few V2.1 nodes / shard disks,
-// or a node missing from the topology) it fails cleanly with 4xx/5xx so the
-// gateway falls back to the replication write path.
+// or a node missing from the topology) it fails with 424 so the gateway fails
+// the ECConfig write: V1 whole-shard EC is retired (docs/v1-retirement-roadmap.md
+// stage 3), so a write must never silently degrade to a layout the V2.1 serving
+// path cannot range-read.
 func (h *opsHandlers) handleECPlanWrite(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -287,64 +289,20 @@ func (h *opsHandlers) handleECPlanWrite(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	chunk, err := h.store.GetChunk(r.Context(), metadata.ChunkID(req.ChunkID))
+	plan, err := h.store.PlanECWrite(r.Context(), metadata.ChunkID(req.ChunkID), req.DataShards, req.ParityShards)
 	if err != nil {
-		writeJSONError(w, http.StatusNotFound, "chunk not found")
+		switch {
+		case errors.Is(err, metadata.ErrECPlanChunkNotFound):
+			writeJSONError(w, http.StatusNotFound, "chunk not found")
+		case errors.Is(err, metadata.ErrECPlanShardMismatch):
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, metadata.ErrECPlanTopology):
+			writeJSONError(w, http.StatusFailedDependency, err.Error())
+		default:
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
-	total := req.DataShards + req.ParityShards
-	if total <= 0 || len(chunk.Replicas) != total {
-		writeJSONError(w, http.StatusBadRequest, "chunk replicas/EC shard count mismatch")
-		return
-	}
-
-	// Build per-node candidate disks from the live topology (Program 9's
-	// ShardDiskCount: only V2.1 nodes report >0 shard stores; DiskID encodes
-	// NodeID*1000 + local disk). The §14 planner needs >=3 distinct nodes with
-	// enough disks — a V1-only cluster (all ShardDiskCount==0) yields no
-	// candidates and fails cleanly, so the gateway falls back to replication.
-	nodes, err := h.store.ListNodes(r.Context())
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	nodeDisks := make(map[uint64][]metadata.ECDisk)
-	for _, n := range nodes {
-		if n.State != metadata.NodeOnline || n.ShardDiskCount <= 0 {
-			continue
-		}
-		for d := 0; d < n.ShardDiskCount; d++ {
-			id := uint64(n.ID)
-			nodeDisks[id] = append(nodeDisks[id], metadata.ECDisk{NodeID: id, DiskID: id*1000 + uint64(d)})
-		}
-	}
-	// Assign each shard a disk on its *owning* node (chunk.Replicas[i].NodeID
-	// — the node the gateway will push shard i to), round-robin across that
-	// node's disks so consecutive shards on the same node hit distinct disks.
-	//
-	// Fault isolation (§14) is a placement goal, not a hard correctness gate:
-	// the gateway pushes each shard to exactly the node the allocation chose,
-	// so the plan is only free to pick *which disk* on that node. A real
-	// multi-node cluster spreads shards across ≥3 fault domains because the
-	// allocation did; a single-node V2.1 testbed legitimately hosts all 9
-	// shards on its one node's disks (user-selected — single-node must support
-	// write-path direct EC). The round-robin guarantees no node is asked to
-	// hold more shards than it has registered shard disks.
-	nextDisk := make(map[uint64]int, len(nodeDisks))
-	plan := make([]metadata.ECShard, 0, total)
-	for i, rep := range chunk.Replicas {
-		node := uint64(rep.NodeID)
-		disks := nodeDisks[node]
-		if len(disks) == 0 {
-			writeJSONError(w, http.StatusFailedDependency,
-				fmt.Sprintf("node %d not online/no shard disks for direct EC write", node))
-			return
-		}
-		j := nextDisk[node] % len(disks)
-		nextDisk[node] = nextDisk[node] + 1
-		plan = append(plan, metadata.ECShard{Index: i, NodeID: node, DiskID: disks[j].DiskID})
-	}
-
 	writeJSON(w, struct {
 		Shards []metadata.ECShard `json:"shards"`
 	}{Shards: plan})

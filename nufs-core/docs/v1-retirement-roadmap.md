@@ -129,14 +129,27 @@
 
 ---
 
-## 阶段 3：V1 EC 退役（删 ②）
+## 阶段 3：V1 EC 退役（删 ②） ✅ 完成
 
-- [ ] `chunkstore/ec.go:59-61` fallback 改为**硬错误**（ECConfig 桶在 authority 不可用时直接写失败，行为显式化）
-- [ ] `writeECChunk`（`ec.go:134`）与 `readECChunk` 的 `ECStripeID==""` 分支删除（V1 整片 EC）
-- [ ] 确认无路径产生 `ECStripeID==""` 的 EC chunk（转换路径 `ConvertToEC` 不产生）
+> 2026-08-15 完成。`writeECShardDirect` 的 fallback（authority 未接 / `PlanECWrite`
+> 失败）改为**硬错误**（`chunkstore.ErrECUnavailable`，S3 映射 503）；`writeECChunk`
+>（V1 整片 EC）与 `readECChunk` 的 `ECStripeID==""` 整片读分支已删除。同时
+> `*metadata.PebbleStore` 新增 `PlanECWrite`/`RecordDirectEC`，结构性满足
+> `chunkstore.ECWriteAuthority`（与 `*HTTPClient` 并列），metad `/api/v1/ec/plan-write`
+> handler 委托之 —— 本地/PebbleStore 模式与 smoke EC 测试因此走**真实 direct-EC 路径**
+>（encode K+M → `ReplicateECShard` → 持久 Complete stripe），不再依赖 V1 降级。
 
-### 决策点
+### 退出条件 ✅
+- ✅ `chunkstore/ec.go` fallback 改为硬错误（`ErrECUnavailable`；authority 中途被清也硬失败）
+- ✅ `writeECChunk` 已删除；`readECChunk` 无 `ECStripeID==""` 分支（全走 `ReadECShard`）
+- ✅ 无路径产生 `ECStripeID==""` 的 EC chunk：三处写入点
+  （`SwitchChunkToEC` 转换、`RecordDirect` 直写、datanode `ec_converter.go`）均设
+  `ECStripeID`；仅未写入的 EC chunk 无 stripe，读写失败行为与退役前一致
+
+### 行为变更
 - fallback 删除 = 代价从"降级写成功"变"写失败"。对 ECConfig 桶是正确行为；需在发布说明写明。
+- smoke `TestRepair_EndToEnd_EC`（4+2、6 节点）改走真实 direct-EC：注册节点报
+  `ShardDiskCount=1`，kill 1 节点 → 5≥K=4 重建通过。
 
 ---
 
