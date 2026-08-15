@@ -45,11 +45,14 @@ type S3FileSystem struct {
 	metricsSrv *http.Server
 	shutdownCh chan struct{}
 
-	// MinIO admin client (nil when the endpoint is not MinIO or the
-	// credentials lack admin rights - probed lazily by statfs). Used for
-	// server-side bucket usage/quota instead of an object sweep.
-	adm         *madmin.AdminClient
-	adminProbe  sync.Once
+	// MinIO admin client for server-side bucket usage/quota (statfs).
+	// Probed lazily and retried with a cooldown (see statfs.go); shares
+	// the S3 client's transport so --insecure TLS and proxy settings
+	// apply to the admin path too.
+	adm        *madmin.AdminClient
+	admMu      sync.Mutex
+	admOK      bool
+	admProbeAt time.Time
 	statfsCache statfsUsage
 }
 
@@ -118,9 +121,13 @@ func New(cfg *Config, options ...Option) (*S3FileSystem, error) {
 	}
 
 	// MinIO admin client for server-side bucket usage/quota (statfs).
-	// Construction cannot fail on a non-MinIO endpoint; usability is
-	// probed lazily on first statfs and disabled permanently on failure.
-	adm, _ := madmin.New(cfg.Target.Host, ac.AccessKey, ac.SecretKey, cfg.Target.Scheme == "https")
+	// Shares the S3 client's transport (proxy + --insecure TLS); whether
+	// it is usable is probed lazily by statfs.
+	adm, _ := madmin.NewWithOptions(cfg.Target.Host, &madmin.Options{
+		Creds:     credentials.NewStaticV4(ac.AccessKey, ac.SecretKey, ac.SecretToken),
+		Secure:    cfg.Target.Scheme == "https",
+		Transport: transport,
+	})
 
 	mfs := &S3FileSystem{
 		config:      cfg,
@@ -132,8 +139,9 @@ func New(cfg *Config, options ...Option) (*S3FileSystem, error) {
 		breaker:     newCircuitBreaker(5, 30*time.Second),
 		shutdownCh:  make(chan struct{}),
 		adm:         adm,
-		statfsCache: statfsUsage{ttl: cfg.ScanTTL},
+		statfsCache: statfsUsage{ttl: cfg.ScanTTL, cooldown: statfsFailureCooldown},
 	}
+	mfs.statfsCache.fetch = mfs.statfsFetch
 
 	// Start sync workers.
 	mfs.startSync(4)

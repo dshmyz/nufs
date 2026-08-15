@@ -10,109 +10,150 @@ import (
 	"github.com/minio/minio-go/v7"
 )
 
-// statfsUsage lazily caches the bucket's usage (and quota, when the server
-// has one configured) as observed from the SERVER, refreshed at most once
-// per ttl. df/statfs is low-frequency, so a blocking refresh on cache miss
-// is acceptable and keeps the data truthful: the bucket is shared state
-// that other clients mutate, so no locally maintained counter can be
-// correct - only the server knows.
-//
-// Two refresh paths:
-//   - MinIO with admin-capable credentials: server-side accounting via
-//     DataUsageInfo (no object listing) plus the bucket's hard quota via
-//     GetBucketQuota. df then shows total/used/free.
-//   - Any other S3-compatible server: a one-shot ListObjectsV2 sweep of
-//     the bucket - the industry default for S3-backed mounts. Capacity is
-//     unbounded (Bfree=0), df shows used only.
+// statfsRefreshTimeout bounds one statfs refresh: a stalled-but-connected
+// server must hang df for at most this long, never indefinitely (the
+// FUSE statfs context carries no deadline of its own).
+const statfsRefreshTimeout = 2 * time.Minute
+
+// statfsFailureCooldown is the negative cache after a failed refresh: a
+// monitoring loop polling df against a failing server must not amplify
+// into a full-prefix listing on every call. Stale data is served instead.
+const statfsFailureCooldown = 30 * time.Second
+
+// statfsProbeRetry bounds how often the MinIO admin probe is retried: a
+// transient outage at first df must not permanently pin the mount to
+// full-prefix sweeps for its whole uptime.
+const statfsProbeRetry = 5 * time.Minute
+
+// statfsNominalFree is the free space reported when the server has no
+// quota configured (capacity is genuinely unbounded). Reporting zero
+// free would make statvfs say the filesystem is 100% full and every
+// space-checking writer (installers, backup tools, JVM/Python runtimes)
+// would refuse to write.
+const statfsNominalFree = 1 << 40 // 1 TiB
+
+// statfsUsage lazily caches the mounted prefix's usage (and quota, when
+// the server has one configured) as observed from the SERVER, refreshed
+// at most once per ttl. The bucket is shared state that other clients
+// mutate, so no locally maintained counter can be correct - only the
+// server knows.
 type statfsUsage struct {
-	mu    sync.Mutex
-	ttl   time.Duration
-	usage uint64 // total object bytes in the bucket
-	quota uint64 // configured hard quota bytes; 0 = unbounded
-	at    time.Time
+	mu       sync.Mutex
+	ttl      time.Duration
+	cooldown time.Duration
+	usage    uint64
+	quota    uint64    // last observed quota; 0 = none/unbounded
+	at       time.Time // last successful observation
+	failAt   time.Time // last failed attempt (negative cache)
+
+	// fetch queries the server for (usage, quota); prevQuota is the last
+	// cached quota so a quota endpoint failure can keep the last known
+	// value. ok=false means the observation is incomplete and must NOT
+	// be cached. Injected to keep the caching rules unit-testable.
+	fetch func(ctx context.Context, prevQuota uint64) (usage, quota uint64, ok bool)
 }
 
 // get returns (usage, quota), refreshing from the server on first call
-// and whenever the cached observation is older than ttl.
-func (s *statfsUsage) get(ctx context.Context, fsys *S3FileSystem) (usage, quota uint64) {
+// and whenever the cached observation is older than ttl. A failed
+// refresh serves the stale values and suppresses retries for cooldown.
+func (s *statfsUsage) get(ctx context.Context) (usage, quota uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.at.IsZero() && time.Since(s.at) < s.ttl {
+	now := time.Now()
+	if !s.at.IsZero() && now.Sub(s.at) < s.ttl {
 		return s.usage, s.quota
 	}
-	s.refreshLocked(ctx, fsys)
+	if !s.failAt.IsZero() && now.Sub(s.failAt) < s.cooldown {
+		return s.usage, s.quota // stale, but too soon to retry
+	}
+	usage, quota, ok := s.fetch(ctx, s.quota)
+	if !ok {
+		s.failAt = now
+		return s.usage, s.quota
+	}
+	s.usage, s.quota, s.at, s.failAt = usage, quota, now, time.Time{}
 	return s.usage, s.quota
 }
 
-// refreshLocked queries the server for current usage and quota. Caller
-// holds s.mu.
-func (s *statfsUsage) refreshLocked(ctx context.Context, fsys *S3FileSystem) {
-	if adm := fsys.adminClient(); adm != nil {
-		if info, err := adm.DataUsageInfo(ctx); err == nil {
-			if u, ok := info.BucketsUsage[fsys.config.Bucket]; ok {
-				var q uint64
-				if bq, qerr := adm.GetBucketQuota(ctx, fsys.config.Bucket); qerr == nil {
-					q = bq.Size
+// statfsFetch is the production fetch: MinIO admin API first (server-side
+// accounting, no listing, plus the bucket's hard quota); subtree mounts
+// (BasePath != "", the admin API accounts whole buckets only) and
+// non-MinIO servers fall back to a ListObjectsV2 sweep scoped to the
+// mount's prefix.
+func (fsys *S3FileSystem) statfsFetch(ctx context.Context, prevQuota uint64) (usage, quota uint64, ok bool) {
+	ctx, cancel := context.WithTimeout(ctx, statfsRefreshTimeout)
+	defer cancel()
+
+	if fsys.config.BasePath == "" {
+		if adm := fsys.adminClient(); adm != nil {
+			if info, err := adm.DataUsageInfo(ctx); err == nil {
+				if u, found := info.BucketsUsage[fsys.config.Bucket]; found {
+					q := prevQuota // keep the last known quota on a failed query
+					if bq, qerr := adm.GetBucketQuota(ctx, fsys.config.Bucket); qerr == nil {
+						q = bq.Size
+					} else {
+						slog.Debug("s3fs: quota query failed, keeping last known", "error", qerr)
+					}
+					if ctx.Err() != nil {
+						return 0, 0, false
+					}
+					return u.Size, q, true
 				}
-				// Same anti-poisoning rule as the sweep: a canceled call
-				// (e.g. quota query aborted) must not be cached - the
-				// quota would read as "unbounded" for a full TTL.
-				if ctx.Err() != nil {
-					return
-				}
-				s.usage = u.Size
-				s.quota = q
-				s.at = time.Now()
-				return
+			} else {
+				slog.Debug("s3fs: DataUsageInfo unavailable, falling back to object sweep", "error", err)
 			}
-		} else {
-			slog.Debug("s3fs: DataUsageInfo unavailable, falling back to object sweep", "error", err)
 		}
 	}
 
-	// Standard-S3 fallback: one-shot full-bucket sweep.
+	// Standard-S3 fallback: one sweep of the mounted prefix.
+	prefix := fsys.config.BasePath
+	if prefix != "" {
+		prefix += "/"
+	}
+	metricsIncS3List()
 	var total uint64
-	var sweepErr error
 	ch := fsys.api.ListObjects(ctx, fsys.config.Bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
 		Recursive: true,
 	})
 	for obj := range ch {
 		if obj.Err != nil {
-			sweepErr = obj.Err
-			break
+			return 0, 0, false // partial observation - must not be cached
 		}
 		total += uint64(obj.Size)
 	}
-	// A canceled or failed sweep must not be cached as truth for a full
-	// TTL - a df interrupted mid-sweep would otherwise report a partial
-	// total (or zero) for ScanTTL. Leave the cache stale so the next
-	// statfs retries.
-	if sweepErr != nil || ctx.Err() != nil {
-		return
+	if ctx.Err() != nil {
+		return 0, 0, false
 	}
-	s.usage = total
-	s.quota = 0
-	s.at = time.Now()
+	return total, 0, true
 }
 
 // adminClient returns the MinIO admin client when the endpoint speaks the
 // MinIO admin protocol AND the mount credentials carry admin rights, nil
-// otherwise. The probe runs once on first statfs (not at mount, to keep
-// mount fast): a server that is not MinIO, or credentials without admin
-// rights, simply and permanently disables the admin path.
+// otherwise. Probed lazily on first statfs (not at mount) and retried at
+// most once per statfsProbeRetry, so a transient outage degrades to the
+// sweep only until the next re-probe.
 func (fsys *S3FileSystem) adminClient() *madmin.AdminClient {
-	fsys.adminProbe.Do(func() {
-		if fsys.adm == nil {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		// Any successful response - including "no quota set" - proves the
-		// admin API is reachable with these credentials.
-		if _, err := fsys.adm.GetBucketQuota(ctx, fsys.config.Bucket); err != nil {
-			slog.Debug("s3fs: MinIO admin API unavailable, statfs falls back to object sweep", "error", err)
-			fsys.adm = nil
-		}
-	})
+	fsys.admMu.Lock()
+	defer fsys.admMu.Unlock()
+	if fsys.adm == nil {
+		return nil
+	}
+	if fsys.admOK {
+		return fsys.adm
+	}
+	if !fsys.admProbeAt.IsZero() && time.Since(fsys.admProbeAt) < statfsProbeRetry {
+		return nil
+	}
+	fsys.admProbeAt = time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Any successful response - including "no quota set" - proves the
+	// admin API is reachable with these credentials.
+	if _, err := fsys.adm.GetBucketQuota(ctx, fsys.config.Bucket); err != nil {
+		slog.Debug("s3fs: MinIO admin API unavailable, statfs falls back to object sweep", "error", err)
+		return nil
+	}
+	fsys.admOK = true
 	return fsys.adm
 }

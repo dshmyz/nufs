@@ -526,7 +526,7 @@ func (d *S3Dir) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	if d.mfs == nil {
 		return 0
 	}
-	usage, quota := d.mfs.statfsCache.get(ctx, d.mfs)
+	usage, quota := d.mfs.statfsCache.get(ctx)
 	used := usage / uint64(blockSize)
 	if quota > 0 {
 		capBlocks := quota / uint64(blockSize)
@@ -536,7 +536,15 @@ func (d *S3Dir) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 			out.Bavail = capBlocks - used
 		}
 	} else {
-		out.Blocks = used
+		// S3 capacity is genuinely unbounded. Reporting Blocks=used and
+		// Bfree=0 would make statvfs say the mount is 100% full, breaking
+		// every space-checking writer (installers, backups, runtimes).
+		// Instead add a nominal 1 TiB free headroom: the df total is
+		// slightly larger than used, use% stays small and honest.
+		free := statfsNominalFree / uint64(blockSize)
+		out.Blocks = used + free
+		out.Bfree = free
+		out.Bavail = free
 	}
 	return 0
 }
