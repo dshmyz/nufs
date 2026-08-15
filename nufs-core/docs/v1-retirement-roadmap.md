@@ -89,12 +89,24 @@
   单小块再转 inline——殊途同归到同一布局。
 - **交叉验证是硬要求**：S3 写 → FUSE 读；FUSE 写 → S3 读；同文件双路径并发访问。
 
-### 1.2 数据面（small segment）
-- [ ] `MultiV2Store`/`v2_store.go` 挂载 `SmallStore`（`datanode/storage/segment/small_store.go:35`，现 `NewSmallStore` 零调用者）
-- [ ] `datanode/server_v2.go` V2Store.Write ≤64KiB 路由到 small stream
-- [ ] 读路径按 small 标志分流（small stream 独立 index 已有）
-- [ ] 复用 `compress.go` 的 4KiB–64KiB 采样压缩
-- [ ] 确认 small stream 纳入 seal/compact/磁盘水位维护
+### 1.2 数据面（small segment） ✅ 完成
+
+> 2026-08-16 完成。small-stream 数据面接线随 V2.1 迁移落地（提交 `5123ce4`）：
+> `cmd/datanode/main.go` 每盘创建 `NewSmallStore`（StreamID 0，独立 `index-small`）
+> 并经 `AttachSmallStores` 挂载；`datanode/server_v2.go` 的 `Write`/`WriteGen`
+> ≤ `SmallFileThreshold`(64KiB) 路由到 small stream，超限 `migrateSmallToData`；
+> 读路径按 `loc.small` 经 `backendAt` 分流；采样压缩走共享 `Store.Write`；
+> compaction worker 经 `DataStores()`（含 small）驱动。`AddDisk` 运行期热加盘
+> 同样建/挂 small stream（`server_v2.go` AddDisk，factory 三件套化，本次补上）。
+> 测试覆盖在 `datanode/v2_small_store_test.go`。
+>
+> 注：roadmap 原文 `v2_store.go` 引用陈旧——接线在 `datanode/server_v2.go`。
+
+- [x] `MultiV2Store`/`server_v2.go` 挂载 `SmallStore`（`datanode/storage/segment/small_store.go`，每盘一个）
+- [x] `server_v2.go` V2Store.Write ≤64KiB 路由到 small stream
+- [x] 读路径按 small 标志分流（small stream 独立 index 已有）
+- [x] 复用 `compress.go` 的 4KiB–64KiB 采样压缩
+- [x] 确认 small stream 纳入 seal/compact/磁盘水位维护
 
 ### 1.3 元数据面（inline extent）
 - [ ] `metadata/inode_store.go:65 SetInlineExtent` 接入 FUSE Flush（≤16MiB 单块转 inline）

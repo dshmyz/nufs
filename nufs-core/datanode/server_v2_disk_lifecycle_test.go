@@ -13,20 +13,26 @@ import (
 )
 
 // newDiskFactory builds a V2.1-style disk factory that constructs the paired
-// data (StreamID 1) and EC-shard (StreamID 2) segment stores for a dir, the
-// same shape runDataNodeV21 wires via SetDiskFactory.
-func newDiskFactory(t *testing.T) func(dir string) (data, shard storage.Store, err error) {
-	return func(dir string) (storage.Store, storage.Store, error) {
+// data (StreamID 1), EC-shard (StreamID 2) and small-file (StreamID 0) segment
+// stores for a dir, the same shape runDataNodeV21 wires via SetDiskFactory.
+func newDiskFactory(t *testing.T) func(dir string) (data, shard, small storage.Store, err error) {
+	return func(dir string) (storage.Store, storage.Store, storage.Store, error) {
 		data, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 1})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		shard, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 2})
 		if err != nil {
 			_ = data.Close()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return data, shard, nil
+		small, err := segment.NewSmallStore(segment.Config{Dir: dir, UseMemIndex: true})
+		if err != nil {
+			_ = data.Close()
+			_ = shard.Close()
+			return nil, nil, nil, err
+		}
+		return data, shard, small, nil
 	}
 }
 
@@ -289,17 +295,23 @@ func TestV2StoreReAdoptSameDirAfterRetire(t *testing.T) {
 	// StreamID 2 shard) so each holds a real index flock. The shard index is
 	// placed under dir/index-ecshard (mirroring runDataNodeV21.newDiskStores)
 	// so the data and shard stores of the same dir don't collide on one lock.
-	factory := func(dir string) (storage.Store, storage.Store, error) {
+	factory := func(dir string) (storage.Store, storage.Store, storage.Store, error) {
 		data, err := segment.New(segment.Config{Dir: dir, UseMemIndex: false, StreamID: 1})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		shard, err := segment.New(segment.Config{Dir: dir, IndexDir: dir + "/index-ecshard", UseMemIndex: false, StreamID: 2})
 		if err != nil {
 			_ = data.Close()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return data, shard, nil
+		small, err := segment.NewSmallStore(segment.Config{Dir: dir, IndexDir: dir + "/index-small", UseMemIndex: false})
+		if err != nil {
+			_ = data.Close()
+			_ = shard.Close()
+			return nil, nil, nil, err
+		}
+		return data, shard, small, nil
 	}
 
 	// Seed TWO real on-disk disks so RemoveDisk on a third (adopted) disk isn't
@@ -448,10 +460,13 @@ func TestV2StoreDiskLifecycleSurvivesRestart(t *testing.T) {
 	defer backends[0].Close()
 	defer backends[1].Close()
 
-	// Adopt a third disk and write to it in-session.
-	v.SetDiskFactory(func(dir string) (storage.Store, storage.Store, error) {
+	// Adopt a third disk and write to it in-session. The store has no small
+	// streams attached (this test predates them), so AddDisk skips the small
+	// store; nil is the honest factory return (reusing the data store as
+	// "small" would have AddDisk close the live data store on discard).
+	v.SetDiskFactory(func(dir string) (storage.Store, storage.Store, storage.Store, error) {
 		s, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 1})
-		return s, s, err
+		return s, s, nil, err
 	})
 	if _, err := v.AddDisk(dir2, 8, 8); err != nil {
 		t.Fatalf("AddDisk: %v", err)

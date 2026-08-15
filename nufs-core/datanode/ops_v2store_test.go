@@ -165,17 +165,23 @@ func TestOpsServer_V2StoreDiskLifecycleAdoptRetire(t *testing.T) {
 	s, dispatch := newV2OpsServer(t)
 	// The datanode main wires this factory; a configured store advertises and
 	// serves the full disk-lifecycle surface (task #183).
-	s.store.(*V2Store).SetDiskFactory(func(dir string) (storage.Store, storage.Store, error) {
+	s.store.(*V2Store).SetDiskFactory(func(dir string) (storage.Store, storage.Store, storage.Store, error) {
 		data, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 1})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		shard, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 2})
 		if err != nil {
 			_ = data.Close()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return data, shard, nil
+		small, err := segment.NewSmallStore(segment.Config{Dir: dir, UseMemIndex: true})
+		if err != nil {
+			_ = data.Close()
+			_ = shard.Close()
+			return nil, nil, nil, err
+		}
+		return data, shard, small, nil
 	})
 
 	dir := t.TempDir()
@@ -282,17 +288,23 @@ func TestDiskIndexByDirRegression(t *testing.T) {
 // the raw store.
 func TestOpsServer_SameDirReAdoptPrefersHealthy(t *testing.T) {
 	s, dispatch := newV2OpsServer(t)
-	s.store.(*V2Store).SetDiskFactory(func(dir string) (storage.Store, storage.Store, error) {
+	s.store.(*V2Store).SetDiskFactory(func(dir string) (storage.Store, storage.Store, storage.Store, error) {
 		data, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 1})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		shard, err := segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 2})
 		if err != nil {
 			_ = data.Close()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return data, shard, nil
+		small, err := segment.NewSmallStore(segment.Config{Dir: dir, UseMemIndex: true})
+		if err != nil {
+			_ = data.Close()
+			_ = shard.Close()
+			return nil, nil, nil, err
+		}
+		return data, shard, small, nil
 	})
 
 	dir := t.TempDir()

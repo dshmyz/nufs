@@ -3,6 +3,7 @@ package datanode
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
@@ -250,5 +251,101 @@ func TestV2SmallStore_AttachCountMismatch(t *testing.T) {
 	v := NewMultiV2Store([]storage.Store{ds})
 	if err := v.AttachSmallStores([]storage.Store{ds, ds}); err == nil {
 		t.Fatalf("expected count-mismatch error, got nil")
+	}
+}
+
+// TestV2SmallStore_AddDiskAttachesSmallStream verifies runtime hot-add of a
+// disk (DiskLifecycleOps.AddDisk) builds AND attaches a small-file stream for
+// the new disk, exactly like the startup disks: len(v.small) stays parallel to
+// len(v.disks), and a new chunk ≤ SmallFileThreshold routes to the new disk's
+// small stream (not the old ones). This closes the 1.2 gap where AddDisk built
+// only data + EC-shard stores, leaving a small-less disk that never received
+// small files.
+func TestV2SmallStore_AddDiskAttachesSmallStream(t *testing.T) {
+	d := t.TempDir()
+	ds, err := segment.New(segment.Config{Dir: d, UseMemIndex: true, StreamID: 1})
+	if err != nil {
+		t.Fatalf("data store: %v", err)
+	}
+	sm, err := segment.NewSmallStore(segment.Config{Dir: d, UseMemIndex: true})
+	if err != nil {
+		t.Fatalf("small store: %v", err)
+	}
+	t.Cleanup(func() { _ = sm.Close() })
+	t.Cleanup(func() { _ = ds.Close() })
+	v := NewMultiV2Store([]storage.Store{ds})
+	if err := v.AttachSmallStores([]storage.Store{sm}); err != nil {
+		t.Fatalf("AttachSmallStores: %v", err)
+	}
+
+	// A factory mirroring runDataNodeV21.newDiskStores: data (StreamID 1),
+	// shard (StreamID 2) and small (StreamID 0) segment stores per adopted dir.
+	newDir := t.TempDir()
+	var adoptedData, adoptedShard, adoptedSmall storage.Store
+	v.SetDiskFactory(func(dir string) (storage.Store, storage.Store, storage.Store, error) {
+		data, err := segment.New(segment.Config{Dir: dir, IndexDir: filepath.Join(dir, "index"), UseMemIndex: true, StreamID: 1})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		shard, err := segment.New(segment.Config{Dir: dir, IndexDir: filepath.Join(dir, "index-ecshard"), UseMemIndex: true, StreamID: 2})
+		if err != nil {
+			_ = data.Close()
+			return nil, nil, nil, err
+		}
+		small, err := segment.NewSmallStore(segment.Config{Dir: dir, IndexDir: filepath.Join(dir, "index-small"), UseMemIndex: true})
+		if err != nil {
+			_ = data.Close()
+			_ = shard.Close()
+			return nil, nil, nil, err
+		}
+		adoptedData, adoptedShard, adoptedSmall = data, shard, small
+		return data, shard, small, nil
+	})
+	t.Cleanup(func() { closeStore(adoptedSmall) })
+	t.Cleanup(func() { closeStore(adoptedShard) })
+	t.Cleanup(func() { closeStore(adoptedData) })
+
+	// Seed disk 0's small stream so the fresh adopted disk is the strict
+	// least-used small target for the post-adopt write.
+	seed := bytes.Repeat([]byte{7}, 100)
+	if err := v.Write(metadata.ChunkID(70000), seed); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	if loc, ok := v.currentLoc(metadata.ChunkID(70000)); !ok || loc.disk != 0 || !loc.small {
+		t.Fatalf("seed chunk not on disk 0 small stream: ok=%v loc=%+v", ok, loc)
+	}
+
+	idx, err := v.AddDisk(newDir, 8, 8)
+	if err != nil {
+		t.Fatalf("AddDisk: %v", err)
+	}
+	if idx != 1 {
+		t.Fatalf("AddDisk returned index %d, want 1", idx)
+	}
+	if len(v.small) != len(v.disks) {
+		t.Fatalf("after AddDisk small=%d disks=%d, want parallel (small-capable store)", len(v.small), len(v.disks))
+	}
+
+	cid := metadata.ChunkID(70001)
+	payload := make([]byte, 4096)
+	for i := range payload {
+		payload[i] = byte(i * 17)
+	}
+	if err := v.Write(cid, payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	loc, ok := v.currentLoc(cid)
+	if !ok || !loc.small || loc.disk != idx {
+		t.Fatalf("small chunk after AddDisk: ok=%v small=%v disk=%d, want small=true disk=%d", ok, loc.small, loc.disk, idx)
+	}
+	got, _, err := v.Read(cid, 0, 0)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("read after AddDisk: got %d bytes err %v", len(got), err)
+	}
+	if !storeHas(t, adoptedSmall, cid, 1, payload) {
+		t.Fatalf("adopted disk's small stream missing the chunk")
+	}
+	if storeHas(t, adoptedData, cid, 1, payload) {
+		t.Fatalf("small chunk leaked into adopted disk's data stream")
 	}
 }

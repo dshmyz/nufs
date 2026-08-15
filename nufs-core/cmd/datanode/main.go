@@ -398,13 +398,14 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		enc = encryption.NewKeyRegistry(kms)
 	}
 
-	// newDiskStores builds the paired data-stream (StreamID 1) and EC-shard
-	// (StreamID 2) segment stores for one disk dir. It is the single factory
-	// for every disk: the startup loop below builds the configured data dirs
-	// through it, and the V2Store's DiskLifecycleOps.AddDisk reuses it to
-	// adopt a runtime-added dir with exactly the same engine config (change
-	// journal, segment size, stream IDs, encryption) as its siblings.
-	newDiskStores := func(dir string) (storage.Store, storage.Store, error) {
+	// newDiskStores builds the paired data-stream (StreamID 1), EC-shard
+	// (StreamID 2) and small-file (StreamID 0) segment stores for one disk
+	// dir. It is the single factory for every disk: the startup loop below
+	// builds the configured data dirs through it, and the V2Store's
+	// DiskLifecycleOps.AddDisk reuses it to adopt a runtime-added dir with
+	// exactly the same engine config (change journal, segment size, stream
+	// IDs, encryption) as its siblings.
+	newDiskStores := func(dir string) (storage.Store, storage.Store, storage.Store, error) {
 		segCfg := segment.Config{
 			Dir:           dir,
 			SegmentSize:   segSize,
@@ -415,7 +416,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		}
 		s, err := segment.New(segCfg)
 		if err != nil {
-			return nil, nil, fmt.Errorf("init V2.1 data store: %w", err)
+			return nil, nil, nil, fmt.Errorf("init V2.1 data store: %w", err)
 		}
 		shardCfg := segment.Config{
 			Dir:           dir,
@@ -430,21 +431,8 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		if err != nil {
 			// Unwind the already-opened data store for this dir.
 			_ = s.Close()
-			return nil, nil, fmt.Errorf("init V2.1 shard store: %w", err)
+			return nil, nil, nil, fmt.Errorf("init V2.1 shard store: %w", err)
 		}
-		return s, ss, nil
-	}
-
-	for _, dir := range dataDirs {
-		s, ss, err := newDiskStores(dir)
-		if err != nil {
-			log.Error("failed to init V2.1 store", "disk", dir, "error", err)
-			closeStores()
-			os.Exit(1)
-		}
-		stores = append(stores, s)
-		shardStores = append(shardStores, ss)
-
 		// Per-disk small-file stream (StreamID 0): chunks ≤
 		// SmallFileThreshold are written as single records here. Its index is
 		// separate from the data stream's (default Dir/index) to avoid two
@@ -457,10 +445,22 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 			Enc:           enc,
 		})
 		if err != nil {
-			log.Error("failed to init V2.1 small store", "disk", dir, "error", err)
+			_ = s.Close()
+			_ = ss.Close()
+			return nil, nil, nil, fmt.Errorf("init V2.1 small store: %w", err)
+		}
+		return s, ss, sm, nil
+	}
+
+	for _, dir := range dataDirs {
+		s, ss, sm, err := newDiskStores(dir)
+		if err != nil {
+			log.Error("failed to init V2.1 store", "disk", dir, "error", err)
 			closeStores()
 			os.Exit(1)
 		}
+		stores = append(stores, s)
+		shardStores = append(shardStores, ss)
 		smallStores = append(smallStores, sm)
 	}
 	log.Info("V2.1 storage engine ready", "disks", len(dataDirs))

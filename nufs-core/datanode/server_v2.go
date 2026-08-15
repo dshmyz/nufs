@@ -142,21 +142,22 @@ type V2Store struct {
 	diskRun      bool
 	diskInterval time.Duration // probe cadence; <=0 falls back to diskHealthDefaultInterval
 
-	// diskFactory, when set, builds the paired data-stream and EC-shard
-	// segment stores for a newly adopted disk dir (streams 1 and 2, sharing
-	// the dir and change journal — the AddDisk analogue of the startup store
-	// construction in runDataNodeV21). It is injected by the datanode main
-	// because segment store construction needs the engine config (change
-	// journal, index dir, KMS, segment size, stream IDs) that lives there,
-	// not on the V2Store. nil means DiskLifecycleOps.AddDisk is unsupported.
-	diskFactory func(dir string) (data, shard storage.Store, err error)
+	// diskFactory, when set, builds the paired data-stream, EC-shard and
+	// small-file segment stores for a newly adopted disk dir (streams 1, 2
+	// and 0, sharing the dir and change journal — the AddDisk analogue of the
+	// startup store construction in runDataNodeV21). It is injected by the
+	// datanode main because segment store construction needs the engine
+	// config (change journal, index dir, KMS, segment size, stream IDs) that
+	// lives there, not on the V2Store. nil means DiskLifecycleOps.AddDisk is
+	// unsupported.
+	diskFactory func(dir string) (data, shard, small storage.Store, err error)
 }
 
 // SetDiskFactory installs the disk-construction callback used by
 // DiskLifecycleOps.AddDisk. The datanode main wires it after building the
 // startup stores so a runtime-adopted disk is constructed exactly like its
 // siblings.
-func (v *V2Store) SetDiskFactory(fn func(dir string) (data, shard storage.Store, err error)) {
+func (v *V2Store) SetDiskFactory(fn func(dir string) (data, shard, small storage.Store, err error)) {
 	v.diskFactory = fn
 }
 
@@ -1319,9 +1320,13 @@ func (v *V2Store) RemoveDisk(idx int) error {
 }
 
 // AddDisk adopts a new data dir by asking the injected disk factory to build
-// its paired data-stream and EC-shard segment stores, then appends both (plus
-// a capacity guard) to the V2Store and enumerates the new data/shards into
-// the location maps. Returns the new disk's index.
+// its paired data-stream, EC-shard and small-file segment stores, then appends
+// them (plus a capacity guard) to the V2Store and enumerates the new
+// data/shards/small extents into the location maps. Returns the new disk's
+// index. The small-file stream is attached only when the store already runs
+// small streams (every data disk has one); a store built without small stores
+// keeps routing everything to the data stream, preserving the AttachSmallStores
+// invariant len(small)==0 || len(small)==len(disks).
 //
 // Without a configured diskFactory (SetDiskFactory never called) AddDisk is
 // unsupported and returns an error — the single-disk/test construction path
@@ -1341,8 +1346,11 @@ func (v *V2Store) AddDisk(dir string, maxWrites, maxReads int) (int, error) {
 		if idx < len(v.shards) {
 			closeStore(v.shards[idx].store)
 		}
+		if idx < len(v.small) {
+			closeStore(v.small[idx].store)
+		}
 	}
-	data, shard, err := v.diskFactory(dir)
+	data, shard, small, err := v.diskFactory(dir)
 	if err != nil {
 		return 0, fmt.Errorf("add disk: build engine store for %s: %w", dir, err)
 	}
@@ -1356,6 +1364,7 @@ func (v *V2Store) AddDisk(dir string, maxWrites, maxReads int) (int, error) {
 		if extents, err := l.ListExtents(); err != nil {
 			closeStore(data)
 			closeStore(shard)
+			closeStore(small)
 			return 0, fmt.Errorf("add disk: enumerate data store for %s: %w", dir, err)
 		} else {
 			newLocs = make(map[metadata.ChunkID]chunkLoc, len(extents))
@@ -1374,6 +1383,7 @@ func (v *V2Store) AddDisk(dir string, maxWrites, maxReads int) (int, error) {
 		if extents, err := l.ListExtents(); err != nil {
 			closeStore(data)
 			closeStore(shard)
+			closeStore(small)
 			return 0, fmt.Errorf("add disk: enumerate shard store for %s: %w", dir, err)
 		} else {
 			newShards = make(map[metadata.ChunkID]map[int]int, len(extents))
@@ -1389,12 +1399,54 @@ func (v *V2Store) AddDisk(dir string, maxWrites, maxReads int) (int, error) {
 			}
 		}
 	}
+	// The small-file stream (StreamID 0) for the new disk. Its backend index
+	// parallels the data disk (n) so backendAt/leastUsedSmall/diskFailed
+	// resolve it like any sibling small stream. A nil small store from the
+	// factory is only tolerated on a store with no small streams (the built
+	// engine is then torn down below).
+	var smallB *diskBackend
+	var newSmallLocs map[metadata.ChunkID]chunkLoc
+	if len(v.small) > 0 {
+		if small == nil {
+			closeStore(data)
+			closeStore(shard)
+			return 0, fmt.Errorf("add disk: factory returned no small stream for %s", dir)
+		}
+		smallB = &diskBackend{store: small, index: n}
+		if l, ok := small.(extentLister); ok {
+			smallB.lister = l
+			if extents, err := l.ListExtents(); err != nil {
+				closeStore(data)
+				closeStore(shard)
+				closeStore(small)
+				return 0, fmt.Errorf("add disk: enumerate small store for %s: %w", dir, err)
+			} else {
+				newSmallLocs = make(map[metadata.ChunkID]chunkLoc, len(extents))
+				for _, e := range extents {
+					id := metadata.ChunkID(e.ExtentID)
+					smallB.usedByts.Add(int64(e.Value.LogicalLen))
+					smallB.extCount.Add(1)
+					newSmallLocs[id] = chunkLoc{disk: n, gen: e.Generation, small: true}
+				}
+			}
+		}
+	} else if small != nil {
+		// No small streams in this store: the built engine would leak its
+		// index lock and background goroutines, so tear it down.
+		closeStore(small)
+	}
 
 	v.mu.Lock()
 	v.disks = append(v.disks, dataB)
 	v.shards = append(v.shards, shardB)
+	if smallB != nil {
+		v.small = append(v.small, smallB)
+	}
 	v.caps = append(v.caps, capacityForDisk(dir))
 	for id, loc := range newLocs {
+		v.locOf[id] = loc
+	}
+	for id, loc := range newSmallLocs {
 		v.locOf[id] = loc
 	}
 	for cid, m := range newShards {
