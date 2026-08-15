@@ -28,6 +28,7 @@ import (
 	// DFS backend
 	"github.com/dshmyz/nufs/nufs-core/chunkstore"
 	gofuse "github.com/dshmyz/nufs/nufs-core/gateway/fuse"
+	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
 	"github.com/dshmyz/nufs/nufs-core/metadata"
 
 	// S3 backend
@@ -97,6 +98,14 @@ func main() {
 		// always read as a supplement when the corresponding --access-key
 		// etc. is unset. LoadCredentials in gateway/fuse implements this.
 		credentialsDir = flag.String("credentials-dir", "", "DFS: directory containing credentials.json; env META_* fall back when flags are unset")
+
+		// DFS TLS flags — mirror metad's TLS configuration so the FUSE
+		// client can connect to a TLS-enabled metadata and datanode.
+		tlsCert              = flag.String("tls-cert", "", "DFS: TLS certificate file (enables HTTPS for metadata + datanode)")
+		tlsKey               = flag.String("tls-key", "", "DFS: TLS private key file")
+		tlsCA                = flag.String("tls-ca", "", "DFS: CA certificate for mutual TLS (client verification)")
+		tlsRequireClientCert = flag.Bool("tls-require-client-cert", false, "DFS: Require client certificate signed by --tls-ca")
+		tlsSkipVerify        = flag.Bool("tls-skip-verify", false, "DFS: Skip TLS server certificate verification (dev only)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
@@ -155,11 +164,18 @@ func main() {
 			accessKey:      *accessKey,
 			secretKey:      *secretKey,
 			credentialsDir: *credentialsDir,
-			uid:            uint32(*uid),
-			gid:            uint32(*gid),
-			allowOther:     *allowOther,
-			readOnly:       *readOnly,
-			debug:          *debug,
+			tls: tlsutil.Config{
+				CertFile:          *tlsCert,
+				KeyFile:           *tlsKey,
+				CAFile:            *tlsCA,
+				SkipVerify:        *tlsSkipVerify,
+				RequireClientCert: *tlsRequireClientCert,
+			},
+			uid:        uint32(*uid),
+			gid:        uint32(*gid),
+			allowOther: *allowOther,
+			readOnly:   *readOnly,
+			debug:      *debug,
 		})
 	case "s3":
 		s3Args := flag.Args()
@@ -234,6 +250,7 @@ type dfsMountArgs struct {
 	accessKey      string
 	secretKey      string
 	credentialsDir string
+	tls            tlsutil.Config
 	uid, gid       uint32
 	allowOther     bool
 	readOnly       bool
@@ -286,6 +303,7 @@ func runNUFS(log *slog.Logger, a *dfsMountArgs) {
 			bucket:        a.bucket,
 			mountUID:      a.uid,
 			mountGID:      a.gid,
+			tls:           a.tls,
 			allowOther:    a.allowOther,
 			readOnly:      a.readOnly,
 			debug:         a.debug,
@@ -333,6 +351,7 @@ type mountConfig struct {
 	bucket        string
 	mountUID      uint32
 	mountGID      uint32
+	tls           tlsutil.Config
 	allowOther    bool
 	readOnly      bool
 	debug         bool
@@ -373,7 +392,17 @@ func (s *nufsMountState) mount() error {
 	var meta metadata.MetadataService
 	var ownerForMount string
 	if s.metaAddr != "" {
-		client := metadata.NewHTTPClient("http://"+s.metaAddr, 30*time.Second)
+		scheme := "http"
+		if s.cfg.tls.CertFile != "" || s.cfg.tls.SkipVerify {
+			scheme = "https"
+		}
+		client := metadata.NewHTTPClient(scheme+"://"+s.metaAddr, 30*time.Second)
+
+		if s.cfg.tls.CertFile != "" || s.cfg.tls.SkipVerify {
+			if err := client.EnableTLS(s.cfg.tls); err != nil {
+				return fmt.Errorf("enable TLS for metadata client: %w", err)
+			}
+		}
 
 		// Exchange accessKey/secretKey for a signed, principal-bound token.
 		// The verified principal drives RBAC; an empty owner means no RBAC
@@ -400,6 +429,9 @@ func (s *nufsMountState) mount() error {
 	s.meta = meta
 
 	chunkStore := chunkstore.NewDatanodeChunkStore()
+	if s.cfg.tls.CertFile != "" || s.cfg.tls.SkipVerify {
+		chunkStore.SetTLS(s.cfg.tls)
+	}
 
 	if s.cfg.cacheDir != "" {
 		var err error
@@ -453,7 +485,14 @@ func (s *nufsMountState) mount() error {
 // principal. The endpoint is pinned to the metad ops origin so the token
 // request reaches the auth authority the fuse will actually talk to.
 func (s *nufsMountState) exchangeAndStoreToken(client *metadata.HTTPClient) (string, error) {
-	authClient := metadata.NewHTTPClient("http://"+s.metaAddr, 30*time.Second)
+	scheme := "http"
+	if s.cfg.tls.CertFile != "" || s.cfg.tls.SkipVerify {
+		scheme = "https"
+	}
+	authClient := metadata.NewHTTPClient(scheme+"://"+s.metaAddr, 30*time.Second)
+	if s.cfg.tls.CertFile != "" || s.cfg.tls.SkipVerify {
+		_ = authClient.EnableTLS(s.cfg.tls)
+	}
 	result, err := authClient.ExchangeCredential(context.Background(), s.accessKey, s.secretKey, s.cfg.bucket)
 	if err != nil {
 		return "", fmt.Errorf("authenticate with metad: %w", err)
@@ -565,7 +604,14 @@ func (s *nufsMountState) remount(newMetaAddr string) error {
 	}
 
 	s.metaAddr = newMetaAddr
-	newMeta := metadata.NewHTTPClient("http://"+newMetaAddr, 30*time.Second)
+	scheme := "http"
+	if s.cfg.tls.CertFile != "" || s.cfg.tls.SkipVerify {
+		scheme = "https"
+	}
+	newMeta := metadata.NewHTTPClient(scheme+"://"+newMetaAddr, 30*time.Second)
+	if s.cfg.tls.CertFile != "" || s.cfg.tls.SkipVerify {
+		_ = newMeta.EnableTLS(s.cfg.tls)
+	}
 	if s.accessKey != "" && s.secretKey != "" {
 		// Stop any running refresh goroutine before re-authenticating.
 		if s.tokenRefreshCancel != nil {
