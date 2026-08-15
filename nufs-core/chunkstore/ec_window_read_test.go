@@ -202,7 +202,8 @@ func TestECWindowRead_DegradedReconstructsFromPeers(t *testing.T) {
 
 // TestECWindowRead_UnrecoverableError verifies that when fewer than K peer
 // windows are available the read fails with an explicit error — no hang, no
-// panic, no partial data.
+// panic, no partial data.  (The window path's error falls back to the full
+// read, which reports its own insufficient-shards error.)
 func TestECWindowRead_UnrecoverableError(t *testing.T) {
 	nodes, _, _, chunk, _ := v21WindowSetup(t, metadata.ChunkID(50004))
 	cs := NewDatanodeChunkStore()
@@ -222,7 +223,8 @@ func TestECWindowRead_UnrecoverableError(t *testing.T) {
 		}
 	}
 	// Stop the window's shard owner and one other node: the surviving node
-	// holds at most 3 shards (< K=6), so reconstruction cannot proceed.
+	// holds at most 3 shards (< K=6), so neither the window reconstruction
+	// nor the full read can succeed.
 	nodes[int(owner)-1].srv.Stop()
 	other := owner%3 + 1 // never equals owner for owner ∈ {1,2,3}
 	nodes[int(other)-1].srv.Stop()
@@ -231,7 +233,33 @@ func TestECWindowRead_UnrecoverableError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error for unrecoverable window, got nil")
 	}
-	if !strings.Contains(err.Error(), "unavailable") {
+	if !strings.Contains(err.Error(), "insufficient shards") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestECWindowRead_CapSizeFallsBackToFullRead verifies that a directly-written
+// EC chunk whose chunk.Size is the MaxChunkSize allocation cap (the S3 ECConfig
+// write path never updates it) still reads correctly: the window math would
+// point past the true shard extents, fails validation, and the read falls back
+// to the full-read path, which derives the padded length from the shards.
+func TestECWindowRead_CapSizeFallsBackToFullRead(t *testing.T) {
+	_, _, _, chunk, payload := v21WindowSetup(t, metadata.ChunkID(50005))
+	chunk.Size = int32(metadata.MaxChunkSize) // direct-EC write leaves the cap
+	cs := NewDatanodeChunkStore()
+	defer cs.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// A window that the cap-sized math places past the true shard extents.
+	off := int64(1 << 20) // 1 MiB — beyond the true shard 0 extent (≈699,051 B)
+	ln := int32(4096)
+	got, err := cs.ReadChunkRange(ctx, chunk, off, ln)
+	if err != nil {
+		t.Fatalf("ReadChunkRange: %v", err)
+	}
+	if want := payload[off : off+int64(ln)]; !bytes.Equal(got, want) {
+		t.Fatalf("data mismatch: got %d bytes, want %d", len(got), len(want))
 	}
 }

@@ -245,16 +245,22 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 
 	// Window path: the codec is contiguous (byte p lives in data shard
 	// p/shardSize), so a range read only needs the shard(s) that own its
-	// bytes.  It requires a trustworthy literal length.  Today only
-	// ConvertToEC produces ECStripeID chunks and it keeps the literal size;
-	// the direct-EC write path's metadata record is not yet served, so a
-	// cap-sized Size with ECStripeID cannot occur in production.  Anything
-	// ambiguous falls through to the full read below, which is always
-	// correct regardless of Size.
+	// bytes.  It is attempted whenever chunk.Size is a plausible length.
+	// NOTE: for directly-written EC chunks (S3 ECConfig path) chunk.Size is
+	// the MaxChunkSize allocation cap, not the literal length — the window
+	// math would then point past the true (smaller) shard extents.  The
+	// window path validates every fetch and falls back to the full read
+	// below on any failure; the full read derives the padded length from
+	// the shards themselves and is correct for any Size.
 	literalSize := int64(chunk.Size)
 	if chunk.ECStripeID != "" && length > 0 && offset >= 0 && offset < dataLen &&
 		literalSize > 0 && literalSize <= dataLen {
-		return s.readECWindow(ctx, chunk, offset, length, literalSize)
+		out, err := s.readECWindow(ctx, chunk, offset, length, literalSize)
+		if err == nil {
+			return out, nil
+		}
+		slog.Warn("chunkstore: ec window read failed, falling back to full read",
+			"chunkID", chunk.ID, "window", fmt.Sprintf("[%d,%d)", offset, offset+int64(length)), "error", err)
 	}
 
 	// ---- Full-read path: fetch all K+M shards in parallel, decode, trim. ----
@@ -437,11 +443,17 @@ func (s *DatanodeChunkStore) readECWindow(ctx context.Context, chunk *metadata.C
 	for i := 0; i < launched; i++ {
 		select {
 		case res := <-resCh:
-			if res.err == nil {
+			// Length must match exactly: a shorter response means the
+			// shardSize assumption overshot the real extent (chunk.Size is
+			// the MaxChunkSize cap for directly-written EC chunks) — treat
+			// as missing so the caller falls back to the full read.
+			if res.err == nil && len(res.data) == int(wins[res.idx].end-wins[res.idx].start) {
 				got[res.idx] = res.data
 			} else {
-				slog.Warn("chunkstore: ec window read failed", "chunkID", chunk.ID,
-					"shard", wins[res.idx].shard, "error", res.err)
+				if res.err != nil {
+					slog.Warn("chunkstore: ec window read failed", "chunkID", chunk.ID,
+						"shard", wins[res.idx].shard, "error", res.err)
+				}
 			}
 		case <-ctx.Done():
 			return nil, fmt.Errorf("chunkstore: ec window read context cancelled: %w", ctx.Err())
