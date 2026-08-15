@@ -53,7 +53,7 @@ func main() {
 
 		// S3 backend flags
 		scanTTL     = flag.Duration("scan-ttl", 60*time.Second, "S3: Directory scan cache TTL")
-		metricsAddr = flag.String("metrics-addr", "127.0.0.1:9900", "S3: Metrics/health HTTP address")
+		metricsAddr = flag.String("metrics-addr", ":9901", "Metrics/health HTTP address (DFS and S3; empty = disabled)")
 		insecure    = flag.Bool("insecure", false, "S3: Skip TLS verification")
 
 		// Shared flags
@@ -70,9 +70,6 @@ func main() {
 		allowOther = flag.Bool("allow-other", false, "Allow other users to access the mount")
 		readOnly   = flag.Bool("read-only", false, "Read-only mount (deny all writes with EROFS)")
 		debug      = flag.Bool("debug", false, "Debug logging (verbose FUSE + metadata traces)")
-
-		// DFS metrics flag
-		dfsMetricsAddr = flag.String("dfs-metrics-addr", ":9901", "DFS: Metrics/health HTTP address (empty=disabled)")
 
 		// DFS read/write cache memory limits — bound the fuse daemon's
 		// resident memory used by its two caches. readCacheMax limits the
@@ -159,7 +156,7 @@ func main() {
 			cacheDir:       *cacheDir,
 			readCacheMax:   *readCacheMax,
 			writeCacheMax:  *writeCacheMax,
-			metricsAddr:    *dfsMetricsAddr,
+			metricsAddr:    *metricsAddr,
 			directIO:       *directIO,
 			bucket:         *bucket,
 			accessKey:      *accessKey,

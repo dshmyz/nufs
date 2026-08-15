@@ -71,8 +71,8 @@ direct_io:          false             # DFS: bypass kernel page cache
 # tls_ca:             ""                # CA certificate for mutual TLS (client verification)
 # tls_require_client_cert: false        # require client cert signed by tls_ca
 
-# ── DFS metrics & monitoring ──────────────────────────────────────
-dfs_metrics_addr: ":9901"             # DFS metrics/health HTTP address (empty = disabled)
+# ── Metrics & monitoring (shared) ──────────────────────────────────
+metrics_addr:   ":9901"               # Metrics/health HTTP address (DFS and S3; empty = disabled)
 
 # ── FUSE mount options (shared) ───────────────────────────────────
 uid:            0                     # file owner UID (0 = caller's uid)
@@ -84,5 +84,4 @@ debug:          false                 # verbose FUSE + metadata traces
 # ── S3 backend ────────────────────────────────────────────────────
 # (used when backend=s3; all DFS fields above are ignored)
 scan_ttl:       "60s"                 # directory scan cache TTL
-metrics_addr:   ":9900"               # S3 metrics/health HTTP address (empty = disabled)
 insecure:       false                 # skip TLS verification for S3 endpoint
