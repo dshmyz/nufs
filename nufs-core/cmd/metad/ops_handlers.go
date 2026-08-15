@@ -182,6 +182,12 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, dataSt
 	mux.HandleFunc("/api/v1/namespace/link", mut(s.handleLink))
 	mux.HandleFunc("/api/v1/inodes/", s.handleInodesByID) // read-only
 
+	// V2.1 extent-layout surface (roadmap stage 1 §1.3): the /extents/{id}
+	// top-level read is registered separately from the inode sub-resources
+	// (extents/inline/promote/append-extent), which dispatch inside
+	// handleInodesByID. Mutating sub-resources gate on requireLeader.
+	mux.HandleFunc("/api/v1/extents/", s.handleExtentByID)
+
 	// Repair + rebalance (all mutating)
 	mux.HandleFunc("/api/v1/repair/queue", s.handleRepairQueue) // read-only
 	mux.HandleFunc("/api/v1/repair/trigger", mut(s.handleTriggerRepair))

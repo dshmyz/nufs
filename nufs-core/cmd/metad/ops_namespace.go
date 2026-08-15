@@ -301,9 +301,26 @@ func (h *opsHandlers) handleInodesByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	inodeID := metadata.InodeID(rawID)
-	if len(parts) >= 2 && parts[1] == "xattrs" {
-		h.handleXAttrs(w, r, inodeID, parts)
-		return
+	if len(parts) >= 2 {
+		// Sub-resources under /api/v1/inodes/{id}/: xattrs (V1) and the
+		// V2.1 extent-layout surface (extents/inline/promote/append-extent).
+		switch parts[1] {
+		case "xattrs":
+			h.handleXAttrs(w, r, inodeID, parts)
+			return
+		case "extents":
+			h.handleInodeExtents(w, r, inodeID)
+			return
+		case "inline":
+			h.handleInodeInline(w, r, inodeID)
+			return
+		case "promote":
+			h.handleInodePromote(w, r, inodeID)
+			return
+		case "append-extent":
+			h.handleInodeAppendExtent(w, r, inodeID)
+			return
+		}
 	}
 	switch r.Method {
 	case http.MethodGet:
@@ -328,6 +345,149 @@ func (h *opsHandlers) handleInodesByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// --- V2.1 extent-layout inode surface (roadmap stage 1 §1.3) ---
+
+// extentInodeService resolves the V2 extent-inode surface from the data
+// plane store (the primary PebbleStore for --shards 1, a ShardedStore for
+// --shards N>1). Both implement metadata.ExtentInodeService.
+func (h *opsHandlers) extentInodeService(w http.ResponseWriter) (metadata.ExtentInodeService, bool) {
+	es, ok := h.dataStore.(metadata.ExtentInodeService)
+	if !ok {
+		writeJSONError(w, http.StatusNotImplemented, "extent inode surface not configured")
+		return nil, false
+	}
+	return es, true
+}
+
+// handleInodeExtents serves GET /api/v1/inodes/{id}/extents (ResolveExtents).
+func (h *opsHandlers) handleInodeExtents(w http.ResponseWriter, r *http.Request, inodeID metadata.InodeID) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	es, ok := h.extentInodeService(w)
+	if !ok {
+		return
+	}
+	refs, err := es.ResolveExtents(r.Context(), inodeID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if refs == nil {
+		refs = []metadata.ExtentRef{}
+	}
+	writeJSON(w, map[string]interface{}{"extents": refs})
+}
+
+// handleInodeInline serves PUT /api/v1/inodes/{id}/inline (SetInlineExtent).
+func (h *opsHandlers) handleInodeInline(w http.ResponseWriter, r *http.Request, inodeID metadata.InodeID) {
+	if r.Method != http.MethodPut {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.requireLeader(w, r) {
+		return
+	}
+	var body struct {
+		Extent *metadata.ExtentMetaV2 `json:"extent"`
+		Size   int64                  `json:"size"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Extent == nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	es, ok := h.extentInodeService(w)
+	if !ok {
+		return
+	}
+	if err := es.SetInlineExtent(r.Context(), inodeID, body.Extent, body.Size); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "updated"})
+}
+
+// handleInodePromote serves PUT /api/v1/inodes/{id}/promote (PromoteToPages).
+func (h *opsHandlers) handleInodePromote(w http.ResponseWriter, r *http.Request, inodeID metadata.InodeID) {
+	if r.Method != http.MethodPut {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.requireLeader(w, r) {
+		return
+	}
+	es, ok := h.extentInodeService(w)
+	if !ok {
+		return
+	}
+	if err := es.PromoteToPages(r.Context(), inodeID); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "updated"})
+}
+
+// handleInodeAppendExtent serves PUT /api/v1/inodes/{id}/append-extent
+// (AppendExtent).
+func (h *opsHandlers) handleInodeAppendExtent(w http.ResponseWriter, r *http.Request, inodeID metadata.InodeID) {
+	if r.Method != http.MethodPut {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.requireLeader(w, r) {
+		return
+	}
+	var body struct {
+		Extent *metadata.ExtentMetaV2 `json:"extent"`
+		Offset int64                  `json:"offset"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Extent == nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	es, ok := h.extentInodeService(w)
+	if !ok {
+		return
+	}
+	root, err := es.AppendExtent(r.Context(), inodeID, body.Extent, body.Offset)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]interface{}{"extent_root": root})
+}
+
+// handleExtentByID serves GET /api/v1/extents/{id} (GetExtentMeta).
+func (h *opsHandlers) handleExtentByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	path := r.URL.Path[len("/api/v1/extents/"):]
+	rawID, err := strconv.ParseUint(path, 10, 64)
+	if err != nil || rawID == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid extent ID")
+		return
+	}
+	es, ok := h.extentInodeService(w)
+	if !ok {
+		return
+	}
+	m, err := es.GetExtentMeta(r.Context(), metadata.ExtentIDV2(rawID))
+	if errors.Is(err, metadata.ErrExtentNotFound) {
+		// Machine-readable code so HTTPClient.GetExtentMeta maps the 404 back
+		// to ErrExtentNotFound (readResponse matches on code=="extent_not_found").
+		writeJSONErrorC(w, http.StatusNotFound, "extent_not_found", err.Error())
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, m)
 }
 
 func (h *opsHandlers) handleXAttrs(w http.ResponseWriter, r *http.Request, inodeID metadata.InodeID, parts []string) {

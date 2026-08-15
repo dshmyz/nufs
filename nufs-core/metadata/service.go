@@ -53,6 +53,48 @@ type InodeService interface {
 	UpdateInode(ctx context.Context, meta *InodeMeta) error
 }
 
+// ExtentInodeService is the V2.1 extent-layout inode surface (§11.1). Unlike
+// InodeService (which speaks the legacy ChunkMap InodeMeta), this interface
+// exposes the InodeMetaV2 layout transitions (Empty → InlineExtent →
+// ExtentPages) and extent resolution.
+//
+// It is deliberately NOT embedded in MetadataService: the gateway depends on
+// the smallest interface it needs, and V2 layout support is discovered by a
+// type assertion so V1-only test mocks keep working unchanged. Production
+// backends (PebbleStore local, ShardedStore, HTTPClient remote) all implement
+// it.
+//
+// Both InodeMeta (V1) and InodeMetaV2 (V2) persist under the same
+// /inode/{id} key (field-name msgpack, disjoint layout fields). The model
+// invariant enforced across this surface: an inode row is written by exactly
+// one model. V1 UpdateInode refuses to overwrite a V2-layout row
+// (ErrInodeModelMismatch); these methods are the only way to write V2 layout.
+type ExtentInodeService interface {
+	// ResolveExtents returns the file's flat extent references (inline or
+	// extent pages). For an empty inode — or a V1 (ChunkMap) row, which
+	// decodes as LayoutEmpty — it returns (nil, nil): callers probe this
+	// only when the ChunkMap is empty, so nil means "no V2 extents".
+	ResolveExtents(ctx context.Context, id InodeID) ([]ExtentRef, error)
+
+	// GetExtentMeta returns a V2 extent's metadata (length, placement,
+	// storage class, EC stripe). Extents are recorded under
+	// /extent-meta/{extent_id} by SetInlineExtent / AppendExtent.
+	GetExtentMeta(ctx context.Context, extentID ExtentIDV2) (*ExtentMetaV2, error)
+
+	// SetInlineExtent promotes an empty inode to a single inline extent
+	// (files with one extent, ≤ 16 MiB). Persists the extent metadata and
+	// the inode's inline layout in one serving-surface call.
+	SetInlineExtent(ctx context.Context, id InodeID, extent *ExtentMetaV2, size int64) error
+
+	// PromoteToPages transitions an inline-extent inode to extent pages
+	// (multi-extent files). The inline extent becomes page 0 under a COW root.
+	PromoteToPages(ctx context.Context, id InodeID) error
+
+	// AppendExtent appends an extent reference to a pages-layout inode,
+	// persisting the extent metadata. Returns the new COW extent root.
+	AppendExtent(ctx context.Context, id InodeID, extent *ExtentMetaV2, offset int64) (uint64, error)
+}
+
 // ChunkService defines chunk lifecycle operations.
 type ChunkService interface {
 	AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error)

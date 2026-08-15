@@ -422,6 +422,8 @@ func (c *HTTPClient) readResponse(resp *http.Response, v interface{}) error {
 				return ErrXAttrNotFound
 			case "entry_not_found":
 				return ErrEntryNotFound
+			case "extent_not_found":
+				return ErrExtentNotFound
 			}
 		}
 		return fmt.Errorf("metad: %s (status=%d)", string(data), resp.StatusCode)
@@ -754,6 +756,69 @@ func (c *HTTPClient) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 		return err
 	}
 	return c.readResponse(resp, nil)
+}
+
+// --- ExtentInodeService (V2.1 extent-layout inode surface) ---
+
+// Compile-time check: HTTPClient satisfies the V2 extent-inode surface.
+var _ ExtentInodeService = (*HTTPClient)(nil)
+
+func (c *HTTPClient) ResolveExtents(ctx context.Context, id InodeID) ([]ExtentRef, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, fmt.Sprintf("/api/v1/inodes/%d/extents", id), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Extents []ExtentRef `json:"extents"`
+	}
+	if err := c.readResponse(resp, &out); err != nil {
+		return nil, err
+	}
+	return out.Extents, nil
+}
+
+func (c *HTTPClient) GetExtentMeta(ctx context.Context, extentID ExtentIDV2) (*ExtentMetaV2, error) {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, fmt.Sprintf("/api/v1/extents/%d", extentID), nil)
+	if err != nil {
+		return nil, err
+	}
+	var m ExtentMetaV2
+	if err := c.readResponse(resp, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (c *HTTPClient) SetInlineExtent(ctx context.Context, id InodeID, extent *ExtentMetaV2, size int64) error {
+	req := map[string]interface{}{"extent": extent, "size": size}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, fmt.Sprintf("/api/v1/inodes/%d/inline", id), req)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) PromoteToPages(ctx context.Context, id InodeID) error {
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, fmt.Sprintf("/api/v1/inodes/%d/promote", id), nil)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
+func (c *HTTPClient) AppendExtent(ctx context.Context, id InodeID, extent *ExtentMetaV2, offset int64) (uint64, error) {
+	req := map[string]interface{}{"extent": extent, "offset": offset}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, fmt.Sprintf("/api/v1/inodes/%d/append-extent", id), req)
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		ExtentRoot uint64 `json:"extent_root"`
+	}
+	if err := c.readResponse(resp, &out); err != nil {
+		return 0, err
+	}
+	return out.ExtentRoot, nil
 }
 
 // Chunk operations

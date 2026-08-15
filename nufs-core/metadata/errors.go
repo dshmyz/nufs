@@ -58,7 +58,16 @@ var (
 	ErrCrossBucketRename = errors.New("metadata: rename across buckets is not allowed")
 	ErrXAttrNotFound     = errors.New("metadata: extended attribute not found")
 	ErrExtentNotInline   = errors.New("metadata: extent is not inline")
-	ErrDirTooLarge       = errors.New("metadata: directory exceeds maximum entries limit")
+	// ErrExtentNotFound is returned when an extent's metadata row
+	// (/extent-meta/{id}) does not exist.
+	ErrExtentNotFound = errors.New("metadata: extent not found")
+	// ErrInodeModelMismatch is returned when a V1 write path (UpdateInode)
+	// is applied to an inode that carries a V2 layout (LayoutInlineExtent /
+	// LayoutExtentPages). Both models share the same /inode/{id} row, and a
+	// V1 overwrite would silently wipe the V2 layout fields — refuse loudly
+	// instead (roadmap stage 1 / V2.1 inode wiring).
+	ErrInodeModelMismatch = errors.New("metadata: inode has a V2 layout; V1 update refused")
+	ErrDirTooLarge        = errors.New("metadata: directory exceeds maximum entries limit")
 	ErrAccessDenied      = errors.New("metadata: access denied")
 	ErrQuotaExceeded     = errors.New("metadata: bucket quota exceeded")
 )

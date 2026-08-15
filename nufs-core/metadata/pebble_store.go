@@ -1889,19 +1889,30 @@ func (s *PebbleStore) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 		return ErrInvalidArgument
 	}
 	meta.CTime = time.Now().UnixNano()
-	ops := []batchOp{
-		{Key: fmt.Sprintf("%s%d", prefixInode, meta.ID), Value: meta},
-	}
+	key := fmt.Sprintf("%s%d", prefixInode, meta.ID)
+	var ops []batchOp
 
-	// Only read old inode if bucket stats are enabled (avoid unnecessary Pebble I/O).
-	// Most callers (e.g. SetXAttr/RemoveXAttr) don't change Size, so the delta read
-	// is a no-op waste. This optimization saves a local Pebble + unmarshal per call.
-	if s.cfg.UseBucketStats {
-		var oldMeta InodeMeta
-		if oldExists, _ := s.getJSON(fmt.Sprintf("%s%d", prefixInode, meta.ID), &oldMeta); oldExists {
-			s.addBucketStatsOp(oldMeta.BucketRoot, meta.Size-oldMeta.Size, 0, &ops)
+	// Model collision guard + bucket-stats delta share one raw read of the
+	// existing row. V1 (InodeMeta, ChunkMap) and V2 (InodeMetaV2, layout)
+	// coexist under the same key; a V1 overwrite would silently wipe the V2
+	// layout fields, so refuse it loudly instead of corrupting. The same
+	// read supplies the Size delta for bucket stats, so production
+	// (UseBucketStats) pays no extra I/O for the guard.
+	if found, raw, err := s.getRaw(key); err != nil {
+		return err
+	} else if found {
+		var v2 InodeMetaV2
+		if err := unmarshalValue(raw, &v2); err != nil {
+			return err
+		}
+		if v2.Layout != LayoutEmpty {
+			return fmt.Errorf("%w: inode %d carries layout %d", ErrInodeModelMismatch, meta.ID, v2.Layout)
+		}
+		if s.cfg.UseBucketStats {
+			s.addBucketStatsOp(v2.BucketRoot, meta.Size-v2.Size, 0, &ops)
 		}
 	}
+	ops = append(ops, batchOp{Key: key, Value: meta})
 	if err := s.applyBatchMsgpack(ops, nil); err != nil {
 		return err
 	}

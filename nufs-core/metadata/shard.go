@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -770,6 +771,72 @@ func (ss *ShardedStore) UpdateInode(ctx context.Context, meta *InodeMeta) error 
 		return err
 	}
 	return store.UpdateInode(ctx, meta)
+}
+
+// --- ExtentInodeService (V2.1 extent-layout inode surface) ---
+
+// Compile-time check: ShardedStore satisfies the V2 extent-inode surface.
+var _ ExtentInodeService = (*ShardedStore)(nil)
+
+func (ss *ShardedStore) ResolveExtents(ctx context.Context, id InodeID) ([]ExtentRef, error) {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return nil, err
+	}
+	return store.ResolveExtents(ctx, id)
+}
+
+// GetExtentMeta scans shards: the /extent-meta/{id} row is written as a side
+// effect of SetInlineExtent / AppendExtent, which route by the *inode*, so the
+// row lands in the inode's shard — not derivable from the extent ID alone.
+// (This mirrors the bucket reads, which scan because broadcast writes don't
+// pin a shard.) Extent IDs are globally unique, so at most one shard holds the
+// row; return the first hit.
+func (ss *ShardedStore) GetExtentMeta(ctx context.Context, extentID ExtentIDV2) (*ExtentMetaV2, error) {
+	ss.mu.RLock()
+	shards := make([]*PebbleStore, 0, len(ss.shards))
+	for _, s := range ss.shards {
+		shards = append(shards, s)
+	}
+	ss.mu.RUnlock()
+	var lastErr error
+	for _, s := range shards {
+		m, err := s.GetExtentMeta(ctx, extentID)
+		if err == nil {
+			return m, nil
+		}
+		if !errors.Is(err, ErrExtentNotFound) {
+			lastErr = err
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, ErrExtentNotFound
+}
+
+func (ss *ShardedStore) SetInlineExtent(ctx context.Context, id InodeID, extent *ExtentMetaV2, size int64) error {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return err
+	}
+	return store.SetInlineExtent(ctx, id, extent, size)
+}
+
+func (ss *ShardedStore) PromoteToPages(ctx context.Context, id InodeID) error {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return err
+	}
+	return store.PromoteToPages(ctx, id)
+}
+
+func (ss *ShardedStore) AppendExtent(ctx context.Context, id InodeID, extent *ExtentMetaV2, offset int64) (uint64, error) {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return 0, err
+	}
+	return store.AppendExtent(ctx, id, extent, offset)
 }
 
 // --- ChunkService ---
