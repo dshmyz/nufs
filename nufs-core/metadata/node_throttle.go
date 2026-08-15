@@ -94,11 +94,9 @@ func NewNodeRegistrationThrottle(cfg *NodeThrottleConfig) *NodeRegistrationThrot
 // runtime (e.g. from admin page / feature flag). Per-node
 // limiters are lazily rebuilt with the new rate on next call.
 func (t *NodeRegistrationThrottle) Reconfigure(cfg NodeThrottleConfig) {
-	t.config.Store(cfg)
 	newGlobal := rate.NewLimiter(cfg.GlobalRate, cfg.GlobalBurst)
 	t.mu.Lock()
-	// Swap before clearing per-node state so a concurrently-running Allow/Wait
-	// keeps a stable *rate.Limiter the whole time (atomic pointer).
+	t.config.Store(cfg)
 	t.global.Store(newGlobal)
 	// Per-node limiters are rebuilt lazily on next Allow() to
 	// avoid iterating the map under lock.
