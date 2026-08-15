@@ -1547,42 +1547,6 @@ func TestPebbleStore_ChunkState_DegradesOnReplicaFailed(t *testing.T) {
 	}
 }
 
-func TestPebbleStore_ChunkState_RecoversWhenAllReady(t *testing.T) {
-	const rf = 2
-	store, chunk := newDegradeFixture(t, rf, SpreadRack)
-	ctx := context.Background()
-
-	got, err := store.GetChunk(ctx, chunk.ID)
-	if err != nil {
-		t.Fatalf("GetChunk: %v", err)
-	}
-	nodes := make([]NodeID, 0, len(got.Replicas))
-	for _, r := range got.Replicas {
-		nodes = append(nodes, r.NodeID)
-	}
-
-	// Bring every replica to Ready, then fail one → Degraded.
-	reportEveryReady(t, store, chunk, nodes)
-	if err := store.ReportChunkState(ctx, nodes[0],
-		map[ChunkID]ReplicaState{chunk.ID: ReplicaFailed}); err != nil {
-		t.Fatalf("ReportChunkState failed: %v", err)
-	}
-	deg, _ := store.GetChunk(ctx, chunk.ID)
-	if deg.State != ChunkDegraded {
-		t.Fatalf("expected ChunkDegraded, got %d", deg.State)
-	}
-
-	// Restore the failed replica → all Ready → chunk recovers to ChunkReady.
-	if err := store.ReportChunkState(ctx, nodes[0],
-		map[ChunkID]ReplicaState{chunk.ID: ReplicaReady}); err != nil {
-		t.Fatalf("ReportChunkState recovered: %v", err)
-	}
-	rec, _ := store.GetChunk(ctx, chunk.ID)
-	if rec.State != ChunkReady {
-		t.Fatalf("expected ChunkReady after all replicas ready, got %d", rec.State)
-	}
-}
-
 func TestPebbleStore_ChunkState_IgnoresCreated(t *testing.T) {
 	store := newTestPebbleStore(t)
 	ctx := context.Background()

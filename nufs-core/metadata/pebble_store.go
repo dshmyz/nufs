@@ -871,20 +871,29 @@ func (s *PebbleStore) getJSON(key string, v interface{}) (bool, error) {
 
 // getRawBytes returns the current raw bytes stored at key, or (nil, false)
 // when absent. Unlike getValue it does not decode; it returns the exact on-disk
-// value so callers can use it as a CAS ExpectedValue for a conditional batch
-// (the precondition compares raw bytes).
-func (s *PebbleStore) getRawBytes(key string) ([]byte, bool, error) {
+// getRaw fetches a single Pebble key and returns a copy of the value.
+// Returns (true, value, nil) on hit; (false, nil, nil) on miss;
+// (false, nil, err) on I/O error.  Callers that need richer error
+// messages wrap the returned error themselves.
+func (s *PebbleStore) getRaw(key string) (found bool, value []byte, err error) {
 	val, closer, err := s.db.Get([]byte(key))
-	if err == pebble.ErrNotFound {
-		return nil, false, nil
+	if errors.Is(err, pebble.ErrNotFound) {
+		return false, nil, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("pebble store: get %q: %w", key, err)
+		return false, nil, err
 	}
 	defer closer.Close()
-	data := make([]byte, len(val))
-	copy(data, val)
-	return data, true, nil
+	value = make([]byte, len(val))
+	copy(value, val)
+	return true, value, nil
+}
+
+// getRawBytes is a legacy alias kept for call-sites that expect the
+// (value, found, err) return order.  It delegates to getRaw.
+func (s *PebbleStore) getRawBytes(key string) ([]byte, bool, error) {
+	found, value, err := s.getRaw(key)
+	return value, found, err
 }
 
 // getValuesBatch fetches multiple keys in a single pass using a

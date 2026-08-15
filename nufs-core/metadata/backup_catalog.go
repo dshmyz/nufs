@@ -671,15 +671,8 @@ func (s *PebbleStore) ClearRestorePendingMarker(ctx context.Context) error {
 }
 
 func (s *PebbleStore) readBackupMetadataRaw(key string) ([]byte, bool, error) {
-	value, closer, err := s.db.Get([]byte(key))
-	if errors.Is(err, pebble.ErrNotFound) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	defer closer.Close()
-	return append([]byte(nil), value...), true, nil
+	found, value, err := s.getRaw(key)
+	return value, found, err
 }
 
 func (s *PebbleStore) applyBackupMetadataConditional(ctx context.Context, conditional *ConditionalBatch) error {

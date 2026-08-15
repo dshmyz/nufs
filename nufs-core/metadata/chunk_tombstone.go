@@ -504,15 +504,8 @@ func (s *PebbleStore) checkChunkTombstoneCall(ctx context.Context) error {
 }
 
 func (s *PebbleStore) readChunkTombstoneRaw(key string) ([]byte, bool, error) {
-	value, closer, err := s.db.Get([]byte(key))
-	if errors.Is(err, pebble.ErrNotFound) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	defer closer.Close()
-	return append([]byte(nil), value...), true, nil
+	found, value, err := s.getRaw(key)
+	return value, found, err
 }
 
 func decodeChunkTombstone(raw []byte) (ChunkTombstone, error) {
