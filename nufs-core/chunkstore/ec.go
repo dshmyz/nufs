@@ -280,6 +280,7 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 
 	// Read shards in parallel.  Non-overlapping shards are skipped (not
 	// sent to the channel); the collector marks them absent.
+	launched := 0
 	for _, rep := range chunk.Replicas {
 		idx := rep.ShardIndex
 
@@ -296,6 +297,7 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 		if !fetch {
 			continue // skip — not in window
 		}
+		launched++
 
 		go func(r metadata.ReplicaInfo) {
 			if r.Addr == "" {
@@ -346,10 +348,10 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 		}(rep)
 	}
 
-	// Collect shards
+	// Collect shards — exactly as many as goroutines were launched.
 	shards := make([][]byte, totalShards)
 	present := make([]bool, totalShards)
-	for i := 0; i < len(chunk.Replicas); i++ {
+	for i := 0; i < launched; i++ {
 		select {
 		case sd := <-ch:
 			if sd.err == nil && sd.index >= 0 && sd.index < totalShards {
@@ -380,6 +382,18 @@ func (s *DatanodeChunkStore) readECChunk(ctx context.Context, chunk *metadata.Ch
 	decodeLen := paddedLen
 	if chunk.Size > 0 && int64(chunk.Size) < int64(paddedLen) {
 		decodeLen = int(chunk.Size) // actual data length (tests set this correctly)
+	}
+
+	// Pad partial data shards to shardSize so all present shards have the
+	// same length — reedsolomon.Reconstruct requires uniform shard sizes.
+	if wantWindow && shardSize > 0 {
+		for i := 0; i < ec.DataShards; i++ {
+			if present[i] && int64(len(shards[i])) < shardSize {
+				padded := make([]byte, shardSize)
+				copy(padded, shards[i])
+				shards[i] = padded
+			}
+		}
 	}
 	fullData, err := encoder.Decode(shards, present, decodeLen)
 	if err != nil {

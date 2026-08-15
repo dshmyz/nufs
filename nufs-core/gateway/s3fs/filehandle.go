@@ -29,22 +29,22 @@ type S3FileHandle struct {
 
 	handle uint64
 
-	dirty     bool
-	flushed   bool
+	dirty      bool
+	flushed    bool
 	downloaded bool
-	dlOnce    sync.Once
-	dlErr     error
-	dlCtx     context.Context
+	dlOnce     sync.Once
+	dlErr      error
+	dlCtx      context.Context
 
 	cachePath string
 }
 
 var (
-	_ fs.FileReader  = (*S3FileHandle)(nil)
-	_ fs.FileWriter  = (*S3FileHandle)(nil)
-	_ fs.FileFlusher = (*S3FileHandle)(nil)
+	_ fs.FileReader   = (*S3FileHandle)(nil)
+	_ fs.FileWriter   = (*S3FileHandle)(nil)
+	_ fs.FileFlusher  = (*S3FileHandle)(nil)
 	_ fs.FileReleaser = (*S3FileHandle)(nil)
-	_ fs.FileFsyncer = (*S3FileHandle)(nil)
+	_ fs.FileFsyncer  = (*S3FileHandle)(nil)
 )
 
 // ensureDownloaded lazily downloads from S3 on first read.
@@ -171,6 +171,14 @@ func (fh *S3FileHandle) Release(ctx context.Context) syscall.Errno {
 	metricsIncRelease()
 	fh.Close()
 	fh.f.mfs.Release(fh)
+
+	// Clear the file's lastFH reference if it points to this handle,
+	// so truncateCacheFile doesn't use a stale/closed file descriptor.
+	fh.f.mfs.mu.Lock()
+	if fh.f.lastFH == fh {
+		fh.f.lastFH = nil
+	}
+	fh.f.mfs.mu.Unlock()
 
 	if fh.dirty && !fh.flushed {
 		// Flush failed — keep cache file for crash recovery.

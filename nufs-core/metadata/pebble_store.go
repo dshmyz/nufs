@@ -228,9 +228,9 @@ type PebbleStore struct {
 	chunkIDMax     atomic.Uint64
 	chunkIDMaxInit atomic.Bool
 
-	closed   atomic.Bool
-	mu       sync.RWMutex
-	cfg      PebbleStoreConfig
+	closed atomic.Bool
+	mu     sync.RWMutex
+	cfg    PebbleStoreConfig
 
 	// Dynamic config — swapped atomically via atomic.Pointer so reads are lock-free.
 	// Use GetDynamicConfig() / SetDynamicConfig() to access.
@@ -1337,9 +1337,9 @@ func buildNamespaceConditionalOps(nsKey string, ops []batchOp, deletes []string,
 		pre = &ConditionalPrecondition{Key: []byte(nsKey), ExpectAbsent: true}
 	}
 	return &ConditionalBatch{
-		Version:      conditionalBatchVersion,
+		Version:       conditionalBatchVersion,
 		Preconditions: []ConditionalPrecondition{*pre},
-		Mutations:    mutations,
+		Mutations:     mutations,
 	}, nil
 }
 
@@ -2712,18 +2712,16 @@ func (s *PebbleStore) batchUpdateChunkStatesCtx(ctx context.Context, nodeID Node
 				State:  state,
 			})
 		}
-		// Reflect replica loss/gain on the chunk's overall state so a
-		// data-carrying chunk that has had a replica marked ReplicaFailed is
-		// surfaced as ChunkDegraded, and recovers to ChunkReady once every
-		// replica this view knows about reports healthy again. Reconciling
-		// *expected* replicas against actuals is left to the scrubber /
-		// anti-entropy; here we only degrade/upgrade off the states actually
-		// reported, so a ChunkCreated/ChunkOrphan is never spuriously promoted.
+		// Reflect replica loss on the chunk's overall state so a data-carrying
+		// chunk that has had a replica marked ReplicaFailed is surfaced as
+		// ChunkDegraded. Upgrade back to ChunkReady is left to the scrubber /
+		// anti-entropy which have full visibility into the expected replica set;
+		// partial heartbeat batches may not include all nodes, so auto-upgrading
+		// here would risk falsely marking a chunk as ready when some replicas
+		// are still failed but unreported.
 		prevState := chunk.State
 		if state == ReplicaFailed && (chunk.State == ChunkSealed || chunk.State == ChunkReady) {
 			chunk.State = ChunkDegraded
-		} else if chunk.State == ChunkDegraded && allReplicasReady(&chunk) {
-			chunk.State = ChunkReady
 		}
 		changed := chunk.State != prevState
 		if err := s.updateLiveChunkMetadata(ctx, raw, &chunk); err != nil {
@@ -2737,21 +2735,6 @@ func (s *PebbleStore) batchUpdateChunkStatesCtx(ctx context.Context, nodeID Node
 		}
 	}
 	return nil
-}
-
-// allReplicasReady reports whether every replica listed on the chunk is in the
-// ready state. A chunk with no replicas is not considered ready (it has no
-// healthy copy to serve reads from).
-func allReplicasReady(chunk *ChunkMeta) bool {
-	if len(chunk.Replicas) == 0 {
-		return false
-	}
-	for i := range chunk.Replicas {
-		if chunk.Replicas[i].State != ReplicaReady {
-			return false
-		}
-	}
-	return true
 }
 
 // ========== ClusterService Implementation ==========

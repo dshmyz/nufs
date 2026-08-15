@@ -29,6 +29,11 @@ type S3File struct {
 	Chgtime time.Time
 	Crtime  time.Time
 	Atime   time.Time
+
+	// lastFH is the most recently opened file handle for this inode.
+	// truncateCacheFile uses it for O(1) lookup instead of scanning all
+	// open handles. Set by Open, nil after Release closes the file.
+	lastFH *S3FileHandle
 }
 
 var (
@@ -98,6 +103,7 @@ func (f *S3File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32,
 		return nil, 0, syscall.EIO
 	}
 
+	f.lastFH = fh
 	return fh, fuse.FOPEN_KEEP_CACHE, 0
 }
 
@@ -185,12 +191,10 @@ func (f *S3File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttr
 // Flush uploads the truncated content to S3.
 func (f *S3File) truncateCacheFile(size uint64) {
 	f.mfs.mu.RLock()
-	defer f.mfs.mu.RUnlock()
-	for _, h := range f.mfs.handles {
-		if h.f != nil && h.f.InodeID == f.InodeID {
-			h.File.Truncate(int64(size))
-			return
-		}
+	h := f.lastFH
+	f.mfs.mu.RUnlock()
+	if h != nil && h.File != nil {
+		h.File.Truncate(int64(size))
 	}
 }
 

@@ -38,7 +38,7 @@ const statfsNominalFree = 1 << 40 // 1 TiB
 // mutate, so no locally maintained counter can be correct - only the
 // server knows.
 type statfsUsage struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	ttl      time.Duration
 	cooldown time.Duration
 	usage    uint64
@@ -56,7 +56,24 @@ type statfsUsage struct {
 // get returns (usage, quota), refreshing from the server on first call
 // and whenever the cached observation is older than ttl. A failed
 // refresh serves the stale values and suppresses retries for cooldown.
+//
+// Fast path (cache hit within TTL): RLock only — concurrent df callers
+// are not blocked.  Slow path acquires the write lock for the network
+// fetch so only one refresh runs at a time.
 func (s *statfsUsage) get(ctx context.Context) (usage, quota uint64) {
+	s.mu.RLock()
+	if !s.at.IsZero() && time.Since(s.at) < s.ttl {
+		u, q := s.usage, s.quota
+		s.mu.RUnlock()
+		return u, q
+	}
+	if !s.failAt.IsZero() && time.Since(s.failAt) < s.cooldown {
+		u, q := s.usage, s.quota
+		s.mu.RUnlock()
+		return u, q
+	}
+	s.mu.RUnlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
@@ -64,7 +81,7 @@ func (s *statfsUsage) get(ctx context.Context) (usage, quota uint64) {
 		return s.usage, s.quota
 	}
 	if !s.failAt.IsZero() && now.Sub(s.failAt) < s.cooldown {
-		return s.usage, s.quota // stale, but too soon to retry
+		return s.usage, s.quota
 	}
 	usage, quota, ok := s.fetch(ctx, s.quota)
 	if !ok {
