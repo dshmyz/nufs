@@ -511,8 +511,10 @@ func (d *S3Dir) Access(ctx context.Context, mask uint32) syscall.Errno {
 	return 0
 }
 
-// Statfs returns filesystem statistics. S3 object storage has no fixed
-// capacity, so total/free blocks are reported as 0 (df shows "unknown").
+// Statfs returns filesystem statistics. Reports the total size of cached
+// file data from the local metadata cache (fast, no S3 API call). S3 has
+// no fixed capacity so Blocks/Bfree are not meaningful — only Files/used
+// reflect the actual bucket content visible to this mount.
 func (d *S3Dir) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	const blockSize = uint32(4096)
 	out.Bsize = blockSize
@@ -523,6 +525,9 @@ func (d *S3Dir) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	out.Bavail = 0
 	out.Files = 0
 	out.Ffree = 0
+	if d.mfs != nil && d.mfs.cache != nil {
+		out.Blocks = d.mfs.cache.TotalFileSize() / uint64(blockSize)
+	}
 	return 0
 }
 
