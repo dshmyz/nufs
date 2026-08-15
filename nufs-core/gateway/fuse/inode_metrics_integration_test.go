@@ -112,13 +112,8 @@ func TestDFSFile_Read_HitCache_IncrementsCacheHits(t *testing.T) {
 	}
 	cache.recorder = rec
 
-	f := &DFSFile{
-		fs:         dfs,
-		chunkStore: cs,
-		inodeID:    id,
-		cache:      cache,
-		recorder:   rec,
-	}
+	f := newTestFileFromDFS(dfs, id, rec)
+	f.buffered.SetReadCache(cache)
 
 	// 写入数据并 Flush，生成 chunk
 	_, _ = f.Write(context.Background(), nil, []byte("hello world"), 0)
@@ -156,7 +151,7 @@ func TestDFSFile_Read_HitCache_IncrementsCacheHits(t *testing.T) {
 }
 
 // TestDFSFile_Flush_ErrorIncrementsOpsErrors 验证 Flush 失败时递增 OpsErrors。
-// Program 11 移除了 >MaxChunkPayload 的 EFBIG 分支（多 chunk Flush），故这里改用一个
+// Program 11 移除了 >metadata.MaxChunkSize 的 EFBIG 分支（多 chunk Flush），故这里改用一个
 // 未注册任何节点的 store 触发放置失败（"insufficient healthy nodes"）→ Flush 返回
 // EIO，断言 OpsErrors 递增。
 func TestDFSFile_Flush_ErrorIncrementsOpsErrors(t *testing.T) {

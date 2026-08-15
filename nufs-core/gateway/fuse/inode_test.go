@@ -24,7 +24,7 @@ import (
 // immediately instead of silently producing wrong data — the regression
 // tripwire for the off-0 overwrite / hydration bug class.
 func TestMain(m *testing.M) {
-	EnableBufferImageInvariant()
+	chunkstore.EnableBufferImageInvariant()
 	os.Exit(m.Run())
 }
 
@@ -75,41 +75,33 @@ func newTestMetaStore(t testing.TB) (*metadata.PebbleStore, metadata.InodeID) {
 	return store, file.ID
 }
 
+// newTestFileFromDFS builds a DFSFile (via the production newDFSFile wiring)
+// from an existing filesystem root and inode, so unit fixtures exercise the
+// same buffer construction as production. Panics if the inode can't be read.
+func newTestFileFromDFS(dfs *DFSFileSystem, id metadata.InodeID, rec MetricsRecorder) *DFSFile {
+	metaInode, err := dfs.Meta().GetInode(context.Background(), id)
+	if err != nil {
+		panic(err)
+	}
+	return newDFSFile(dfs, metaInode, rec)
+}
+
 // newTestFile returns a DFSFile backed by the given meta+chunkStore,
 // with a pre-set inodeID. A real DFSFileSystem root is created so the
 // file's `fs` field resolves Meta()/checkAccess; the inode is not
 // attached to a FUSE bridge (unit tests exercise its methods directly).
-// logicalSize is seeded from the committed inode size, mirroring the
+// committedSize is seeded from the committed inode size, mirroring the
 // production Open path — a partial overwrite must not shrink the file
 // below its committed extent.
 func newTestFile(meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID) *DFSFile {
 	dfs := NewDFSFileSystem(meta, cs, nil, nil, nil)
-	logicalSize := int64(0)
-	if inode, err := meta.GetInode(context.Background(), id); err == nil {
-		logicalSize = inode.Size
-	}
-	return &DFSFile{
-		fs:          dfs,
-		chunkStore:  cs,
-		inodeID:     id,
-		logicalSize: logicalSize,
-	}
+	return newTestFileFromDFS(dfs, id, nil)
 }
 
 // newTestFileWithRecorder 同 newTestFile 但注入 MetricsRecorder。
 func newTestFileWithRecorder(meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID, rec MetricsRecorder) *DFSFile {
 	dfs := NewDFSFileSystem(meta, cs, nil, rec, nil)
-	logicalSize := int64(0)
-	if inode, err := meta.GetInode(context.Background(), id); err == nil {
-		logicalSize = inode.Size
-	}
-	return &DFSFile{
-		fs:          dfs,
-		chunkStore:  cs,
-		inodeID:     id,
-		recorder:    rec,
-		logicalSize: logicalSize,
-	}
+	return newTestFileFromDFS(dfs, id, rec)
 }
 
 // ========== B1: Read returns real chunk data (was: always zero bytes) ==========
@@ -273,8 +265,8 @@ func TestDFSFile_Read_SparseCommittedChunkMap_ZeroFillsHoles(t *testing.T) {
 	if errno := f.Flush(context.Background(), nil); errno != 0 {
 		t.Fatalf("Flush: errno=%v", errno)
 	}
-	if f.chunkBufs != nil {
-		t.Fatalf("post-Flush: chunkBufs=%v, want nil (committed-walk path)", f.chunkBufs)
+	if f.buffered.Dirty() {
+		t.Fatalf("post-Flush: file still dirty (committed-walk path)")
 	}
 
 	// Rewrite the committed ChunkMap to a sparse layout with a hole:
@@ -529,14 +521,11 @@ func TestDFSFile_Flush_Idempotent(t *testing.T) {
 		t.Fatalf("after flush #2: Size=%d, want %d (B3 regression: re-sized)", inode2.Size, size1)
 	}
 
-	// Internal state checks: buffer should be nil, dirty should be
+	// Internal state checks: buffer should be clean, dirty should be
 	// false. These are implementation details but they're the
 	// direct fix for the B3 bug; locking them in here documents
 	// the contract.
-	if f.chunkBufs != nil {
-		t.Fatalf("after flush: chunkBufs=%v, want nil (B3 fix)", f.chunkBufs)
-	}
-	if f.dirty {
+	if f.buffered.Dirty() {
 		t.Fatalf("after flush: dirty=true, want false (B3 fix)")
 	}
 }
@@ -567,33 +556,22 @@ func TestDFSFile_Flush_CleanIsNoop(t *testing.T) {
 
 // TestDFSFile_Flush_Oversized_AllocatesMultiChunk replaces the old
 // EFBIG rejection (commit 1.1 single-chunk path). Now a buffer larger
-// than MaxChunkPayload is split into multiple chunks and the inode's
-// ChunkMap holds one ref per MaxChunkPayload window (Program 11).
+// than metadata.MaxChunkSize is split into multiple chunks and the inode's
+// ChunkMap holds one ref per metadata.MaxChunkSize window (Program 11).
 func TestDFSFile_Flush_Oversized_AllocatesMultiChunk(t *testing.T) {
 	meta, id := newTestMetaStore(t)
 	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
-	// Directly seed the in-memory chunk buffers past the chunk limit.
-	size := 2*MaxChunkPayload + 123
+	// Seed the buffer past the chunk limit via the real Write path.
+	size := 2*metadata.MaxChunkSize + 123
 	buf := make([]byte, size)
 	for i := range buf {
 		buf[i] = byte(i % 251)
 	}
-	f.mu.Lock()
-	f.chunkBufs = make(map[int64][]byte)
-	f.dirtyMap = make(map[int64]bool)
-	for base := int64(0); base < int64(size); base += MaxChunkPayload {
-		end := base + MaxChunkPayload
-		if end > int64(size) {
-			end = int64(size)
-		}
-		f.chunkBufs[base] = buf[base:end]
-		f.dirtyMap[base] = true
+	if _, errno := f.Write(context.Background(), nil, buf, 0); errno != 0 {
+		t.Fatalf("Write seed: errno=%v", errno)
 	}
-	f.dirty = true
-	f.logicalSize = int64(size)
-	f.mu.Unlock()
 
 	errno := f.Flush(context.Background(), nil)
 	if errno != 0 {
@@ -614,13 +592,13 @@ func TestDFSFile_Flush_Oversized_AllocatesMultiChunk(t *testing.T) {
 	// Each ref is sealed, holds the right offset/length window, and
 	// read-back is byte-exact across the whole file.
 	for i, cref := range inode.ChunkMap {
-		wantOff := int64(i) * MaxChunkPayload
+		wantOff := int64(i) * metadata.MaxChunkSize
 		if cref.Offset != wantOff {
 			t.Fatalf("ChunkMap[%d].Offset=%d, want %d", i, cref.Offset, wantOff)
 		}
-		wantLen := MaxChunkPayload
+		wantLen := metadata.MaxChunkSize
 		if i == 2 {
-			wantLen = size - 2*MaxChunkPayload
+			wantLen = size - 2*metadata.MaxChunkSize
 		}
 		if int(cref.Length) != wantLen {
 			t.Fatalf("ChunkMap[%d].Length=%d, want %d", i, cref.Length, wantLen)
@@ -649,7 +627,7 @@ func TestDFSFile_Flush_Oversized_AllocatesMultiChunk(t *testing.T) {
 }
 
 // TestDFSFile_Flush_MultiChunk_ReadBack is the Program 11 capstone for
-// the plain multi-chunk path: a payload spanning 2*MaxChunkPayload+123
+// the plain multi-chunk path: a payload spanning 2*metadata.MaxChunkSize+123
 // bytes (3 chunk windows) flushes into 3 sealed chunks at aligned
 // offsets, and Read reconstructs the whole file byte-exact across them.
 func TestDFSFile_Flush_MultiChunk_ReadBack(t *testing.T) {
@@ -657,7 +635,7 @@ func TestDFSFile_Flush_MultiChunk_ReadBack(t *testing.T) {
 	cs := chunkstore.NewMemoryChunkStore()
 	f := newTestFile(meta, cs, id)
 
-	size := 2*MaxChunkPayload + 123
+	size := 2*metadata.MaxChunkSize + 123
 	want := make([]byte, size)
 	for i := range want {
 		want[i] = byte((i*7 + 3) % 256)
@@ -703,7 +681,7 @@ func TestDFSFile_Flush_MultiChunk_CrossFlushReuse(t *testing.T) {
 	f := newTestFile(meta, cs, id)
 
 	// First flush: a 2-window file.
-	size1 := MaxChunkPayload + 50
+	size1 := metadata.MaxChunkSize + 50
 	first := make([]byte, size1)
 	for i := range first {
 		first[i] = byte(i % 200)
@@ -728,7 +706,7 @@ func TestDFSFile_Flush_MultiChunk_CrossFlushReuse(t *testing.T) {
 	}
 
 	// Second flush: overwrite a chunk-worth of data and extend the file.
-	size2 := MaxChunkPayload + 300
+	size2 := metadata.MaxChunkSize + 300
 	second := make([]byte, size2)
 	for i := range second {
 		second[i] = byte((i*11 + 1) % 256)
@@ -952,7 +930,7 @@ func TestDFSFile_LoadCommitted_MultipleRefsInChunk_PreservesAll(t *testing.T) {
 	f := newTestFile(meta, cs, id)
 
 	// Seed a real 16-byte file, then rewrite ChunkMap to two non-contiguous
-	// refs inside the SAME base [0, MaxChunkPayload):
+	// refs inside the SAME base [0, metadata.MaxChunkSize):
 	//   ref A: file [0,4)  -> "0123"
 	//   ref B: file [10,14) -> "abcd"
 	seed := []byte("0123456789abcdef")
@@ -1200,8 +1178,8 @@ func TestDFSFile_Read_AfterFlush_FallsBackToCommitted(t *testing.T) {
 	if errno := f.Flush(context.Background(), nil); errno != 0 {
 		t.Fatalf("Flush: errno=%v", errno)
 	}
-	if f.chunkBufs != nil {
-		t.Fatalf("after Flush buffer should be nil, got %v", f.chunkBufs)
+	if f.buffered.Dirty() {
+		t.Fatalf("after Flush buffer should be clean, got dirty")
 	}
 	dest := make([]byte, 32)
 	rr, errno := f.Read(context.Background(), nil, dest, 0)
@@ -1457,12 +1435,7 @@ func TestDFSFile_Open_AcquiresExclusiveLock(t *testing.T) {
 	cs := chunkstore.NewMemoryChunkStore()
 
 	dfs := NewDFSFileSystem(store, cs, nil, nil, nil)
-	f := &DFSFile{
-		fs:         dfs,
-		chunkStore: cs,
-		inodeID:    id,
-		lockOwner:  dfs.lockOwner,
-	}
+	f := newTestFileFromDFS(dfs, id, nil)
 	ctx := context.Background()
 
 	// Open for writing → exclusive lock.
@@ -1480,12 +1453,8 @@ func TestDFSFile_Open_AcquiresExclusiveLock(t *testing.T) {
 
 	// A concurrent open from a DIFFERENT owner must fail (exclusive
 	// lock is held).
-	f2 := &DFSFile{
-		fs:         dfs,
-		chunkStore: cs,
-		inodeID:    id,
-		lockOwner:  "fusegw-other-pid",
-	}
+	f2 := newTestFileFromDFS(dfs, id, nil)
+	f2.lockOwner = "fusegw-other-pid"
 	_, _, errno2 := f2.Open(ctx, syscall.O_RDWR)
 	if errno2 != syscall.EIO {
 		t.Fatalf("concurrent Open: errno=%v, want EIO (lock busy)", errno2)
@@ -1514,9 +1483,12 @@ func TestDFSFile_Open_AcquiresSharedLock(t *testing.T) {
 	cs := chunkstore.NewMemoryChunkStore()
 	dfs := NewDFSFileSystem(store, cs, nil, nil, nil)
 
-	f1 := &DFSFile{fs: dfs, chunkStore: cs, inodeID: id, lockOwner: "reader-1"}
-	f2 := &DFSFile{fs: dfs, chunkStore: cs, inodeID: id, lockOwner: "reader-2"}
-	fw := &DFSFile{fs: dfs, chunkStore: cs, inodeID: id, lockOwner: "writer"}
+	f1 := newTestFileFromDFS(dfs, id, nil)
+	f1.lockOwner = "reader-1"
+	f2 := newTestFileFromDFS(dfs, id, nil)
+	f2.lockOwner = "reader-2"
+	fw := newTestFileFromDFS(dfs, id, nil)
+	fw.lockOwner = "writer"
 	ctx := context.Background()
 
 	// Two readers can coexist.
@@ -1964,7 +1936,10 @@ func TestDFSFile_Allocate_KeepSize_GrowsBufferNotSize(t *testing.T) {
 	}
 
 	// The written head must still be intact in the chunk buffer.
-	chunk := f.getChunk(0)
+	chunk := f.buffered.BufferChunk(0)
+	if chunk == nil {
+		t.Fatalf("KEEP_SIZE: base-0 buffer not resident")
+	}
 	if string(chunk[:3]) != "abc" {
 		t.Fatalf("KEEP_SIZE clobbered head: chunk[:3]=%q, want \"abc\"", chunk[:3])
 	}
@@ -2100,8 +2075,8 @@ func TestDFSFile_Allocate_UnsupportedFlags_EOPNOTSUPP(t *testing.T) {
 	if inode.Size != 2 {
 		t.Fatalf("after rejected Allocate: Size=%d, want 2", inode.Size)
 	}
-	if f.chunkBufs != nil {
-		t.Fatalf("after rejected Allocate: chunkBufs=%v, want nil (state untouched)", f.chunkBufs)
+	if f.buffered.Dirty() {
+		t.Fatalf("after rejected Allocate: file dirty (state untouched)")
 	}
 	dest := make([]byte, 4)
 	rr, errno := f.Read(context.Background(), nil, dest, 0)

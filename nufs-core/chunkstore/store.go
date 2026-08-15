@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/dshmyz/nufs/nufs-core/datanode"
@@ -40,20 +41,46 @@ type DatanodeChunkStore struct {
 	// MinReplicasPerWrite is the floor on the number of replicas that
 	// must acknowledge a write. <= 0 means "all replicas must succeed".
 	MinReplicasPerWrite int
+	// ecMu guards ecWrite: a metadata hot-swap (remount) re-points the
+	// authority while Flush may be mid-write on another goroutine, so
+	// reads and writes must not race.
+	ecMu sync.Mutex
 	// ecWrite is the write-path direct-EC authority (Program 10, §14). When
 	// set, an ECConfig chunk's write routes to writeECShardDirect (encode K+M
 	// and push each shard to its owning node's shard store); when nil, it falls
 	// back to V1 writeECChunk. Wired from the S3 layer (gateway) as the
-	// *metadata.HTTPClient authority.
+	// *metadata.HTTPClient authority, and re-pointed on a FUSE remount.
 	ecWrite ECWriteAuthority
 }
 
 // SetECWriteAuthority injects the write-path direct-EC authority (Program 10).
 // A nil value keeps V1 writeECChunk semantics; a real authority (the metadata
 // HTTPClient) enables V2.1 direct EC writes for ECConfig buckets. The production
-// gateway wires this at construction; unit-test / in-memory stores omit it.
+// gateway wires this at construction; the FUSE remount handler re-points it at a
+// new client after a metadata hot-swap. Unit-test / in-memory stores omit it.
 func (s *DatanodeChunkStore) SetECWriteAuthority(a ECWriteAuthority) {
+	s.ecMu.Lock()
 	s.ecWrite = a
+	s.ecMu.Unlock()
+}
+
+// ECWriteEnabled reports whether this store is wired to the direct-EC write
+// authority. The ChunkWriter uses it (with per-chunk EC placement) to decide
+// whether to skip the generic CommitChunk, which would 500 on a chunk that
+// writeECShardDirect already lifted to ChunkReady.
+func (s *DatanodeChunkStore) ECWriteEnabled() bool {
+	s.ecMu.Lock()
+	defer s.ecMu.Unlock()
+	return s.ecWrite != nil
+}
+
+// ecAuthority returns the current direct-EC authority (nil when unwired). The
+// returned value stays valid even after a remount swaps the pointer; callers
+// must not hold the lock across the operation they run with it.
+func (s *DatanodeChunkStore) ecAuthority() ECWriteAuthority {
+	s.ecMu.Lock()
+	defer s.ecMu.Unlock()
+	return s.ecWrite
 }
 
 // NewDatanodeChunkStore returns a ChunkStore that dials datanode daemons
@@ -98,7 +125,7 @@ func (s *DatanodeChunkStore) WriteChunk(ctx context.Context, chunk *metadata.Chu
 		// encode K+M shards and push each directly to its owning node's shard
 		// store (no intermediate replica). Without one (unwired store, or the
 		// authority not present in this engine) fall back to V1 writeECChunk.
-		if s.ecWrite != nil {
+		if s.ECWriteEnabled() {
 			return s.writeECShardDirect(ctx, chunk, data)
 		}
 		return s.writeECChunk(ctx, chunk, data)

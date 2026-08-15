@@ -15,16 +15,12 @@ import (
 
 // ========== 集成测试：验证 ReliabilityWrapper 正确接入 Read/Flush 路径 ==========
 
-// newTestFileWithReliability 创建带 ReliabilityWrapper 的 DFSFile。
+// newTestFileWithReliability 创建带 ReliabilityWrapper 的 DFSFile。rel 注入
+// filesystem 根（而非 DFSFile），因为 BufferedFile 的执行器取自
+// dfs.reliability；nil rel 仍是安全的 passthrough。
 func newTestFileWithReliability(meta metadata.MetadataService, cs chunkstore.ChunkStore, id metadata.InodeID, rec MetricsRecorder, rel *ReliabilityWrapper) *DFSFile {
-	dfs := NewDFSFileSystem(meta, cs, nil, rec, nil)
-	return &DFSFile{
-		fs:          dfs,
-		chunkStore:  cs,
-		inodeID:     id,
-		recorder:    rec,
-		reliability: rel,
-	}
+	dfs := NewDFSFileSystem(meta, cs, nil, rec, rel)
+	return newTestFileFromDFS(dfs, id, rec)
 }
 
 // TestDFSFile_Read_WithReliability_Works 验证注入 ReliabilityWrapper 后
@@ -161,12 +157,7 @@ func TestDFSFile_Flush_NilReliability_Passthrough(t *testing.T) {
 	dfs := NewDFSFileSystem(meta, cs, nil, rec, nil)
 
 	// reliability=nil → passthrough
-	f := &DFSFile{
-		fs:         dfs,
-		chunkStore: cs,
-		inodeID:    id,
-		recorder:   rec,
-	}
+	f := newTestFileFromDFS(dfs, id, rec)
 
 	data := []byte("nil reliability passthrough")
 	_, _ = f.Write(context.Background(), nil, data, 0)

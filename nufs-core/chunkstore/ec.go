@@ -42,6 +42,17 @@ func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *meta
 	ec := chunk.ECGroup
 	encoder := GetECEncoder(ec.DataShards, ec.ParityShards)
 
+	// Capture the authority once: a metadata hot-swap (remount) may re-point
+	// s.ecWrite mid-write, so read the current value under ecMu and use the
+	// local for the whole direct-EC operation (PlanECWrite → RecordDirectEC).
+	auth := s.ecAuthority()
+	if auth == nil {
+		// Authority cleared between the WriteChunk enabled-check and here
+		// (e.g. a remount to a store without the authority); fall back to V1
+		// writeECChunk rather than dereferencing a nil interface.
+		return s.writeECChunk(ctx, chunk, data)
+	}
+
 	result, err := encoder.Encode(data)
 	if err != nil {
 		return fmt.Errorf("chunkstore: ec encode chunk %d: %w", chunk.ID, err)
@@ -54,7 +65,7 @@ func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *meta
 	// The metadata authority (not the gateway) decides the §14 placement. If it
 	// is unreachable or cannot place all shards across a V2.1 topology, fall
 	// back to V1 whole-shard replication before touching any shard store.
-	plan, err := s.ecWrite.PlanECWrite(ctx, chunk.ID, ec.DataShards, ec.ParityShards)
+	plan, err := auth.PlanECWrite(ctx, chunk.ID, ec.DataShards, ec.ParityShards)
 	if err != nil || len(plan) != totalShards {
 		// DEPRECATED (V1 EC): fallback to writeECChunk. Per
 		// docs/v1-retirement-roadmap.md stage 3 this becomes a hard error —
@@ -129,7 +140,7 @@ func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *meta
 	// Quorum landed. Lift the chunk into durable EC state (Complete stripe +
 	// ECStripeID) so serving read / self-heal / orphan-GC recognize it.
 	checksum := crc32.ChecksumIEEE(data)
-	if err := s.ecWrite.RecordDirectEC(ctx, chunk.ID, ec.DataShards, ec.ParityShards, plan, checksum); err != nil {
+	if err := auth.RecordDirectEC(ctx, chunk.ID, ec.DataShards, ec.ParityShards, plan, checksum); err != nil {
 		return fmt.Errorf("chunkstore: ec record-direct chunk %d: %w", chunk.ID, err)
 	}
 	return nil

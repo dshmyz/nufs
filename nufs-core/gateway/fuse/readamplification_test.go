@@ -71,7 +71,7 @@ func ampTestSetup(t *testing.T) (*ampCounterMeta, *amplificationCounter, *DFSFil
 	underlying := chunkstore.NewMemoryChunkStore()
 	counting := &amplificationCounter{ChunkStore: underlying}
 	dfs := NewDFSFileSystem(store, counting, nil, nil, nil)
-	return &ampCounterMeta{meta: store}, counting, &DFSFile{fs: dfs, chunkStore: counting, inodeID: file.ID}, file.ID
+	return &ampCounterMeta{meta: store}, counting, newDFSFile(dfs, file, nil), file.ID
 }
 
 type ampCounterMeta struct {
@@ -130,7 +130,7 @@ func TestReadThenRewrite_PreservesCommittedData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewChunkCache: %v", err)
 	}
-	f.cache = cache
+	f.buffered.SetReadCache(cache)
 
 	// Write 8 MiB of patterned data and flush it (committed extent = 8 MiB).
 	const committed = 8 << 20

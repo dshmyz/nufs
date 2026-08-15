@@ -235,7 +235,7 @@ func (d *DFSDir) Create(ctx context.Context, name string, flags uint32, mode uin
 		dfs.applyMountOwner(ctx, metaInode, dirMeta)
 	}
 
-	file := &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability, logicalSize: metaInode.Size}
+	file := newDFSFile(dfs, metaInode, rec)
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, file, fs.StableAttr{
@@ -456,7 +456,7 @@ func (d *DFSDir) Link(ctx context.Context, target fs.InodeEmbedder, name string,
 	}
 
 	dfs := d.fs
-	child := &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability, logicalSize: metaInode.Size}
+	child := newDFSFile(dfs, metaInode, rec)
 	attr := inodeMetaToAttr(metaInode)
 
 	inode := d.NewInode(ctx, child, fs.StableAttr{

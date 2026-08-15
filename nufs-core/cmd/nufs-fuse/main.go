@@ -364,6 +364,7 @@ type nufsMountState struct {
 	server   *fuse.Server
 	fsys     *gofuse.DFSFileSystem
 	meta     metadata.MetadataService
+	chunkStore *chunkstore.DatanodeChunkStore
 	cache    *gofuse.ChunkCache
 	recorder gofuse.MetricsRecorder
 }
@@ -411,8 +412,17 @@ func (s *nufsMountState) mount() error {
 	s.meta = meta
 
 	chunkStore := chunkstore.NewDatanodeChunkStore()
+	s.chunkStore = chunkStore
 	if s.cfg.tls.CertFile != "" || s.cfg.tls.SkipVerify {
 		chunkStore.SetTLS(s.cfg.tls)
+	}
+	// Wire the write-path direct-EC authority (Program 10, §14) so Flush can
+	// write ECConfig-bucket chunks straight to their owning shard stores and
+	// skip the generic CommitChunk (which would 500 on a direct-EC chunk).
+	// Only the remote metadata HTTP client implements the authority; local
+	// (PebbleStore) mode leaves it unset, which keeps V1 commit semantics.
+	if auth, ok := meta.(chunkstore.ECWriteAuthority); ok {
+		chunkStore.SetECWriteAuthority(auth)
 	}
 
 	if s.cfg.cacheDir != "" {
@@ -609,6 +619,16 @@ func (s *nufsMountState) remount(newMetaAddr string) error {
 	}
 
 	s.fsys.SwapMetadata(newMeta)
+	// Re-point the direct-EC authority at the new metadata client: the old
+	// authority references the pre-swap client, whose PlanECWrite/RecordDirectEC
+	// would keep hitting the old metad address after a failover remount,
+	// failing (or mis-routing) every EC write. A new client without the
+	// authority clears it so EC chunks fall back to the generic commit path.
+	if auth, ok := any(newMeta).(chunkstore.ECWriteAuthority); ok {
+		s.chunkStore.SetECWriteAuthority(auth)
+	} else {
+		s.chunkStore.SetECWriteAuthority(nil)
+	}
 	s.cfg.log.Info("metadata hot-swapped", "addr", newMetaAddr)
 	return nil
 }

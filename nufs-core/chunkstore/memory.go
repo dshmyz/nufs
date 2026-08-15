@@ -29,6 +29,12 @@ func NewMemoryChunkStore() *MemoryChunkStore {
 	return &MemoryChunkStore{chunks: make(map[metadata.ChunkID][]byte)}
 }
 
+// ECWriteEnabled reports that the in-memory store never performs direct-EC
+// writes, so the ChunkWriter must not skip CommitChunk for it (tests use a
+// small wrapper that embeds MemoryChunkStore and overrides this to simulate
+// an authority-wired store).
+func (m *MemoryChunkStore) ECWriteEnabled() bool { return false }
+
 // WriteChunk stores data for the chunk.
 func (m *MemoryChunkStore) WriteChunk(_ context.Context, chunk *metadata.ChunkMeta, data []byte) error {
 	if m.MinReplicasPerWrite > 0 && m.WriteHook == nil {

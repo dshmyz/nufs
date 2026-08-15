@@ -23,6 +23,10 @@ type metadataObjectCommitter struct {
 	meta                metadata.MetadataService
 	chunkStore          chunkstore.ChunkStore
 	rejectEmptyReplicas bool
+	// writer is the shared chunk dispatch pipeline (allocate→write→commit→
+	// seal→ref). It runs with passthrough executors, preserving the S3
+	// reliability path exactly as before.
+	writer *chunkstore.ChunkWriter
 }
 
 const maxBatchAllocationChunks int64 = 1024
@@ -32,6 +36,7 @@ func newMetadataObjectCommitter(meta metadata.MetadataService, chunkStore chunks
 		meta:                meta,
 		chunkStore:          chunkStore,
 		rejectEmptyReplicas: rejectEmptyReplicas,
+		writer:              chunkstore.NewChunkWriter(meta, chunkStore),
 	}
 }
 
@@ -271,7 +276,7 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 				offsets[i] = int64(i) * metadata.MaxChunkSize
 			}
 
-			preAllocChunks, err := c.meta.AllocateChunksBatch(ctx, inode.ID, offsets, b.Policy)
+			preAllocChunks, err := c.writer.AllocateRanges(ctx, inode.ID, b.Policy, offsets)
 			tAllocate = time.Now()
 			if err != nil {
 				primaryErr := fmt.Errorf("%w: failed to batch allocate chunks: %v", ErrObjectMetadataFailed, err)
@@ -323,42 +328,21 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 			chunkData := buf[:n]
 			chunk := preAllocChunks[chunkIdx]
 
-			checksum := crc32Checksum(chunkData)
-			if err := c.chunkStore.WriteChunk(ctx, chunk, chunkData); err != nil {
-				primaryErr := fmt.Errorf("%w: failed to write chunk data: %v", ErrObjectWriteFailed, err)
+			newRef, err := c.writer.WriteAllocated(ctx, chunk, offsets[chunkIdx], chunkData)
+			if err != nil {
+				var primaryErr error
+				switch {
+				case errors.Is(err, chunkstore.ErrChunkWriteFailed):
+					primaryErr = fmt.Errorf("%w: failed to write chunk data: %v", ErrObjectWriteFailed, err)
+				case errors.Is(err, chunkstore.ErrChunkCommitFailed):
+					primaryErr = fmt.Errorf("%w: failed to commit chunk: %v", ErrObjectCommitFailed, err)
+				default:
+					primaryErr = fmt.Errorf("%w: failed to write chunk data: %v", ErrObjectWriteFailed, err)
+				}
 				return PutObjectResult{}, c.compensateFailedWrite(
 					ctx, attemptID, req, inode, b.RootInode, newObject, oldInodeSnapshot,
 					allAllocatedChunkRefs, primaryErr,
 				)
-			}
-
-			if chunk.ECGroup != nil {
-				// Direct-EC write (WriteChunk→writeECShardDirect), the V2.1 path for an
-				// ECConfig bucket, already lifts the chunk to durable ChunkReady + a
-				// Complete stripe carrying the original checksum (RecordDirect). The
-				// generic CommitChunk requires ChunkCreated and would 500 on ChunkReady,
-				// so skip it for EC chunks — SealChunk stays (it is idempotent on
-				// ChunkReady and otherwise advances ChunkSealed→ChunkReady).
-				_ = checksum // EC path carries its checksum in the recorded stripe
-			} else {
-				if err := c.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
-					primaryErr := fmt.Errorf("%w: failed to commit chunk: %v", ErrObjectCommitFailed, err)
-					return PutObjectResult{}, c.compensateFailedWrite(
-						ctx, attemptID, req, inode, b.RootInode, newObject, oldInodeSnapshot,
-						allAllocatedChunkRefs, primaryErr,
-					)
-				}
-			}
-
-			if err := c.meta.SealChunk(ctx, chunk.ID); err != nil {
-				log.Printf("s3gw: seal chunk %d: %v", chunk.ID, err)
-			}
-
-			newRef := metadata.ChunkRef{
-				ID:      chunk.ID,
-				Offset:  int64(chunkIdx) * metadata.MaxChunkSize,
-				Length:  int32(n),
-				Version: 1,
 			}
 			newChunkRefs = append(newChunkRefs, newRef)
 			allAllocatedChunkRefs[chunkIdx] = newRef
@@ -406,33 +390,24 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 				)
 			}
 
-			checksum := crc32Checksum(chunkData)
-			if err := c.chunkStore.WriteChunk(ctx, chunk, chunkData); err != nil {
-				primaryErr := fmt.Errorf("%w: failed to write data to enough datanodes: %v", ErrObjectWriteFailed, err)
+			committedRef, err := c.writer.WriteAllocated(ctx, chunk, totalSize, chunkData)
+			if err != nil {
+				var primaryErr error
+				switch {
+				case errors.Is(err, chunkstore.ErrChunkWriteFailed):
+					primaryErr = fmt.Errorf("%w: failed to write data to enough datanodes: %v", ErrObjectWriteFailed, err)
+				case errors.Is(err, chunkstore.ErrChunkCommitFailed):
+					primaryErr = fmt.Errorf("%w: failed to commit chunk: %v", ErrObjectCommitFailed, err)
+				default:
+					primaryErr = fmt.Errorf("%w: failed to write data to enough datanodes: %v", ErrObjectWriteFailed, err)
+				}
 				return PutObjectResult{}, c.compensateFailedWrite(
 					ctx, attemptID, req, inode, b.RootInode, newObject, oldInodeSnapshot,
 					allAllocatedChunkRefs, primaryErr,
 				)
 			}
 
-			if chunk.ECGroup != nil {
-				// Direct-EC write already recorded the durable stripe + checksum
-				// (WriteChunk→writeECShardDirect→RecordDirect lifts to ChunkReady);
-				// CommitChunk requires ChunkCreated and would 500 on ChunkReady.
-				// SealChunk is idempotent on ChunkReady, so leave it in place.
-			} else if err := c.meta.CommitChunk(ctx, chunk.ID, checksum); err != nil {
-				primaryErr := fmt.Errorf("%w: failed to commit chunk: %v", ErrObjectCommitFailed, err)
-				return PutObjectResult{}, c.compensateFailedWrite(
-					ctx, attemptID, req, inode, b.RootInode, newObject, oldInodeSnapshot,
-					allAllocatedChunkRefs, primaryErr,
-				)
-			}
-
-			if err := c.meta.SealChunk(ctx, chunk.ID); err != nil {
-				log.Printf("s3gw: seal chunk %d: %v", chunk.ID, err)
-			}
-
-			newChunkRefs = append(newChunkRefs, newRef)
+			newChunkRefs = append(newChunkRefs, committedRef)
 			_, _ = hash.Write(chunkData)
 			totalSize += int64(n)
 		}

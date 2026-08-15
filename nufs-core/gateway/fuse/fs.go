@@ -276,7 +276,7 @@ func Mount(opts MountOptions) (*fuse.Server, *DFSFileSystem, error) {
 	}
 	// Clean up orphaned staging files from previous runs or crashes.
 	if root.writeStagingDir != "" {
-		cleanStagingDir(root.writeStagingDir)
+		chunkstore.CleanStagingDir(root.writeStagingDir)
 	}
 
 	// Single-bucket mode: resolve bucket root inode.
@@ -445,7 +445,7 @@ func (dfs *DFSFileSystem) Create(ctx context.Context, name string, flags uint32,
 		dfs.applyMountOwner(ctx, metaInode, rootMeta)
 	}
 
-	file := &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability, logicalSize: metaInode.Size}
+	file := newDFSFile(dfs, metaInode, rec)
 	attr := inodeMetaToAttr(metaInode)
 	inode := dfs.NewInode(ctx, file, fs.StableAttr{Mode: fuse.S_IFREG, Ino: uint64(metaInode.ID)})
 	out.Attr = attr
@@ -613,7 +613,7 @@ func (dfs *DFSFileSystem) Link(ctx context.Context, target fs.InodeEmbedder, nam
 	case metadata.FileDirectory:
 		child = &DFSDir{fs: dfs, inodeID: metaInode.ID, recorder: rec}
 	default:
-		child = &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: rec, reliability: dfs.reliability, logicalSize: metaInode.Size}
+		child = newDFSFile(dfs, metaInode, rec)
 	}
 	attr := inodeMetaToAttr(metaInode)
 	inode := dfs.NewInode(ctx, child, fs.StableAttr{Mode: attr.Mode, Ino: uint64(metaInode.ID)})
@@ -768,19 +768,67 @@ func (dfs *DFSFileSystem) Statfs(ctx context.Context, out *fuse.StatfsOut) sysca
 
 // ========== Inode type resolution ==========
 
+// newDFSFile constructs a DFSFile (go-fuse glue) over a fresh
+// chunkstore.BufferedFile. The buffer is wired to the filesystem's metadata
+// accessor (hot-swappable via SwapMetadata), reliability executor, read
+// cache, spill stats, write-attempt ledger, dirty budget, and default
+// placement policy. committedSize seeds the buffer's logical tail from the
+// inode's current committed Size (a partial overwrite must not shrink the
+// file below its committed extent).
+func newDFSFile(dfs *DFSFileSystem, metaInode *metadata.InodeMeta, rec MetricsRecorder) *DFSFile {
+	opts := []chunkstore.BufferedFileOption{
+		chunkstore.WithExecutor(chunkstore.Executor{
+			DoMeta:    dfs.reliability.DoMeta,
+			DoChunk:   dfs.reliability.DoChunk,
+			LockInode: dfs.reliability.LockInode,
+		}),
+		chunkstore.WithSpillStats(dfs.recorder),
+		chunkstore.WithFlushLedger(flushLedger{dfs: dfs, inodeID: metaInode.ID}),
+		chunkstore.WithBudget(chunkstore.Budget{
+			MaxDirtyBytes:    dfs.maxDirtyBytes,
+			GlobalBudget:     dfs.globalDirtyBudget,
+			GlobalDirtyBytes: &dfs.globalDirtyBytes,
+			StagingDir:       dfs.writeStagingDir,
+		}),
+		chunkstore.WithDefaultPolicy(fuseDefaultPolicy),
+	}
+	// Only install a cache when one is actually configured: a typed-nil
+	// *ChunkCache wrapped in the ReadCache interface is != nil to Go, which
+	// would make BufferedFile call Get on a nil pointer (unit tests and
+	// cache-less mounts).
+	if dfs.chunkCache != nil {
+		opts = append(opts, chunkstore.WithReadCache(dfs.chunkCache))
+	}
+
+	return &DFSFile{
+		fs:          dfs,
+		inodeID:     metaInode.ID,
+		lockOwner:   dfs.lockOwner,
+		recorder:    rec,
+		reliability: dfs.reliability,
+		buffered: chunkstore.NewBufferedFile(
+			func() metadata.MetadataService { return dfs.Meta() },
+			dfs.chunkStore,
+			metaInode.ID,
+			metaInode.Size,
+			opts...,
+		),
+	}
+}
+
 // newChildInode creates the appropriate InodeEmbedder based on file type.
 func newChildInode(dfs *DFSFileSystem, metaInode *metadata.InodeMeta) fs.InodeEmbedder {
 	switch metaInode.Type {
 	case metadata.FileDirectory:
 		return &DFSDir{fs: dfs, inodeID: metaInode.ID, recorder: dfs.recorder}
 	case metadata.FileRegular:
-		return &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: dfs.recorder, reliability: dfs.reliability, logicalSize: metaInode.Size}
+		return newDFSFile(dfs, metaInode, dfs.recorder)
 	case metadata.FileSymlink:
 		return &DFSSymlink{fs: dfs, inodeID: metaInode.ID, recorder: dfs.recorder}
 	case metadata.FileFIFO, metadata.FileCharDevice, metadata.FileBlockDevice, metadata.FileSocket:
 		return &DFSFifo{fs: dfs, inodeID: metaInode.ID, recorder: dfs.recorder}
 	default:
-		return &DFSFile{fs: dfs, chunkStore: dfs.chunkStore, cache: dfs.chunkCache, inodeID: metaInode.ID, lockOwner: dfs.lockOwner, recorder: dfs.recorder, reliability: dfs.reliability, logicalSize: metaInode.Size}
+		return newDFSFile(dfs, metaInode, dfs.recorder)
 	}
 }
 
