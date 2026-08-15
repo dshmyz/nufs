@@ -315,29 +315,3 @@ func (c *PebbleCache) Close() error {
 	}
 	return nil
 }
-
-// TotalFileSize sums the Size of all non-directory inodes in the cache.
-// This gives the total bytes of cached file data (excluding pending uploads).
-func (c *PebbleCache) TotalFileSize() uint64 {
-	c.rwmu.RLock()
-	defer c.rwmu.RUnlock()
-	if c.db == nil {
-		return 0
-	}
-	iter, err := c.db.NewIter(&pebble.IterOptions{
-		LowerBound: []byte("inode:"),
-		UpperBound: []byte("inode:\xff"),
-	})
-	if err != nil {
-		return 0
-	}
-	defer iter.Close()
-	var total uint64
-	for iter.First(); iter.Valid(); iter.Next() {
-		var in CacheInode
-		if json.Unmarshal(iter.Value(), &in) == nil && !in.IsDir {
-			total += in.Size
-		}
-	}
-	return total
-}

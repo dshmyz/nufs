@@ -16,6 +16,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	madmin "github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
@@ -43,6 +44,13 @@ type S3FileSystem struct {
 
 	metricsSrv *http.Server
 	shutdownCh chan struct{}
+
+	// MinIO admin client (nil when the endpoint is not MinIO or the
+	// credentials lack admin rights - probed lazily by statfs). Used for
+	// server-side bucket usage/quota instead of an object sweep.
+	adm         *madmin.AdminClient
+	adminProbe  sync.Once
+	statfsCache statfsUsage
 }
 
 // New creates a new S3FileSystem.
@@ -109,15 +117,22 @@ func New(cfg *Config, options ...Option) (*S3FileSystem, error) {
 		return nil, fmt.Errorf("bucket %q does not exist", cfg.Bucket)
 	}
 
+	// MinIO admin client for server-side bucket usage/quota (statfs).
+	// Construction cannot fail on a non-MinIO endpoint; usability is
+	// probed lazily on first statfs and disabled permanently on failure.
+	adm, _ := madmin.New(cfg.Target.Host, ac.AccessKey, ac.SecretKey, cfg.Target.Scheme == "https")
+
 	mfs := &S3FileSystem{
-		config:    cfg,
-		api:       api,
-		cache:     cache,
-		handles:   make(map[uint64]*S3FileHandle),
-		locks:     newLockMap(),
-		syncChan:  make(chan interface{}, 100),
-		breaker:   newCircuitBreaker(5, 30*time.Second),
-		shutdownCh: make(chan struct{}),
+		config:      cfg,
+		api:         api,
+		cache:       cache,
+		handles:     make(map[uint64]*S3FileHandle),
+		locks:       newLockMap(),
+		syncChan:    make(chan interface{}, 100),
+		breaker:     newCircuitBreaker(5, 30*time.Second),
+		shutdownCh:  make(chan struct{}),
+		adm:         adm,
+		statfsCache: statfsUsage{ttl: cfg.ScanTTL},
 	}
 
 	// Start sync workers.

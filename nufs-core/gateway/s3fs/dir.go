@@ -511,22 +511,32 @@ func (d *S3Dir) Access(ctx context.Context, mask uint32) syscall.Errno {
 	return 0
 }
 
-// Statfs returns filesystem statistics. Reports the total size of cached
-// file data from the local metadata cache (fast, no S3 API call). S3 has
-// no fixed capacity so Blocks/Bfree are not meaningful — only Files/used
-// reflect the actual bucket content visible to this mount.
+// Statfs reports the bucket's usage as observed from the server: on
+// MinIO with admin credentials this is the server-side data-usage
+// accounting plus the configured bucket quota (df shows
+// total/used/free); on any other S3 server it is a lazy ListObjectsV2
+// sweep, cached for ScanTTL (df shows used only - capacity is
+// unbounded). See statfs.go for why no locally maintained counter is
+// used: the bucket is shared state, only the server knows the truth.
 func (d *S3Dir) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	const blockSize = uint32(4096)
 	out.Bsize = blockSize
 	out.Frsize = blockSize
 	out.NameLen = 255
-	out.Blocks = 0
-	out.Bfree = 0
-	out.Bavail = 0
-	out.Files = 0
-	out.Ffree = 0
-	if d.mfs != nil && d.mfs.cache != nil {
-		out.Blocks = d.mfs.cache.TotalFileSize() / uint64(blockSize)
+	if d.mfs == nil {
+		return 0
+	}
+	usage, quota := d.mfs.statfsCache.get(ctx, d.mfs)
+	used := usage / uint64(blockSize)
+	if quota > 0 {
+		capBlocks := quota / uint64(blockSize)
+		out.Blocks = capBlocks
+		if capBlocks > used {
+			out.Bfree = capBlocks - used
+			out.Bavail = capBlocks - used
+		}
+	} else {
+		out.Blocks = used
 	}
 	return 0
 }
