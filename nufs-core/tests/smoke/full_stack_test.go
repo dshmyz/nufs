@@ -3,6 +3,7 @@ package smoke
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,39 +36,21 @@ func TestFullStack_S3PutGetDatnode(t *testing.T) {
 	leader := cluster.WaitForLeader(t, ctx)
 	t.Logf("raft leader elected: %s", leader.ID)
 
-	// === Phase 2: Start 3 real datanodes with disk storage ===
+	// === Phase 2: Start 3 real V2.1 datanodes with disk storage ===
 	const numDatanodes = 3
 	datanodeAddrs := make([]string, numDatanodes)
 	datanodeServers := make([]*datanode.Server, numDatanodes)
+	datanodeNodes := make([]*v21Datanode, numDatanodes)
 	datanodeDirs := make([]string, numDatanodes)
 
 	for i := 0; i < numDatanodes; i++ {
 		dir := t.TempDir()
 		datanodeDirs[i] = dir
-		store, err2 := datanode.NewChunkStore(dir, 64, 256, nil)
-		if err2 != nil {
-			t.Fatalf("create datanode %d store: %v", i, err2)
-		}
-		if err := store.WaitForScan(); err != nil {
-			t.Fatalf("datanode %d scan: %v", i, err)
-		}
-
-		cfg := datanode.DefaultConfig()
-		cfg.ListenAddr = "127.0.0.1:0"
-		cfg.NodeID = metadata.NodeID(i + 1)
-		cfg.RequestTimeout = 5 * time.Second
-		srv := datanode.NewServer(cfg, store)
-		if err := srv.Start(); err != nil {
-			t.Fatalf("start datanode %d: %v", i, err)
-		}
-		datanodeServers[i] = srv
-		datanodeAddrs[i] = srv.Addr()
+		n := startV21Datanode(t, metadata.NodeID(i+1), dir)
+		datanodeNodes[i] = n
+		datanodeServers[i] = n.Server
+		datanodeAddrs[i] = n.Server.Addr()
 	}
-	defer func() {
-		for _, s := range datanodeServers {
-			s.Stop()
-		}
-	}()
 
 	// Register datanodes with metadata service
 	for i, addr := range datanodeAddrs {
@@ -134,15 +117,23 @@ func TestFullStack_S3PutGetDatnode(t *testing.T) {
 
 	// === Phase 6: Restart datanode 0 and verify recovery ===
 	t.Log("restarting datanode 0")
-	store0, _ := datanode.NewChunkStore(datanodeDirs[0], 64, 256, nil)
-	store0.WaitForScan()
-	cfg0 := datanode.DefaultConfig()
-	cfg0.ListenAddr = datanodeAddrs[0]
-	cfg0.NodeID = 1
-	cfg0.RequestTimeout = 5 * time.Second
-	srv0 := datanode.NewServer(cfg0, store0)
-	srv0.Start()
-	defer srv0.Stop()
+	// Release the old node's segment stores before re-opening the same dir,
+	// then re-register the node so metadata points at the fresh server.
+	datanodeNodes[0].Close()
+	datanodeNodes[0] = startV21Datanode(t, 1, datanodeDirs[0])
+	datanodeServers[0] = datanodeNodes[0].Server
+	if err := leader.Store.RegisterNode(ctx, &metadata.NodeInfo{
+		ID:         1,
+		Addr:       datanodeNodes[0].Server.Addr(),
+		State:      metadata.NodeOnline,
+		CapacityGB: 1000,
+		Tier:       metadata.TierHot,
+		Zone:       "test-zone",
+		Rack:       "rack-0",
+		MachineID:  "test-machine",
+	}); err != nil && !errors.Is(err, metadata.ErrNodeAlreadyExists) {
+		t.Fatalf("re-register datanode 0: %v", err)
+	}
 	t.Log("datanode 0 restarted")
 }
 
@@ -154,31 +145,12 @@ func TestFullStack_MultiDiskJBOD(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// === Start a single datanode in multi-disk mode (2 disks) ===
+	// === Start a single V2.1 datanode in multi-disk mode (2 disks) ===
 	disk0Dir := t.TempDir()
 	disk1Dir := t.TempDir()
-	wals := make([]*datanode.WriteAheadLog, 2)
-	wals[0], _ = datanode.NewWriteAheadLog(disk0Dir + "/wal")
-	wals[1], _ = datanode.NewWriteAheadLog(disk1Dir + "/wal")
 
-	cs, err := datanode.NewMultiDiskChunkStore([]string{disk0Dir, disk1Dir}, 64, 256, wals)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cs.WaitForScan()
-	dm, _ := datanode.NewMultiDiskManager([]string{disk0Dir, disk1Dir}, cs, []int64{100, 100}, wals)
-	cs.SetDiskManager(dm)
-
-	// Start TCP server for the datanode
-	srvCfg := datanode.DefaultConfig()
-	srvCfg.ListenAddr = "127.0.0.1:0"
-	srvCfg.NodeID = 1
-	srvCfg.RequestTimeout = 5 * time.Second
-	srv := datanode.NewServer(srvCfg, cs)
-	if err := srv.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Stop()
+	n := startV21Datanode(t, 1, disk0Dir, disk1Dir)
+	cs := n.Store
 
 	// Register with metadata
 	metaDir := t.TempDir()
@@ -191,7 +163,7 @@ func TestFullStack_MultiDiskJBOD(t *testing.T) {
 	defer metaStore.Close()
 
 	err = metaStore.RegisterNode(ctx, &metadata.NodeInfo{
-		ID: 1, Addr: srv.Addr(), State: metadata.NodeOnline,
+		ID: 1, Addr: n.Server.Addr(), State: metadata.NodeOnline,
 		CapacityGB: 100, Tier: metadata.TierHot,
 		Zone: "test-zone", Rack: "rack-1", MachineID: "test-machine",
 	})

@@ -19,7 +19,7 @@ import (
 )
 
 // countChunksPerDisk counts chunks on each disk from ListChunks.
-func countChunksPerDisk(cs *datanode.ChunkStore) []int64 {
+func countChunksPerDisk(cs datanode.OpsStore) []int64 {
 	counts := make([]int64, len(cs.DiskInfos()))
 	for _, info := range cs.ListChunks() {
 		if info.DiskIndex >= 0 && info.DiskIndex < len(counts) {
@@ -39,31 +39,16 @@ func TestOpsFlow_AdoptMigrateDecommissionRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Phase 1: Start with 2 disks
+	// Phase 1: Start a V2.1 node with 2 disks
 	disk0Dir := t.TempDir()
 	disk1Dir := t.TempDir()
-	wal0, _ := datanode.NewWriteAheadLog(disk0Dir + "/wal")
-	wal1, _ := datanode.NewWriteAheadLog(disk1Dir + "/wal")
-
-	cs, _ := datanode.NewMultiDiskChunkStore([]string{disk0Dir, disk1Dir}, 8, 8,
-		[]*datanode.WriteAheadLog{wal0, wal1})
-	cs.WaitForScan()
-	dm, _ := datanode.NewMultiDiskManager([]string{disk0Dir, disk1Dir}, cs,
-		[]int64{100, 100}, []*datanode.WriteAheadLog{wal0, wal1})
-	cs.SetDiskManager(dm)
-
-	srvCfg := datanode.DefaultConfig()
-	srvCfg.ListenAddr = "127.0.0.1:0"
-	srvCfg.NodeID = 1
-	srvCfg.RequestTimeout = 5 * time.Second
-	srv := datanode.NewServer(srvCfg, cs)
-	srv.Start()
-	defer srv.Stop()
+	n := startV21Datanode(t, 1, disk0Dir, disk1Dir)
+	cs := n.Store
 
 	metaStore, _ := metadata.NewPebbleStore(metadata.PebbleStoreConfig{Dir: t.TempDir(), NodeID: 1})
 	defer metaStore.Close()
 	metaStore.RegisterNode(ctx, &metadata.NodeInfo{
-		ID: 1, Addr: srv.Addr(), State: metadata.NodeOnline,
+		ID: 1, Addr: n.Server.Addr(), State: metadata.NodeOnline,
 		CapacityGB: 10000, Tier: metadata.TierHot,
 		Zone: "z1", Rack: "r1", MachineID: "m1",
 	})
@@ -90,8 +75,7 @@ func TestOpsFlow_AdoptMigrateDecommissionRestart(t *testing.T) {
 
 	// Phase 3: Adopt a 3rd disk
 	disk2Dir := t.TempDir()
-	wal2, _ := datanode.NewWriteAheadLog(disk2Dir + "/wal")
-	idx, err := cs.AddDisk(disk2Dir, 8, 8, wal2)
+	idx, err := cs.AddDisk(disk2Dir, 8, 8)
 	if err != nil {
 		t.Fatalf("AddDisk: %v", err)
 	}
@@ -114,7 +98,9 @@ func TestOpsFlow_AdoptMigrateDecommissionRestart(t *testing.T) {
 	// Phase 5: Migrate disk 0 to other disks
 	t.Log("phase 5: migrating disk 0...")
 	start := time.Now()
-	cs.MigrateDisk(0)
+	if _, err := cs.MigrateDisk(0); err != nil {
+		t.Fatalf("MigrateDisk(0): %v", err)
+	}
 	elapsed := time.Since(start)
 	counts = countChunksPerDisk(cs)
 	t.Logf("phase 5: disk0=%d after migration (took %v)", counts[0], elapsed.Round(time.Millisecond))
@@ -129,7 +115,9 @@ func TestOpsFlow_AdoptMigrateDecommissionRestart(t *testing.T) {
 	t.Log("phase 5: all data readable after migration")
 
 	// Phase 6: Remove disk 1
-	cs.RemoveDisk(1)
+	if err := cs.RemoveDisk(1); err != nil {
+		t.Fatalf("RemoveDisk(1): %v", err)
+	}
 	status := cs.DiskInfos()
 	if !status[1].Failed {
 		t.Fatal("disk 1 should be failed after removal")
@@ -160,26 +148,29 @@ func TestChaos_RandomDiskNodeKill(t *testing.T) {
 	defer metaStore.Close()
 
 	const numNodes = 3
+	nodes := make([]*v21Datanode, numNodes)
 	servers := make([]*datanode.Server, numNodes)
-	addrs := make([]string, numNodes)
 	for i := 0; i < numNodes; i++ {
-		store, _ := datanode.NewChunkStore(t.TempDir(), 64, 256, nil)
-		store.WaitForScan()
-		cfg := datanode.DefaultConfig()
-		cfg.ListenAddr = "127.0.0.1:0"
-		cfg.NodeID = metadata.NodeID(i + 1)
-		cfg.RequestTimeout = 5 * time.Second
-		srv := datanode.NewServer(cfg, store)
-		srv.Start()
-		servers[i] = srv
-		addrs[i] = srv.Addr()
+		n := startV21Datanode(t, metadata.NodeID(i+1), t.TempDir())
+		nodes[i] = n
+		servers[i] = n.Server
 		metaStore.RegisterNode(ctx, &metadata.NodeInfo{
-			ID: metadata.NodeID(i + 1), Addr: addrs[i],
+			ID: metadata.NodeID(i + 1), Addr: n.Server.Addr(),
 			State: metadata.NodeOnline, CapacityGB: 10000,
 			Tier: metadata.TierHot, Zone: "z", Rack: "r", MachineID: "m",
 		})
 	}
-	defer func() { for _, s := range servers { s.Stop() } }()
+	// Stop/close every node at test end. t.Cleanup (registered by
+	// startV21Datanode) covers the originals; Stop and Close are both
+	// idempotent, so this only additionally cleans up the mid-run restart.
+	defer func() {
+		for _, n := range nodes {
+			if n != nil {
+				n.Server.Stop()
+				n.Close()
+			}
+		}
+	}()
 
 	cs := chunkstore.NewDatanodeChunkStore()
 	defer cs.Close()
@@ -189,9 +180,11 @@ func TestChaos_RandomDiskNodeKill(t *testing.T) {
 	ts := httptest.NewServer(gw.Handler())
 	defer ts.Close()
 
-	// Pre-seed known data
+	// Pre-seed known data. RF=3 so known.txt is replicated on every node: with
+	// RF=1 and 2 of 3 nodes killed (or restarted fresh), the single replica
+	// could land on a dead node and the final assertion becomes probabilistic.
 	metaStore.CreateBucket(ctx, "chaos-bucket", metadata.PlacementPolicy{
-		ReplicationFactor: 1, StorageTier: metadata.TierHot,
+		ReplicationFactor: 3, StorageTier: metadata.TierHot,
 	})
 	knownPayload := bytes.Repeat([]byte("known-data"), 1000)
 	doPut(t, ctx, ts.URL+"/chaos-bucket/known.txt", bytes.NewReader(knownPayload), http.StatusOK)
@@ -202,7 +195,9 @@ func TestChaos_RandomDiskNodeKill(t *testing.T) {
 
 	// Chaos: kill datanodes during operations
 	var opsDone, errorsHit, readsOK atomic.Int64
+	chaosDone := make(chan struct{})
 	go func() {
+		defer close(chaosDone)
 		time.Sleep(10 * time.Second)
 		t.Log("chaos: kill datanode 0")
 		servers[0].Stop()
@@ -211,17 +206,17 @@ func TestChaos_RandomDiskNodeKill(t *testing.T) {
 		servers[1].Stop()
 		time.Sleep(10 * time.Second)
 		t.Log("chaos: restart datanode 0")
-		store, _ := datanode.NewChunkStore(t.TempDir(), 64, 256, nil)
-		store.WaitForScan()
-		cfg := datanode.DefaultConfig()
-		cfg.ListenAddr = addrs[0]
-		cfg.NodeID = 1
-		cfg.RequestTimeout = 5 * time.Second
-		srv := datanode.NewServer(cfg, store)
-		srv.Start()
-		servers[0] = srv
+		// Build via newV21Node (no t.Fatalf): this goroutine is not the test
+		// goroutine, and FailNow from here would panic the test binary.
+		nn, err := newV21Node(1, t.TempDir())
+		if err != nil {
+			t.Errorf("restart datanode 0: %v", err)
+			return
+		}
+		servers[0] = nn.Server
+		nodes[0] = nn
 		metaStore.RegisterNode(ctx, &metadata.NodeInfo{
-			ID: 1, Addr: addrs[0], State: metadata.NodeOnline,
+			ID: 1, Addr: nn.Server.Addr(), State: metadata.NodeOnline,
 			CapacityGB: 10000, Tier: metadata.TierHot,
 			Zone: "z", Rack: "r", MachineID: "m",
 		})
@@ -256,6 +251,9 @@ func TestChaos_RandomDiskNodeKill(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
+	// Join the chaos goroutine before the deferred cleanup so the restarted
+	// node's stop/close has a happens-before edge (no data race on nodes[0]).
+	<-chaosDone
 
 	// Verify known data survived
 	finalBody := doGet(t, ctx, ts.URL+"/chaos-bucket/known.txt", http.StatusOK)

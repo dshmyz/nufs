@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/dshmyz/nufs/nufs-core/chunkstore"
-	"github.com/dshmyz/nufs/nufs-core/datanode"
 	"github.com/dshmyz/nufs/nufs-core/gateway/s3"
 	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
@@ -54,29 +53,16 @@ func TestBenchmark_S3Workload(t *testing.T) {
 	defer metaStore.Close()
 
 	const numDatanodes = 3
-	servers := make([]*datanode.Server, numDatanodes)
 	addrs := make([]string, numDatanodes)
 	for i := 0; i < numDatanodes; i++ {
-		store, err := datanode.NewChunkStore(t.TempDir(), 64, 256, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		store.WaitForScan()
-		cfg := datanode.DefaultConfig()
-		cfg.ListenAddr = "127.0.0.1:0"
-		cfg.NodeID = metadata.NodeID(i + 1)
-		cfg.RequestTimeout = 10 * time.Second
-		srv := datanode.NewServer(cfg, store)
-		srv.Start()
-		servers[i] = srv
-		addrs[i] = srv.Addr()
+		n := startV21Datanode(t, metadata.NodeID(i+1), t.TempDir())
+		addrs[i] = n.Server.Addr()
 		metaStore.RegisterNode(ctx, &metadata.NodeInfo{
 			ID: metadata.NodeID(i + 1), Addr: addrs[i],
 			State: metadata.NodeOnline, CapacityGB: 10000,
 			Tier: metadata.TierHot, Zone: "test", Rack: "r1", MachineID: "m1",
 		})
 	}
-	defer func() { for _, s := range servers { s.Stop() } }()
 
 	cs := chunkstore.NewDatanodeChunkStore()
 	defer cs.Close()
