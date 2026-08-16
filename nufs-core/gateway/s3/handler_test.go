@@ -1274,10 +1274,10 @@ func TestMultipartUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
 
 	var initResult InitiateMultipartUploadResult
 	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if err := xml.Unmarshal(body, &initResult); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
@@ -1290,7 +1290,9 @@ func TestMultipartUpload(t *testing.T) {
 
 	uploadID := initResult.UploadID
 
-	// Upload 2 parts
+	// Upload 2 parts, capturing the real ETags the gateway returns (quoted
+	// crc32 checksums) — the Complete request must echo them back.
+	var etags = make(map[int]string)
 	for i := 1; i <= 2; i++ {
 		partBody := strings.NewReader("part data " + strings.Repeat("x", i*100))
 		url := ts.URL + "/mpbucket/bigfile.dat?uploadId=" + uploadID + "&partNumber=" + string(rune('0'+i))
@@ -1303,9 +1305,11 @@ func TestMultipartUpload(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("upload part %d: expected 200, got %d", i, resp.StatusCode)
 		}
-		if resp.Header.Get("ETag") == "" {
-			t.Errorf("part %d: expected ETag", i)
+		etag := resp.Header.Get("ETag")
+		if etag == "" {
+			t.Fatalf("part %d: missing ETag", i)
 		}
+		etags[i] = etag
 	}
 
 	// List parts
@@ -1314,37 +1318,130 @@ func TestMultipartUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
 
 	var listParts ListPartsResult
 	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if err := xml.Unmarshal(body, &listParts); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
 	if len(listParts.Parts) != 2 {
 		t.Errorf("expected 2 parts, got %d", len(listParts.Parts))
 	}
+	for i := 1; i <= 2; i++ {
+		found := false
+		for _, p := range listParts.Parts {
+			if p.PartNumber == i && p.ETag != "" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("listed part %d missing ETag", i)
+		}
+	}
 
-	// Complete multipart upload. CompleteMultipartUpload is currently
-	// unimplemented (part data is never merged into an object), so the gateway
-	// must reject it loudly with NotImplemented instead of returning a false
-	// success that a client would interpret as "object now exists". The upload
-	// and its staged parts are left intact for an operator (or client) to abort.
-	completeXML := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"etag1"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"etag2"</ETag></Part></CompleteMultipartUpload>`
+	// Complete multipart upload: the staged parts merge into a real object
+	// (roadmap §1.4 — the gateway write path can no longer produce a V1
+	// ChunkMap). Protocol-level assertion only: the merged object's layout and
+	// byte content are covered by the PebbleStore-backed
+	// multipart_dual_model_test.go.
+	completeXML := "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" + etags[1] +
+		"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>" + etags[2] +
+		"</ETag></Part></CompleteMultipartUpload>"
 	url = ts.URL + "/mpbucket/bigfile.dat?uploadId=" + uploadID
 	req, _ = http.NewRequest(http.MethodPost, url, strings.NewReader(completeXML))
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("complete: expected 200, got %d", resp.StatusCode)
+	}
+	var completeResult CompleteMultipartUploadResult
+	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("complete: expected 501 NotImplemented, got %d", resp.StatusCode)
+	if err := xml.Unmarshal(body, &completeResult); err != nil {
+		t.Fatalf("unmarshal complete result: %v", err)
+	}
+	if completeResult.ETag == "" {
+		t.Error("complete: expected non-empty ETag")
 	}
 
-	// The upload must still exist and be abortable after a rejected Complete:
-	// a failed Complete must not have silently destroyed the staged parts.
-	url = ts.URL + "/mpbucket/bigfile.dat?uploadId=" + uploadID
+	// The upload is terminal: a second Complete must see it as gone.
+	req, _ = http.NewRequest(http.MethodPost, url, strings.NewReader(completeXML))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("re-complete: expected 404 NoSuchUpload, got %d", resp.StatusCode)
+	}
+
+	// So must an Abort.
+	req, _ = http.NewRequest(http.MethodDelete, url, nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("abort after complete: expected 404, got %d", resp.StatusCode)
+	}
+}
+
+// TestMultipartUploadRejectedCompleteKeepsParts guards the error path of a
+// complete: when the merge is rejected (here: an ETag that does not match the
+// staged part), the upload and its staged parts must survive, still abortable,
+// so a client can fix the request or abandon the upload.
+func TestMultipartUploadRejectedCompleteKeepsParts(t *testing.T) {
+	_, ts, _ := newTestGateway(t)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/mpbucket", nil)
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/mpbucket/bigfile.dat?uploads", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var initResult InitiateMultipartUploadResult
+	if err := xml.Unmarshal(body, &initResult); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	uploadID := initResult.UploadID
+
+	req, _ = http.NewRequest(http.MethodPut,
+		ts.URL+"/mpbucket/bigfile.dat?uploadId="+uploadID+"&partNumber=1",
+		strings.NewReader("part one"))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.Header.Get("ETag") == "" {
+		t.Fatal("part 1: missing ETag")
+	}
+
+	// Complete with a mismatched part ETag — S3 semantics reject it with 400.
+	completeXML := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"wrong"</ETag></Part></CompleteMultipartUpload>`
+	url := ts.URL + "/mpbucket/bigfile.dat?uploadId=" + uploadID
+	req, _ = http.NewRequest(http.MethodPost, url, strings.NewReader(completeXML))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("complete with bad ETag: expected 400, got %d", resp.StatusCode)
+	}
+
+	// The failed complete must not have destroyed the staged parts.
 	req, _ = http.NewRequest(http.MethodDelete, url, nil)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -1352,7 +1449,7 @@ func TestMultipartUpload(t *testing.T) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("abort after complete: expected 204, got %d", resp.StatusCode)
+		t.Fatalf("abort after rejected complete: expected 204, got %d", resp.StatusCode)
 	}
 }
 

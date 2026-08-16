@@ -141,13 +141,34 @@
 - [ ] 心跳降级检测 extent 版（把 `ExtentLifecycle` 接进上报/降级路径）
 - [ ] bucket 配额按 extent 聚合
 - [ ] 备份/恢复按 extent 清单
-- [ ] S3 multipart 合并落 extent
+- [x] S3 multipart 合并落 extent（gateway/s3/multipart.go——见下注）
 - [ ] 孤儿 GC 认 extent 布局
+
+> 2026-08-16 完成（本刀）。`handleCompleteMultipartUpload` 的 501 stub 改为真合并：按
+> complete 请求顺序用 `io.MultiReader` 流式拼装 staged parts（磁盘 part `os.Open`，
+> 内存 part `bytes.NewReader`），整个 merge+commit 持 `upload.mu`，交 `gw.committer.Put`
+> ——与单发 PUT 完全同一编排（quota/AdvisoryLock/超写 supersede+tombstone/
+> ECConfig ColdEC 标注全继承），经 `CommitChunkRefsModelAware` 落 V2 inline/pages
+> extent。守卫：parts 非空→400、part 号严格递增唯一→400、逐 part ETag 匹配→400、
+> 任一 part `Size==0`→400、bucket/key 与 upload 一致→404；`result.Size != total` 视作
+> 失败并保留暂存（可重试/abort）。**complete 是终态**：新增 `multipartUpload.finished`
+> 旗标 + `writePart` 锁内守卫 + `errUploadFinished`——成功即置位并 `cleanupUpload`
+> + `activeUploads.remove`，晚到 UploadPart（已持指针）→404 且丢弃、double-complete→404；
+> 锁序新增 `upload.mu→tracker.mu`（remove）嵌套，无反向持有，无环。测试：改写
+> `TestMultipartUpload`（协议面 200→二次 complete 404→abort 404）+ 新增
+> `TestMultipartUploadRejectedCompleteKeepsParts`（坏 ETag→400 且 upload 保留）+ 新增
+> `multipart_dual_model_test.go`（真 PebbleStore fixture：inline/pages 布局 + GET 读回 +
+> 超写旧 chunk tombstone 经 `ListChunkTombstones` 断言）。
+> **行为注记**：complete 总大小受 `gw.maxObjectSize`（默认 5GiB，与单发 PUT 同 cap，
+> 已逐 part 受同 cap）——"multipart 超单发 PUT 上限"不可达，413 EntityTooLarge 接受。
+> **Deferred**：写尝试恢复语义沿用 `Put` 自带 attempt+补偿（recover 幂等，补偿用新分配
+> chunk ID 无碰撞）；part 暂存为 in-process 语义不变（gateway 重启即丢）。
 
 ### 1.5 退出条件
 - 网关写入路径不再产生新 ChunkMap；ChunkMap 只读存量（阶段 4 删）。
-  > 1.3c 后单发 PUT 与 FUSE flush 均经 `CommitChunkRefsModelAware` 落 V2；剩余
-  > 产生 ChunkMap 的写路径是 S3 multipart（合并落 extent 在 §1.4，见 `ec_lifecycle` 项）。
+  > 1.3c/§1.4 后三条写路径——单发 PUT 与 FUSE flush（`CommitChunkRefsModelAware`）
+  > 与 S3 multipart complete（同一编排，见 §1.4）——全部落 V2 布局，网关写路径不再
+  > 产生新 ChunkMap。
 - 阶段 0 的 ❌/⚠️ 项全部闭环。
 - 小文件读改写、promote 后读写、稀疏文件、EC 转换、配额、备份全绿。
 

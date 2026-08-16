@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -13,6 +14,12 @@ import (
 	"sync"
 	"time"
 )
+
+// errUploadFinished is returned by writePart when the upload has already been
+// completed. The newly written part's staged data is discarded; the caller maps
+// it to NoSuchUpload — a completed upload no longer exists as a target for
+// further parts.
+var errUploadFinished = errors.New("multipart: upload already completed")
 
 var (
 	activeUploads = &uploadTracker{
@@ -47,6 +54,12 @@ type multipartUpload struct {
 	Parts     map[int]*uploadPart
 	partDir   string
 	mu        sync.Mutex
+	// finished marks a successfully completed upload. Complete is a terminal
+	// operation: once set, any late UploadPart that already holds the upload
+	// pointer is rejected and any second Complete fails with NoSuchUpload
+	// (the tracker entry is removed on success, but a concurrent request may
+	// have fetched the pointer before that removal).
+	finished bool
 }
 
 type uploadPart struct {
@@ -201,6 +214,17 @@ func (t *uploadTracker) writePart(upload *multipartUpload, partNum int, data []b
 	}
 
 	upload.mu.Lock()
+	if upload.finished {
+		// The upload was completed while this part was being read/written.
+		// Discard the part we just stored — re-adding it would orphan the
+		// temp file (or resurrect deleted data), as complete's cleanup already
+		// removed it. Complete is terminal: the part cannot join the object.
+		upload.mu.Unlock()
+		if p.partPath != "" {
+			os.Remove(p.partPath)
+		}
+		return errUploadFinished
+	}
 	// Clean up previous part data for this part number
 	if old, ok := upload.Parts[partNum]; ok {
 		old.cleanup()
@@ -269,6 +293,12 @@ func (gw *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, buck
 	etag := fmt.Sprintf("\"%08x\"", crc32Checksum(data))
 
 	if err := activeUploads.writePart(upload, partNum, data, etag); err != nil {
+		if errors.Is(err, errUploadFinished) {
+			WriteXMLError(w, http.StatusNotFound, ErrCodeNoSuchUpload,
+				"The specified multipart upload has already been completed",
+				"/"+bucket+"/"+key, requestID)
+			return
+		}
 		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"Failed to store part data", "/"+bucket+"/"+key, requestID)
 		return
@@ -304,47 +334,133 @@ func (gw *Gateway) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Verify all parts exist under the upload's own mutex. (The original handler
-	// interleaved Unlock/WriteXMLError/Lock around this loop; hoisting the check
-	// into a helper that returns the first missing part lets us hold upload.mu for
-	// the whole read and leave error handling to the caller.)
+	// The merge and the entire object commit run under the upload's own mutex.
+	// A concurrent UploadPart replaces a part (and deletes the old part file)
+	// through writePart, so reads of the parts must serialize against it:
+	// holding the lock keeps the part files we open from being unlinked
+	// mid-merge. This also makes Complete a terminal operation — after it
+	// succeeds, writePart rejects new parts and a second Complete fails with
+	// NoSuchUpload.
 	upload.mu.Lock()
-	missingPart := upload.missingPart(completeReq.Parts)
-	upload.mu.Unlock()
-	if missingPart > 0 {
-		WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidPart,
-			fmt.Sprintf("Part %d not found", missingPart), "/"+bucket+"/"+key, requestID)
+	defer upload.mu.Unlock()
+
+	if upload.finished {
+		WriteXMLError(w, http.StatusNotFound, ErrCodeNoSuchUpload,
+			"The specified multipart upload does not exist", "/"+bucket+"/"+key, requestID)
+		return
+	}
+	if upload.Bucket != bucket || upload.Key != key {
+		WriteXMLError(w, http.StatusNotFound, ErrCodeNoSuchUpload,
+			"The specified multipart upload does not exist", "/"+bucket+"/"+key, requestID)
+		return
+	}
+	if len(completeReq.Parts) == 0 {
+		WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidRequest,
+			"You must specify at least one part", "/"+bucket+"/"+key, requestID)
 		return
 	}
 
-	// CompleteMultipartUpload is currently a planned-but-unimplemented path: the
-	// parts have been persisted (in memory or to disk) but there is no data path
-	// that merges them into chunks, registers them in metadata, and creates the
-	// file inode. We must NOT swallow the upload and return success — a client
-	// would believe the object exists when it was silently discarded (and the
-	// TTL cleanup would delete the staged parts a day later). Fail loudly with
-	// NotImplemented so callers stop uploading through this route; the staged
-	// parts stay on disk for an operator to inspect. Returning 501 also frees
-	// the S3 client from assuming the post-condition (object present), which is
-	// what the previous 200-success stub violated.
-	WriteXMLError(w, http.StatusNotImplemented, ErrCodeNotImplemented,
-		"CompleteMultipartUpload is not implemented: part data will not be merged into an object. Abort the upload or use a non-multipart PUT.",
-		"/"+bucket+"/"+key, requestID)
-}
-
-// missingPart returns the first part number requested by a Complete upload that
-// is absent from the upload's Parts map, or 0 when every requested part exists.
-// The caller must hold upload.mu.
-func (u *multipartUpload) missingPart(parts []CompletePart) int {
-	if u == nil {
-		return 1
-	}
-	for _, cp := range parts {
-		if _, ok := u.Parts[cp.PartNumber]; !ok {
-			return cp.PartNumber
+	// Assemble the object as the concatenation of the parts in the order the
+	// caller listed them (the complete request, not the part numbers, defines
+	// the byte order). Enforce S3's request invariants: strictly ascending
+	// unique part numbers, ETags matching the staged parts, and non-empty
+	// parts — a zero-length mid-list part would be silently absorbed by the
+	// chunk-write loop (ReadFull n==0 → break) and truncate the object.
+	var (
+		mergedSize int64
+		readers    []io.Reader
+		openFiles  []*os.File
+	)
+	lastPartNumber := 0
+	for _, cp := range completeReq.Parts {
+		if cp.PartNumber <= lastPartNumber {
+			WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidPart,
+				"Part numbers must be listed in ascending order without duplicates",
+				"/"+bucket+"/"+key, requestID)
+			return
 		}
+		lastPartNumber = cp.PartNumber
+		p, present := upload.Parts[cp.PartNumber]
+		if !present {
+			WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidPart,
+				fmt.Sprintf("Part %d does not exist", cp.PartNumber), "/"+bucket+"/"+key, requestID)
+			return
+		}
+		if cp.ETag != p.ETag {
+			WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidPart,
+				fmt.Sprintf("ETag for part %d does not match the uploaded part", cp.PartNumber),
+				"/"+bucket+"/"+key, requestID)
+			return
+		}
+		if p.Size == 0 {
+			WriteXMLError(w, http.StatusBadRequest, ErrCodeInvalidPart,
+				fmt.Sprintf("Part %d is empty", cp.PartNumber), "/"+bucket+"/"+key, requestID)
+			return
+		}
+		if p.partPath != "" {
+			f, err := os.Open(p.partPath)
+			if err != nil {
+				WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					fmt.Sprintf("Failed to read part %d data", cp.PartNumber), "/"+bucket+"/"+key, requestID)
+				return
+			}
+			openFiles = append(openFiles, f)
+			readers = append(readers, f)
+		} else {
+			readers = append(readers, bytes.NewReader(p.Data))
+		}
+		mergedSize += p.Size
 	}
-	return 0
+	defer func() {
+		for _, f := range openFiles {
+			_ = f.Close()
+		}
+	}()
+
+	// Commit the concatenated staged parts through the same orchestration as a
+	// single PUT (metadataObjectCommitter.Put): the object lands via
+	// CommitChunkRefsModelAware — inline extent (≤16MiB single ref) or COW
+	// extent pages — with quota admission, advisory locking, overwrite
+	// supersede + tombstone, and ECConfig ColdEC marking all inherited from the
+	// single-PUT path. Roadmap §1.4: complete must no longer be able to produce
+	// a V1 ChunkMap object.
+	result, err := gw.committer.Put(r.Context(), PutObjectRequest{
+		Bucket:        bucket,
+		Key:           key,
+		Body:          io.MultiReader(readers...),
+		ContentLength: mergedSize,
+		MaxObjectSize: gw.maxObjectSize,
+		RequestID:     requestID,
+	})
+	if err != nil {
+		gw.writePutObjectCommitterError(w, err, bucket, key, requestID)
+		return
+	}
+	if result.Size != mergedSize {
+		// A staged part file shorter than its recorded size would be silently
+		// absorbed as a truncated object by the chunk loop; surface it so the
+		// upload stays staged for a corrected Complete (or an abort) instead.
+		WriteXMLError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"merged object size does not match the staged part sizes",
+			"/"+bucket+"/"+key, requestID)
+		return
+	}
+
+	// Success: the upload is terminal. Drop its staged part data and evict it
+	// from the tracker while still holding the upload lock, so a concurrent
+	// writePart that already holds the pointer sees finished and cannot
+	// resurrect a deleted part file. remove() takes the tracker lock under the
+	// upload lock — a new upload.mu→tracker.mu nesting — but no path ever holds
+	// the tracker lock while taking an upload lock, so there is no cycle.
+	upload.finished = true
+	cleanupUpload(upload)
+	activeUploads.remove(uploadID)
+
+	WriteXML(w, http.StatusOK, CompleteMultipartUploadResult{
+		Bucket: bucket,
+		Key:    key,
+		ETag:   result.ETag,
+	})
 }
 
 // handleAbortMultipartUpload handles DELETE /{bucket}/{key}?uploadId=xxx
