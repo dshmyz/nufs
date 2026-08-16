@@ -1704,21 +1704,40 @@ func (s *PebbleStore) Unlink(ctx context.Context, parent InodeID, name string) e
 		return ErrNotFile
 	}
 
-	var meta InodeMeta
+	// Model-aware inode handling (mirrors UpdateInode): the V1 and V2 inode
+	// rows share the /inode/ prefix and differ only in layout fields, so the
+	// read is model-agnostic but the rewrite must preserve the row's own
+	// model. A V2-layout row re-encoded as InodeMeta would silently strip
+	// Layout/InlineExtent/ExtentRoot — hard-linked V2 files would lose data.
+	var v2 InodeMetaV2
 	inodeKey := fmt.Sprintf("%s%d", prefixInode, entry.InodeID)
-	pExists, _ := s.getJSON(inodeKey, &meta)
+	found, raw, err := s.getRaw(inodeKey)
+	if err != nil {
+		return err
+	}
 	var ops []batchOp
 	deletes := []string{nsKey}
 
 	var deleteInode bool
-	if pExists {
-		meta.NLink--
-		meta.MTime = time.Now().UnixNano()
-		if meta.NLink <= 0 {
-			s.addBucketStatsOp(meta.BucketRoot, -meta.Size, -1, &ops)
+	if found {
+		if err := unmarshalValue(raw, &v2); err != nil {
+			return err
+		}
+		v2.NLink--
+		v2.MTime = time.Now().UnixNano()
+		if v2.NLink <= 0 {
+			s.addBucketStatsOp(v2.BucketRoot, -v2.Size, -1, &ops)
 			deletes = append(deletes, inodeKey)
 			deleteInode = true
+		} else if v2.Layout != LayoutEmpty {
+			ops = append(ops, batchOp{Key: inodeKey, Value: &v2})
 		} else {
+			var meta InodeMeta
+			if err := unmarshalValue(raw, &meta); err != nil {
+				return err
+			}
+			meta.NLink = v2.NLink
+			meta.MTime = v2.MTime
 			ops = append(ops, batchOp{Key: inodeKey, Value: &meta})
 		}
 	}
@@ -1743,7 +1762,7 @@ func (s *PebbleStore) Unlink(ctx context.Context, parent InodeID, name string) e
 		return err
 	}
 	if deleteInode {
-		s.releaseInodeID(meta.ID)
+		s.releaseInodeID(v2.ID)
 	}
 	// Invalidate cache for the deleted inode (or updated if still live)
 	s.inCache.del(entry.InodeID)
@@ -2046,28 +2065,45 @@ func (s *PebbleStore) Link(ctx context.Context, parent InodeID, name string, tar
 		return nil, ErrServiceClosed
 	}
 
+	// Model-aware (mirrors UpdateInode/Unlink): preserve the inode row's own
+	// model on rewrite — a V2-layout row re-encoded as InodeMeta would strip
+	// Layout/InlineExtent/ExtentRoot. The return value is projected from the
+	// raw V1 decode regardless (field-name aliasing makes the shared scalars
+	// identical), so the *InodeMeta return contract is unchanged.
 	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
 
-	var meta InodeMeta
 	inodeKey := fmt.Sprintf("%s%d", prefixInode, target)
-	exists, err := s.getJSON(inodeKey, &meta)
+	found, raw, err := s.getRaw(inodeKey)
 	if err != nil {
 		return nil, err
 	}
-	if !exists {
+	if !found {
 		return nil, ErrInodeNotFound
 	}
-	if meta.Type == FileDirectory {
+	var v2 InodeMetaV2
+	if err := unmarshalValue(raw, &v2); err != nil {
+		return nil, err
+	}
+	if v2.Type == FileDirectory {
 		return nil, ErrInvalidArgument
 	}
 
-	meta.NLink++
-	meta.CTime = time.Now().UnixNano()
-	entry := &DirEntry{InodeID: target, Type: meta.Type, Name: name}
-	ops := []batchOp{
-		{Key: inodeKey, Value: &meta},
-		{Key: nsKey, Value: entry},
+	v2.NLink++
+	v2.CTime = time.Now().UnixNano()
+	entry := &DirEntry{InodeID: target, Type: v2.Type, Name: name}
+	var ops []batchOp
+	if v2.Layout != LayoutEmpty {
+		ops = append(ops, batchOp{Key: inodeKey, Value: &v2})
+	} else {
+		var meta InodeMeta
+		if err := unmarshalValue(raw, &meta); err != nil {
+			return nil, err
+		}
+		meta.NLink = v2.NLink
+		meta.CTime = v2.CTime
+		ops = append(ops, batchOp{Key: inodeKey, Value: &meta})
 	}
+	ops = append(ops, batchOp{Key: nsKey, Value: entry})
 	// Name-uniqueness is enforced atomically: a concurrent same-name link
 	// fails with ErrEntryExists instead of persisting an orphan entry.
 	conditional, err := buildNamespaceConditional(nsKey, ops)
@@ -2077,6 +2113,12 @@ func (s *PebbleStore) Link(ctx context.Context, parent InodeID, name string, tar
 	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
 		return nil, err
 	}
+	var meta InodeMeta
+	if err := unmarshalValue(raw, &meta); err != nil {
+		return nil, err
+	}
+	meta.NLink = v2.NLink
+	meta.CTime = v2.CTime
 	return &meta, nil
 }
 
@@ -4379,9 +4421,13 @@ func (s *PebbleStore) ComputeAllBucketUsage(ctx context.Context) ([]BucketUsage,
 			return nil
 		}
 		if _, ok := needed[InodeID(id)]; ok {
-			var meta InodeMeta
-			if err := unmarshalValue(val, &meta); err == nil {
-				sizes[InodeID(id)] = meta.Size
+			// Model-aware (roadmap §1.4 "bucket 配额按 extent 聚合"): a V2
+			// layout inode aggregates its extent metadata rather than its
+			// Size counter, which the inline writer keeps in sync but a
+			// rebuild should verify from the extents themselves.
+			var in InodeMetaV2
+			if err := unmarshalValue(val, &in); err == nil {
+				sizes[InodeID(id)] = s.extentBytesForInode(ctx, &in)
 			}
 		}
 		return nil
@@ -4409,6 +4455,36 @@ func collectFileInodes(children map[InodeID][]DirEntry, parent InodeID, needed m
 			needed[e.InodeID] = struct{}{}
 		}
 	}
+}
+
+// extentBytesForInode returns the byte usage of an inode aggregated from its
+// V2 extent metadata (roadmap §1.4 "bucket 配额按 extent 聚合"): the inline
+// extent's LogicalLen, or the sum of its resolved extent pages' LogicalLen.
+// A missing /extent-meta/ row (a dangling reference left by a torn write)
+// falls back to the inode's Size so a rebuild never under-counts. V1 rows
+// and layout-less V2 rows fall back to Size — for V1 the row's Size is
+// authoritative and this is the legacy behavior.
+func (s *PebbleStore) extentBytesForInode(ctx context.Context, in *InodeMetaV2) int64 {
+	switch in.Layout {
+	case LayoutInlineExtent:
+		if in.InlineExtent != nil {
+			return in.InlineExtent.LogicalLen
+		}
+	case LayoutExtentPages:
+		refs, err := NewExtentPageStore(s).ResolveExtents(in)
+		if err == nil {
+			var total int64
+			for _, r := range refs {
+				ext, err := s.GetExtentMeta(ctx, r.ExtentID)
+				if err != nil {
+					return in.Size // dangling extent — never under-count
+				}
+				total += ext.LogicalLen
+			}
+			return total
+		}
+	}
+	return in.Size
 }
 
 func walkUsageTree(children map[InodeID][]DirEntry, sizes map[InodeID]int64, dir InodeID) (usedBytes int64, objects int) {

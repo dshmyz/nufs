@@ -139,7 +139,7 @@
 - [x] Scrubber extent 版（按 ExtentMetaV2 校验 + Lifecycle 计数）
 - [x] 修复机制 extent 版（TriggerRepair 的 extent 语义 + 队列）
 - [x] 心跳降级检测 extent 版（把 `ExtentLifecycle` 接进上报/降级路径）
-- [ ] bucket 配额按 extent 聚合
+- [x] bucket 配额按 extent 聚合（重建路径按 extent 聚合 + Unlink/Link 模型感知——见下注）
 - [ ] 备份/恢复按 extent 清单
 - [x] S3 multipart 合并落 extent（gateway/s3/multipart.go——见下注）
 - [x] 孤儿 GC 认 extent 布局
@@ -252,6 +252,26 @@
 > 仍跳过触发（分片健康归 EC healer）；② Dangling（无 backing chunk）不触发（无物可修）；
 > ③ `TriggerExtentRepair` 只加 PebbleStore、不扩 `RepairService` 接口/ShardedStore/HTTPClient
 > ——调用方仅 metad 内 `ExtentScrubber` 与 ops handler，无远程/跨 shard 调用方，避免死代码。
+
+> 2026-08-16 完成（第六刀）。**bucket 配额按 extent 聚合**：快路径计数器
+> （`UseBucketStats=true`）本就工作且有测试（V2 写经 `putWithBucketStats` 做 inode Size 差分，
+> `gateway/s3/quota_test.go` 全覆盖）；真正 deferred 的重建路径——`ComputeAllBucketUsage`
+> 慢路径 + `ensureBucketStats` 迁移种子（`ops_prometheus.go` 的指标源也走它）——此前只
+> decode V1 `InodeMeta` 读 Size：对 V2 行靠 msgpack 字段名别名碰巧读对，但**不是按 extent
+> 聚合**且零测试。本刀：慢路径改模型感知，新 helper `extentBytesForInode` 按布局聚合
+> （inline→`InlineExtent.LogicalLen`，pages→`ResolveExtents` 逐 extent 读 `/extent-meta/` 的
+> `LogicalLen` 求和、缺行回退 `in.Size` 防欠计；V1/空行回退 `in.Size`）。**顺带修了
+> `Unlink`/`Link` 的 V2 行损坏 bug**：NLink>1 分支此前把共享 `/inode/` 行按 V1 `InodeMeta`
+> 重编码，静默剥掉 Layout/InlineExtent/ExtentRoot——硬链接过的 V2 文件数据引用丢失；现镜像
+> `UpdateInode` 模型感知（V2 行按 `InodeMetaV2` 写回保留布局，V1 行按 `InodeMeta` 写回保留
+> ChunkMap），扣减改用 `v2.Size`。另修 `putWithBucketStats` 陈旧注释（AppendExtent 已计数，
+> 只剩 PromoteToPages 用 `s.Put`）。测试 `metadata/bucket_usage_extent_test.go`：慢路径
+> V1+inline+pages 混布聚合（Size 故意漂移到 9000/9999 证明按 extent 读而非计数器）、悬垂
+> extent 回退 in.Size、`ensureBucketStats` 重开迁移种子、Unlink V2 扣减归零、Link/Unlink
+> 跨硬链接保 layout（回归钩双验：慢路径退回读 Size 与 Link 退回 V1 重编码均红）。门禁
+> `verify-docker -l fast` PASS（metadata 全包 macOS 直跑撞 EADDRNOTAVAIL，Linux 容器干净）。
+> **已知未修**：慢路径对象计数经 `walkUsageTree` 对硬链接双计（与快路径唯一 inode 语义
+> 不一致，既有设计取舍非本刀引入）；`AppendExtent` 是 restore/HTTP-only 面。
 
 ### 1.5 退出条件
 - 网关写入路径不再产生新 ChunkMap；ChunkMap 只读存量（阶段 4 删）。

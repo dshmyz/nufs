@@ -46,9 +46,9 @@ func (s *InodeStoreV2) Put(in *InodeMetaV2) error {
 // addBucketStatsOp for V1 rows; the V2 commit writers must do the same or
 // the counter freezes and byte-quota enforcement silently degrades once
 // writes start landing V2 layout. The stats row and the inode row share
-// one atomic Raft batch, matching UpdateInode. AppendExtent/PromoteToPages
-// use s.Put directly: PromoteToPages does not change Size, and
-// AppendExtent's serving surface is not yet wired to a quota-enforced path.
+// one atomic Raft batch, matching UpdateInode. SetInlineExtent,
+// AppendExtent and ReplaceExtents all call this; only PromoteToPages uses
+// s.Put directly (it does not change Size).
 func (s *InodeStoreV2) putWithBucketStats(in *InodeMetaV2, oldSize int64) error {
 	if !s.store.cfg.UseBucketStats {
 		return s.Put(in)
