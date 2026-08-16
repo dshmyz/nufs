@@ -83,7 +83,7 @@ func (s *PebbleStore) GetCredential(_ context.Context, accessKey string) (*Crede
 		return nil, ErrServiceClosed
 	}
 	var cred Credential
-	exists, err := s.getJSON(prefixCredential+accessKey, &cred)
+	exists, err := s.getValue(prefixCredential+accessKey, &cred)
 	if err != nil {
 		return nil, err
 	}

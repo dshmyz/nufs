@@ -845,11 +845,6 @@ func (s *PebbleStore) getValue(key string, v interface{}) (bool, error) {
 }
 
 // getJSON is kept for backward compatibility; delegates to getValue.
-// Deprecated: use getValue instead.
-func (s *PebbleStore) getJSON(key string, v interface{}) (bool, error) {
-	return s.getValue(key, v)
-}
-
 // getRawBytes returns the current raw bytes stored at key, or (nil, false)
 // when absent. Unlike getValue it does not decode; it returns the exact on-disk
 // getRaw fetches a single Pebble key and returns a copy of the value.
@@ -1104,7 +1099,7 @@ func (s *PebbleStore) CreateBucket(ctx context.Context, name string, policy Plac
 
 	bucketKey := prefixBucket + name
 	var existing BucketInfo
-	exists, err := s.getJSON(bucketKey, &existing)
+	exists, err := s.getValue(bucketKey, &existing)
 	if err != nil {
 		return err
 	}
@@ -1160,7 +1155,7 @@ func (s *PebbleStore) DeleteBucket(ctx context.Context, name string) error {
 
 	bucketKey := prefixBucket + name
 	var info BucketInfo
-	exists, err := s.getJSON(bucketKey, &info)
+	exists, err := s.getValue(bucketKey, &info)
 	if err != nil {
 		return err
 	}
@@ -1227,7 +1222,7 @@ func (s *PebbleStore) GetBucket(ctx context.Context, name string) (*BucketInfo, 
 		return &b, nil
 	}
 	var info BucketInfo
-	exists, err := s.getJSON(prefixBucket+name, &info)
+	exists, err := s.getValue(prefixBucket+name, &info)
 	if err != nil {
 		return nil, err
 	}
@@ -1248,7 +1243,7 @@ func (s *PebbleStore) GetBucketByRoot(ctx context.Context, rootInode InodeID) (*
 	}
 	var name string
 	key := fmt.Sprintf("%s%d", prefixBucketByRoot, rootInode)
-	exists, err := s.getJSON(key, &name)
+	exists, err := s.getValue(key, &name)
 	if err != nil {
 		return nil, err
 	}
@@ -1359,7 +1354,7 @@ func (s *PebbleStore) MkDir(ctx context.Context, parent InodeID, name string, mo
 	// Update parent + inherit BucketRoot
 	var parentMeta InodeMeta
 	parentKey := fmt.Sprintf("%s%d", prefixInode, parent)
-	pExists, _ := s.getJSON(parentKey, &parentMeta)
+	pExists, _ := s.getValue(parentKey, &parentMeta)
 	if pExists {
 		meta.BucketRoot = parentMeta.BucketRoot
 		parentMeta.NLink++
@@ -1395,7 +1390,7 @@ func (s *PebbleStore) RmDir(ctx context.Context, parent InodeID, name string) er
 
 	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
 	var entry DirEntry
-	exists, err := s.getJSON(nsKey, &entry)
+	exists, err := s.getValue(nsKey, &entry)
 	if err != nil {
 		return err
 	}
@@ -1425,7 +1420,7 @@ func (s *PebbleStore) RmDir(ctx context.Context, parent InodeID, name string) er
 	var parentMeta InodeMeta
 	parentKey := fmt.Sprintf("%s%d", prefixInode, parent)
 	var ops []batchOp
-	pExists, _ := s.getJSON(parentKey, &parentMeta)
+	pExists, _ := s.getValue(parentKey, &parentMeta)
 	if pExists {
 		parentMeta.MTime = time.Now().UnixNano()
 		if parentMeta.NLink > 0 {
@@ -1674,7 +1669,7 @@ func (s *PebbleStore) Unlink(ctx context.Context, parent InodeID, name string) e
 
 	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
 	var entry DirEntry
-	exists, err := s.getJSON(nsKey, &entry)
+	exists, err := s.getValue(nsKey, &entry)
 	if err != nil {
 		return err
 	}
@@ -1764,7 +1759,7 @@ func (s *PebbleStore) Lookup(ctx context.Context, parent InodeID, name string) (
 
 	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
 	var entry DirEntry
-	exists, err := s.getJSON(nsKey, &entry)
+	exists, err := s.getValue(nsKey, &entry)
 	if err != nil {
 		if s.metrics != nil {
 			s.metrics.RecordError()
@@ -1779,7 +1774,7 @@ func (s *PebbleStore) Lookup(ctx context.Context, parent InodeID, name string) (
 	}
 
 	var meta InodeMeta
-	exists, err = s.getJSON(fmt.Sprintf("%s%d", prefixInode, entry.InodeID), &meta)
+	exists, err = s.getValue(fmt.Sprintf("%s%d", prefixInode, entry.InodeID), &meta)
 	if err != nil {
 		if s.metrics != nil {
 			s.metrics.RecordError()
@@ -1841,7 +1836,7 @@ func (s *PebbleStore) GetInode(ctx context.Context, id InodeID) (*InodeMeta, err
 		s.metrics.RecordCacheMiss()
 	}
 	var meta InodeMeta
-	exists, err := s.getJSON(fmt.Sprintf("%s%d", prefixInode, id), &meta)
+	exists, err := s.getValue(fmt.Sprintf("%s%d", prefixInode, id), &meta)
 	if err != nil {
 		if s.metrics != nil {
 			s.metrics.RecordError()
@@ -1955,7 +1950,7 @@ func (s *PebbleStore) Rename(ctx context.Context, oldParent InodeID, oldName str
 
 	oldNSKey := fmt.Sprintf("%s%d/%s", prefixNS, oldParent, oldName)
 	var entry DirEntry
-	exists, err := s.getJSON(oldNSKey, &entry)
+	exists, err := s.getValue(oldNSKey, &entry)
 	if err != nil {
 		return err
 	}
@@ -1966,7 +1961,7 @@ func (s *PebbleStore) Rename(ctx context.Context, oldParent InodeID, oldName str
 	// Check destination
 	newNSKey := fmt.Sprintf("%s%d/%s", prefixNS, newParent, newName)
 	var destEntry DirEntry
-	destExists, _ := s.getJSON(newNSKey, &destEntry)
+	destExists, _ := s.getValue(newNSKey, &destEntry)
 	if destExists {
 		if destEntry.Type == FileDirectory {
 			return ErrEntryExists
@@ -2028,7 +2023,7 @@ func (s *PebbleStore) Readlink(ctx context.Context, id InodeID) (string, error) 
 		return "", ErrServiceClosed
 	}
 	var meta InodeMeta
-	exists, err := s.getJSON(fmt.Sprintf("%s%d", prefixInode, id), &meta)
+	exists, err := s.getValue(fmt.Sprintf("%s%d", prefixInode, id), &meta)
 	if err != nil {
 		return "", err
 	}
@@ -2553,102 +2548,12 @@ func (s *PebbleStore) CommitChunk(ctx context.Context, chunkID ChunkID, checksum
 	return nil
 }
 
-// CreateObjectWithChunks is an optimized write path that combines
-// CreateFile + AllocateChunksBatch + CommitChunk into a single atomic
-// metadata operation. This reduces lock contention from 4 acquisitions
-// to 1 by building one batch of Pebble operations and applying them
-// atomically.
-//
-// For new objects: creates inode + allocates chunks + sets ChunkMap.
-// The caller then writes data to datanodes (outside this lock).
-// Returns the created inode and allocated chunks.
-func (s *PebbleStore) CreateObjectWithChunks(ctx context.Context, parent InodeID, name string, mode uint32, offsets []int64, policy PlacementPolicy) (*InodeMeta, []*ChunkMeta, error) {
-	if s.closed.Load() {
-		return nil, nil, ErrServiceClosed
-	}
-	if len(name) > MaxNameLength {
-		return nil, nil, ErrNameTooLong
-	}
-	if len(offsets) == 0 {
-		return nil, nil, fmt.Errorf("no offsets provided")
-	}
-	if len(offsets) > MaxChunkAllocationBatch {
-		return nil, nil, fmt.Errorf("max chunk allocation batch is %d", MaxChunkAllocationBatch)
-	}
-
-	// 1. Fast-path existence check (avoids allocating chunks for a name that
-	// already exists). This is only an optimization: hard atomicity comes from
-	// the nsKey ExpectAbsent precondition in the conditional batch below, so a
-	// concurrent same-name create fails with ErrEntryExists instead of
-	// persisting an orphan inode + orphan chunks.
-	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
-	var existing DirEntry
-	exists, err := s.getJSON(nsKey, &existing)
-	if err != nil {
-		return nil, nil, err
-	}
-	if exists {
-		return nil, nil, ErrEntryExists
-	}
-
-	// 2. Generate inode
-	inodeID := s.nextInodeID()
-	now := time.Now().UnixNano()
-	bucketRoot := s.getBucketRoot(parent)
-
-	// 3. Place chunks (reuse existing placement logic)
-	chunks, err := s.buildAllocatedChunks(ctx, offsets, policy)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// 4. Build inode with ChunkMap already set
-	chunkRefs := make([]ChunkRef, len(chunks))
-	for i, chunk := range chunks {
-		chunkRefs[i] = ChunkRef{ID: chunk.ID, Offset: offsets[i], Length: chunk.Size, Version: 1}
-	}
-	inode := &InodeMeta{
-		ID: inodeID, Type: FileRegular, Mode: mode, NLink: 1,
-		BucketRoot: bucketRoot, ChunkMap: chunkRefs,
-		CTime: now, MTime: now, ATime: now,
-	}
-
-	// 5. Build single atomic batch
-	entry := &DirEntry{InodeID: inodeID, Type: FileRegular, Name: name}
-	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
-
-	ops := []batchOp{
-		{Key: nsKey, Value: entry},    // namespace entry
-		{Key: inodeKey, Value: inode}, // inode with ChunkMap
-	}
-	s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
-
-	// Add chunk metadata operations
-	for _, chunk := range chunks {
-		ops = append(ops, batchOp{Key: chunkMetadataKey(chunk.ID), Value: chunk})
-	}
-
-	// Single atomic write: the nsKey ExpectAbsent precondition makes the
-	// existence check + inode + chunks commit atomic, so a concurrent
-	// same-name create maps ErrRaftConditionalConflict to ErrEntryExists.
-	conditional, err := buildNamespaceConditional(nsKey, ops)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
-		return nil, nil, err
-	}
-
-	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", inodeID)})
-	return inode, chunks, nil
-}
-
 func (s *PebbleStore) GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error) {
 	if s.closed.Load() {
 		return nil, ErrServiceClosed
 	}
 	var chunk ChunkMeta
-	exists, err := s.getJSON(fmt.Sprintf("%s%d", prefixChunk, chunkID), &chunk)
+	exists, err := s.getValue(fmt.Sprintf("%s%d", prefixChunk, chunkID), &chunk)
 	if err != nil {
 		return nil, err
 	}
@@ -2720,7 +2625,7 @@ func (s *PebbleStore) ListChunks(ctx context.Context, inodeID InodeID) ([]ChunkR
 		return nil, ErrServiceClosed
 	}
 	var meta InodeMeta
-	exists, err := s.getJSON(fmt.Sprintf("%s%d", prefixInode, inodeID), &meta)
+	exists, err := s.getValue(fmt.Sprintf("%s%d", prefixInode, inodeID), &meta)
 	if err != nil {
 		return nil, err
 	}
@@ -2850,7 +2755,7 @@ func (s *PebbleStore) RegisterNode(ctx context.Context, info *NodeInfo) error {
 	}
 	key := prefixNode + fmt.Sprintf("%d", info.ID)
 	var existing NodeInfo
-	exists, err := s.getJSON(key, &existing)
+	exists, err := s.getValue(key, &existing)
 	if err != nil {
 		return err
 	}
@@ -3036,7 +2941,7 @@ func (s *PebbleStore) ReconcileChangeEvents(ctx context.Context, nodeID NodeID, 
 func (s *PebbleStore) advanceChangeAck(ctx context.Context, nodeID NodeID, seq uint64) error {
 	key := prefixNode + fmt.Sprintf("%d", nodeID)
 	var info NodeInfo
-	exists, err := s.getJSON(key, &info)
+	exists, err := s.getValue(key, &info)
 	if err != nil {
 		return err
 	}
@@ -3056,7 +2961,7 @@ func (s *PebbleStore) advanceChangeAck(ctx context.Context, nodeID NodeID, seq u
 func (s *PebbleStore) GetChangeAck(ctx context.Context, nodeID NodeID) (uint64, error) {
 	key := prefixNode + fmt.Sprintf("%d", nodeID)
 	var info NodeInfo
-	exists, err := s.getJSON(key, &info)
+	exists, err := s.getValue(key, &info)
 	if err != nil {
 		return 0, err
 	}
@@ -3148,7 +3053,7 @@ func (s *PebbleStore) HeartbeatLiveness(ctx context.Context, nodeID NodeID, repo
 	}
 	key := prefixNode + fmt.Sprintf("%d", nodeID)
 	var info NodeInfo
-	exists, err := s.getJSON(key, &info)
+	exists, err := s.getValue(key, &info)
 	if err != nil {
 		return err
 	}
@@ -3207,7 +3112,7 @@ func (s *PebbleStore) DecommissionNode(ctx context.Context, nodeID NodeID) error
 	}
 	key := prefixNode + fmt.Sprintf("%d", nodeID)
 	var info NodeInfo
-	exists, err := s.getJSON(key, &info)
+	exists, err := s.getValue(key, &info)
 	if err != nil {
 		return err
 	}
@@ -3243,7 +3148,7 @@ func (s *PebbleStore) RestoreNode(ctx context.Context, nodeID NodeID) error {
 	}
 	key := prefixNode + fmt.Sprintf("%d", nodeID)
 	var info NodeInfo
-	exists, err := s.getJSON(key, &info)
+	exists, err := s.getValue(key, &info)
 	if err != nil {
 		return err
 	}
@@ -3272,7 +3177,7 @@ func (s *PebbleStore) EnterMaintenance(ctx context.Context, nodeID NodeID) error
 	}
 	key := prefixNode + fmt.Sprintf("%d", nodeID)
 	var info NodeInfo
-	exists, err := s.getJSON(key, &info)
+	exists, err := s.getValue(key, &info)
 	if err != nil {
 		return err
 	}
@@ -3298,7 +3203,7 @@ func (s *PebbleStore) ExitMaintenance(ctx context.Context, nodeID NodeID) error 
 	}
 	key := prefixNode + fmt.Sprintf("%d", nodeID)
 	var info NodeInfo
-	exists, err := s.getJSON(key, &info)
+	exists, err := s.getValue(key, &info)
 	if err != nil {
 		return err
 	}
@@ -3367,7 +3272,7 @@ func (s *PebbleStore) GetNode(ctx context.Context, nodeID NodeID) (*NodeInfo, er
 		return nil, ErrServiceClosed
 	}
 	var info NodeInfo
-	exists, err := s.getJSON(prefixNode+fmt.Sprintf("%d", nodeID), &info)
+	exists, err := s.getValue(prefixNode+fmt.Sprintf("%d", nodeID), &info)
 	if err != nil {
 		return nil, err
 	}
@@ -4255,7 +4160,7 @@ func (s *PebbleStore) bucketStatsKey(rootInode InodeID) string {
 // if the key does not exist (e.g., pre-migration).
 func (s *PebbleStore) readBucketStats(rootInode InodeID) BucketUsage {
 	var stats BucketUsage
-	s.getJSON(s.bucketStatsKey(rootInode), &stats)
+	s.getValue(s.bucketStatsKey(rootInode), &stats)
 	return stats
 }
 
@@ -4315,7 +4220,7 @@ func (s *PebbleStore) addBucketStatsOp(rootInode InodeID, deltaBytes int64, delt
 // Used when creating new inodes to inherit the containing bucket.
 func (s *PebbleStore) getBucketRoot(parent InodeID) InodeID {
 	var parentMeta InodeMeta
-	ok, _ := s.getJSON(fmt.Sprintf("%s%d", prefixInode, parent), &parentMeta)
+	ok, _ := s.getValue(fmt.Sprintf("%s%d", prefixInode, parent), &parentMeta)
 	if !ok {
 		return 0
 	}
@@ -4538,7 +4443,7 @@ func (s *PebbleStore) GetBucketPolicy(_ context.Context, bucket string) (*Bucket
 		return nil, ErrServiceClosed
 	}
 	var policy BucketPolicy
-	exists, err := s.getJSON(prefixACL+bucket, &policy)
+	exists, err := s.getValue(prefixACL+bucket, &policy)
 	if err != nil {
 		return nil, err
 	}

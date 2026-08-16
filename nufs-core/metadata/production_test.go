@@ -169,7 +169,7 @@ func TestLeaseManager_PreservesOperatorStates(t *testing.T) {
 				// disaster drill path, so write it directly like the lease test.
 				var cur NodeInfo
 				key := prefixNode + fmt.Sprintf("%d", id)
-				if _, err := store.getJSON(key, &cur); err != nil {
+				if _, err := store.getValue(key, &cur); err != nil {
 					return err
 				}
 				cur.State = NodeFailed

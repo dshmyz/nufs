@@ -266,8 +266,9 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 		hash                     = sha256.New()
 	)
 
-	// Batch allocation: skip if CreateObjectWithChunks already allocated
-	// (new object path), otherwise allocate for overwrite.
+	// Batch allocation: AllocateRanges atomically allocates up to
+	// MaxChunkAllocationBatch chunks for the object; the overwrite path falls
+	// through to per-range allocation below.
 
 	if numChunks, useBatch := batchAllocationChunkCount(contentLength); useBatch {
 		offsets := make([]int64, numChunks)

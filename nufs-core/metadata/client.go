@@ -870,24 +870,6 @@ func (c *HTTPClient) CommitChunk(ctx context.Context, chunkID ChunkID, checksum 
 	return c.readResponse(resp, nil)
 }
 
-// CreateObjectWithChunks falls back to sequential operations over HTTP.
-// The batch optimization only applies to in-process PebbleStore; the HTTP
-// client cannot batch across multiple RPC calls to a remote service.
-func (c *HTTPClient) CreateObjectWithChunks(ctx context.Context, parent InodeID, name string, mode uint32, offsets []int64, policy PlacementPolicy) (*InodeMeta, []*ChunkMeta, error) {
-	inode, err := c.CreateFile(ctx, parent, name, mode)
-	if err != nil {
-		return nil, nil, err
-	}
-	chunks, err := c.AllocateChunksBatch(ctx, inode.ID, offsets, policy)
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, chunk := range chunks {
-		_ = c.CommitChunk(ctx, chunk.ID, 0)
-	}
-	return inode, chunks, nil
-}
-
 func (c *HTTPClient) GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error) {
 	path := fmt.Sprintf("/api/v1/chunks/%d", chunkID)
 	resp, err := c.doRequestWithRetry(ctx, http.MethodGet, path, nil)

@@ -90,7 +90,7 @@ func (s *PebbleStore) GetWriteAttempt(_ context.Context, id string) (*ObjectWrit
 		return nil, ErrServiceClosed
 	}
 	var attempt ObjectWriteAttempt
-	exists, err := s.getJSON(writeAttemptKey(id), &attempt)
+	exists, err := s.getValue(writeAttemptKey(id), &attempt)
 	if err != nil {
 		return nil, err
 	}

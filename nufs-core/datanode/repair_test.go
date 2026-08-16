@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"fmt"
 	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
@@ -137,10 +136,6 @@ func (m *mockMetadataService) ReadDir(_ context.Context, _ metadata.InodeID, _ i
 func (m *mockMetadataService) ReadDirFrom(_ context.Context, _ metadata.InodeID, _ string, _ int) ([]metadata.DirEntry, error) {
 	return nil, nil
 }
-func (m *mockMetadataService) CreateObjectWithChunks(_ context.Context, _ metadata.InodeID, _ string, _ uint32, _ []int64, _ metadata.PlacementPolicy) (*metadata.InodeMeta, []*metadata.ChunkMeta, error) {
-	return nil, nil, fmt.Errorf("not implemented in mock")
-}
-
 func (m *mockMetadataService) CreateFile(_ context.Context, _ metadata.InodeID, _ string, _ uint32) (*metadata.InodeMeta, error) {
 	return nil, nil
 }

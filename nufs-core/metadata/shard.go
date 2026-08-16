@@ -255,15 +255,6 @@ func (ss *ShardedStore) ShardForKey(key string) ShardID {
 	return ss.ring.Route(key)
 }
 
-// CreateObjectWithChunks delegates to the shard that owns the parent's namespace.
-func (ss *ShardedStore) CreateObjectWithChunks(ctx context.Context, parent InodeID, name string, mode uint32, offsets []int64, policy PlacementPolicy) (*InodeMeta, []*ChunkMeta, error) {
-	store, err := ss.GetShard(fmt.Sprintf("%d/%s", parent, name))
-	if err != nil {
-		return nil, nil, err
-	}
-	return store.CreateObjectWithChunks(ctx, parent, name, mode, offsets, policy)
-}
-
 // AllShards returns all registered shard stores.
 func (ss *ShardedStore) AllShards() map[ShardID]*PebbleStore {
 	ss.mu.RLock()

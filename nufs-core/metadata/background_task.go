@@ -85,7 +85,7 @@ func (s *PebbleStore) GetBackgroundTask(_ context.Context, id string) (*Backgrou
 		return nil, ErrServiceClosed
 	}
 	var task BackgroundTask
-	exists, err := s.getJSON(backgroundTaskKey(id), &task)
+	exists, err := s.getValue(backgroundTaskKey(id), &task)
 	if err != nil {
 		return nil, err
 	}

@@ -368,19 +368,35 @@
   > 读嗅探保留（旧 raft 日志 / 旧库 / 旧备份 catalog 需 JSON 兼容），不做行级迁移工具。
   > 新增 `codec_test.go` 回归：msgpack 往返 + legacy JSON 行嗅探读兼容 + msgpack 首字节
   > 0x8n 与 `{`/`[` 无碰撞；legacy JSON 读兼容另由 `backup_verify_test.go` JSON fixture
-  > 测试独立证明。验证：verify-docker -l fast PASS；`getJSON` 别名 33 处存活调用点保留
-  > （重命名归下一刀归零）。
+  > 测试独立证明。验证：verify-docker -l fast PASS；`getJSON` 别名 30 处存活调用点随
+  > 下一刀（CreateObjectWithChunks 删除）一并翻 `getValue` 并删除别名定义。
 - [x] V1 引擎/EC 的 legacy 测试迁移或删除（~~`datanode/chunkstore_test.go` 等~~）
   > 阶段 2/3 已全删（`git log --diff-filter=D` 证实 20 个文件），其余现存测试逐文件核对
   > 均引用存活符号；本条剩 `-race` 全量绿验证，与 JSON/msgpack 全量验证一并做。
-- [ ] 全仓 grep 清理 `storage-version`、`ECStripeID==""`、`ChunkMap` 写路径引用
+  > ✅（2026-08-17）：Docker 容器（Linux）全模块 `-race -count=1 -p 1` 分包串行全绿
+  > （含 metadata / cmd/metad / gateway/fuse / gateway/s3 / datanode 全家 /
+  > tests/metadata_dr；tests/smoke 7 个测试文件均 gated 于 `NUFS_RUN_SMOKE=1`，
+  > `-race` 覆盖到编译面）。
+- [x] 全仓 grep 清理 `storage-version`、`ECStripeID==""`、`ChunkMap` 写路径引用
   > §1.5 探子审计：Go 侧 `storage-version` 已净（flag 随阶段 2 删）；`ECStripeID==""`
   > 生产分支阶段 3 已退役（现仅 `!= ""` 判别符 + 测试断言 + 注释）；本刀清掉 6 个
   > deploy/soak 文件的 `--storage-version=v2.1` 残留（运行即 flag 解析退出）。
-  > 剩余：`CreateObjectWithChunks`（V1 不可达路径）删除 + `ChunkMap` 写路径归零。
+  > ✅（2026-08-17 收官）：`CreateObjectWithChunks` 五处定义全删（`service.go` 接口声明、
+  > `pebble_store.go` 80 行实现、`shard.go` ShardedStore 委托、`client.go` HTTPClient
+  > fallback、两个测试 mock）+ `committer_put.go:269` stale 注释指向真实
+  > `AllocateRanges` 批量路径--0 生产调用方（无 metad HTTP 路由、无 cmd/gateway/tests
+  > 引用），删除即纯死面收口。`ChunkMap` 写路径 grep 归零：仅剩 2 个裁决保留的持久
+  > 生产者（`pebble_store.go` AllocateChunksBatch transient append、
+  > `inode_v2_serving.go` CommitChunkRefsModelAware V1 防御 fallback）+ 3 处内存
+  > clone（inode 缓存深拷贝 x2、S3 old-inode snapshot）非持久写。`getJSON` 别名收官：
+  > 30 处 `*PebbleStore` 接收者调用点翻 `getValue` + 删别名定义（doctor 的
+  > `opsClient.getJSON` 是独立 HTTP helper，不碰）。
 
 ### 退出条件
 - 全仓无 V1 引用；`-race` 全量绿。
+  > ✅（2026-08-17）：阶段 4 三复选框全闭--V1 引用面归零（storage-version / V1 EC
+  > fallback / ChunkMap 独立写路径 / CreateObjectWithChunks / JSON 行写），`-race`
+  > 全量绿（Docker 分包串行），verify-docker -l fast PASS。V1 退役路线图收工。
 
 ---
 

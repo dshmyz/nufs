@@ -93,7 +93,7 @@ func TestChaos_NetworkPartition_QuorumPreserved(t *testing.T) {
 	for _, id := range []NodeID{4, 5} {
 		key := fmt.Sprintf("%s%d", prefixNode, id)
 		var info NodeInfo
-		exists, _ := store.getJSON(key, &info)
+		exists, _ := store.getValue(key, &info)
 		if exists {
 			info.State = NodeFailed
 			store.putMsgpack(key, &info)

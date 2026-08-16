@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"fmt"
 	"github.com/dshmyz/nufs/nufs-core/chunkstore"
 	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
@@ -660,10 +659,6 @@ func (m *mockMetaService) ExitMaintenance(_ context.Context, _ metadata.NodeID) 
 
 func (m *mockMetaService) RollingUpgradePlan(_ context.Context) ([]metadata.NodeID, error) {
 	return nil, nil
-}
-
-func (m *mockMetaService) CreateObjectWithChunks(_ context.Context, _ metadata.InodeID, _ string, _ uint32, _ []int64, _ metadata.PlacementPolicy) (*metadata.InodeMeta, []*metadata.ChunkMeta, error) {
-	return nil, nil, fmt.Errorf("not implemented in mock")
 }
 
 func (m *mockMetaService) ComputeAllBucketUsage(_ context.Context) ([]metadata.BucketUsage, error) {

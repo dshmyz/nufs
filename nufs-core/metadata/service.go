@@ -216,14 +216,6 @@ type MetadataService interface {
 
 	// Lifecycle
 	Close() error
-
-	// OptimizedWrite combines CreateFile + AllocateChunksBatch +
-	// CommitChunk into a single atomic metadata operation, reducing
-	// lock contention from 4 acquisitions to 1. Used by the S3 gateway
-	// PutObject path for improved write latency.
-	// Returns the created inode and allocated chunks.
-	CreateObjectWithChunks(ctx context.Context, parent InodeID, name string,
-		mode uint32, offsets []int64, policy PlacementPolicy) (*InodeMeta, []*ChunkMeta, error)
 }
 
 // Compile-time interface check
