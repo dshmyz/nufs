@@ -137,7 +137,7 @@
 
 ### 1.4 extent 级机制补齐（阶段 0 的 ❌/⚠️ 项，可与接线并行）
 - [x] Scrubber extent 版（按 ExtentMetaV2 校验 + Lifecycle 计数）
-- [ ] 修复机制 extent 版（TriggerRepair 的 extent 语义 + 队列）
+- [x] 修复机制 extent 版（TriggerRepair 的 extent 语义 + 队列）
 - [x] 心跳降级检测 extent 版（把 `ExtentLifecycle` 接进上报/降级路径）
 - [ ] bucket 配额按 extent 聚合
 - [ ] 备份/恢复按 extent 清单
@@ -230,6 +230,28 @@
 > 清理路径，删文件后行成孤儿是常态），真清理归未来 extent-GC 刀；③ 恢复写经
 > `applyViaRaft` 自动转发 leader，follower 安全（与 GC 同款）；④ V1 chunk（无 /extent-meta
 > 行）不碰，两 scrubber 并存互补。
+
+> 2026-08-16 完成（第五刀）。**修复机制 extent 版**：第四刀把 Unhealthy extent 停在"只计数
+> 不触发"（deferred），本刀把**触发 + 队列的 extent 语义**补齐。生产改动三处：
+> `metadata/pebble_store.go` 新增 `TriggerExtentRepair(ctx, extentID)`——先 `GetExtentMeta`
+> 校验 extent 行（`ErrExtentNotFound` 快速失败，不给已被 GC 的 chunk 排队），再写
+> `/repair/{id}` 队列（extent ID == chunk ID 不变式，key 复用），`Reason: "extent_unhealthy"`
+> + `Priority: 1` 与心跳/rebalance 触发（`Reason: "triggered"`）可区分；`metadata/extent_scrub.go`
+> 的 `Scan` 把 Unhealthy 分支（原 `result.Unhealthy++; return nil`）改为触发——`TriggerExtentRepair`
+> 成功 `RepairTriggered++`、失败仅 `slog.Error` 不中止扫描，`Start` slog 加 `repair_triggered`；
+> `cmd/metad/ops_repair.go` 的 `handleTriggerRepair` 同时接受 `chunk_id` 与 `extent_id`
+> （extent 路径 `ErrExtentNotFound`→404，两者皆 0→400 "chunk_id or extent_id required"），
+> `handleRepairQueue` 输出改为逐任务注解——`repairQueueEntry{RepairTask; IsExtent;
+> ExtentLifecycle}`，经 `extentLifecycleName` switch 映射
+> ready/ready_degraded/migrating/deleting/deleted/ec_converting/unknown，响应对 Go 消费者
+> 向后兼容（未知字段忽略，`HTTPClient.GetRepairQueue` 照旧 decode `[]RepairTask`）。
+> **触发缺口（本刀动机）**：心跳链 `markReplicaFailedAndRepair` 只在副本*迁移*到 Failed 时
+> `TriggerRepair`——一个 chunk 未经历该迁移就落到全副本 Failed（如节点整体离线）会停在
+> Unhealthy 永不入队。Scrubber 兜底入队，datanode RepairWorker 找到健康源即重复制，下一轮
+> scrub 把全副本 Ready 的 extent 一起恢复回 Ready——与第四刀闭环。**Deferred**：① EC extent
+> 仍跳过触发（分片健康归 EC healer）；② Dangling（无 backing chunk）不触发（无物可修）；
+> ③ `TriggerExtentRepair` 只加 PebbleStore、不扩 `RepairService` 接口/ShardedStore/HTTPClient
+> ——调用方仅 metad 内 `ExtentScrubber` 与 ops handler，无远程/跨 shard 调用方，避免死代码。
 
 ### 1.5 退出条件
 - 网关写入路径不再产生新 ChunkMap；ChunkMap 只读存量（阶段 4 删）。

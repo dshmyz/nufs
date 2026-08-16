@@ -9,32 +9,43 @@ import (
 	"time"
 )
 
-// extent_scrub.go — roadmap §1.4: Scrubber extent 版. The V1 Scrubber
-// (production.go) verifies chunk metadata; the ExtentScrubber verifies the
-// V2 extent model (ExtentMetaV2.Lifecycle distribution + backing-chunk
-// health) and heals the one transition the heartbeat path deliberately
-// never performs — returning a ReadyDegraded extent (and its fully recovered
-// chunk) to Ready. The chunk upgrade is the scrubber's job per the note next
-// to batchUpdateChunkStatesCtx (pebble_store.go): the heartbeat path only
-// sees per-replica deltas and only degrades; the scrubber has the whole
-// replica set in hand.
+// extent_scrub.go — roadmap §1.4: Scrubber extent 版 + 修复触发. The V1
+// Scrubber (production.go) verifies chunk metadata; the ExtentScrubber
+// verifies the V2 extent model (ExtentMetaV2.Lifecycle distribution +
+// backing-chunk health), heals the one transition the heartbeat path
+// deliberately never performs — returning a ReadyDegraded extent (and its
+// fully recovered chunk) to Ready — and enqueues repairs for Unhealthy
+// extents whose backing chunk has no healthy replica. The chunk upgrade is
+// the scrubber's job per the note next to batchUpdateChunkStatesCtx
+// (pebble_store.go): the heartbeat path only sees per-replica deltas and only
+// degrades; the scrubber has the whole replica set in hand.
 //
 // Recovery is keyed on replica health, not chunk.State: the repair flow
 // (datanode repairByAddingReplica → ReportChunkState(target, ReplicaReady))
 // never flips ChunkDegraded back to ChunkReady, so a repaired chunk sits
 // with all replicas Ready while State stays Degraded. The scrubber detects
 // exactly that state and restores chunk + extent together.
+//
+// Repair triggering mirrors the V1 Scrubber: an extent whose backing chunk
+// has no healthy replica is queued via TriggerExtentRepair so the datanode
+// RepairWorker re-replicates it once a healthy source exists. The heartbeat
+// path only triggers on a replica *transition* to Failed
+// (markReplicaFailedAndRepair), so an extent that lands with every replica
+// Failed without that transition would otherwise sit Unhealthy with no repair
+// ever queued. Re-triggering each pass is idempotent (the repair queue is
+// keyed by chunk ID).
 
 // ExtentScrubResult holds the result of one extent scrub pass.
 type ExtentScrubResult struct {
-	ExtentsScanned int
-	Ready          int // LifecycleReady
-	ReadyDegraded  int // LifecycleReadyDegraded
-	Other          int // any other Lifecycle value
-	Dangling       int // /extent-meta row whose backing chunk row is gone
-	Unhealthy      int // backing chunk present but no healthy replica
-	Recovered      int // ReadyDegraded extents restored to Ready
-	ScanDuration   time.Duration
+	ExtentsScanned  int
+	Ready           int // LifecycleReady
+	ReadyDegraded   int // LifecycleReadyDegraded
+	Other           int // any other Lifecycle value
+	Dangling        int // /extent-meta row whose backing chunk row is gone
+	Unhealthy       int // backing chunk present but no healthy replica
+	Recovered       int // ReadyDegraded extents restored to Ready
+	RepairTriggered int // Unhealthy extents enqueued for repair
+	ScanDuration    time.Duration
 }
 
 // ExtentScrubber periodically scans V2 extent metadata for lifecycle
@@ -120,8 +131,21 @@ func (s *ExtentScrubber) Scan(ctx context.Context) (*ExtentScrubResult, error) {
 			return nil
 		}
 
+		// Safety net (roadmap §1.4): the heartbeat path only queues a repair
+		// when a replica *transitions* to Failed (markReplicaFailedAndRepair),
+		// so a chunk that ends up with every replica Failed without that
+		// transition sits Unhealthy with no repair ever queued. Enqueue the
+		// backing chunk's repair; the datanode RepairWorker re-replicates once
+		// a healthy source exists, and the next scrub pass heals the extent
+		// (all-Ready → Ready). Re-triggering each pass is idempotent (queue
+		// keyed by chunk ID), mirroring the V1 Scrubber.
 		if !chunkHasHealthyReplica(chunk) {
 			result.Unhealthy++
+			if err := s.store.TriggerExtentRepair(ctx, ext.ID); err != nil {
+				slog.Error("extent scrub: trigger repair failed", "extent", ext.ID, "error", err)
+			} else {
+				result.RepairTriggered++
+			}
 			return nil
 		}
 
@@ -188,6 +212,7 @@ func (s *ExtentScrubber) Start(interval time.Duration) {
 						"dangling", result.Dangling,
 						"unhealthy", result.Unhealthy,
 						"recovered", result.Recovered,
+						"repair_triggered", result.RepairTriggered,
 						"duration", result.ScanDuration)
 				}
 			case <-s.stopCh:

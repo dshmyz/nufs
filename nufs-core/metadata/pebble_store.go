@@ -3681,6 +3681,31 @@ func (s *PebbleStore) TriggerRepair(ctx context.Context, chunkID ChunkID) error 
 	return s.putJSON(key, &task)
 }
 
+// TriggerExtentRepair enqueues a repair task for the chunk backing a V2
+// extent (extent ID == chunk ID invariant). It is the extent-aware repair
+// trigger (roadmap §1.4): the data-plane repair path (datanode RepairWorker)
+// is shared with V1 chunks — only the trigger knows about the extent model.
+// The extent row is validated first so a stale/nonexistent extent fails fast
+// (ErrExtentNotFound) instead of queueing a repair for a chunk that may have
+// been GC'd. The reason string is surfaced verbatim by /api/v1/repair/queue so
+// extent-triggered repairs are distinguishable from heartbeat/rebalance ones.
+func (s *PebbleStore) TriggerExtentRepair(ctx context.Context, extentID ExtentIDV2) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	if _, err := s.GetExtentMeta(ctx, extentID); err != nil {
+		return err // ErrExtentNotFound when the row is gone
+	}
+	key := fmt.Sprintf("%s%d", prefixRepair, uint64(extentID))
+	task := RepairTask{
+		ChunkID:   ChunkID(extentID),
+		Reason:    "extent_unhealthy",
+		Priority:  1,
+		CreatedAt: time.Now(),
+	}
+	return s.putJSON(key, &task)
+}
+
 func (s *PebbleStore) RemoveRepairTask(ctx context.Context, chunkID ChunkID) error {
 	if s.closed.Load() {
 		return ErrServiceClosed

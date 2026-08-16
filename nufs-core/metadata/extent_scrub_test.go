@@ -115,9 +115,9 @@ func TestExtentScrubber_CountsLifecycle(t *testing.T) {
 		t.Fatalf("lifecycle counts = ready %d / degraded %d / other %d, want 1/1/1",
 			result.Ready, result.ReadyDegraded, result.Other)
 	}
-	if result.Dangling != 0 || result.Unhealthy != 0 || result.Recovered != 0 {
-		t.Fatalf("health counts = dangling %d / unhealthy %d / recovered %d, want 0/0/0",
-			result.Dangling, result.Unhealthy, result.Recovered)
+	if result.Dangling != 0 || result.Unhealthy != 0 || result.Recovered != 0 || result.RepairTriggered != 0 {
+		t.Fatalf("health counts = dangling %d / unhealthy %d / recovered %d / repair_triggered %d, want 0/0/0/0",
+			result.Dangling, result.Unhealthy, result.Recovered, result.RepairTriggered)
 	}
 }
 
@@ -238,9 +238,9 @@ func TestExtentScrubber_SkipsECRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("extent scrub: %v", err)
 	}
-	if result.ReadyDegraded != 1 || result.Unhealthy != 0 || result.Recovered != 0 {
-		t.Fatalf("EC extent = degraded %d / unhealthy %d / recovered %d, want 1/0/0",
-			result.ReadyDegraded, result.Unhealthy, result.Recovered)
+	if result.ReadyDegraded != 1 || result.Unhealthy != 0 || result.Recovered != 0 || result.RepairTriggered != 0 {
+		t.Fatalf("EC extent = degraded %d / unhealthy %d / recovered %d / repair_triggered %d, want 1/0/0/0",
+			result.ReadyDegraded, result.Unhealthy, result.Recovered, result.RepairTriggered)
 	}
 	ext, err := store.GetExtentMeta(ctx, 98004)
 	if err != nil {
@@ -290,8 +290,91 @@ func TestExtentScrubber_FlagsDanglingAndUnhealthy(t *testing.T) {
 	if result.Unhealthy != 1 {
 		t.Fatalf("unhealthy = %d, want 1", result.Unhealthy)
 	}
+	if result.RepairTriggered != 1 {
+		t.Fatalf("repair_triggered = %d, want 1 (unhealthy triggers, dangling does not)", result.RepairTriggered)
+	}
 	if result.Recovered != 0 {
 		t.Fatalf("recovered = %d, want 0", result.Recovered)
+	}
+}
+
+// TestExtentScrubber_TriggersRepairForUnhealthy verifies the safety-net
+// repair trigger: an extent whose backing chunk has no healthy replica is
+// enqueued via TriggerExtentRepair (Reason "extent_unhealthy"), a healthy
+// extent is never queued, and re-triggering across passes is idempotent
+// (overwrites the same queue key, never accumulates).
+func TestExtentScrubber_TriggersRepairForUnhealthy(t *testing.T) {
+	store := newTestPebbleStore(t)
+	ctx := context.Background()
+
+	// Healthy extent: must never be queued.
+	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, 98001), &ChunkMeta{
+		ID: ChunkID(98001), Size: 4096, State: ChunkReady,
+		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaReady}},
+		Checksum: 0xABCDEF,
+	}); err != nil {
+		t.Fatalf("seed healthy chunk: %v", err)
+	}
+	if err := store.putExtentMeta(&ExtentMetaV2{
+		ID: ExtentIDV2(98001), Generation: 1, LogicalLen: 4096, Lifecycle: LifecycleReady,
+	}); err != nil {
+		t.Fatalf("seed healthy extent: %v", err)
+	}
+	// Unhealthy extent: every replica Failed, no healthy source.
+	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, 99002), &ChunkMeta{
+		ID: ChunkID(99002), Size: 4096, State: ChunkDegraded,
+		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaFailed}, {NodeID: 2, State: ReplicaFailed}},
+	}); err != nil {
+		t.Fatalf("seed unhealthy chunk: %v", err)
+	}
+	if err := store.putExtentMeta(&ExtentMetaV2{
+		ID: ExtentIDV2(99002), Generation: 1, LogicalLen: 4096, Lifecycle: LifecycleReadyDegraded,
+	}); err != nil {
+		t.Fatalf("seed unhealthy extent: %v", err)
+	}
+
+	scrubber := NewExtentScrubber(store)
+	result, err := scrubber.Scan(ctx)
+	if err != nil {
+		t.Fatalf("extent scrub: %v", err)
+	}
+	if result.Unhealthy != 1 {
+		t.Fatalf("unhealthy = %d, want 1", result.Unhealthy)
+	}
+	if result.RepairTriggered != 1 {
+		t.Fatalf("repair_triggered = %d, want 1", result.RepairTriggered)
+	}
+
+	tasks, err := store.GetRepairQueue(ctx)
+	if err != nil {
+		t.Fatalf("GetRepairQueue: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("repair queue size = %d, want 1 (healthy extent not queued)", len(tasks))
+	}
+	if tasks[0].ChunkID != ChunkID(99002) {
+		t.Fatalf("queued chunk = %d, want 99002", tasks[0].ChunkID)
+	}
+	if tasks[0].Reason != "extent_unhealthy" {
+		t.Fatalf("reason = %q, want %q", tasks[0].Reason, "extent_unhealthy")
+	}
+	if tasks[0].Priority != 1 {
+		t.Fatalf("priority = %d, want 1", tasks[0].Priority)
+	}
+
+	// A second pass re-triggers the same queue key — idempotent, not additive.
+	idem, err := scrubber.Scan(ctx)
+	if err != nil {
+		t.Fatalf("extent scrub repeat: %v", err)
+	}
+	if idem.RepairTriggered != 1 {
+		t.Fatalf("repair_triggered on repeat scan = %d, want 1", idem.RepairTriggered)
+	}
+	if tasks, err = store.GetRepairQueue(ctx); err != nil {
+		t.Fatalf("GetRepairQueue after repeat: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("repair queue size after repeat = %d, want 1", len(tasks))
 	}
 }
 
