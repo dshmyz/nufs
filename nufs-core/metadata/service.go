@@ -245,6 +245,7 @@ type ServiceBundle struct {
 	Leases       *LeaseManager
 	GC           *ChunkGC
 	Scrub        *Scrubber
+	ExtentScrub  *ExtentScrubber
 	Raft         *RaftNode
 	Lifecycle    *LifecycleEngine
 	Audit        *AuditLogger
@@ -272,6 +273,9 @@ func (sb *ServiceBundle) Close() error {
 	}
 	if sb.Scrub != nil {
 		sb.Scrub.Stop()
+	}
+	if sb.ExtentScrub != nil {
+		sb.ExtentScrub.Stop()
 	}
 	if sb.GC != nil {
 		sb.GC.Stop()
@@ -386,6 +390,8 @@ func NewPebbleServiceBundle(store *PebbleStore, opts ...ServiceOption) (*Service
 	if sopts.ScrubInterval > 0 {
 		bundle.Scrub = NewScrubber(store, bundle.Events)
 		bundle.Scrub.Start(sopts.ScrubInterval)
+		bundle.ExtentScrub = NewExtentScrubber(store)
+		bundle.ExtentScrub.Start(sopts.ScrubInterval)
 	}
 
 	// Lifecycle engine

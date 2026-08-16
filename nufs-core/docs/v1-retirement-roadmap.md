@@ -136,7 +136,7 @@
   在 `:618` `MarkExtentColdEC`，1.3d 完成见上注）
 
 ### 1.4 extent 级机制补齐（阶段 0 的 ❌/⚠️ 项，可与接线并行）
-- [ ] Scrubber extent 版（按 ExtentMetaV2 校验 + Lifecycle 计数）
+- [x] Scrubber extent 版（按 ExtentMetaV2 校验 + Lifecycle 计数）
 - [ ] 修复机制 extent 版（TriggerRepair 的 extent 语义 + 队列）
 - [x] 心跳降级检测 extent 版（把 `ExtentLifecycle` 接进上报/降级路径）
 - [ ] bucket 配额按 extent 聚合
@@ -203,6 +203,33 @@
 > `AllocateChunk`（inode 路由）与 `GetChunk`/`ReportChunkState`/`CommitChunk`（chunk-key
 > 路由）约半数分叉 → 分叉 chunk 对读/心跳不可见，心跳降级链本就失效。既有潜在问题，
 > 测试只覆盖单 store 路径；建议独立排查 `AllocateChunk` 与 chunk-key 路由对齐。
+
+> 2026-08-16 完成（第四刀）。**Scrubber extent 版**：激活的 `ExtentLifecycle` 从"只读
+> 装饰"闭环成真机制——镜像 V1 `Scrubber`（production.go，chunk 级校验）在 extent 层做
+> **校验 + Lifecycle 计数 + 恢复**。生产改动四处：`pebble_store.go` 新增 `ScanExtents`
+>（镜像 `ScanAllChunks`，扫 `/extent-meta/`）与 `ScrubExtents`（count-only，供 ops 端点）；
+> 新建 `extent_scrub.go` 的 `ExtentScrubber`（`Scan` 逐 extent：Lifecycle 分布计数 →
+> `GetChunk(ext.ID)` 校验 backing chunk：`ErrChunkNotFound`→`Dangling`（孤儿行，良性非
+> 数据丢失，chunk 行才是权威）、`ECGroup` 非 nil→跳过副本判断（EC 分片健康归 EC healer）、
+> 无健康副本→`Unhealthy`；**恢复**：`LifecycleReadyDegraded` + 全副本 `ReplicaReady` →
+> `chunk.State=ChunkReady`（`UpdateChunk`）+ `ext.Lifecycle=LifecycleReady`
+>（`putExtentMeta`），一起恢复防两模型发散）；`service.go` 的 ServiceBundle 加
+> `ExtentScrub` 字段，与 V1 `Scrub` 同 `ScrubInterval` 门控同启同停；`cmd/metad/ops_scrub.go`
+> 的 `handleScrub` 响应加 `extents_scanned/ready/degraded/dangling/unhealthy`。
+> **恢复动机**：`batchUpdateChunkStatesCtx`（第三刀注释 `:2781`）只降级从不升级，真实
+> 修复路径（`repairByAddingReplica`→`ReportChunkState(target, ReplicaReady)`）也不翻
+> chunk.State → 已修复 chunk 全副本 Ready 但 State 仍 Degraded、extent 仍 ReadyDegraded，
+> 正是本刀恢复键（**副本健康**，非 chunk.State）。测试 `metadata/extent_scrub_test.go`：
+> 复用第三刀 `newExtentDegradeFixture` + 模拟修复完成（全副本置 Ready、State 保持
+> Degraded）→ Scan 断言 Recovered==1 + chunk Ready + extent Ready + 重扫幂等；计数 /
+> 副本仍 Failed 不恢复 / EC 跳过恢复 / Dangling+Unhealthy 标记 / StartStop 周期真跑
+> Scan（slog recovered=1→0）; bundle 门控测试（10ms→running，0→nil）。回归钩已验证：
+> 临时禁掉恢复块 → `recovered = 0, want 1` 直接红。cmd/metad `ops_scrub_test.go` 断言
+> 端点新字段。**Deferred**：① 修复触发不做（Unhealthy 只计数，`/repair/{id}` 触发归
+> "修复机制 extent 版"刀）；② 孤儿 /extent-meta 行 = Dangling 良性（`Unlink` 无 extent-meta
+> 清理路径，删文件后行成孤儿是常态），真清理归未来 extent-GC 刀；③ 恢复写经
+> `applyViaRaft` 自动转发 leader，follower 安全（与 GC 同款）；④ V1 chunk（无 /extent-meta
+> 行）不碰，两 scrubber 并存互补。
 
 ### 1.5 退出条件
 - 网关写入路径不再产生新 ChunkMap；ChunkMap 只读存量（阶段 4 删）。

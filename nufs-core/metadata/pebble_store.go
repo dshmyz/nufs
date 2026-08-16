@@ -3600,6 +3600,23 @@ func (s *PebbleStore) ScanAllChunks(ctx context.Context, fn func(*ChunkMeta) err
 	})
 }
 
+// ScanExtents iterates over all V2 extent metadata (used by the extent
+// scrubber, roadmap §1.4). Corrupted /extent-meta rows are logged and
+// skipped, mirroring ScanAllChunks.
+func (s *PebbleStore) ScanExtents(ctx context.Context, fn func(*ExtentMetaV2) error) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	return s.scanPrefix(prefixExtentMeta, func(key, val []byte) error {
+		var ext ExtentMetaV2
+		if err := unmarshalValue(val, &ext); err != nil {
+			slog.Warn("pebble store: corrupted extent entry", "key", string(key), "error", err)
+			return nil
+		}
+		return fn(&ext)
+	})
+}
+
 // CountNodeReplicas scans every chunk and counts how many replicas (in any
 // sync state) the given node currently hosts. The decommission drain-completion
 // check uses this: a draining node is only "fully drained" once it holds zero
@@ -4403,6 +4420,26 @@ func (s *PebbleStore) ScrubAllChunks(fn func(chunkID ChunkID, replicaCount, heal
 			}
 		}
 		fn(chunk.ID, len(chunk.Replicas), healthy)
+		return nil
+	})
+}
+
+// ScrubExtents iterates all V2 extent metadata and reports each row's
+// Lifecycle and backing-chunk health without mutating anything (recovery is
+// the ExtentScrubber worker's job). Mirrors ScrubAllChunks for the
+// /api/v1/scrub ops endpoint. orphan=true means the backing chunk row is
+// gone (a dangling /extent-meta row); healthy is meaningless when orphan.
+func (s *PebbleStore) ScrubExtents(fn func(extentID ExtentIDV2, lifecycle ExtentLifecycle, healthy, orphan bool)) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	return s.scanPrefix(prefixExtentMeta, func(key, val []byte) error {
+		var ext ExtentMetaV2
+		if err := unmarshalValue(val, &ext); err != nil {
+			return nil
+		}
+		exists, healthy := s.extentBackingChunkHealth(&ext)
+		fn(ext.ID, ext.Lifecycle, healthy, !exists)
 		return nil
 	})
 }
