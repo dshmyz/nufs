@@ -205,36 +205,54 @@ func ResolveFileChunks(ctx context.Context, es ExtentInodeService, inode *InodeM
 // extentForRef builds the V2 extent metadata for a chunk reference. The
 // extent's data lives in the chunk whose numeric ID equals the extent ID
 // (see ResolveFileChunks), so the extent mirrors the chunk's ID and
-// length. Placement (PGID), storage class and EC stripe are left at
-// defaults until roadmap §1.3d/§1.4 wire ECConfig buckets into the extent
-// surface.
-func extentForRef(ref ChunkRef) *ExtentMetaV2 {
+// length. class/ecStripe come from ecClassForRef: ECConfig-bucket writes
+// mark the extent ColdEC with the chunk's stripe, everything else stays
+// hot-replica (roadmap §1.3d).
+func extentForRef(ref ChunkRef, class StorageClass, ecStripe string) *ExtentMetaV2 {
 	return &ExtentMetaV2{
 		ID:           ExtentIDV2(ref.ID),
 		Generation:   1,
 		LogicalLen:   int64(ref.Length),
 		Lifecycle:    LifecycleReady,
-		StorageClass: StorageClassHotReplica,
+		StorageClass: class,
+		ECStripeID:   ecStripe,
 	}
 }
 
-// extentsFor converts a chunk-ref set to the ExtentWrite set fed to
-// ReplaceExtents (each extent at the ref's file offset).
-func extentsFor(refs []ChunkRef) []ExtentWrite {
-	writes := make([]ExtentWrite, 0, len(refs))
-	for _, ref := range refs {
-		writes = append(writes, ExtentWrite{Extent: extentForRef(ref), Offset: ref.Offset})
+// ecClassForRef resolves whether the chunk backing a committed ref is an EC
+// chunk, and the extent's storage class + stripe reference if so (roadmap
+// §1.3d). The chunk is the truth: direct-EC writes land via
+// writeECShardDirect, which lifts the chunk to durable EC
+// (RecordDirectEC sets ECStripeID = ECGroup.GroupID) before the ref is ever
+// committed, so by commit time an ECConfig-bucket chunk carries both fields.
+//
+// Degrades to hot-replica defaults when the chunk cannot be read or is not
+// EC — the extent's data is reachable through the chunk path regardless of
+// class, so a lookup failure (e.g. a fake ref in a unit test, or a chunk
+// raced by a tombstone) must never fail the write.
+func ecClassForRef(ctx context.Context, meta commitModelAwareService, ref ChunkRef) (StorageClass, string) {
+	ch, err := meta.GetChunk(ctx, ref.ID)
+	if err != nil || ch == nil || ch.ECGroup == nil {
+		return StorageClassHotReplica, ""
 	}
-	return writes
+	stripe := ch.ECStripeID
+	if stripe == "" {
+		// Fall back to the group ID for the pre/post-RecordDirect window —
+		// both spell the same "ec-<chunk-id>" value.
+		stripe = ch.ECGroup.GroupID
+	}
+	return StorageClassColdEC, stripe
 }
 
 // commitModelAwareService is the narrow surface CommitChunkRefsModelAware
-// needs: UpdateInode for the V1 fallback. The V2 extent surface is probed
-// by type assertion, so services that only compose sub-interfaces (e.g.
-// the write-attempt recovery worker's writeRecoveryMeta) can use the
-// shared commit decision without implementing the full MetadataService.
+// needs: UpdateInode for the V1 fallback and GetChunk to resolve each ref's
+// EC class at commit time. The V2 extent surface is probed by type
+// assertion, so services that only compose sub-interfaces (e.g. the
+// write-attempt recovery worker's writeRecoveryMeta) can use the shared
+// commit decision without implementing the full MetadataService.
 type commitModelAwareService interface {
 	UpdateInode(ctx context.Context, meta *InodeMeta) error
+	GetChunk(ctx context.Context, chunkID ChunkID) (*ChunkMeta, error)
 }
 
 // CommitChunkRefsModelAware lands newChunkRefs as the file's data set
@@ -269,9 +287,16 @@ func CommitChunkRefsModelAware(ctx context.Context, meta commitModelAwareService
 		}
 		if isV2 || len(newChunkRefs) > 0 {
 			if len(newChunkRefs) == 1 && size <= MaxInlineExtentSize {
-				return es.SetInlineExtent(ctx, inode.ID, extentForRef(newChunkRefs[0]), size)
+				ref := newChunkRefs[0]
+				class, stripe := ecClassForRef(ctx, meta, ref)
+				return es.SetInlineExtent(ctx, inode.ID, extentForRef(ref, class, stripe), size)
 			}
-			return es.ReplaceExtents(ctx, inode.ID, extentsFor(newChunkRefs), size)
+			writes := make([]ExtentWrite, 0, len(newChunkRefs))
+			for _, ref := range newChunkRefs {
+				class, stripe := ecClassForRef(ctx, meta, ref)
+				writes = append(writes, ExtentWrite{Extent: extentForRef(ref, class, stripe), Offset: ref.Offset})
+			}
+			return es.ReplaceExtents(ctx, inode.ID, writes, size)
 		}
 	}
 	inode.Size = size

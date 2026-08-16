@@ -119,11 +119,21 @@
 > 与 `HTTPClient` 贯通，V2 写经 `putWithBucketStats` 累计 bucket 用量。
 > 交叉验证（§1.1 硬要求）在 `gateway/s3/dual_model_cross_test.go`：
 > S3 写 → FUSE ReadView 读回、FUSE flush → S3 GET 读回，inline/pages 双布局。
+> 1.3d（本刀）：写侧 commit 经 `ecClassForRef` 逐 ref 解析 chunk 的 EC 真值并标
+> extent——ECConfig 桶落 inline/pages 的 `ExtentMetaV2` 得 `StorageClass=ColdEC` +
+> `ECStripeID=ec-<chunkID>`（chunk 行在 `writeECShardDirect` 的 `RecordDirectEC`
+> 抬升后必带两者；stripe 回退 `ECGroup.GroupID` 兜住 RecordDirect 前后窗口）。
+> 单元 `metadata/ec_extent_marking_test.go`（EC 桶 inline/pages → ColdEC、热桶回归、
+> 缺 chunk 优雅降级为 HotReplica）+ smoke `TestRepair_EndToEnd_EC` 端到端断言。
+> **Deferred**：① conversion 路径（`publishECConvert`→`SwitchChunkToEC`）不标 extent——
+> publish 端点无 inode 上下文，标 extent 需 datanode 侧传 inode，归 §1.4 转换重做；
+> ② `MarkExtentColdEC` 保持仅 inline（pages 拒 `ErrExtentNotInline`），既有测试覆盖其假设。
 
 - [x] `metadata` 的 `SetInlineExtent` 接入 FUSE Flush（≤16MiB 单块转 inline）
 - [x] 超限整集走 `ReplaceExtents`（`inode_store.go`，整体写 COW pages；roadmap 原文 `PromoteToPages` 语义不匹配覆写，见上注）
 - [x] 网关读路径兼容 ChunkMap + ExtentPages 双模型（`ResolveExtents`，1.3b 已铺读侧，本刀写侧落地后交叉读回验证）
-- [ ] EC 交互重测（`ec_lifecycle.go:528` 已假设 inline 布局）
+- [x] EC 交互重测（`ec_lifecycle.go` 的 inline 假设已测；标注为 `:528` 过期，实际假设
+  在 `:618` `MarkExtentColdEC`，1.3d 完成见上注）
 
 ### 1.4 extent 级机制补齐（阶段 0 的 ❌/⚠️ 项，可与接线并行）
 - [ ] Scrubber extent 版（按 ExtentMetaV2 校验 + Lifecycle 计数）

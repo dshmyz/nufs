@@ -3,6 +3,7 @@ package smoke
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -201,6 +202,38 @@ func TestRepair_EndToEnd_EC(t *testing.T) {
 		t.Fatal("initial GET mismatch")
 	}
 	t.Log("EC data written and verified (K=4, M=2)")
+
+	// Roadmap §1.3d: the extent committing the EC chunk must carry the chunk's
+	// class + stripe so extent-level consumers (quota, scrub, repair, orphan
+	// GC) can tell EC extents from hot-replica ones. The direct-EC write lifts
+	// the chunk to durable EC (ECStripeID = ECGroup.GroupID = "ec-<id>") before
+	// the commit, so the extent must read back ColdEC with that stripe.
+	bucket, err := metaStore.GetBucket(ctx, "ec-repair-test")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	obj, err := metaStore.Lookup(ctx, bucket.RootInode, "data.txt")
+	if err != nil {
+		t.Fatalf("Lookup data.txt: %v", err)
+	}
+	refs, err := metadata.ResolveFileChunks(ctx, metaStore, obj)
+	if err != nil {
+		t.Fatalf("ResolveFileChunks: %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("EC PUT landed %d refs, want 1 (single small object → inline)", len(refs))
+	}
+	em, err := metaStore.GetExtentMeta(ctx, metadata.ExtentIDV2(refs[0].ID))
+	if err != nil {
+		t.Fatalf("GetExtentMeta(%d): %v", refs[0].ID, err)
+	}
+	if em.StorageClass != metadata.StorageClassColdEC {
+		t.Errorf("EC object extent StorageClass = %d, want ColdEC", em.StorageClass)
+	}
+	if want := fmt.Sprintf("ec-%d", refs[0].ID); em.ECStripeID != want {
+		t.Errorf("EC object extent ECStripeID = %q, want %q", em.ECStripeID, want)
+	}
+	t.Logf("EC object extent marked ColdEC, stripe=%q", em.ECStripeID)
 
 	// Kill datanode 0 (losing shard 0)
 	t.Log("killing datanode 0 (shard 0)...")
