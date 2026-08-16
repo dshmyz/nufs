@@ -2,7 +2,6 @@ package metadata
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"sync"
 	"time"
@@ -208,7 +207,7 @@ func (al *AuditLogger) flush() {
 			rec.ID = formatAuditUniqueID(rec.Timestamp, i)
 		}
 		key := []byte(auditKey(rec.Timestamp, rec.ID))
-		val, err := json.Marshal(rec)
+		val, err := marshalValue(rec, codecMsgpack)
 		if err != nil {
 			al.logger.Error("audit marshal failed", "error", err)
 			continue
@@ -254,7 +253,7 @@ func (al *AuditLogger) QueryAudit(ctx context.Context, startTs, endTs int64, lim
 			continue
 		}
 		var rec AuditRecord
-		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+		if err := unmarshalValue(iter.Value(), &rec); err != nil {
 			continue
 		}
 		records = append(records, rec)

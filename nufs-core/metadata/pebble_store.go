@@ -743,7 +743,7 @@ func (s *PebbleStore) initRootInode() error {
 		MTime: now,
 		ATime: now,
 	}
-	return s.putJSON(key, root)
+	return s.putMsgpack(key, root)
 }
 
 func (s *PebbleStore) nextInodeID() InodeID {
@@ -813,28 +813,9 @@ func (s *PebbleStore) putMsgpack(key string, v interface{}) error {
 	return s.applyViaRaft(OpSet, key, data)
 }
 
-// putJSON writes a JSON-encoded value (cold path: admin/debug operations).
-// Hot-path writes should use putMsgpack instead.
-func (s *PebbleStore) putJSON(key string, v interface{}) error {
-	data, err := marshalValue(v, codecJSON)
-	if err != nil {
-		return fmt.Errorf("pebble store: marshal: %w", err)
-	}
-	return s.applyViaRaft(OpSet, key, data)
-}
-
 // putMsgpackBatch writes a msgpack-encoded value to a Pebble batch (hot path).
 func putMsgpackBatch(batch *pebble.Batch, key string, v interface{}) error {
 	data, err := marshalValue(v, codecMsgpack)
-	if err != nil {
-		return fmt.Errorf("pebble store: marshal: %w", err)
-	}
-	return batch.Set([]byte(key), data, nil)
-}
-
-// putJSONBatch writes a JSON-encoded value to a Pebble batch (cold path).
-func putJSONBatch(batch *pebble.Batch, key string, v interface{}) error {
-	data, err := marshalValue(v, codecJSON)
 	if err != nil {
 		return fmt.Errorf("pebble store: marshal: %w", err)
 	}
@@ -3720,7 +3701,7 @@ func (s *PebbleStore) TriggerRepair(ctx context.Context, chunkID ChunkID) error 
 		Reason:    "triggered",
 		CreatedAt: time.Now(),
 	}
-	return s.putJSON(key, &task)
+	return s.putMsgpack(key, &task)
 }
 
 // TriggerExtentRepair enqueues a repair task for the chunk backing a V2
@@ -3745,7 +3726,7 @@ func (s *PebbleStore) TriggerExtentRepair(ctx context.Context, extentID ExtentID
 		Priority:  1,
 		CreatedAt: time.Now(),
 	}
-	return s.putJSON(key, &task)
+	return s.putMsgpack(key, &task)
 }
 
 func (s *PebbleStore) RemoveRepairTask(ctx context.Context, chunkID ChunkID) error {
@@ -4167,7 +4148,7 @@ func (s *PebbleStore) TriggerRebalance(ctx context.Context) error {
 			Priority:  2,
 			CreatedAt: time.Now(),
 		}
-		if err := s.putJSON(key, &task); err != nil {
+		if err := s.putMsgpack(key, &task); err != nil {
 			return err
 		}
 	}
@@ -4268,24 +4249,6 @@ type BucketUsage struct {
 
 func (s *PebbleStore) bucketStatsKey(rootInode InodeID) string {
 	return fmt.Sprintf("%s%d", prefixBucketStats, rootInode)
-}
-
-// bucketNameByRoot looks up the bucket name given a root inode ID.
-// It scans the bucket prefix to find the matching RootInode.
-// Returns empty string if not found.
-func (s *PebbleStore) bucketNameByRoot(rootInode InodeID) string {
-	prefix := []byte(prefixBucket)
-	iter, _ := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix})
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		var info BucketInfo
-		if err := json.Unmarshal(iter.Value(), &info); err == nil {
-			if info.RootInode == rootInode {
-				return info.Name
-			}
-		}
-	}
-	return ""
 }
 
 // readBucketStats reads the current counter for a bucket. Returns zeros

@@ -90,7 +90,7 @@ func TestExtentScrubber_CountsLifecycle(t *testing.T) {
 		{98003, LifecycleECConverting, []ReplicaState{ReplicaReady}},
 	}
 	for _, s := range seed {
-		if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, s.id), &ChunkMeta{
+		if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, s.id), &ChunkMeta{
 			ID: ChunkID(s.id), Size: 4096, State: ChunkReady,
 			Replicas: replicasFromStates(s.replicas),
 			Checksum: 0xABCDEF,
@@ -220,7 +220,7 @@ func TestExtentScrubber_SkipsECRecovery(t *testing.T) {
 	store := newTestPebbleStore(t)
 	ctx := context.Background()
 
-	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, 98004), &ChunkMeta{
+	if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, 98004), &ChunkMeta{
 		ID: ChunkID(98004), Size: 4096, State: ChunkReady,
 		ECGroup:  &ECGroupInfo{GroupID: "ec-98004", DataShards: 6, ParityShards: 3},
 		Replicas: []ReplicaInfo{},
@@ -265,7 +265,7 @@ func TestExtentScrubber_FlagsDanglingAndUnhealthy(t *testing.T) {
 		t.Fatalf("seed dangling extent: %v", err)
 	}
 	// Unhealthy: chunk present but no healthy replica.
-	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, 99002), &ChunkMeta{
+	if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, 99002), &ChunkMeta{
 		ID: ChunkID(99002), Size: 4096, State: ChunkDegraded,
 		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaFailed}},
 	}); err != nil {
@@ -308,7 +308,7 @@ func TestExtentScrubber_TriggersRepairForUnhealthy(t *testing.T) {
 	ctx := context.Background()
 
 	// Healthy extent: must never be queued.
-	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, 98001), &ChunkMeta{
+	if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, 98001), &ChunkMeta{
 		ID: ChunkID(98001), Size: 4096, State: ChunkReady,
 		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaReady}},
 		Checksum: 0xABCDEF,
@@ -321,7 +321,7 @@ func TestExtentScrubber_TriggersRepairForUnhealthy(t *testing.T) {
 		t.Fatalf("seed healthy extent: %v", err)
 	}
 	// Unhealthy extent: every replica Failed, no healthy source.
-	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, 99002), &ChunkMeta{
+	if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, 99002), &ChunkMeta{
 		ID: ChunkID(99002), Size: 4096, State: ChunkDegraded,
 		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaFailed}, {NodeID: 2, State: ReplicaFailed}},
 	}); err != nil {

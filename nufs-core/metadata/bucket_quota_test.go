@@ -498,10 +498,11 @@ func newQuotaAllocationFile(t *testing.T) (context.Context, *PebbleStore, *Inode
 	if err != nil {
 		t.Fatalf("GetBucket: %v", err)
 	}
-	// bucketNameByRoot still scans legacy JSON bucket records in the allocation
-	// path, so exercise the quota estimate against that supported on-disk form.
-	if err := store.putJSON(prefixBucket+"photos", bucket); err != nil {
-		t.Fatalf("write legacy JSON bucket record: %v", err)
+	// The quota allocation path scans /bucket rows by root inode (format-agnostic
+	// via unmarshalValue), so exercise the quota estimate against a full on-disk
+	// bucket row (msgpack since the stage-4 write-surface convergence).
+	if err := store.putMsgpack(prefixBucket+"photos", bucket); err != nil {
+		t.Fatalf("write bucket record: %v", err)
 	}
 	file, err := store.CreateFile(ctx, bucket.RootInode, "new-object", 0644)
 	if err != nil {

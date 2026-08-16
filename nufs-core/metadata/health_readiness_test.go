@@ -29,7 +29,7 @@ func TestComputeClusterReadiness_AllHealthy(t *testing.T) {
 		State:    ChunkReady,
 		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaReady}, {NodeID: 2, State: ReplicaReady}, {NodeID: 3, State: ReplicaReady}},
 	}
-	if err := store.putJSON(prefixChunk+"100", chunk); err != nil {
+	if err := store.putMsgpack(prefixChunk+"100", chunk); err != nil {
 		t.Fatalf("put chunk: %v", err)
 	}
 
@@ -152,7 +152,7 @@ func TestComputeClusterReadiness_UnderReplicated(t *testing.T) {
 			{NodeID: 3, State: ReplicaStale},
 		},
 	}
-	if err := store.putJSON(prefixChunk+"200", chunk); err != nil {
+	if err := store.putMsgpack(prefixChunk+"200", chunk); err != nil {
 		t.Fatalf("put chunk: %v", err)
 	}
 

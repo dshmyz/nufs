@@ -33,7 +33,7 @@ func TestPrometheusHandler_NodeAndChunkGauges(t *testing.T) {
 		State:    ChunkReady,
 		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaReady}, {NodeID: 2, State: ReplicaReady}, {NodeID: 3, State: ReplicaReady}},
 	}
-	if err := store.putJSON(prefixChunk+"100", chunk); err != nil {
+	if err := store.putMsgpack(prefixChunk+"100", chunk); err != nil {
 		t.Fatalf("put chunk: %v", err)
 	}
 

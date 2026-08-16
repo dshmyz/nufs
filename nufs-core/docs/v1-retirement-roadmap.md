@@ -360,11 +360,16 @@
 
 ## 阶段 4：格式与测试清理
 
-- [ ] JSON/msgpack 双格式共存（`docs/architecture/data-organization.md:60`）→ 只留 msgpack
-  > 已定最小面（§1.5 探子审计）：**只写 msgpack + 停止新增 JSON 行**——翻 5 处活 putJSON
-  > 写点（`pebble_store.go:746` initRootInode / `:3723,:3748,:4170` repair /
-  > `audit.go:211`）为 msgpack，删死代码 `putJSONBatch`/`EncodeSetJSON`/`bucketNameByRoot`；
+- [x] JSON/msgpack 双格式共存（`docs/architecture/data-organization.md:60`）→ 只留 msgpack
+  > ✅（2026-08-17 收官）：**只写 msgpack**——5 处活 write 点翻 msgpack（`pebble_store.go:746`
+  > initRootInode / `:3723,:3748,:4170` repair / `audit.go:211`），QueryAudit 直接 JSON 读者改
+  > `unmarshalValue`（:257）；删死代码 `putJSON`/`putJSONBatch`/`EncodeSetJSON`/
+  > `bucketNameByRoot`/`codecJSON` 常量及其分支（22 处测试 seed 同步翻 `putMsgpack`）；
   > 读嗅探保留（旧 raft 日志 / 旧库 / 旧备份 catalog 需 JSON 兼容），不做行级迁移工具。
+  > 新增 `codec_test.go` 回归：msgpack 往返 + legacy JSON 行嗅探读兼容 + msgpack 首字节
+  > 0x8n 与 `{`/`[` 无碰撞；legacy JSON 读兼容另由 `backup_verify_test.go` JSON fixture
+  > 测试独立证明。验证：verify-docker -l fast PASS；`getJSON` 别名 33 处存活调用点保留
+  > （重命名归下一刀归零）。
 - [x] V1 引擎/EC 的 legacy 测试迁移或删除（~~`datanode/chunkstore_test.go` 等~~）
   > 阶段 2/3 已全删（`git log --diff-filter=D` 证实 20 个文件），其余现存测试逐文件核对
   > 均引用存活符号；本条剩 `-race` 全量绿验证，与 JSON/msgpack 全量验证一并做。

@@ -118,7 +118,7 @@ func TestChunkTombstoneSnapshotsLiveChunkWithoutResettingQuarantine(t *testing.T
 		State:    ChunkReady,
 		Replicas: []ReplicaInfo{{NodeID: 7, Addr: "node-7:9001", State: ReplicaReady}},
 	}
-	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, chunkID), chunk); err != nil {
+	if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, chunkID), chunk); err != nil {
 		t.Fatalf("seed chunk: %v", err)
 	}
 
@@ -758,7 +758,7 @@ func TestChunkGCTombstonesOrphansBeforePhysicalPurge(t *testing.T) {
 	store := newTestPebbleStore(t)
 	ctx := context.Background()
 	chunkID := ChunkID(45)
-	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, chunkID), &ChunkMeta{ID: chunkID, Size: 512, State: ChunkReady}); err != nil {
+	if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, chunkID), &ChunkMeta{ID: chunkID, Size: 512, State: ChunkReady}); err != nil {
 		t.Fatalf("seed orphan: %v", err)
 	}
 
@@ -823,7 +823,7 @@ func TestChunkGC_KeepsV2ExtentBackedChunks(t *testing.T) {
 				t.Fatalf("AllocateChunk: %v", err)
 			}
 			tc.seed(t, store, id, chunk)
-			if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, orphanID), &ChunkMeta{ID: orphanID, Size: 512, State: ChunkReady}); err != nil {
+			if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, orphanID), &ChunkMeta{ID: orphanID, Size: 512, State: ChunkReady}); err != nil {
 				t.Fatalf("seed orphan: %v", err)
 			}
 
@@ -877,7 +877,7 @@ func TestChunkGCOrphanLifecycleEndToEnd(t *testing.T) {
 	// A raw orphan: chunk metadata exists, no inode references it, and it was
 	// never DeleteChunk'd — the crash-leftover profile.
 	chunkID := ChunkID(46)
-	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, chunkID), &ChunkMeta{ID: chunkID, Size: 512, State: ChunkReady}); err != nil {
+	if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, chunkID), &ChunkMeta{ID: chunkID, Size: 512, State: ChunkReady}); err != nil {
 		t.Fatalf("seed orphan: %v", err)
 	}
 
@@ -960,7 +960,7 @@ func TestChunkGCDryRunDoesNotCreateOrPurgeTombstones(t *testing.T) {
 	store := newTestPebbleStore(t)
 	ctx := context.Background()
 	chunkID := ChunkID(54)
-	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, chunkID), &ChunkMeta{ID: chunkID, Size: 256, State: ChunkReady}); err != nil {
+	if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, chunkID), &ChunkMeta{ID: chunkID, Size: 256, State: ChunkReady}); err != nil {
 		t.Fatalf("seed orphan: %v", err)
 	}
 
@@ -1019,7 +1019,7 @@ func putCommittedCatalog(t *testing.T, store *PebbleStore, createdAt, reconciled
 
 func seedTombstonedChunk(t *testing.T, store *PebbleStore, chunkID ChunkID, size int32, deletedAt time.Time) {
 	t.Helper()
-	if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, chunkID), &ChunkMeta{ID: chunkID, Size: size, State: ChunkReady}); err != nil {
+	if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, chunkID), &ChunkMeta{ID: chunkID, Size: size, State: ChunkReady}); err != nil {
 		t.Fatalf("seed chunk %d: %v", chunkID, err)
 	}
 	tombstone := ChunkTombstone{

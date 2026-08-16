@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -282,7 +283,7 @@ func writeFixtureValue(t *testing.T, db *pebble.DB, key string, value interface{
 
 func writeFixtureJSON(t *testing.T, db *pebble.DB, key string, value interface{}) {
 	t.Helper()
-	data, err := marshalValue(value, codecJSON)
+	data, err := json.Marshal(value)
 	if err != nil {
 		t.Fatal(err)
 	}

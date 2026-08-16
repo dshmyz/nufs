@@ -114,7 +114,7 @@ func TestLeaseManager_ExpiresOfflineNodes(t *testing.T) {
 		ID: 1, Addr: "node1:9001", CapacityGB: 100,
 		State: NodeOnline, LastSeen: time.Now().Add(-60 * time.Second).UnixNano(),
 	}
-	store.putJSON(prefixNode+"1", info)
+	store.putMsgpack(prefixNode+"1", info)
 
 	// Start lease manager with 10s TTL
 	lm := NewLeaseManager(store, bus, 10*time.Second)
@@ -173,7 +173,7 @@ func TestLeaseManager_PreservesOperatorStates(t *testing.T) {
 					return err
 				}
 				cur.State = NodeFailed
-				return store.putJSON(key, &cur)
+				return store.putMsgpack(key, &cur)
 			},
 			want: NodeFailed,
 		},
@@ -260,7 +260,7 @@ func TestLeaseManager_DrainingTerminalState(t *testing.T) {
 	}
 	// Node 1 hosts one live replica.
 	n1 := ChunkID(1001)
-	if err := store.putJSON(prefixChunk+fmt.Sprint(n1), &ChunkMeta{
+	if err := store.putMsgpack(prefixChunk+fmt.Sprint(n1), &ChunkMeta{
 		ID: n1, Size: 64, State: ChunkReady,
 		Replicas: []ReplicaInfo{{NodeID: 1, Addr: "n1:9001", State: ReplicaReady}},
 	}); err != nil {
@@ -332,11 +332,11 @@ func TestChunkGC_FindsOrphans(t *testing.T) {
 	store.AllocateChunk(ctx, file.ID, MaxChunkSize, PlacementPolicy{ReplicationFactor: 3, TopologySpread: SpreadRack})
 
 	// Create orphan chunks (directly in Pebble, no inode reference)
-	store.putJSON(fmt.Sprintf("%s%d", prefixChunk, ChunkID(99901)), &ChunkMeta{
+	store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, ChunkID(99901)), &ChunkMeta{
 		ID: ChunkID(99901), Size: 1000, State: ChunkReady,
 		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaReady}},
 	})
-	store.putJSON(fmt.Sprintf("%s%d", prefixChunk, ChunkID(99902)), &ChunkMeta{
+	store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, ChunkID(99902)), &ChunkMeta{
 		ID: ChunkID(99902), Size: 2000, State: ChunkReady,
 		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaReady}},
 	})
@@ -380,14 +380,14 @@ func TestScrubber_DetectsCorruption(t *testing.T) {
 	bus := NewEventBus(4)
 
 	// Create a sealed chunk with no replicas (corrupted)
-	store.putJSON(fmt.Sprintf("%s%d", prefixChunk, ChunkID(88001)), &ChunkMeta{
+	store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, ChunkID(88001)), &ChunkMeta{
 		ID: ChunkID(88001), Size: 1000, State: ChunkReady,
 		Replicas: []ReplicaInfo{}, // no replicas!
 		Checksum: 0xDEAD,
 	})
 
 	// Create a healthy chunk
-	store.putJSON(fmt.Sprintf("%s%d", prefixChunk, ChunkID(88002)), &ChunkMeta{
+	store.putMsgpack(fmt.Sprintf("%s%d", prefixChunk, ChunkID(88002)), &ChunkMeta{
 		ID: ChunkID(88002), Size: 1000, State: ChunkReady,
 		Replicas: []ReplicaInfo{{NodeID: 1, State: ReplicaReady}},
 		Checksum: 0xBEEF,

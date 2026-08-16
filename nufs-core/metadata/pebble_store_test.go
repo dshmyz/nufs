@@ -1821,7 +1821,7 @@ func TestPebbleStore_TriggerRebalanceWithChunks(t *testing.T) {
 			info.UsedGB = 10
 		}
 		key := fmt.Sprintf("%s%d", prefixNode, info.ID)
-		store.putJSON(key, info)
+		store.putMsgpack(key, info)
 	}
 
 	// Trigger rebalance
@@ -2484,7 +2484,7 @@ func TestPebbleStore_HeartbeatPromotesOfflineToOnline(t *testing.T) {
 	// Simulate the lease manager expiring the node: force State to offline.
 	off := &NodeInfo{ID: 40, Addr: "node40:9001", CapacityGB: 100,
 		State: NodeOffline, LastSeen: time.Now().Add(-2 * time.Minute).UnixNano()}
-	if err := store.putJSON(prefixNode+"40", off); err != nil {
+	if err := store.putMsgpack(prefixNode+"40", off); err != nil {
 		t.Fatalf("force offline: %v", err)
 	}
 	// A resumed heartbeat must promote offline -> online.

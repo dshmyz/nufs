@@ -53,11 +53,12 @@ NUFS 把「元数据」与「数据」严格分离，落盘引擎也完全不同
 | `backup/task/`、`backup/catalog/`（+ `backup/catalog-state`） | 备份任务与目录 |
 | `system/cluster-id`、`system/inode-reference-epoch`、`system/restore-pending` | 系统级元数据 |
 
-### 2.2 值序列化：msgpack + JSON 自动识别（`metadata/codec.go`）
+### 2.2 值序列化：msgpack 写 + JSON 兼容读（`metadata/codec.go`）
 
-- **新写入默认 msgpack**（热路径，更小更快）；
+- **新写入全部 msgpack**（阶段 4 收敛后写面不再产生 JSON 行；热路径更小更快）；
 - **读取自动识别**：首字节是 `{`（0x7B）或 `[`（0x5B）→ 按 JSON 解，否则按 msgpack。
-  这保证老数据（JSON）与新数据（msgpack）共存在同一 Pebble 库中依然可读。
+  这保证收敛前写入的存量 JSON 行（旧库 / 旧 raft 日志 / 旧备份 catalog）与 msgpack 新行
+  共存于同一 Pebble 库中依然可读。不做行级迁移工具。
 
 ### 2.3 关键结构体（`metadata/types.go`）
 

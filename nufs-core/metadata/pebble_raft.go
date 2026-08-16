@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2113,19 +2112,6 @@ func (n *RaftNode) Shutdown() error {
 	}
 	f := n.raft.Shutdown()
 	return f.Error()
-}
-
-// ============================================================
-// Helper: encode JSON value for Raft apply
-// ============================================================
-
-// EncodeSetJSON creates a RaftLogEntry that sets key to JSON-encoded value.
-func EncodeSetJSON(key string, v interface{}) (*RaftLogEntry, error) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	return &RaftLogEntry{Op: OpSet, Key: []byte(key), Value: data}, nil
 }
 
 // ============================================================
