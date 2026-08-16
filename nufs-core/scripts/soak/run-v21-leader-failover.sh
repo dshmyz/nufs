@@ -159,7 +159,7 @@ dn_run() { # node leader —— 显式 --node-id，rack/zone 派生自序数；�
     --register-addr="127.0.0.1:$lp" --ops-addr="127.0.0.1:$ops" \
     --data-dirs="$(node_dirs "$n")" --metadata=127.0.0.1:$(metad_ops "$leader") \
     --rack="rack$rk" --zone="zone$zn" \
-    --storage-version=v2.1 --allow-insecure-dev --log-level=info \
+    --allow-insecure-dev --log-level=info \
     > "$(node_log "$n")" 2>&1 &
   echo $! > "$(node_pid "$n")"
 }

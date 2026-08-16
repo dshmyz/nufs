@@ -73,9 +73,9 @@ services:
       - nufs-data:/var/lib/dfs
     restart: unless-stopped
 
-  # V2.1 storage engine data node — uses the same binary with
-  # --storage-version=v2.1. Verifies the V2.1 engine through the
-  # full read/write path via the S3 gateway.
+  # V2.1 storage engine data node — V2.1 IS the only engine (V1 storage
+  # engine retired in roadmap stage 2), no --storage-version flag. Verifies
+  # the V2.1 engine through the full read/write path via the S3 gateway.
   datanode-v21:
     image: nufs:latest
     entrypoint: /usr/local/bin/datanode
@@ -88,7 +88,6 @@ services:
       - --rack=rack1
       - --zone=zone1
       - --capacity=500
-      - --storage-version=v2.1
       - --log-level=info
       - --log-json=true
     depends_on:
@@ -115,7 +114,6 @@ services:
       - --rack=rack1
       - --zone=zone1
       - --capacity=500
-      - --storage-version=v2.1
       - --log-level=info
       - --log-json=true
     depends_on:

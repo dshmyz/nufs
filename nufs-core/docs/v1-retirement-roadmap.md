@@ -39,18 +39,21 @@
 | 稀疏文件/hole | `ChunkRef.Offset` | `ExtentRef.LogicalOffset`（`types.go:178`） | ✅ 可表示，未接线 |
 | MVCC read-your-writes | `ChunkRef.Version` | COW root + `ExtentRootVersion` | ✅ 更强，未接线 |
 | 放置策略 | `ChunkMeta` placement | PGID + PlacementEpoch（§11.3） | ✅ 已实现 |
-| 存储 tier | `ChunkMeta.Tier` | `ExtentMetaV2.StorageClass`（`types.go:126`） | ⚠️ 字段有，机制未接 |
-| 心跳降级检测 | Chunk 状态机 + `batchUpdateChunkStatesCtx` | `ExtentMetaV2.Lifecycle`（`types.go:124`） | ⚠️ 字段有，心跳路径无 |
-| **Scrubber**（校验/降级计数） | `ScanAllChunks`/ChunkMeta | **无 extent 版 scrubber** | ❌ 缺 |
-| **修复**（TriggerRepair/队列） | ChunkMeta + repair queue | **无 extent 版** | ❌ 缺 |
-| **bucket 配额** | `ChunkMeta.Size` 聚合 | **无 extent 版** | ❌ 缺 |
-| **备份/恢复** | ChunkMeta 清单 | **无 extent 版** | ❌ 缺 |
-| **S3 multipart** | 分片 → chunk 合并 | **无 extent 版** | ❌ 缺 |
-| **孤儿 GC** | 元数据查 ChunkMeta | **无 extent 版**（现有 GC 是数据面） | ❌ 缺 |
+| 存储 tier / EC 存储类 | `ChunkMeta.Tier` + `ChunkMeta.ECGroup`/`ECStripeID` | 数据面 `ChunkMeta.ECGroup`/`ECStripeID`（权威源）+ 管理面 `ExtentMetaV2.Lifecycle`；`ExtentMetaV2.StorageClass` 为**写-闭环派生镜像** | ✅ 已接线（§1.5 判据重定义：StorageClass 读面不消费系有意避免双源漂移） |
+| 心跳降级检测 | Chunk 状态机 + `batchUpdateChunkStatesCtx` | `ExtentMetaV2.Lifecycle`（`types.go:124`） | ✅（§1.4 第三刀：chunk 降级镜像 extent，`MarkExtentDegraded`） |
+| **Scrubber**（校验/降级计数） | `ScanAllChunks`/ChunkMeta | extent 版 `ExtentScrubber`（`extent_scrub.go`） | ✅（§1.4 第四刀：校验 + Lifecycle 计数 + ReadyDegraded→Ready 恢复） |
+| **修复**（TriggerRepair/队列） | ChunkMeta + repair queue | `TriggerExtentRepair` + `/repair/{id}` 队列（extent ID==chunk ID 不变式） | ✅（§1.4 第五刀：心跳盲区由 scrubber 兜底入队） |
+| **bucket 配额** | `ChunkMeta.Size` 聚合 | 慢路径 `extentBytesForInode` 按 extent 聚合 + 快路径计数器 | ✅（§1.4 第六刀） |
+| **备份/恢复** | ChunkMeta 清单 | 整 checkpoint 归档 + verify 层模型感知（extent 交叉校验，format 1→2） | ✅（§1.4 第七刀） |
+| **S3 multipart** | 分片 → chunk 合并 | complete 流式合并落 V2 extent（复用单发 PUT 同一编排） | ✅（§1.4 首刀） |
+| **孤儿 GC** | 元数据查 ChunkMeta | `stableInodeReferenceSnapshot` 模型感知引用集（per-inode resolve） | ✅（§1.4 第二刀，修 V2 extent-backed chunk 误删） |
 
-> 结论：❌ 项全是 chunk 级机制，没有任何代码触碰 `ExtentMetaV2/ExtentRef`（仅
-> inode_store/extent_page/ec_lifecycle/types 四处是 extent 家族自身）。**删 ③
-> 前，上述 ❌ 项需在 extent 层实现或移植；⚠️ 项需把字段接成机制。**
+> 结论（§1.5 收官）：阶段 0 的 ❌/⚠️ 项已全部在 §1.4 七刀闭环并附回归钩验证，本表按
+> 代码事实更新。「存储 tier」行依 §1.5 判据重定义——机制真实承载 = `ChunkMeta.ECGroup`/
+> `ECStripeID`（数据面路由）+ `ExtentMetaV2.Lifecycle`（管理面），`StorageClass` 是从
+> 前者派生的镜像标注，读面零消费系有意避免双源漂移；物理 `StorageTier`（hot/warm/cold/
+> archive）是另一套活跃机制（ChunkMeta.Tier 全链路真消费，非本 ⚠️ 指涉）。**删 ③ 前**
+> 剩余仅"可表示未接线"类（稀疏/MVCC，见上两行）与 阶段 4 清理。
 
 ### ① V1 存储引擎 vs V2.1 segment 引擎 ✅ 完成
 
@@ -293,13 +296,30 @@
 > **已知未修**：慢路径对象计数经 `walkUsageTree` 对硬链接双计（与快路径唯一 inode 语义
 > 不一致，既有设计取舍非本刀引入）；`AppendExtent` 是 restore/HTTP-only 面。
 
-### 1.5 退出条件
-- 网关写入路径不再产生新 ChunkMap；ChunkMap 只读存量（阶段 4 删）。
+### 1.5 退出条件 ✅（2026-08-16 §1.5 收官）
+
+- [x] 网关写入路径不再产生新 ChunkMap；ChunkMap 只读存量（阶段 4 删）。
   > 1.3c/§1.4 后三条写路径——单发 PUT 与 FUSE flush（`CommitChunkRefsModelAware`）
   > 与 S3 multipart complete（同一编排，见 §1.4）——全部落 V2 布局，网关写路径不再
-  > 产生新 ChunkMap。
-- 阶段 0 的 ❌/⚠️ 项全部闭环。
-- 小文件读改写、promote 后读写、稀疏文件、EC 转换、配额、备份全绿。
+  > 产生新 ChunkMap。§1.5 收官裁决三处残余写面（**只裁决不删**，删除归阶段 4）：
+  > ① `AllocateChunksBatch`（`pebble_store.go:2193`）瞬态 append——每写发生、随后被
+  > model-aware commit 原子改写为 extent 布局，**非持久** ChunkMap 生产者，保留；
+  > ② `CommitChunkRefsModelAware` V1 fallback（`inode_v2_serving.go:326`）——仅 legacy
+  > V1 行 / 空 ref 新文件触发（当前全接线 service 均实现 `ExtentInodeService`，V2 行
+  > 不触发），防御性保留（回滚/parity 兼容）；③ `CreateObjectWithChunks`
+  > （`pebble_store.go:2584`）——无 metad HTTP 路由、当前接线不可达的 V1 路径，
+  > 阶段 4 删除候选。
+- [x] 阶段 0 的 ❌/⚠️ 项全部闭环。
+  > 见上方阶段 0 汇总表——§1.4 七刀全闭环；「存储 tier ⚠️」按代码事实判据重定义：
+  > 机制真实承载 = `ChunkMeta.ECGroup`/`ECStripeID`（数据面）+ `ExtentMetaV2.Lifecycle`
+  > （管理面），`StorageClass` 是写-闭环派生镜像，**不加人为消费者**——读路由改判
+  > StorageClass 只会复制权威源、制造双源漂移风险（已评估后拒绝）；物理 `StorageTier`
+  > 是独立活跃机制，非本 ⚠️ 指涉。
+- [x] 小文件读改写、promote 后读写、稀疏文件、EC 转换、配额、备份全绿。
+  > 测试矩阵：`datanode/v2_small_store_test.go`、`gateway/s3/dual_model_cross_test.go`、
+  > `gateway/s3/multipart_dual_model_test.go`、`metadata/bucket_usage_extent_test.go`、
+  > `metadata/backup_extent_test.go`、`metadata/ec_extent_marking_test.go`、smoke
+  > `TestRepair_EndToEnd_EC`；门禁 `verify-docker -l fast` 全绿。
 
 ---
 
@@ -341,8 +361,18 @@
 ## 阶段 4：格式与测试清理
 
 - [ ] JSON/msgpack 双格式共存（`docs/architecture/data-organization.md:60`）→ 只留 msgpack
-- [ ] V1 引擎/EC 的 legacy 测试迁移或删除（`datanode/chunkstore_test.go` 等）
+  > 已定最小面（§1.5 探子审计）：**只写 msgpack + 停止新增 JSON 行**——翻 5 处活 putJSON
+  > 写点（`pebble_store.go:746` initRootInode / `:3723,:3748,:4170` repair /
+  > `audit.go:211`）为 msgpack，删死代码 `putJSONBatch`/`EncodeSetJSON`/`bucketNameByRoot`；
+  > 读嗅探保留（旧 raft 日志 / 旧库 / 旧备份 catalog 需 JSON 兼容），不做行级迁移工具。
+- [x] V1 引擎/EC 的 legacy 测试迁移或删除（~~`datanode/chunkstore_test.go` 等~~）
+  > 阶段 2/3 已全删（`git log --diff-filter=D` 证实 20 个文件），其余现存测试逐文件核对
+  > 均引用存活符号；本条剩 `-race` 全量绿验证，与 JSON/msgpack 全量验证一并做。
 - [ ] 全仓 grep 清理 `storage-version`、`ECStripeID==""`、`ChunkMap` 写路径引用
+  > §1.5 探子审计：Go 侧 `storage-version` 已净（flag 随阶段 2 删）；`ECStripeID==""`
+  > 生产分支阶段 3 已退役（现仅 `!= ""` 判别符 + 测试断言 + 注释）；本刀清掉 6 个
+  > deploy/soak 文件的 `--storage-version=v2.1` 残留（运行即 flag 解析退出）。
+  > 剩余：`CreateObjectWithChunks`（V1 不可达路径）删除 + `ChunkMap` 写路径归零。
 
 ### 退出条件
 - 全仓无 V1 引用；`-race` 全量绿。
@@ -351,9 +381,10 @@
 
 ## 依赖与风险
 
-- **阶段 0 是硬门禁**：❌ 项（scrubber/修复/配额/备份/multipart/孤儿 GC 的 extent 版）未闭环前，③ 不可删。
-- **上线门禁**：阶段 0 + 阶段 1 完成 = 上线前置条件；在此之前 V1 三层全部保留
-  （测试矩阵都基于 ChunkMap，删 ③ 会无路径可跑）。
+- **阶段 0 硬门禁 ✅（2026-08-16）**：§1.4 七刀全闭环（scrubber/修复/配额/备份/multipart/
+  孤儿 GC 的 extent 版 + 心跳降级/存储类判据），阶段 0 汇总表已按代码事实更新。
+- **上线门禁 ✅（2026-08-16 §1.5 收官）**：阶段 0 + 阶段 1 完成。③ ChunkMap 仍是网关
+  存量读路径（阶段 4 删除前保留），三处残余写面裁决见 §1.5 注记（删除归阶段 4）。
 - 阶段 2 的协议面等价抽查是硬门禁（V2.1 声称 parity ≠ 已验证）。
 - 阶段 3 的 fallback 硬错误是行为变更，需显式决策。
 - 顺序：**0 + 1（上线门禁）→ 2/3（可并行收尾）→ 4**。
