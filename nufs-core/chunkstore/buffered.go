@@ -520,12 +520,20 @@ func (b *BufferedFile) loadCommittedChunkLocked(ctx context.Context, base int64)
 	if err != nil {
 		return // can't load — buffer stays zero-filled (safe for new files)
 	}
+	// Resolve the committed refs under either storage model (V1 ChunkMap or
+	// V2 extent layout) so partial overwrites of a V2 file merge its committed
+	// bytes instead of zero-filling the whole base.
+	es, _ := b.meta().(metadata.ExtentInodeService)
+	refs, err := metadata.ResolveFileChunks(ctx, es, metaInode)
+	if err != nil {
+		return
+	}
 	// Collect every committed chunk overlapping this base and merge them in
 	// offset order. A single 64 MiB base can hold multiple committed refs
 	// (small writes across flushes each become their own ref); stopping at the
 	// first would zero-fill the others and lose committed data.
 	overlaps := make([]metadata.ChunkRef, 0, 2)
-	for _, cref := range metaInode.ChunkMap {
+	for _, cref := range refs {
 		cEnd := cref.Offset + int64(cref.Length)
 		if cEnd > base && cref.Offset < base+metadata.MaxChunkSize {
 			overlaps = append(overlaps, cref)
@@ -844,18 +852,30 @@ func (b *BufferedFile) Flush(ctx context.Context) (FlushResult, error) {
 	unlock := b.exec.lockInode(uint64(b.inodeID))
 	defer unlock()
 
-	// Read the current inode once. Its ChunkMap holds the OLD chunk refs we
-	// will supersede at the end of this flush.
+	// Read the current inode once and resolve its committed chunk refs under
+	// whichever storage model it carries (V1 ChunkMap or V2 extent layout,
+	// roadmap §1.3b/§1.3c). These are the OLD chunk refs this flush supersedes
+	// at the end; a V2 row's ChunkMap is nil, so the refs must come from the
+	// extent surface (ResolveFileChunks) rather than the inode row.
 	var metaInode *metadata.InodeMeta
+	var oldRefs []metadata.ChunkRef
 	if err := b.exec.doMeta("flush", func() error {
 		var gerr error
 		metaInode, gerr = b.meta().GetInode(ctx, b.inodeID)
+		if gerr != nil {
+			return gerr
+		}
+		es, _ := b.meta().(metadata.ExtentInodeService)
+		oldRefs, gerr = metadata.ResolveFileChunks(ctx, es, metaInode)
 		return gerr
 	}); err != nil {
 		return FlushResult{}, err
 	}
-	oldRefs := make([]metadata.ChunkRef, len(metaInode.ChunkMap))
-	copy(oldRefs, metaInode.ChunkMap)
+	// Surface the resolved refs on the projection so the write-attempt ledger
+	// records them (recovery of a V2 file needs the chunk list even though the
+	// row itself carries none). The commit path re-derives the storage model
+	// from the serving surface, so this does not change its decision.
+	metaInode.ChunkMap = oldRefs
 
 	// Write-attempt ledger: record flush state transitions for observability
 	// and crash recovery. The recovery worker (shared with S3) picks up
@@ -974,13 +994,16 @@ func (b *BufferedFile) Flush(ctx context.Context) (FlushResult, error) {
 		newRefs = append(newRefs, w.ref)
 	}
 
-	// Wholesale-replace the ChunkMap + size + mtime.
+	// Model-aware commit: land newRefs as the file's data under whichever
+	// storage model the serving surface supports (roadmap §1.3c). With a V2
+	// extent surface a single ≤ MaxInlineExtentSize chunk becomes an inline
+	// extent and anything larger (or multi-chunk) spills to COW extent pages;
+	// without the surface it falls back to the V1 ChunkMap update. The helper
+	// sets Size/MTime/CTime itself, so the projection only carries newRefs for
+	// the ledger's Committed record below.
 	metaInode.ChunkMap = newRefs
-	metaInode.Size = size
-	metaInode.MTime = time.Now().UnixNano()
-
 	if err := b.exec.doMeta("flush", func() error {
-		return b.meta().UpdateInode(ctx, metaInode)
+		return metadata.CommitChunkRefsModelAware(ctx, b.meta(), metaInode, newRefs, size)
 	}); err != nil {
 		b.recordFlushAttempt(ctx, attemptID, metaInode, metadata.WriteAttemptRecoveryNeeded, err.Error())
 		return FlushResult{}, err
@@ -1152,13 +1175,20 @@ func (b *BufferedFile) ZeroRange(ctx context.Context, metaInode *metadata.InodeM
 	}
 	// Load committed chunks overlapping the zero range so the non-zeroed
 	// portion of each affected chunk is preserved. Only the affected chunks
-	// are loaded — not the entire file.
+	// are loaded — not the entire file. The refs resolve under either storage
+	// model (V1 ChunkMap or V2 extent layout, roadmap §1.3b/§1.3c): a V2 row's
+	// ChunkMap is nil, so its refs must come from the extent surface.
+	es, _ := b.meta().(metadata.ExtentInodeService)
+	refs, err := metadata.ResolveFileChunks(ctx, es, metaInode)
+	if err != nil {
+		return err
+	}
 	for base := ChunkBase(int64(off)); base < int64(end); base += metadata.MaxChunkSize {
 		if _, ok := b.chunkBufs[base]; ok {
 			continue // already in buffer (from prior write)
 		}
 		// Find committed chunk for this base.
-		for _, cref := range metaInode.ChunkMap {
+		for _, cref := range refs {
 			cEnd := cref.Offset + int64(cref.Length)
 			if cEnd <= base || cref.Offset >= base+metadata.MaxChunkSize {
 				continue

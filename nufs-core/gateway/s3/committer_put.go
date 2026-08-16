@@ -105,7 +105,7 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 	)
 	if inode, err = c.meta.Lookup(ctx, b.RootInode, req.Key); err == nil {
 		oldInodeSnapshot = cloneInodeMeta(inode)
-		oldChunks = append([]metadata.ChunkRef(nil), inode.ChunkMap...)
+		oldChunks, _ = resolveCommittedChunks(ctx, c.meta, inode)
 		oldSize = inode.Size
 		newObject = false
 	} else if !errors.Is(err, metadata.ErrEntryNotFound) && !errors.Is(err, metadata.ErrInodeNotFound) {
@@ -152,7 +152,7 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 			inode, err = c.meta.Lookup(ctx, b.RootInode, req.Key)
 			if err == nil {
 				oldInodeSnapshot = cloneInodeMeta(inode)
-				oldChunks = append([]metadata.ChunkRef(nil), inode.ChunkMap...)
+				oldChunks, _ = resolveCommittedChunks(ctx, c.meta, inode)
 				oldSize = inode.Size
 				newObject = false
 			}
@@ -236,7 +236,7 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 		oldSize = 0
 	} else {
 		oldInodeSnapshot = cloneInodeMeta(inode)
-		oldChunks = append([]metadata.ChunkRef(nil), inode.ChunkMap...)
+		oldChunks, _ = resolveCommittedChunks(ctx, c.meta, inode)
 		oldSize = inode.Size
 	}
 
@@ -437,12 +437,14 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 		Chunks:     newChunkRefs,
 		State:      metadata.WriteAttemptChunksDurable,
 	})
-	inode.Size = totalSize
-	inode.ChunkMap = newChunkRefs
-	now := time.Now().UnixNano()
-	inode.CTime = now
-	inode.MTime = now
-	if err := c.meta.UpdateInode(ctx, inode); err != nil {
+	// Model-aware commit (roadmap §1.3c): a V2 extent surface lands the
+	// ref set as V2 layout (single ≤16MiB chunk → inline extent, else
+	// extent pages); without the surface it falls back to the V1 ChunkMap
+	// update. inode is still the pre-allocation projection (nil ChunkMap
+	// on V2 rows) so the helper's model probe sees the decoded layout; the
+	// serving writer sets CTime/MTime, so the committer no longer touches
+	// them (V1 UpdateInode bumps CTime on the server).
+	if err := metadata.CommitChunkRefsModelAware(ctx, c.meta, inode, newChunkRefs, totalSize); err != nil {
 		c.recordAttempt(ctx, &metadata.ObjectWriteAttempt{
 			ID:         attemptID,
 			Bucket:     req.Bucket,
@@ -648,6 +650,31 @@ func cloneInodeMeta(inode *metadata.InodeMeta) *metadata.InodeMeta {
 	return &clone
 }
 
+// resolveCommittedChunks returns the chunk references a row currently
+// points at, regardless of storage model (roadmap §1.3c): V1 rows return
+// ChunkMap verbatim; V2 rows (nil ChunkMap) are resolved through the
+// extent surface (extent ID == chunk ID). It is the committer's oldChunks
+// probe (so an overwrite of a V2 object tombstones the superseded
+// extents' chunks) and the recovery worker's "already applied" probe. On
+// a resolution error it returns the error so callers can decide whether
+// to degrade (tombstone leak, no data loss) or fail loud. meta is passed
+// as any because only the extent-surface assertion is used — the caller
+// may hold a full MetadataService or a narrower composition such as the
+// recovery worker's writeRecoveryMeta.
+func resolveCommittedChunks(ctx context.Context, meta any, inode *metadata.InodeMeta) ([]metadata.ChunkRef, error) {
+	if inode == nil {
+		return nil, nil
+	}
+	if len(inode.ChunkMap) > 0 {
+		return append([]metadata.ChunkRef(nil), inode.ChunkMap...), nil
+	}
+	es, ok := meta.(metadata.ExtentInodeService)
+	if !ok {
+		return nil, nil
+	}
+	return metadata.ResolveFileChunks(ctx, es, inode)
+}
+
 func (c *metadataObjectCommitter) deleteChunkRefs(ctx context.Context, chunks []metadata.ChunkRef) error {
 	var cleanupErrs []error
 	for _, ref := range chunks {
@@ -687,6 +714,14 @@ func (c *metadataObjectCommitter) cleanupQuotaRejectedWrite(
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("unlink inode: %w", err))
 		}
 	} else if oldInode != nil {
+		// NOTE (§1.4): for a V2 object the rollback snapshot is a V1
+		// projection (nil ChunkMap — the V2 layout lives outside the
+		// row). Allocating for the overwrite transiently clobbers the
+		// row to V1 (see CommitChunkRefsModelAware), so this V1 restore
+		// lands a layout-less row and the V2 object's extents become
+		// unreachable. Mitigating the loss requires either preserving the
+		// layout through allocation or a V2-aware rollback snapshot;
+		// deferred with bucket-stats aggregation to roadmap §1.4.
 		if err := c.meta.UpdateInode(ctx, cloneInodeMeta(oldInode)); err != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("restore inode %d: %w", oldInode.ID, err))
 		}

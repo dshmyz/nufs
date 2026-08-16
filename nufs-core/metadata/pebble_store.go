@@ -1894,9 +1894,12 @@ func (s *PebbleStore) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 
 	// Model collision guard + bucket-stats delta share one raw read of the
 	// existing row. V1 (InodeMeta, ChunkMap) and V2 (InodeMetaV2, layout)
-	// coexist under the same key; a V1 overwrite would silently wipe the V2
-	// layout fields, so refuse it loudly instead of corrupting. The same
-	// read supplies the Size delta for bucket stats, so production
+	// coexist under the same key; a V1 data write carrying a ChunkMap would
+	// silently wipe the V2 layout fields, so refuse it loudly instead of
+	// corrupting. A metadata-only update (nil ChunkMap — GetInode on a V2
+	// row returns no chunks) is merged into the V2 struct so the layout
+	// fields survive chmod/chown/xattr/touch on V2 files. The same read
+	// supplies the Size delta for bucket stats, so production
 	// (UseBucketStats) pays no extra I/O for the guard.
 	if found, raw, err := s.getRaw(key); err != nil {
 		return err
@@ -1906,13 +1909,36 @@ func (s *PebbleStore) UpdateInode(ctx context.Context, meta *InodeMeta) error {
 			return err
 		}
 		if v2.Layout != LayoutEmpty {
-			return fmt.Errorf("%w: inode %d carries layout %d", ErrInodeModelMismatch, meta.ID, v2.Layout)
+			if len(meta.ChunkMap) > 0 {
+				return fmt.Errorf("%w: inode %d carries layout %d", ErrInodeModelMismatch, meta.ID, v2.Layout)
+			}
+			// Metadata-only update on a V2-layout row: overlay the V1
+			// projection's scalar/aux fields, keep the V2 layout fields.
+			oldSize := v2.Size
+			v2.Size = meta.Size
+			v2.NLink = meta.NLink
+			v2.BucketRoot = meta.BucketRoot
+			v2.UID = meta.UID
+			v2.GID = meta.GID
+			v2.Mode = meta.Mode
+			v2.MTime = meta.MTime
+			v2.ATime = meta.ATime
+			v2.Symlink = meta.Symlink
+			v2.XAttrs = meta.XAttrs
+			v2.CTime = meta.CTime // already bumped to now above
+			if s.cfg.UseBucketStats {
+				s.addBucketStatsOp(v2.BucketRoot, meta.Size-oldSize, 0, &ops)
+			}
+			ops = append(ops, batchOp{Key: key, Value: &v2})
+		} else {
+			if s.cfg.UseBucketStats {
+				s.addBucketStatsOp(v2.BucketRoot, meta.Size-v2.Size, 0, &ops)
+			}
+			ops = append(ops, batchOp{Key: key, Value: meta})
 		}
-		if s.cfg.UseBucketStats {
-			s.addBucketStatsOp(v2.BucketRoot, meta.Size-v2.Size, 0, &ops)
-		}
+	} else {
+		ops = append(ops, batchOp{Key: key, Value: meta})
 	}
-	ops = append(ops, batchOp{Key: key, Value: meta})
 	if err := s.applyBatchMsgpack(ops, nil); err != nil {
 		return err
 	}
@@ -2139,13 +2165,22 @@ func (s *PebbleStore) allocateChunksConditionally(ctx context.Context, inodeID I
 				if s.metrics != nil {
 					s.metrics.RecordWrite(time.Since(started))
 				}
+				// The conditional batch writes the inode row straight through
+				// the raft FSM, bypassing UpdateInode's cache invalidation —
+				// drop the cached copy so a following GetInode re-reads the
+				// freshly appended ChunkMap refs.
+				s.inCache.del(inodeID)
 				return chunks, nil
 			}
 			return nil, err
 		}
 		if !errors.Is(err, ErrBackupMetadataConflict) {
-			if err == nil && s.metrics != nil {
-				s.metrics.RecordWrite(time.Since(started))
+			if err == nil {
+				if s.metrics != nil {
+					s.metrics.RecordWrite(time.Since(started))
+				}
+				// Same cache-invalidation rationale as the reconcile path above.
+				s.inCache.del(inodeID)
 			}
 			return chunks, err
 		}
@@ -2429,6 +2464,10 @@ func (s *PebbleStore) nextChunkID() ChunkID {
 	return s.chunkGen.Next()
 }
 
+// buildChunkAllocationConditional builds the atomic chunk-allocation batch:
+// create each chunk row (with per-chunk not-exists preconditions) against a
+// precondition that the inode row is unchanged, then rewrite the inode row
+// with the freshly allocated ChunkMap refs appended.
 func (s *PebbleStore) buildChunkAllocationConditional(inodeKey string, inodeRaw []byte, next *InodeMeta, chunks []*ChunkMeta) (*ConditionalBatch, error) {
 	encodedInode, err := marshalValue(next, codecMsgpack)
 	if err != nil {

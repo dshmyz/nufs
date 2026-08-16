@@ -93,6 +93,16 @@ type ExtentInodeService interface {
 	// AppendExtent appends an extent reference to a pages-layout inode,
 	// persisting the extent metadata. Returns the new COW extent root.
 	AppendExtent(ctx context.Context, id InodeID, extent *ExtentMetaV2, offset int64) (uint64, error)
+
+	// ReplaceExtents rewrites the file's entire extent set as extent pages
+	// under a fresh COW root, replacing whatever model the row previously
+	// had (empty, inline, or earlier pages). This is the whole-set writer
+	// for gateway overwrites: unlike PromoteToPages it does NOT preserve an
+	// old inline extent as page 0, because the overwrite has already
+	// rewritten the old extent's data into the new chunk set. Persists each
+	// extent's /extent-meta row and the inode's pages layout in one
+	// serving-surface call.
+	ReplaceExtents(ctx context.Context, id InodeID, writes []ExtentWrite, size int64) error
 }
 
 // ChunkService defines chunk lifecycle operations.

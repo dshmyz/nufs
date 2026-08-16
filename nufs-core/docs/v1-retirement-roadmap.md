@@ -109,9 +109,20 @@
 - [x] 确认 small stream 纳入 seal/compact/磁盘水位维护
 
 ### 1.3 元数据面（inline extent）
-- [ ] `metadata/inode_store.go:65 SetInlineExtent` 接入 FUSE Flush（≤16MiB 单块转 inline）
-- [ ] 超限走 `PromoteToPages`（`inode_store.go:84`，已实现）
-- [ ] 网关读路径兼容 ChunkMap + ExtentPages 双模型（`ResolveExtents` `inode_store.go:163` 已支持两态）
+> 2026-08-16 完成（1.3a `c6d455f` + 1.3b `ef467eb` + 1.3c `写侧双模型`）。
+> 写侧双模型：FUSE Flush 与 S3 PUT 共用 `metadata.CommitChunkRefsModelAware`
+> （`inode_v2_serving.go`）——≤16MiB 单 chunk → `SetInlineExtent`，否则整集
+> `ReplaceExtents`（`inode_store.go` 新增，旧 extent 不保留，COW pages）。
+> 超限走的是 `ReplaceExtents` 而非 roadmap 原文的 `PromoteToPages`：后者把旧
+> inline extent 保成 page 0，对覆写语义是悬垂引用。`ReplaceExtents` 同样由
+> serving 面（PebbleStore/ShardedStore/metad HTTP `PUT /inodes/{id}/replace-extents`）
+> 与 `HTTPClient` 贯通，V2 写经 `putWithBucketStats` 累计 bucket 用量。
+> 交叉验证（§1.1 硬要求）在 `gateway/s3/dual_model_cross_test.go`：
+> S3 写 → FUSE ReadView 读回、FUSE flush → S3 GET 读回，inline/pages 双布局。
+
+- [x] `metadata` 的 `SetInlineExtent` 接入 FUSE Flush（≤16MiB 单块转 inline）
+- [x] 超限整集走 `ReplaceExtents`（`inode_store.go`，整体写 COW pages；roadmap 原文 `PromoteToPages` 语义不匹配覆写，见上注）
+- [x] 网关读路径兼容 ChunkMap + ExtentPages 双模型（`ResolveExtents`，1.3b 已铺读侧，本刀写侧落地后交叉读回验证）
 - [ ] EC 交互重测（`ec_lifecycle.go:528` 已假设 inline 布局）
 
 ### 1.4 extent 级机制补齐（阶段 0 的 ❌/⚠️ 项，可与接线并行）
@@ -125,6 +136,8 @@
 
 ### 1.5 退出条件
 - 网关写入路径不再产生新 ChunkMap；ChunkMap 只读存量（阶段 4 删）。
+  > 1.3c 后单发 PUT 与 FUSE flush 均经 `CommitChunkRefsModelAware` 落 V2；剩余
+  > 产生 ChunkMap 的写路径是 S3 multipart（合并落 extent 在 §1.4，见 `ec_lifecycle` 项）。
 - 阶段 0 的 ❌/⚠️ 项全部闭环。
 - 小文件读改写、promote 后读写、稀疏文件、EC 转换、配额、备份全绿。
 

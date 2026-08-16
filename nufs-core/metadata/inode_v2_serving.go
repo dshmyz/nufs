@@ -117,6 +117,41 @@ func (s *PebbleStore) AppendExtent(ctx context.Context, id InodeID, extent *Exte
 	return root, nil
 }
 
+// ReplaceExtents rewrites the file's entire extent set as extent pages,
+// replacing whatever model the row previously had (empty, inline, or
+// earlier pages). This is the whole-set writer for gateway overwrites:
+// unlike PromoteToPages it does NOT preserve an old inline extent, because
+// the overwrite has already rewritten the old extent's data into the new
+// chunk set. Persists each extent's /extent-meta row, then the inode's
+// pages layout.
+//
+// Bucket byte usage IS accumulated here (see InodeStoreV2's
+// putWithBucketStats): without it the bucket usage counter freezes once
+// writes land V2 layout and byte-quota enforcement silently degrades.
+// Roadmap §1.4 re-aggregates usage by extent; that redesign is deferred,
+// not the counter maintenance.
+func (s *PebbleStore) ReplaceExtents(ctx context.Context, id InodeID, writes []ExtentWrite, size int64) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	for _, w := range writes {
+		if w.Extent == nil {
+			return ErrInvalidArgument
+		}
+		// Not atomic with the inode row below (two Raft mutations); a
+		// failure after a write leaves a harmless orphan /extent-meta row.
+		if err := s.putExtentMeta(w.Extent); err != nil {
+			return err
+		}
+	}
+	if err := NewInodeStoreV2(s).ReplaceExtents(id, writes, size); err != nil {
+		return err
+	}
+	s.inCache.del(id)
+	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", id)})
+	return nil
+}
+
 // ResolveFileChunks maps a file's inode to the flat list of chunk
 // references holding its data, under either storage model (roadmap §1.3b
 // read dual-model).
@@ -165,4 +200,82 @@ func ResolveFileChunks(ctx context.Context, es ExtentInodeService, inode *InodeM
 		})
 	}
 	return chunks, nil
+}
+
+// extentForRef builds the V2 extent metadata for a chunk reference. The
+// extent's data lives in the chunk whose numeric ID equals the extent ID
+// (see ResolveFileChunks), so the extent mirrors the chunk's ID and
+// length. Placement (PGID), storage class and EC stripe are left at
+// defaults until roadmap §1.3d/§1.4 wire ECConfig buckets into the extent
+// surface.
+func extentForRef(ref ChunkRef) *ExtentMetaV2 {
+	return &ExtentMetaV2{
+		ID:           ExtentIDV2(ref.ID),
+		Generation:   1,
+		LogicalLen:   int64(ref.Length),
+		Lifecycle:    LifecycleReady,
+		StorageClass: StorageClassHotReplica,
+	}
+}
+
+// extentsFor converts a chunk-ref set to the ExtentWrite set fed to
+// ReplaceExtents (each extent at the ref's file offset).
+func extentsFor(refs []ChunkRef) []ExtentWrite {
+	writes := make([]ExtentWrite, 0, len(refs))
+	for _, ref := range refs {
+		writes = append(writes, ExtentWrite{Extent: extentForRef(ref), Offset: ref.Offset})
+	}
+	return writes
+}
+
+// commitModelAwareService is the narrow surface CommitChunkRefsModelAware
+// needs: UpdateInode for the V1 fallback. The V2 extent surface is probed
+// by type assertion, so services that only compose sub-interfaces (e.g.
+// the write-attempt recovery worker's writeRecoveryMeta) can use the
+// shared commit decision without implementing the full MetadataService.
+type commitModelAwareService interface {
+	UpdateInode(ctx context.Context, meta *InodeMeta) error
+}
+
+// CommitChunkRefsModelAware lands newChunkRefs as the file's data set
+// under whichever storage model the serving surface supports (roadmap
+// §1.3c write dual-model). It is the single commit decision shared by the
+// gateway write paths and the write-attempt recovery worker, so the
+// inline-vs-pages policy cannot drift between callers.
+//
+// With a V2 extent surface present, the commit produces V2 layout: a
+// single chunk holding ≤ MaxInlineExtentSize becomes an inline extent;
+// otherwise the whole ref set is rewritten as extent pages
+// (ReplaceExtents). A V2 row that already exists (detected by probing the
+// empty ChunkMap) is rewritten even when newChunkRefs is empty, so a
+// zero-byte overwrite empties it rather than leaving stale extents.
+// Without the extent surface (or for a brand-new zero-ref file) it falls
+// back to the V1 ChunkMap update.
+//
+// CTime/MTime are set by the serving writer on the V2 path (parity with
+// UpdateInode); the V1 fallback sets MTime here and lets UpdateInode bump
+// CTime. inode must be the full read-modify-write projection (callers
+// obtain it via GetInode before allocating).
+func CommitChunkRefsModelAware(ctx context.Context, meta commitModelAwareService, inode *InodeMeta, newChunkRefs []ChunkRef, size int64) error {
+	es, _ := meta.(ExtentInodeService)
+	if es != nil {
+		isV2 := len(inode.ChunkMap) == 0
+		if isV2 {
+			refs, err := es.ResolveExtents(ctx, inode.ID)
+			if err != nil {
+				return err
+			}
+			isV2 = len(refs) > 0
+		}
+		if isV2 || len(newChunkRefs) > 0 {
+			if len(newChunkRefs) == 1 && size <= MaxInlineExtentSize {
+				return es.SetInlineExtent(ctx, inode.ID, extentForRef(newChunkRefs[0]), size)
+			}
+			return es.ReplaceExtents(ctx, inode.ID, extentsFor(newChunkRefs), size)
+		}
+	}
+	inode.Size = size
+	inode.ChunkMap = newChunkRefs
+	inode.MTime = nowUnixNano()
+	return meta.UpdateInode(ctx, inode)
 }

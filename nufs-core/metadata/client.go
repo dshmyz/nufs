@@ -821,6 +821,15 @@ func (c *HTTPClient) AppendExtent(ctx context.Context, id InodeID, extent *Exten
 	return out.ExtentRoot, nil
 }
 
+func (c *HTTPClient) ReplaceExtents(ctx context.Context, id InodeID, writes []ExtentWrite, size int64) error {
+	req := map[string]interface{}{"writes": writes, "size": size}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPut, fmt.Sprintf("/api/v1/inodes/%d/replace-extents", id), req)
+	if err != nil {
+		return err
+	}
+	return c.readResponse(resp, nil)
+}
+
 // Chunk operations
 
 func (c *HTTPClient) AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error) {

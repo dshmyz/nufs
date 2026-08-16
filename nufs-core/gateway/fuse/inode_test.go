@@ -104,6 +104,20 @@ func newTestFileWithRecorder(meta metadata.MetadataService, cs chunkstore.ChunkS
 	return newTestFileFromDFS(dfs, id, rec)
 }
 
+// resolvedChunks returns a file's committed chunk references under either
+// storage model (V1 ChunkMap or V2 extent layout, roadmap §1.3b/§1.3c). FUSE
+// flush lands inline extents for small files, so a post-flush inode's ChunkMap
+// is nil and its refs must come from the extent surface instead of the row.
+func resolvedChunks(t testing.TB, meta metadata.MetadataService, inode *metadata.InodeMeta) []metadata.ChunkRef {
+	t.Helper()
+	es, _ := meta.(metadata.ExtentInodeService)
+	refs, err := metadata.ResolveFileChunks(context.Background(), es, inode)
+	if err != nil {
+		t.Fatalf("ResolveFileChunks: %v", err)
+	}
+	return refs
+}
+
 // ========== B1: Read returns real chunk data (was: always zero bytes) ==========
 
 // TestDFSFile_Read_EmptyFile_ReturnsZeros has been removed: reading a
@@ -159,8 +173,8 @@ func TestDFSFile_Read_AfterFlush_ReadsFromChunkStore(t *testing.T) {
 	if inode.Size != int64(len(want)) {
 		t.Fatalf("after Flush: Size=%d, want %d", inode.Size, len(want))
 	}
-	if len(inode.ChunkMap) == 0 {
-		t.Fatalf("after Flush: ChunkMap is empty (B2 regression: flush didn't allocate)")
+	if len(resolvedChunks(t, meta, inode)) == 0 {
+		t.Fatalf("after Flush: no committed chunk (B2 regression: flush didn't allocate)")
 	}
 
 	// Now Read should return the bytes from the chunk store.
@@ -269,22 +283,21 @@ func TestDFSFile_Read_SparseCommittedChunkMap_ZeroFillsHoles(t *testing.T) {
 		t.Fatalf("post-Flush: file still dirty (committed-walk path)")
 	}
 
-	// Rewrite the committed ChunkMap to a sparse layout with a hole:
-	//   chunk A covers file [0,4)  → "0123"
-	//   hole covers      file [4,10) → zeros
-	//   chunk 2 covers   file [10,16) → "abcd" (second half of the seed)
+	// Grab a committed chunk ID already in the store from the seed flush. The
+	// seed flush landed inline (roadmap §1.3c), so the refs come from the extent
+	// surface rather than the row's ChunkMap (which is nil on a V2 row).
 	inode, err := meta.GetInode(context.Background(), id)
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
 	}
-	// Grab a committed chunk ID already in the store from the seed flush.
-	if len(inode.ChunkMap) != 1 {
-		t.Fatalf("seed ChunkMap len=%d, want 1", len(inode.ChunkMap))
+	refs := resolvedChunks(t, meta, inode)
+	if len(refs) != 1 {
+		t.Fatalf("seed committed refs len=%d, want 1", len(refs))
 	}
-	cid := inode.ChunkMap[0].ID
+	cid := refs[0].ID
 
-	// Allocate + commit a second REAL chunk so UpdateInode considers it
-	// available for attachment (mirroring Flush: allocate → write → commit).
+	// Allocate + commit a second REAL chunk so the extent set can refer to it
+	// (mirroring Flush: allocate → write → commit).
 	bucket, err := meta.GetBucket(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("GetBucket: %v", err)
@@ -304,14 +317,18 @@ func TestDFSFile_Read_SparseCommittedChunkMap_ZeroFillsHoles(t *testing.T) {
 		t.Fatalf("CommitChunk (chunk2): %v", err)
 	}
 
-	sparse := []metadata.ChunkRef{
-		{ID: cid, Offset: 0, Length: 4, Version: 1},
-		{ID: chunk2.ID, Offset: 10, Length: 6, Version: 1},
+	// Rewrite the committed layout to a sparse V2 extent set with a hole:
+	//   extent cid (file [0,4))       → "0123"
+	//   hole  (file [4,10))           → zeros
+	//   extent chunk2 (file [10,16))  → "abcd" (second half of the seed)
+	// Seeding the gap through the extent surface (ReplaceExtents) is required:
+	// the model guard refuses a V1 ChunkMap rewrite on a now-V2 row.
+	writes := []metadata.ExtentWrite{
+		{Extent: &metadata.ExtentMetaV2{ID: metadata.ExtentIDV2(cid), Generation: 1, LogicalLen: 4}, Offset: 0},
+		{Extent: &metadata.ExtentMetaV2{ID: metadata.ExtentIDV2(chunk2.ID), Generation: 1, LogicalLen: 6}, Offset: 10},
 	}
-	inode.ChunkMap = sparse
-	inode.Size = 16
-	if err := meta.UpdateInode(context.Background(), inode); err != nil {
-		t.Fatalf("UpdateInode (sparse): %v", err)
+	if err := meta.ReplaceExtents(context.Background(), id, writes, 16); err != nil {
+		t.Fatalf("ReplaceExtents (sparse): %v", err)
 	}
 
 	dest := make([]byte, 16)
@@ -421,15 +438,16 @@ func TestDFSFile_Flush_AllocatesChunk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
 	}
-	if len(inode.ChunkMap) != 1 {
-		t.Fatalf("ChunkMap len=%d, want 1", len(inode.ChunkMap))
+	refs := resolvedChunks(t, meta, inode)
+	if len(refs) != 1 {
+		t.Fatalf("committed refs len=%d, want 1", len(refs))
 	}
-	chunkID := inode.ChunkMap[0].ID
+	chunkID := refs[0].ID
 	if chunkID == 0 {
-		t.Fatalf("ChunkMap[0].ID == 0; allocator should produce a non-zero ID")
+		t.Fatalf("refs[0].ID == 0; allocator should produce a non-zero ID")
 	}
-	if inode.ChunkMap[0].Length != int32(len(want)) {
-		t.Fatalf("ChunkMap[0].Length=%d, want %d", inode.ChunkMap[0].Length, len(want))
+	if refs[0].Length != int32(len(want)) {
+		t.Fatalf("refs[0].Length=%d, want %d", refs[0].Length, len(want))
 	}
 
 	// Inspect chunk store: the payload must be there verbatim.
@@ -463,10 +481,11 @@ func TestDFSFile_Flush_CommitsAndSeals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
 	}
-	if len(inode.ChunkMap) == 0 {
-		t.Fatalf("ChunkMap empty")
+	refs := resolvedChunks(t, meta, inode)
+	if len(refs) == 0 {
+		t.Fatalf("no committed chunk after flush")
 	}
-	chunk, err := meta.GetChunk(context.Background(), inode.ChunkMap[0].ID)
+	chunk, err := meta.GetChunk(context.Background(), refs[0].ID)
 	if err != nil {
 		t.Fatalf("GetChunk: %v", err)
 	}
@@ -502,7 +521,8 @@ func TestDFSFile_Flush_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode after flush #1: %v", err)
 	}
-	chunkCount := len(inode1.ChunkMap)
+	refs1 := resolvedChunks(t, meta, inode1)
+	chunkCount := len(refs1)
 	size1 := inode1.Size
 
 	// Second flush without further writes should be a no-op.
@@ -514,8 +534,9 @@ func TestDFSFile_Flush_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode after flush #2: %v", err)
 	}
-	if len(inode2.ChunkMap) != chunkCount {
-		t.Fatalf("after flush #2: ChunkMap len=%d, want %d (B3 regression: re-allocated)", len(inode2.ChunkMap), chunkCount)
+	refs2 := resolvedChunks(t, meta, inode2)
+	if len(refs2) != chunkCount {
+		t.Fatalf("after flush #2: committed refs len=%d, want %d (B3 regression: re-allocated)", len(refs2), chunkCount)
 	}
 	if inode2.Size != size1 {
 		t.Fatalf("after flush #2: Size=%d, want %d (B3 regression: re-sized)", inode2.Size, size1)
@@ -583,25 +604,26 @@ func TestDFSFile_Flush_Oversized_AllocatesMultiChunk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
 	}
-	if len(inode.ChunkMap) != 3 {
-		t.Fatalf("after oversized flush: ChunkMap len=%d, want 3", len(inode.ChunkMap))
+	refs := resolvedChunks(t, meta, inode)
+	if len(refs) != 3 {
+		t.Fatalf("after oversized flush: committed refs len=%d, want 3", len(refs))
 	}
 	if inode.Size != int64(size) {
 		t.Fatalf("after oversized flush: Size=%d, want %d", inode.Size, size)
 	}
 	// Each ref is sealed, holds the right offset/length window, and
 	// read-back is byte-exact across the whole file.
-	for i, cref := range inode.ChunkMap {
+	for i, cref := range refs {
 		wantOff := int64(i) * metadata.MaxChunkSize
 		if cref.Offset != wantOff {
-			t.Fatalf("ChunkMap[%d].Offset=%d, want %d", i, cref.Offset, wantOff)
+			t.Fatalf("refs[%d].Offset=%d, want %d", i, cref.Offset, wantOff)
 		}
 		wantLen := metadata.MaxChunkSize
 		if i == 2 {
 			wantLen = size - 2*metadata.MaxChunkSize
 		}
 		if int(cref.Length) != wantLen {
-			t.Fatalf("ChunkMap[%d].Length=%d, want %d", i, cref.Length, wantLen)
+			t.Fatalf("refs[%d].Length=%d, want %d", i, cref.Length, wantLen)
 		}
 		chunk, gerr := meta.GetChunk(context.Background(), cref.ID)
 		if gerr != nil {
@@ -651,8 +673,9 @@ func TestDFSFile_Flush_MultiChunk_ReadBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
 	}
-	if len(inode.ChunkMap) != 3 {
-		t.Fatalf("ChunkMap len=%d, want 3", len(inode.ChunkMap))
+	refs := resolvedChunks(t, meta, inode)
+	if len(refs) != 3 {
+		t.Fatalf("committed refs len=%d, want 3", len(refs))
 	}
 	if inode.Size != int64(size) {
 		t.Fatalf("Size=%d, want %d", inode.Size, size)
@@ -697,11 +720,12 @@ func TestDFSFile_Flush_MultiChunk_CrossFlushReuse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode (before overwrite): %v", err)
 	}
-	if len(before.ChunkMap) != 2 {
-		t.Fatalf("before overwrite: ChunkMap len=%d, want 2", len(before.ChunkMap))
+	beforeRefs := resolvedChunks(t, meta, before)
+	if len(beforeRefs) != 2 {
+		t.Fatalf("before overwrite: committed refs len=%d, want 2", len(beforeRefs))
 	}
-	oldIDs := make(map[metadata.ChunkID]bool, len(before.ChunkMap))
-	for _, cref := range before.ChunkMap {
+	oldIDs := make(map[metadata.ChunkID]bool, len(beforeRefs))
+	for _, cref := range beforeRefs {
 		oldIDs[cref.ID] = true
 	}
 
@@ -723,10 +747,11 @@ func TestDFSFile_Flush_MultiChunk_CrossFlushReuse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode (after overwrite): %v", err)
 	}
-	if len(after.ChunkMap) != 2 {
-		t.Fatalf("after overwrite: ChunkMap len=%d, want 2", len(after.ChunkMap))
+	afterRefs := resolvedChunks(t, meta, after)
+	if len(afterRefs) != 2 {
+		t.Fatalf("after overwrite: committed refs len=%d, want 2", len(afterRefs))
 	}
-	for _, cref := range after.ChunkMap {
+	for _, cref := range afterRefs {
 		if oldIDs[cref.ID] {
 			t.Fatalf("chunk %d reused across flush — overwrite must not reuse chunk IDs (S3-aligned)", cref.ID)
 		}
@@ -945,10 +970,11 @@ func TestDFSFile_LoadCommitted_MultipleRefsInChunk_PreservesAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
 	}
-	if len(inode.ChunkMap) != 1 {
-		t.Fatalf("seed ChunkMap len=%d, want 1", len(inode.ChunkMap))
+	refs := resolvedChunks(t, meta, inode)
+	if len(refs) != 1 {
+		t.Fatalf("seed committed refs len=%d, want 1", len(refs))
 	}
-	cidA := inode.ChunkMap[0].ID
+	cidA := refs[0].ID
 
 	// Second real chunk carrying "abcd" at file offset 10.
 	bucket, err := meta.GetBucket(context.Background(), "test")
@@ -970,14 +996,15 @@ func TestDFSFile_LoadCommitted_MultipleRefsInChunk_PreservesAll(t *testing.T) {
 		t.Fatalf("CommitChunk (ref B): %v", err)
 	}
 
-	twoRefs := []metadata.ChunkRef{
-		{ID: cidA, Offset: 0, Length: 4, Version: 1},       // "0123"
-		{ID: chunkB.ID, Offset: 10, Length: 4, Version: 1}, // "abcd"
+	// Rewrite the inline layout to two non-contiguous extents inside the SAME
+	// base [0, metadata.MaxChunkSize) via the extent surface (ReplaceExtents) —
+	// the merge guard refuses a V1 ChunkMap rewrite on a now-V2 row.
+	twoRefs := []metadata.ExtentWrite{
+		{Extent: &metadata.ExtentMetaV2{ID: metadata.ExtentIDV2(cidA), Generation: 1, LogicalLen: 4}, Offset: 0},
+		{Extent: &metadata.ExtentMetaV2{ID: metadata.ExtentIDV2(chunkB.ID), Generation: 1, LogicalLen: 4}, Offset: 10},
 	}
-	inode.ChunkMap = twoRefs
-	inode.Size = 14
-	if err := meta.UpdateInode(context.Background(), inode); err != nil {
-		t.Fatalf("UpdateInode (twoRefs): %v", err)
+	if err := meta.ReplaceExtents(context.Background(), id, twoRefs, 14); err != nil {
+		t.Fatalf("ReplaceExtents (twoRefs): %v", err)
 	}
 
 	// Partial overwrite in the gap at offset 5 -> hydration must load BOTH refs.
@@ -1604,11 +1631,12 @@ func TestDFSFile_Flush_UsesBucketPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
 	}
-	if len(inode.ChunkMap) == 0 {
-		t.Fatal("ChunkMap is empty after Flush")
+	refs := resolvedChunks(t, meta, inode)
+	if len(refs) == 0 {
+		t.Fatal("no committed chunks after Flush")
 	}
 
-	chunkID := inode.ChunkMap[0].ID
+	chunkID := refs[0].ID
 	chunk, err := meta.GetChunk(context.Background(), chunkID)
 	if err != nil {
 		t.Fatalf("GetChunk: %v", err)
@@ -1667,12 +1695,13 @@ func TestDFSFile_Flush_FallsBackToDefaultOnNoBucket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
 	}
-	if len(metaInode.ChunkMap) == 0 {
-		t.Fatal("ChunkMap is empty after Flush on orphan file")
+	refs := resolvedChunks(t, store, metaInode)
+	if len(refs) == 0 {
+		t.Fatal("no committed chunks after Flush on orphan file")
 	}
 
 	// Verify the chunk has exactly 1 replica (default policy).
-	chunkID := metaInode.ChunkMap[0].ID
+	chunkID := refs[0].ID
 	chunk, err := store.GetChunk(ctx, chunkID)
 	if err != nil {
 		t.Fatalf("GetChunk: %v", err)

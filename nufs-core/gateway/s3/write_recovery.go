@@ -132,6 +132,11 @@ func (w *ObjectWriteRecoveryWorker) cleanupAttempt(ctx context.Context, attempt 
 	if attempt.RollbackInode == nil {
 		return nil
 	}
+	// NOTE (§1.4): for a V2 object the rollback snapshot is a V1
+	// projection (nil ChunkMap), so this restore lands a layout-less row
+	// and the V2 object's extents become unreachable — same gap as the
+	// committer's cleanupQuotaRejectedWrite; deferred with bucket-stats
+	// aggregation to roadmap §1.4.
 	rollback := cloneInodeMeta(attempt.RollbackInode)
 	if err := w.meta.UpdateInode(ctx, rollback); err != nil {
 		return fmt.Errorf("restore inode %d: %w", rollback.ID, err)
@@ -197,7 +202,17 @@ func (w *ObjectWriteRecoveryWorker) recoverAttempt(ctx context.Context, attempt 
 		_ = w.deleteChunks(ctx, attempt.Chunks)
 		return fmt.Errorf("stale write attempt for %s/%s", attempt.Bucket, attempt.Key)
 	}
-	if equalRecoveryChunkRefs(inode.ChunkMap, attempt.Chunks) {
+	// The committed surface is model-aware: a V2 row (nil ChunkMap) is
+	// resolved through the extent surface (extent ID == chunk ID) rather
+	// than read as empty, so an already-applied V2 commit is recognized
+	// instead of being misread as stale and its chunks deleted. A
+	// resolution error fails loud (the attempt stays retryable) rather
+	// than risking delete-after-commit data loss.
+	committedRefs, err := resolveCommittedChunks(ctx, w.meta, inode)
+	if err != nil {
+		return fmt.Errorf("resolve committed chunks for inode %d: %w", attempt.InodeID, err)
+	}
+	if equalRecoveryChunkRefs(committedRefs, attempt.Chunks) {
 		committed := *attempt
 		committed.State = metadata.WriteAttemptCommitted
 		committed.LastError = ""
@@ -215,12 +230,13 @@ func (w *ObjectWriteRecoveryWorker) recoverAttempt(ctx context.Context, attempt 
 	if err := w.ensureChunksDurable(ctx, attempt.Chunks); err != nil {
 		return err
 	}
-	inode.ChunkMap = cloneChunkRefs(attempt.Chunks)
-	inode.Size = newSize
-	now := time.Now().UnixNano()
-	inode.CTime = now
-	inode.MTime = now
-	if err := w.meta.UpdateInode(ctx, inode); err != nil {
+	// Model-aware re-commit mirrors the gateway's commit decision (roadmap
+	// §1.3c): a row with a V2 extent surface is rebuilt as V2 layout, and
+	// without the surface it falls back to the V1 ChunkMap update. This
+	// also promotes a row that allocation left with Length-0 refs to V2,
+	// exactly as the original commit would have, instead of tripping the
+	// V1 UpdateInode model guard on a V2 row.
+	if err := metadata.CommitChunkRefsModelAware(ctx, w.meta, inode, cloneChunkRefs(attempt.Chunks), newSize); err != nil {
 		return fmt.Errorf("update inode %d: %w", attempt.InodeID, err)
 	}
 	committed := *attempt
@@ -229,12 +245,20 @@ func (w *ObjectWriteRecoveryWorker) recoverAttempt(ctx context.Context, attempt 
 	return w.meta.PutWriteAttempt(ctx, &committed)
 }
 
+// equalRecoveryChunkRefs reports whether a row's committed refs match the
+// attempt's recorded chunks. Version is deliberately ignored: refs
+// resolved from a V2 row's extent surface carry Version 0 while recorded
+// WriteAllocated refs carry Version 1, yet ID/Offset/Length uniquely
+// identify the data (allocation always assigns fresh chunk IDs). Ignoring
+// Version cannot forge an "already applied" match on a crash between
+// durable and commit either — those rows carry Length-0 allocated refs
+// that differ on Length.
 func equalRecoveryChunkRefs(left, right []metadata.ChunkRef) bool {
 	if len(left) != len(right) {
 		return false
 	}
 	for i := range left {
-		if left[i] != right[i] {
+		if left[i].ID != right[i].ID || left[i].Offset != right[i].Offset || left[i].Length != right[i].Length {
 			return false
 		}
 	}

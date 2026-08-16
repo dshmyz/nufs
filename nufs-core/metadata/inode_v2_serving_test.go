@@ -116,23 +116,24 @@ func TestUpdateInode_RefusesV2Layout(t *testing.T) {
 		t.Fatalf("V1 update on LayoutEmpty row should succeed: %v", err)
 	}
 
-	// After SetInlineExtent the row carries a V2 layout; V1 overwrite is refused.
+	// After SetInlineExtent the row carries a V2 layout; a V1 write carrying
+	// a ChunkMap (which would clobber the layout fields) is refused.
 	ext := &ExtentMetaV2{ID: ExtentIDV2(0x30000003001), LogicalLen: 4096, PGID: 1}
 	if err := store.SetInlineExtent(ctx, id, ext, 4096); err != nil {
 		t.Fatalf("SetInlineExtent: %v", err)
 	}
-	err := store.UpdateInode(ctx, &InodeMeta{ID: id, Size: 9999})
+	err := store.UpdateInode(ctx, &InodeMeta{ID: id, Size: 9999, ChunkMap: []ChunkRef{{ID: 1}}})
 	if !errors.Is(err, ErrInodeModelMismatch) {
-		t.Fatalf("UpdateInode on inline row err = %v, want ErrInodeModelMismatch", err)
+		t.Fatalf("UpdateInode with ChunkMap on inline row err = %v, want ErrInodeModelMismatch", err)
 	}
 
 	// PromoteToPages: pages layout is protected the same way.
 	if err := store.PromoteToPages(ctx, id); err != nil {
 		t.Fatalf("PromoteToPages: %v", err)
 	}
-	err = store.UpdateInode(ctx, &InodeMeta{ID: id, Size: 9999})
+	err = store.UpdateInode(ctx, &InodeMeta{ID: id, Size: 9999, ChunkMap: []ChunkRef{{ID: 1}}})
 	if !errors.Is(err, ErrInodeModelMismatch) {
-		t.Fatalf("UpdateInode on pages row err = %v, want ErrInodeModelMismatch", err)
+		t.Fatalf("UpdateInode with ChunkMap on pages row err = %v, want ErrInodeModelMismatch", err)
 	}
 
 	// The V2 layout fields survived both rejected updates.
@@ -145,6 +146,57 @@ func TestUpdateInode_RefusesV2Layout(t *testing.T) {
 	}
 }
 
+// TestUpdateInode_MergesMetadataOnlyOnV2Row locks in the 1.3c guard
+// relaxation: a metadata-only update (nil ChunkMap — e.g. chmod/chown/xattr
+// on a V2 file) must merge into the V2 row, preserving its layout fields,
+// rather than failing. The V1 projection must read back the merged attrs.
+func TestUpdateInode_MergesMetadataOnlyOnV2Row(t *testing.T) {
+	store := newV2TestPebbleStore(t)
+	ctx := context.Background()
+	id := InodeID(1004)
+
+	if _, err := NewInodeStoreV2(store).CreateEmpty(id, FileRegular, 1, 0, 0, 0644); err != nil {
+		t.Fatal(err)
+	}
+	ext := &ExtentMetaV2{ID: ExtentIDV2(0x30000003002), LogicalLen: 4096, PGID: 1}
+	if err := store.SetInlineExtent(ctx, id, ext, 4096); err != nil {
+		t.Fatalf("SetInlineExtent: %v", err)
+	}
+
+	// Full read-modify-write projection, exactly what Setattr/SetXAttr do:
+	// GetInode → mutate attrs → UpdateInode (nil ChunkMap on a V2 row).
+	cur, err := store.GetInode(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upd := &InodeMeta{ID: id, Size: cur.Size, NLink: cur.NLink, Mode: 0755, UID: 42, GID: 43, CTime: cur.CTime, MTime: cur.MTime, ATime: cur.ATime, XAttrs: cur.XAttrs}
+	if err := store.UpdateInode(ctx, upd); err != nil {
+		t.Fatalf("metadata-only UpdateInode on V2 row: %v", err)
+	}
+
+	in, err := NewInodeStoreV2(store).Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Layout != LayoutInlineExtent || in.InlineExtent == nil || in.InlineExtent.ID != ext.ID {
+		t.Fatalf("V2 layout lost after metadata merge: %+v", in)
+	}
+	if in.Size != 4096 {
+		t.Fatalf("size = %d, want 4096 preserved", in.Size)
+	}
+	if in.Mode != 0755 || in.UID != 42 || in.GID != 43 {
+		t.Fatalf("merged attrs = mode=%o uid=%d gid=%d", in.Mode, in.UID, in.GID)
+	}
+	got, err := store.GetInode(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != 0755 || got.UID != 42 || got.Size != 4096 {
+		t.Fatalf("V1 projection after merge = %+v", got)
+	}
+}
+
+// TestExtentInodeService_Errors tests the serving surface's error sentinels.
 func TestExtentInodeService_Errors(t *testing.T) {
 	store := newV2TestPebbleStore(t)
 	ctx := context.Background()
@@ -368,9 +420,8 @@ func TestResolveFileChunks_V1EmptyAndNilSurface(t *testing.T) {
 	ctx := context.Background()
 
 	// Empty inode: no chunks, and the extent probe correctly finds no V2
-	// layout either. (Allocation and the V1 check below use a separate
-	// inode: AllocateChunk does not invalidate the inode cache, so a cached
-	// pre-allocation GetInode would shadow the new ChunkMap.)
+	// layout either. (The allocation and V1 check below use a separate inode
+	// so this empty-file case stays free of allocated refs.)
 	newResolveTestInode(t, store, InodeID(2004))
 	inode, err := store.GetInode(ctx, InodeID(2004))
 	if err != nil {
@@ -429,5 +480,45 @@ func TestResolveFileChunks_ErrorPropagation(t *testing.T) {
 	}
 	if _, err := ResolveFileChunks(ctx, store, inode); !errors.Is(err, ErrExtentNotFound) {
 		t.Fatalf("ResolveFileChunks missing extent meta = %v, want ErrExtentNotFound", err)
+	}
+}
+
+// TestAllocateChunk_InvalidatesInodeCache locks in the 1.3c prerequisite fix:
+// AllocateChunk's conditional batch writes the inode row straight through the
+// raft FSM, bypassing UpdateInode's cache invalidation. Without dropping the
+// cached inode, a GetInode that ran before allocation would return the stale
+// pre-allocation row (zero refs) forever, shadowing the fresh ChunkMap.
+func TestAllocateChunk_InvalidatesInodeCache(t *testing.T) {
+	store := newResolveTestStore(t)
+	ctx := context.Background()
+	id := InodeID(2006)
+
+	newResolveTestInode(t, store, id)
+
+	// Populate the cache with the pre-allocation (empty) row.
+	before, err := store.GetInode(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before.ChunkMap) != 0 {
+		t.Fatalf("fixture: expected empty ChunkMap before allocation, got %d", len(before.ChunkMap))
+	}
+
+	chunk, err := store.AllocateChunk(ctx, id, 0, v2ResolveTestPolicy)
+	if err != nil {
+		t.Fatalf("AllocateChunk: %v", err)
+	}
+
+	// Without cache invalidation this GetInode returns the stale empty row;
+	// with the fix it re-reads the fresh ChunkMap from the store.
+	after, err := store.GetInode(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.ChunkMap) != 1 {
+		t.Fatalf("GetInode after AllocateChunk returned %d refs, want 1 (inode cache was not invalidated)", len(after.ChunkMap))
+	}
+	if after.ChunkMap[0].ID != chunk.ID {
+		t.Fatalf("ChunkMap[0].ID = %d, want %d", after.ChunkMap[0].ID, chunk.ID)
 	}
 }

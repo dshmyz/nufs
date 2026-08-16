@@ -110,11 +110,14 @@ func TestExtentInodeServiceHTTPContract(t *testing.T) {
 
 // TestExtentInodeServiceHTTPErrors checks the machine-readable error mapping
 // across the HTTP hop: a missing extent id → 404 mapped back to
-// ErrExtentNotFound on the client, and the V1 UpdateInode PUT on a V2-layout
-// row → the collision guard refuses with a 500 whose body names the V2
-// layout, so the guard holds even when the gateway talks to metad remotely.
-// (The HTTPClient treats 5xx as retryable leader-transition noise and drops
-// the body, so the refusal text is asserted at the handler, not the client.)
+// ErrExtentNotFound on the client, and a V1 UpdateInode PUT on a V2-layout
+// row → the collision guard refuses a data write (non-empty chunks) with a
+// 500 whose body names the V2 layout, while a metadata-only update (nil
+// chunks — GetInode on a V2 row returns none) merges into the row so
+// chmod/chown/touch keep working on V2 files. The guard therefore holds even
+// when the gateway talks to metad remotely. (The HTTPClient treats 5xx as
+// retryable leader-transition noise and drops the body, so the refusal text
+// is asserted at the handler, not the client.)
 func TestExtentInodeServiceHTTPErrors(t *testing.T) {
 	store, bundle := newOpsTestStore(t)
 	mux := buildOpsTestMux(t, store, bundle)
@@ -129,7 +132,7 @@ func TestExtentInodeServiceHTTPErrors(t *testing.T) {
 		t.Fatalf("GetExtentMeta missing = %v, want ErrExtentNotFound", err)
 	}
 
-	// V1 UpdateInode on a V2-layout row refuses across HTTP.
+	// V1 UpdateInode on a V2-layout row across HTTP.
 	id := metadata.InodeID(90002)
 	if _, err := metadata.NewInodeStoreV2(store).CreateEmpty(id, metadata.FileRegular, 1, 0, 0, 0644); err != nil {
 		t.Fatal(err)
@@ -139,23 +142,40 @@ func TestExtentInodeServiceHTTPErrors(t *testing.T) {
 		t.Fatalf("SetInlineExtent: %v", err)
 	}
 
-	v1Body := bytes.NewBufferString(`{"id":90002,"size":9999}`)
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/inodes/90002", v1Body)
+	// Metadata-only update merges: 200, layout preserved, size overlaid.
+	metaBody := bytes.NewBufferString(`{"id":90002,"size":9999}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/inodes/90002", metaBody)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("V1 update on V2-layout row status = %d body=%s, want 500", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("metadata-only V1 update status = %d body=%s, want 200", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "V2 layout") {
-		t.Fatalf("V1 update refusal body = %s, want it to name the V2 layout", rr.Body.String())
-	}
-
-	// The refused update corrupted nothing: the row is still the inline layout.
 	in, err := metadata.NewInodeStoreV2(store).Get(id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if in.Layout != metadata.LayoutInlineExtent || in.Size != 4096 {
-		t.Fatalf("durable inode after refused V1 update = %+v, want inline layout size 4096", in)
+	if in.Layout != metadata.LayoutInlineExtent || in.Size != 9999 {
+		t.Fatalf("merged metadata-only update = %+v, want inline layout size 9999", in)
+	}
+
+	// A V1 data write (non-empty chunks) refuses across HTTP.
+	dataBody := bytes.NewBufferString(`{"id":90002,"size":9999,"chunks":[{"id":123,"offset":0,"length":9999,"version":1}]}`)
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/inodes/90002", dataBody)
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("V1 data write on V2-layout row status = %d body=%s, want 500", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "V2 layout") {
+		t.Fatalf("V1 data write refusal body = %s, want it to name the V2 layout", rr.Body.String())
+	}
+
+	// The refused write corrupted nothing: the row is still the inline layout.
+	in, err = metadata.NewInodeStoreV2(store).Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Layout != metadata.LayoutInlineExtent || in.Size != 9999 {
+		t.Fatalf("durable inode after refused V1 data write = %+v, want inline layout size 9999", in)
 	}
 }

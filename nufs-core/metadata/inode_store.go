@@ -41,6 +41,24 @@ func (s *InodeStoreV2) Put(in *InodeMetaV2) error {
 	return s.store.putMsgpack(inodeV2Key(in.ID), in)
 }
 
+// putWithBucketStats persists the inode row while keeping the bucket byte
+// usage counter correct (roadmap §1.3c). UpdateInode accumulates usage via
+// addBucketStatsOp for V1 rows; the V2 commit writers must do the same or
+// the counter freezes and byte-quota enforcement silently degrades once
+// writes start landing V2 layout. The stats row and the inode row share
+// one atomic Raft batch, matching UpdateInode. AppendExtent/PromoteToPages
+// use s.Put directly: PromoteToPages does not change Size, and
+// AppendExtent's serving surface is not yet wired to a quota-enforced path.
+func (s *InodeStoreV2) putWithBucketStats(in *InodeMetaV2, oldSize int64) error {
+	if !s.store.cfg.UseBucketStats {
+		return s.Put(in)
+	}
+	var ops []batchOp
+	s.store.addBucketStatsOp(in.BucketRoot, in.Size-oldSize, 0, &ops)
+	ops = append(ops, batchOp{Key: inodeV2Key(in.ID), Value: in})
+	return s.store.applyBatchMsgpack(ops, nil)
+}
+
 // CreateEmpty creates an empty inode.
 func (s *InodeStoreV2) CreateEmpty(id InodeID, typ FileType, bucketRoot InodeID, uid, gid, mode uint32) (*InodeMetaV2, error) {
 	now := nowUnixNano()
@@ -72,11 +90,25 @@ func (s *InodeStoreV2) SetInlineExtent(id InodeID, extent *ExtentMetaV2, size in
 	if in == nil {
 		return ErrInodeNotFound
 	}
+	oldRoot := in.ExtentRoot
+	oldCount := in.ExtentPageCount
+	oldSize := in.Size
 	in.Layout = LayoutInlineExtent
 	in.InlineExtent = extent
 	in.Size = size
 	in.MTime = nowUnixNano()
-	return s.Put(in)
+	in.CTime = nowUnixNano()
+	if err := s.putWithBucketStats(in, oldSize); err != nil {
+		return err
+	}
+	// Old extent-pages root enters delayed GC once the inline row is durable
+	// (parity with PromoteToPages/AppendExtent/ReplaceExtents). Without this a
+	// pages→inline shrink (e.g. truncate-down then rewrite to ≤ MaxInlineExtentSize)
+	// would orphan the old root's pages and leave dangling chunk refs behind.
+	if oldRoot != 0 {
+		_ = s.pages.DeleteRoot(id, oldRoot, oldCount)
+	}
+	return nil
 }
 
 // PromoteToPages transitions an inline-extent inode to extent pages
@@ -104,6 +136,7 @@ func (s *InodeStoreV2) PromoteToPages(id InodeID) error {
 	in.ExtentRoot = newRoot
 	in.ExtentRootVersion++
 	in.ExtentPageCount = 1
+	in.CTime = nowUnixNano()
 	if err := s.Put(in); err != nil {
 		return err
 	}
@@ -151,13 +184,71 @@ func (s *InodeStoreV2) AppendExtent(id InodeID, ref ExtentRef, extentSize int64)
 	}
 	in.ExtentRoot = newRoot
 	in.ExtentRootVersion++
+	oldSize := in.Size
 	in.Size += extentSize
 	in.MTime = nowUnixNano()
-	if err := s.Put(in); err != nil {
+	in.CTime = nowUnixNano()
+	if err := s.putWithBucketStats(in, oldSize); err != nil {
 		return 0, err
 	}
 	_ = newPage
 	return newRoot, nil
+}
+
+// ReplaceExtents rewrites the file's entire extent set as extent pages
+// under a fresh COW root, replacing whatever model the row previously had
+// (empty, inline, or earlier pages). Unlike PromoteToPages it does NOT
+// preserve an old inline extent as page 0 — the gateway overwrite has
+// already rewritten the old extent's data into the new chunk set, so the
+// old reference would dangle. Empty writes (a zero-byte overwrite) leave a
+// valid pages-layout inode with no extents.
+func (s *InodeStoreV2) ReplaceExtents(id InodeID, writes []ExtentWrite, size int64) error {
+	in, err := s.Get(id)
+	if err != nil {
+		return err
+	}
+	if in == nil {
+		return ErrInodeNotFound
+	}
+	// The new extent set is written in full under the fresh root — no COW
+	// carry-over from older roots, so the old root can be deleted as soon
+	// as the switch is durable.
+	newRoot := in.ExtentRoot + 1
+	oldRoot := in.ExtentRoot
+	oldCount := in.ExtentPageCount
+	pageCount := uint32((len(writes) + MaxExtentsPerPage - 1) / MaxExtentsPerPage)
+	for p := uint32(0); p < pageCount; p++ {
+		lo := int(p) * MaxExtentsPerPage
+		hi := lo + MaxExtentsPerPage
+		if hi > len(writes) {
+			hi = len(writes)
+		}
+		page := &ExtentPage{InodeID: id, PageNo: p}
+		for _, w := range writes[lo:hi] {
+			page.Extents = append(page.Extents, ExtentRef{ExtentID: w.Extent.ID, LogicalOffset: w.Offset})
+		}
+		if err := s.pages.writePage(page, newRoot); err != nil {
+			return err
+		}
+	}
+	now := nowUnixNano()
+	in.Layout = LayoutExtentPages
+	in.InlineExtent = nil
+	in.ExtentRoot = newRoot
+	in.ExtentRootVersion++
+	in.ExtentPageCount = pageCount
+	oldSize := in.Size
+	in.Size = size
+	in.MTime = now
+	in.CTime = now
+	if err := s.putWithBucketStats(in, oldSize); err != nil {
+		return err
+	}
+	// Old root enters delayed GC once the new root is durable.
+	if oldRoot != 0 {
+		_ = s.pages.DeleteRoot(id, oldRoot, oldCount)
+	}
+	return nil
 }
 
 // ResolveExtents returns the flat extent list for a file (inline or

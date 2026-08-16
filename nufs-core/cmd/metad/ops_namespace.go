@@ -320,6 +320,9 @@ func (h *opsHandlers) handleInodesByID(w http.ResponseWriter, r *http.Request) {
 		case "append-extent":
 			h.handleInodeAppendExtent(w, r, inodeID)
 			return
+		case "replace-extents":
+			h.handleInodeReplaceExtents(w, r, inodeID)
+			return
 		}
 	}
 	switch r.Method {
@@ -458,6 +461,37 @@ func (h *opsHandlers) handleInodeAppendExtent(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, map[string]interface{}{"extent_root": root})
+}
+
+// handleInodeReplaceExtents serves PUT /api/v1/inodes/{id}/replace-extents
+// (ReplaceExtents). The endpoint is a distinct sub-path because the mux
+// dispatches by path segment, and "extents" is already claimed by
+// ResolveExtents (GET).
+func (h *opsHandlers) handleInodeReplaceExtents(w http.ResponseWriter, r *http.Request, inodeID metadata.InodeID) {
+	if r.Method != http.MethodPut {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.requireLeader(w, r) {
+		return
+	}
+	var body struct {
+		Writes []metadata.ExtentWrite `json:"writes"`
+		Size   int64                  `json:"size"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	es, ok := h.extentInodeService(w)
+	if !ok {
+		return
+	}
+	if err := es.ReplaceExtents(r.Context(), inodeID, body.Writes, body.Size); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "updated"})
 }
 
 // handleExtentByID serves GET /api/v1/extents/{id} (GetExtentMeta).

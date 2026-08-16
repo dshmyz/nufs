@@ -177,11 +177,25 @@ type ExtentPage struct {
 // 4 GiB at a 16 MiB extent size.
 const MaxExtentsPerPage = 256
 
+// MaxInlineExtentSize is the largest file that stays in the compact
+// single-inline-extent layout (§11.1). Above it a file's extents spill to
+// COW extent pages. 16 MiB keeps one extent (and thus one placement-group
+// write) per small file; 256 extents/page → 4 GiB per page.
+const MaxInlineExtentSize = 16 * 1024 * 1024
+
 // ExtentRef references an extent within a file's logical byte range.
 type ExtentRef struct {
 	ExtentID ExtentIDV2 `json:"extent_id"`
 	// LogicalOffset is the byte offset of this extent in the file.
 	LogicalOffset int64 `json:"logical_offset"`
+}
+
+// ExtentWrite pairs an extent with its logical offset in the file. It is
+// the unit of ReplaceExtents (the whole-set pages writer for gateway
+// overwrites).
+type ExtentWrite struct {
+	Extent *ExtentMetaV2 `json:"extent"`
+	Offset int64         `json:"offset"`
 }
 
 // DirEntry represents a directory entry (child pointer).

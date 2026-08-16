@@ -68,8 +68,8 @@ var (
 	// instead (roadmap stage 1 / V2.1 inode wiring).
 	ErrInodeModelMismatch = errors.New("metadata: inode has a V2 layout; V1 update refused")
 	ErrDirTooLarge        = errors.New("metadata: directory exceeds maximum entries limit")
-	ErrAccessDenied      = errors.New("metadata: access denied")
-	ErrQuotaExceeded     = errors.New("metadata: bucket quota exceeded")
+	ErrAccessDenied       = errors.New("metadata: access denied")
+	ErrQuotaExceeded      = errors.New("metadata: bucket quota exceeded")
 )
 
 // Internal sentinel errors

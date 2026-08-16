@@ -156,7 +156,9 @@ func TestBufferedFile_FlushCommitsAndClears(t *testing.T) {
 		t.Errorf("ref=%+v, want Offset=0 Length=%d", ref, len(data))
 	}
 
-	// Inode was updated: ChunkMap + size persisted.
+	// Inode was updated: on a serving surface with the extent layout the flush
+	// commits as a V2 inline extent (no ChunkMap), and the read resolver must
+	// return the single ref.
 	inode, err := pb.GetInode(ctx, inodeID)
 	if err != nil {
 		t.Fatalf("GetInode: %v", err)
@@ -164,8 +166,19 @@ func TestBufferedFile_FlushCommitsAndClears(t *testing.T) {
 	if inode.Size != int64(len(data)) {
 		t.Errorf("inode.Size=%d, want %d", inode.Size, len(data))
 	}
-	if len(inode.ChunkMap) != 1 || inode.ChunkMap[0].ID != ref.ID {
-		t.Errorf("ChunkMap=%+v, want single ref %d", inode.ChunkMap, ref.ID)
+	if len(inode.ChunkMap) != 0 {
+		t.Errorf("inode.ChunkMap=%+v, want none (V2 layout)", inode.ChunkMap)
+	}
+	in2, err := metadata.NewInodeStoreV2(pb).Get(inodeID)
+	if err != nil {
+		t.Fatalf("V2 Get: %v", err)
+	}
+	if in2.Layout != metadata.LayoutInlineExtent || in2.InlineExtent == nil || in2.InlineExtent.ID != metadata.ExtentIDV2(ref.ID) {
+		t.Errorf("v2 inode=%+v, want V2 inline extent id %d", in2, ref.ID)
+	}
+	resolved, err := metadata.ResolveFileChunks(ctx, pb, inode)
+	if err != nil || len(resolved) != 1 || resolved[0].ID != ref.ID {
+		t.Errorf("ResolveFileChunks=%+v, %v, want single ref %d", resolved, err, ref.ID)
 	}
 
 	// Chunk payload landed byte-exact in the chunk store.
@@ -611,5 +624,150 @@ func TestBufferedFile_ReadViewV2ExtentLayout(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Fatalf("ReadView window = %q, want %q", got, want)
+	}
+}
+
+// TestBufferedFile_FlushV2InlineAndRewrite drives the write dual-model
+// (roadmap §1.3c) commit decision through the FUSE flush shape: a small flush
+// lands as a V2 inline extent, and a subsequent partial overwrite of that
+// inline file merges its committed bytes (via loadCommittedChunkLocked
+// resolving the extent surface) instead of zero-filling the overwritten base.
+func TestBufferedFile_FlushV2InlineAndRewrite(t *testing.T) {
+	pb, inodeID := newBufferedTestMeta(t)
+	mem := NewMemoryChunkStore()
+	ctx := context.Background()
+	b := newTestBuffered(pb, mem, inodeID)
+
+	payload := "committed-data"
+	if _, err := b.Write(ctx, []byte(payload), 0); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := b.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// First flush committed as a V2 inline extent.
+	in2, err := metadata.NewInodeStoreV2(pb).Get(inodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in2.Layout != metadata.LayoutInlineExtent || in2.InlineExtent == nil {
+		t.Fatalf("first flush v2 inode = %+v, want inline", in2)
+	}
+
+	// Partial overwrite of the inline file: bytes outside [5,7) must survive.
+	if _, err := b.Write(ctx, []byte("XX"), 5); err != nil {
+		t.Fatalf("overwrite Write: %v", err)
+	}
+	if _, err := b.Flush(ctx); err != nil {
+		t.Fatalf("second Flush: %v", err)
+	}
+	want := "commiXXed-data"
+	got, err := b.ReadView(ctx, 0, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("ReadView: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("rewrite body = %q, want %q", got, want)
+	}
+	// Still a single inline extent (the rewrite coalesced into one chunk).
+	in3, err := metadata.NewInodeStoreV2(pb).Get(inodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in3.Layout != metadata.LayoutInlineExtent || in3.InlineExtent == nil {
+		t.Fatalf("rewrite v2 inode = %+v, want inline", in3)
+	}
+}
+
+// TestBufferedFile_FlushV2Pages drives the spill branch of the write
+// dual-model commit: a file larger than MaxInlineExtentSize must land as COW
+// extent pages (ReplaceExtents), stay readable, and on the next overwrite
+// supersede the old chunk (deleted) while preserving the merged image. (The
+// allocation that precedes each commit is a V1-model write, so the transient
+// row loses its extent root — the pages are rewritten in place under root 1
+// and COW root/version do not advance; data correctness is unaffected.)
+func TestBufferedFile_FlushV2Pages(t *testing.T) {
+	pb, inodeID := newBufferedTestMeta(t)
+	mem := NewMemoryChunkStore()
+	ctx := context.Background()
+	b := newTestBuffered(pb, mem, inodeID)
+
+	// One chunk (≤ MaxChunkSize) but too large for the inline layout.
+	n := int64(metadata.MaxInlineExtentSize + 1)
+	big := strings.Repeat("P", int(n))
+	if _, err := b.Write(ctx, []byte(big), 0); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	firstRes, err := b.Flush(ctx)
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if len(firstRes.NewRefs) != 1 {
+		t.Fatalf("first NewRefs = %d, want 1", len(firstRes.NewRefs))
+	}
+	firstRef := firstRes.NewRefs[0].ID
+
+	in, err := metadata.NewInodeStoreV2(pb).Get(inodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Layout != metadata.LayoutExtentPages || in.ExtentPageCount != 1 || in.ExtentRoot == 0 {
+		t.Fatalf("pages v2 inode = %+v, want ExtentPages root!=0", in)
+	}
+
+	got, err := b.ReadView(ctx, 0, n)
+	if err != nil {
+		t.Fatalf("ReadView: %v", err)
+	}
+	if len(got) != int(n) || got[n-1] != 'P' {
+		t.Fatalf("ReadView len=%d, want %d (all P)", len(got), n)
+	}
+
+	// Overwrite a window near the tail and flush again: still pages, a fresh
+	// chunk supersedes the first, and the merged image is byte-exact.
+	tail := n - 4
+	if _, err := b.Write(ctx, []byte("ZZZZ"), tail); err != nil {
+		t.Fatalf("tail Write: %v", err)
+	}
+	secondRes, err := b.Flush(ctx)
+	if err != nil {
+		t.Fatalf("second Flush: %v", err)
+	}
+	if len(secondRes.NewRefs) != 1 {
+		t.Fatalf("second NewRefs = %d, want 1", len(secondRes.NewRefs))
+	}
+	if secondRes.NewRefs[0].ID == firstRef {
+		t.Fatal("second flush reused the first chunk, want a fresh superseding chunk")
+	}
+	in2, err := metadata.NewInodeStoreV2(pb).Get(inodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in2.Layout != metadata.LayoutExtentPages {
+		t.Fatalf("rewrite pages inode = %+v, want ExtentPages", in2)
+	}
+	// The first flush's chunk was superseded: the extent surface now references
+	// only the fresh chunk. (Chunk rows are tombstoned — retained in quarantine
+	// until purge — so "gone" is asserted via the inode's extent surface rather
+	// than GetChunk.)
+	proj, err := pb.GetInode(ctx, inodeID)
+	if err != nil {
+		t.Fatalf("GetInode after rewrite: %v", err)
+	}
+	post, err := metadata.ResolveFileChunks(ctx, pb, proj)
+	if err != nil {
+		t.Fatalf("ResolveFileChunks after rewrite: %v", err)
+	}
+	if len(post) != 1 || post[0].ID == firstRef || post[0].ID != secondRes.NewRefs[0].ID {
+		t.Fatalf("extent surface after rewrite = %+v, want only [%d]", post, secondRes.NewRefs[0].ID)
+	}
+	wantBody := strings.Repeat("P", int(tail)) + "ZZZZ"
+	got, err = b.ReadView(ctx, 0, n)
+	if err != nil {
+		t.Fatalf("ReadView after rewrite: %v", err)
+	}
+	if string(got) != wantBody {
+		t.Fatalf("rewrite body mismatch (%d bytes)", len(got))
 	}
 }

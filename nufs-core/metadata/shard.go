@@ -839,6 +839,14 @@ func (ss *ShardedStore) AppendExtent(ctx context.Context, id InodeID, extent *Ex
 	return store.AppendExtent(ctx, id, extent, offset)
 }
 
+func (ss *ShardedStore) ReplaceExtents(ctx context.Context, id InodeID, writes []ExtentWrite, size int64) error {
+	store, err := ss.routeToShard(shardKeyForInode(id))
+	if err != nil {
+		return err
+	}
+	return store.ReplaceExtents(ctx, id, writes, size)
+}
+
 // --- ChunkService ---
 
 func (ss *ShardedStore) AllocateChunk(ctx context.Context, inodeID InodeID, offset int64, policy PlacementPolicy) (*ChunkMeta, error) {

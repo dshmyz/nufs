@@ -117,11 +117,23 @@ func TestCopyObjectAccountsDestinationUsage(t *testing.T) {
 	if source.ID == destination.ID {
 		t.Fatalf("copy reused source inode %d", source.ID)
 	}
-	if len(source.ChunkMap) == 0 || len(destination.ChunkMap) == 0 {
-		t.Fatalf("copy chunk maps are empty: source=%+v destination=%+v", source.ChunkMap, destination.ChunkMap)
+	// 1.3c: source and destination are V2 inline objects (nil ChunkMap),
+	// so resolve the committed chunks through the extent surface (extent
+	// ID == chunk ID) to prove the copy rewrote the data into fresh chunks
+	// rather than reusing the source's.
+	srcRefs, err := metadata.ResolveFileChunks(ctx, store, source)
+	if err != nil {
+		t.Fatalf("resolve source chunks: %v", err)
 	}
-	if source.ChunkMap[0].ID == destination.ChunkMap[0].ID {
-		t.Fatalf("copy reused source chunk %d", source.ChunkMap[0].ID)
+	dstRefs, err := metadata.ResolveFileChunks(ctx, store, destination)
+	if err != nil {
+		t.Fatalf("resolve destination chunks: %v", err)
+	}
+	if len(srcRefs) == 0 || len(dstRefs) == 0 {
+		t.Fatalf("copy resolved no chunks: source=%+v destination=%+v", srcRefs, dstRefs)
+	}
+	if srcRefs[0].ID == dstRefs[0].ID {
+		t.Fatalf("copy reused source chunk %d", srcRefs[0].ID)
 	}
 }
 
@@ -736,8 +748,20 @@ func TestObjectCommitterBatchShortBodyDeletesUnusedChunksOnSuccess(t *testing.T)
 	if err != nil {
 		t.Fatalf("Lookup committed object: %v", err)
 	}
-	if len(inode.ChunkMap) != 1 || inode.ChunkMap[0].ID != tracked.allocatedBatchChunks[0] {
-		t.Fatalf("committed chunks = %+v, want only first batch allocation", inode.ChunkMap)
+	// 1.3c: a single ≤16MiB chunk commits as V2 inline layout (roadmap
+	// §1.3c), so the committed refs live on the extent surface (extent ID
+	// == chunk ID), not the V1 ChunkMap.
+	v2, err := metadata.NewInodeStoreV2(store).Get(inode.ID)
+	if err != nil {
+		t.Fatalf("Get V2 inode: %v", err)
+	}
+	if v2.Layout != metadata.LayoutInlineExtent || v2.InlineExtent == nil ||
+		v2.InlineExtent.ID != metadata.ExtentIDV2(tracked.allocatedBatchChunks[0]) {
+		t.Fatalf("committed inline extent = %+v, want first batch allocation %d",
+			v2.InlineExtent, tracked.allocatedBatchChunks[0])
+	}
+	if len(inode.ChunkMap) != 0 {
+		t.Fatalf("committed V1 ChunkMap = %+v, want empty (V2 inline layout)", inode.ChunkMap)
 	}
 	if _, err := store.GetChunk(ctx, tracked.allocatedBatchChunks[0]); err != nil {
 		t.Fatalf("GetChunk(consumed): %v", err)
@@ -934,7 +958,7 @@ func TestObjectCommitterOverwriteCleanupFailureRecordsDeepRollbackPlan(t *testin
 		t.Fatal("RollbackInode = nil, want overwrite snapshot")
 	}
 	if attempt.RollbackInode == oldInode ||
-		&attempt.RollbackInode.ChunkMap[0] == &oldInode.ChunkMap[0] ||
+		(len(oldInode.ChunkMap) > 0 && &attempt.RollbackInode.ChunkMap[0] == &oldInode.ChunkMap[0]) ||
 		&attempt.RollbackInode.XAttrs["user.test"][0] == &oldInode.XAttrs["user.test"][0] {
 		t.Fatal("RollbackInode aliases the source inode")
 	}

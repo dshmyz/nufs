@@ -48,14 +48,16 @@ func (n *v21Datanode) Close() {
 // newV21Node builds a V2.1 datanode (store over dirs + TCP server on an
 // ephemeral port) and returns it, registering no test cleanup — so it can be
 // called from a goroutine (the chaos smoke test restarts a node mid-run).
-// Mirrors runDataNodeV21's construction: one data stream (StreamID 1) and one
-// EC shard stream (StreamID 2) per dir, the shard stores attached so Program
-// A EC writes/reconstruction can place shards, and a disk factory so
-// DiskLifecycleOps.AddDisk builds sibling data/shard stores at runtime. On
-// error any already-open stores are closed.
+// Mirrors runDataNodeV21's construction: one data stream (StreamID 1), one EC
+// shard stream (StreamID 2) and one small-file stream (StreamID 0, ≤ 64 KiB)
+// per dir, the shard and small stores attached so Program A EC writes can
+// place shards and ≤ SmallFileThreshold commits route to the small stream,
+// and a disk factory so DiskLifecycleOps.AddDisk builds the sibling
+// data/shard/small trio at runtime. On error any already-open stores are
+// closed.
 func newV21Node(nodeID metadata.NodeID, dirs ...string) (*v21Datanode, error) {
 	n := &v21Datanode{}
-	var dataStores, shardStores []storage.Store
+	var dataStores, shardStores, smallStores []storage.Store
 	for _, d := range dirs {
 		data, err := segment.New(segment.Config{Dir: d, UseMemIndex: true, StreamID: 1})
 		if err != nil {
@@ -72,24 +74,42 @@ func newV21Node(nodeID metadata.NodeID, dirs ...string) (*v21Datanode, error) {
 		}
 		n.stores = append(n.stores, shard)
 		shardStores = append(shardStores, shard)
+
+		small, err := segment.NewSmallStore(segment.Config{Dir: d, UseMemIndex: true})
+		if err != nil {
+			n.Close()
+			return nil, fmt.Errorf("segment.NewSmallStore(small %s): %w", d, err)
+		}
+		n.stores = append(n.stores, small)
+		smallStores = append(smallStores, small)
 	}
 	v := datanode.NewMultiV2Store(dataStores, dirs...)
 	if err := v.AttachShardStores(shardStores); err != nil {
 		n.Close()
 		return nil, fmt.Errorf("attach shard stores: %w", err)
 	}
-	// AddDisk builds the same data+shard pair for a runtime-adopted dir.
-	v.SetDiskFactory(func(dir string) (data, shard storage.Store, err error) {
+	if err := v.AttachSmallStores(smallStores); err != nil {
+		n.Close()
+		return nil, fmt.Errorf("attach small stores: %w", err)
+	}
+	// AddDisk builds the same data+shard+small trio for a runtime-adopted dir.
+	v.SetDiskFactory(func(dir string) (data, shard, small storage.Store, err error) {
 		data, err = segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 1})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		shard, err = segment.New(segment.Config{Dir: dir, UseMemIndex: true, StreamID: 2})
 		if err != nil {
 			closeStore(data)
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return data, shard, nil
+		small, err = segment.NewSmallStore(segment.Config{Dir: dir, UseMemIndex: true})
+		if err != nil {
+			closeStore(data)
+			closeStore(shard)
+			return nil, nil, nil, err
+		}
+		return data, shard, small, nil
 	})
 	n.Store = v
 
