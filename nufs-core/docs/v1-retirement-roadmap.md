@@ -138,7 +138,7 @@
 ### 1.4 extent 级机制补齐（阶段 0 的 ❌/⚠️ 项，可与接线并行）
 - [ ] Scrubber extent 版（按 ExtentMetaV2 校验 + Lifecycle 计数）
 - [ ] 修复机制 extent 版（TriggerRepair 的 extent 语义 + 队列）
-- [ ] 心跳降级检测 extent 版（把 `ExtentLifecycle` 接进上报/降级路径）
+- [x] 心跳降级检测 extent 版（把 `ExtentLifecycle` 接进上报/降级路径）
 - [ ] bucket 配额按 extent 聚合
 - [ ] 备份/恢复按 extent 清单
 - [x] S3 multipart 合并落 extent（gateway/s3/multipart.go——见下注）
@@ -180,6 +180,29 @@
 > `TombstonesCreated==1`；无修复时引用集为空 → `OrphanChunks==2` 直接打死）。
 > **Deferred**：epoch 栅栏语义未动（epoch 本就不被 bump，per-inode CAS 是守门机制，V1/V2
 > 行为一致）；备份 verify 的 extent 交叉校验仍在待办。
+
+> 2026-08-16 完成（第三刀）。**心跳降级检测 extent 版**：激活 `ExtentLifecycle`——此前
+> `LifecycleReadyDegraded` 零写者零读者（纯装饰字段），本刀把它接进降级路径。生产改动两处：
+> `metadata/inode_v2_serving.go` 新增 `MarkExtentDegraded`（读 /extent-meta 行，`Lifecycle==Ready`
+> 才翻 `ReadyDegraded`，幂等 + 单调守卫：ECConverting 不动、V1 chunk 无行不造）；
+> `metadata/pebble_store.go` 的 `batchUpdateChunkStatesCtx` 在 chunk 降级成功后镜像 extent。
+> **条件用 `chunk.State==ChunkDegraded` 而非 `changed`**：心跳是 `lastKnownState` 差分，mark
+> 失败整批返错 → lastKnownState 不前进 → datanode 下轮重发同差分 → 镜像重试自愈（fail-closed，
+> 与引用集收集同风格）。**路由关键**：chunk 行与 /extent-meta 行都按 `inode:{id}` 路由共置 →
+> 降级镜像是一次同 store 写，无需跨 shard 扫描、无需改 ShardedStore/metad handler
+> （`ShardedStore.Heartbeat` + `ChangeCorrupt`/`markNodeReplicasFailedAndRepair` 全汇入同一
+> `batchUpdateChunkStatesCtx`，单钩子全覆盖）。测试 `metadata/extent_lifecycle_test.go`：
+> inline/pages 双布局断言 chunk Degraded + extent ReadyDegraded、重复 ReplicaFailed 幂等、
+> V1 降级不造 extent 行（GetExtentMeta→ErrExtentNotFound）、单调守卫。回归钩已验证：
+> stash 掉钩子后 extent Lifecycle 停留 0 直接红。
+> **行为注记**：升级回 Ready 不做（与 V1 chunk 单向降级一致，`:2781` 注释明言升级留
+> scrubber/anti-entropy；extent 恢复方向归 Scrubber extent 刀）；`MarkExtentColdEC` 写
+> inode 行 `InlineExtent.Lifecycle` 不改 /extent-meta 行——两者可发散（既有行为非本刀引入），
+> 本刀以 /extent-meta 行为 Lifecycle 权威。
+> **发现未修（独立刀候选）**：`--shards N>1`（默认 1，`--raft=false` 专属）下
+> `AllocateChunk`（inode 路由）与 `GetChunk`/`ReportChunkState`/`CommitChunk`（chunk-key
+> 路由）约半数分叉 → 分叉 chunk 对读/心跳不可见，心跳降级链本就失效。既有潜在问题，
+> 测试只覆盖单 store 路径；建议独立排查 `AllocateChunk` 与 chunk-key 路由对齐。
 
 ### 1.5 退出条件
 - 网关写入路径不再产生新 ChunkMap；ChunkMap 只读存量（阶段 4 删）。

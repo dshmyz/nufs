@@ -59,6 +59,29 @@ func (s *PebbleStore) GetExtentMeta(ctx context.Context, extentID ExtentIDV2) (*
 	return &m, nil
 }
 
+// MarkExtentDegraded flips a V2 extent's Lifecycle Ready → ReadyDegraded when
+// its backing chunk (ID == extent ID) degrades (roadmap §1.4 heartbeat-degrade
+// wiring). No-op for V1 chunks (no /extent-meta row) and for extents not in
+// LifecycleReady (e.g. EC-converting), keeping the field monotone toward
+// degraded; the recovery direction is the extent scrubber's job. The chunk row
+// and its /extent-meta row are both written through the inode's shard, so a
+// caller on the chunk's shard finds the extent row locally — no cross-shard hop.
+func (s *PebbleStore) MarkExtentDegraded(ctx context.Context, extentID ExtentIDV2) error {
+	if s.closed.Load() {
+		return ErrServiceClosed
+	}
+	var m ExtentMetaV2
+	exists, err := s.getValue(extentMetaKey(extentID), &m)
+	if err != nil {
+		return err
+	}
+	if !exists || m.Lifecycle != LifecycleReady {
+		return nil
+	}
+	m.Lifecycle = LifecycleReadyDegraded
+	return s.putExtentMeta(&m)
+}
+
 // SetInlineExtent promotes an inode to a single inline extent (≤ 16 MiB).
 // Persists the extent metadata first (so a subsequent PromoteToPages keeps
 // it reachable), then the inode's inline layout. The V1 inode cache is

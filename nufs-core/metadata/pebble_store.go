@@ -2796,6 +2796,19 @@ func (s *PebbleStore) batchUpdateChunkStatesCtx(ctx context.Context, nodeID Node
 			}
 			return err
 		}
+		// Mirror the chunk degrade onto its V2 extent (roadmap §1.4): the
+		// /extent-meta/{id} row is co-located with the chunk row (both written
+		// through the inode's shard), so the extent is reached locally. The call
+		// is idempotent and keyed on the resulting state (not `changed`) so a
+		// failed mirror is retried by the datanode's next heartbeat — the delta
+		// is re-sent because lastKnownState only advances on success. The chunk
+		// state is the durable truth; this is a derived mirror, fail-closed so a
+		// transient write failure surfaces rather than silently skipping.
+		if chunk.State == ChunkDegraded {
+			if err := s.MarkExtentDegraded(ctx, ExtentIDV2(chunkID)); err != nil {
+				return fmt.Errorf("batch update: mark extent %d degraded: %w", chunkID, err)
+			}
+		}
 		if changed {
 			s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("chunk:%d", chunkID)})
 		}
