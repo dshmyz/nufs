@@ -142,7 +142,7 @@
 - [ ] bucket 配额按 extent 聚合
 - [ ] 备份/恢复按 extent 清单
 - [x] S3 multipart 合并落 extent（gateway/s3/multipart.go——见下注）
-- [ ] 孤儿 GC 认 extent 布局
+- [x] 孤儿 GC 认 extent 布局
 
 > 2026-08-16 完成（本刀）。`handleCompleteMultipartUpload` 的 501 stub 改为真合并：按
 > complete 请求顺序用 `io.MultiReader` 流式拼装 staged parts（磁盘 part `os.Open`，
@@ -163,6 +163,23 @@
 > 已逐 part 受同 cap）——"multipart 超单发 PUT 上限"不可达，413 EntityTooLarge 接受。
 > **Deferred**：写尝试恢复语义沿用 `Put` 自带 attempt+补偿（recover 幂等，补偿用新分配
 > chunk ID 无碰撞）；part 暂存为 in-process 语义不变（gateway 重启即丢）。
+
+> 2026-08-16 完成（第二刀，修数据丢失 bug）。**修复对象**：`ChunkGC` 的引用集
+> `stableInodeReferenceSnapshot`（`metadata/chunk_tombstone.go`）此前只 decode `InodeMeta`
+> 收 `ChunkMap`，V2 布局 inode（InlineExtent/ExtentPages）decode 出空 ChunkMap → 其
+> extent-backed chunk（数据在 `ID==ExtentID` 的 chunk 行）被 GC 判孤儿 → tombstone + 隔离后
+> purge **物理删数据**——而 GC 生产默认 10min 周期（`cmd/metad/main.go` `gc-interval`），
+> V2 写自 §1.3c 起是默认路径，属活跃数据丢失。**修复**：同一 `/inode/` 扫描改成
+> 模型感知——每行先按 `InodeMetaV2` decode，`Layout != LayoutEmpty`（V1 行 decode 出
+> Layout==0，`ResolveExtents` 探测判别器）即按 V2 收引用：inline → `InlineExtent.ID`；
+> pages → 复用 `ExtentPageStore.ResolveExtents` per-inode（COW root 回走），收集每个
+> `ExtentRef.ExtentID`；其余仍走 V1 `decodeReferencedInode` 收 ChunkMap。**选 per-inode
+> resolve 而非直接扫 `/extent-page/` prefix**：扫 prefix 会把已删 inode 遗留的旧 COW page
+> 计入引用（V2 孤儿永不回收，存储泄漏）；per-inode 只数 live V2 inode 真实引用的 extent。
+> 测试：`TestChunkGC_KeepsV2ExtentBackedChunks`（inline/pages 双 layout + 真孤儿，断言
+> `TombstonesCreated==1`；无修复时引用集为空 → `OrphanChunks==2` 直接打死）。
+> **Deferred**：epoch 栅栏语义未动（epoch 本就不被 bump，per-inode CAS 是守门机制，V1/V2
+> 行为一致）；备份 verify 的 extent 交叉校验仍在待办。
 
 ### 1.5 退出条件
 - 网关写入路径不再产生新 ChunkMap；ChunkMap 只读存量（阶段 4 删）。

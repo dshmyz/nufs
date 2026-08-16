@@ -354,9 +354,47 @@ func (s *PebbleStore) stableInodeReferenceSnapshot(ctx context.Context) (inodeRe
 			return inodeReferenceSnapshot{}, err
 		}
 		references := make(map[ChunkID]struct{})
+		pages := NewExtentPageStore(s)
 		err = s.scanPrefix(prefixInode, func(key, value []byte) error {
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			// Model-aware reference collection (roadmap §1.4). A row decodes
+			// as InodeMetaV2 with a real Layout when it is a V2 layout row;
+			// V1 ChunkMap rows decode as LayoutEmpty (the ResolveExtents
+			// probe discriminator). V2 extent data lives in the chunk whose
+			// numeric ID equals the extent ID, so both V2 layouts contribute
+			// the same chunk references a V1 ChunkMap would — without this
+			// the orphan GC would tombstone (then purge) every V2-backed
+			// chunk, since the V1 decode of a V2 row yields an empty ChunkMap.
+			var v2 InodeMetaV2
+			if err := unmarshalValue(value, &v2); err == nil && v2.Layout != LayoutEmpty {
+				if err := validateInodeKeyIdentity(string(key), v2.ID); err != nil {
+					return err
+				}
+				switch v2.Layout {
+				case LayoutInlineExtent:
+					if v2.InlineExtent != nil {
+						references[ChunkID(v2.InlineExtent.ID)] = struct{}{}
+					}
+					return nil
+				case LayoutExtentPages:
+					// Per-inode resolve walks the COW root history for live
+					// pages only; a raw /extent-page/ prefix scan would count
+					// orphaned pages of deleted inodes and leak them forever.
+					refs, err := pages.ResolveExtents(&v2)
+					if err != nil {
+						return fmt.Errorf("inode reference scan: resolve extents for inode %d: %w", v2.ID, err)
+					}
+					for _, ref := range refs {
+						references[ChunkID(ref.ExtentID)] = struct{}{}
+					}
+					return nil
+				default:
+					// Unknown layout in a V2-decoded row: fail closed rather
+					// than silently dropping its chunk references.
+					return fmt.Errorf("inode reference scan: inode %d has unknown V2 layout %d", v2.ID, v2.Layout)
+				}
 			}
 			meta, _, err := decodeReferencedInode(string(key), rawReferenceValue{found: true, value: value})
 			if err != nil {

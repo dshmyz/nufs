@@ -777,6 +777,87 @@ func TestChunkGCTombstonesOrphansBeforePhysicalPurge(t *testing.T) {
 	}
 }
 
+// TestChunkGC_KeepsV2ExtentBackedChunks pins the roadmap §1.4 orphan-GC fix:
+// V2 layout inodes reference their data through /extent-meta and COW
+// /extent-page rows, not a V1 ChunkMap. The GC reference snapshot must
+// recognize those references or every V2-backed chunk is misjudged as an
+// orphan and tombstoned (then purged after quarantine) — data loss on the
+// production-default V2 write path (§1.3c). Without the fix the V2 chunk is
+// tombstoned alongside the true orphan (TombstonesCreated==2 instead of 1),
+// so the assertions fail directly.
+func TestChunkGC_KeepsV2ExtentBackedChunks(t *testing.T) {
+	ctx := context.Background()
+	orphanID := ChunkID(5099)
+	cases := []struct {
+		name string
+		seed func(t *testing.T, store *PebbleStore, id InodeID, chunk *ChunkMeta)
+	}{
+		{
+			name: "inline extent",
+			seed: func(t *testing.T, store *PebbleStore, id InodeID, chunk *ChunkMeta) {
+				if err := store.SetInlineExtent(ctx, id, &ExtentMetaV2{ID: ExtentIDV2(chunk.ID), Generation: 1, LogicalLen: 4096}, 4096); err != nil {
+					t.Fatalf("SetInlineExtent: %v", err)
+				}
+			},
+		},
+		{
+			name: "extent pages",
+			seed: func(t *testing.T, store *PebbleStore, id InodeID, chunk *ChunkMeta) {
+				if err := store.ReplaceExtents(ctx, id, []ExtentWrite{{Extent: &ExtentMetaV2{ID: ExtentIDV2(chunk.ID), Generation: 1, LogicalLen: 4096}, Offset: 0}}, 4096); err != nil {
+					t.Fatalf("ReplaceExtents: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newResolveTestStore(t)
+			id := InodeID(2001)
+			newResolveTestInode(t, store, id)
+
+			// The V2 layout's backing chunk: a real allocated chunk row whose
+			// numeric ID mirrors the extent ID (extent==chunk-ID invariant),
+			// plus a true orphan chunk (directly in Pebble, no inode ref).
+			chunk, err := store.AllocateChunk(ctx, id, 0, v2ResolveTestPolicy)
+			if err != nil {
+				t.Fatalf("AllocateChunk: %v", err)
+			}
+			tc.seed(t, store, id, chunk)
+			if err := store.putJSON(fmt.Sprintf("%s%d", prefixChunk, orphanID), &ChunkMeta{ID: orphanID, Size: 512, State: ChunkReady}); err != nil {
+				t.Fatalf("seed orphan: %v", err)
+			}
+
+			result, err := NewChunkGC(store, nil, nil, false).Scan(ctx)
+			if err != nil {
+				t.Fatalf("GC scan: %v", err)
+			}
+			// Only the true orphan is tombstoned; the V2-backed chunk survives.
+			if result.OrphanChunks != 1 {
+				t.Fatalf("OrphanChunks = %d, want 1", result.OrphanChunks)
+			}
+			if result.TombstonesCreated != 1 {
+				t.Fatalf("TombstonesCreated = %d, want 1 (V2-backed chunk must not be orphaned)", result.TombstonesCreated)
+			}
+			if result.ChunksPurged != 0 || result.DeletedChunks != 0 {
+				t.Fatalf("GC result = %+v, want no purges/deletes this cycle", result)
+			}
+			if _, err := store.GetChunk(ctx, chunk.ID); err != nil {
+				t.Fatalf("V2-backed chunk %d must survive GC: %v", chunk.ID, err)
+			}
+			if _, err := store.GetChunk(ctx, orphanID); err != nil {
+				t.Fatalf("orphan must remain readable through quarantine: %v", err)
+			}
+			tombstones, err := store.ListChunkTombstones(ctx, 0)
+			if err != nil {
+				t.Fatalf("ListChunkTombstones: %v", err)
+			}
+			if len(tombstones) != 1 || tombstones[0].ChunkID != orphanID {
+				t.Fatalf("tombstones = %+v, want only the true orphan", tombstones)
+			}
+		})
+	}
+}
+
 // TestChunkGCOrphanLifecycleEndToEnd pins the full orphan chunk lifecycle in a
 // single non-dry-run pass: a chunk that was allocated and committed but never
 // attached to any inode (the FUSE flush crash-between-write-and-UpdateInode
