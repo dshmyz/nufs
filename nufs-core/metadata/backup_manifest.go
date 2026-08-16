@@ -14,7 +14,13 @@ import (
 	"time"
 )
 
-const BackupFormatVersion = 1
+// BackupFormatVersion 1 → 2: version 2 adds /extent-meta/ and
+// /extent-page/ keyspace counts to BackupRecordCounts plus the
+// extent_references cross-check in VerifyBackupArtifact. A v1 manifest
+// only describes the legacy ChunkMap-model keyspaces, so it can no longer
+// satisfy the strict record-count equality version-2 verify enforces; old
+// artifacts must be re-manifested rather than silently drift.
+const BackupFormatVersion = 2
 
 type BackupFile struct {
 	Path   string `json:"path"`
@@ -39,6 +45,8 @@ type BackupRecordCounts struct {
 	DirectoryEntries    int64 `json:"directory_entries"`
 	Inodes              int64 `json:"inodes"`
 	Chunks              int64 `json:"chunks"`
+	ExtentMeta          int64 `json:"extent_meta"`
+	ExtentPages         int64 `json:"extent_pages"`
 	Nodes               int64 `json:"nodes"`
 	Policies            int64 `json:"policies"`
 	RepairTasks         int64 `json:"repair_tasks"`
@@ -187,6 +195,19 @@ func collectBackupFiles(ctx context.Context, checkpointDir string) ([]BackupFile
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		// LOCK is a pebble-internal file written by the first open of a dir.
+		// A fresh checkpoint (CreateStandaloneCheckpoint / raft
+		// CreateBackupCheckpoint) has no LOCK but gains one while
+		// inspectBackupCheckpoint opens it read-only during BuildBackupManifest,
+		// so excluding it keeps the collected file set identical whether the
+		// artifact dir was opened from birth (regular fixtures) or born as a
+		// checkpoint. pebble regenerates LOCK on open, so a restored store is
+		// unaffected by its absence. The marker.format-version file is NOT
+		// excluded: it is part of a checkpoint from birth and pebble requires
+		// it to recognize a restored dir as a database.
+		if rel == "LOCK" {
+			return nil
+		}
 		if err := validateBackupPath(rel); err != nil {
 			return err
 		}

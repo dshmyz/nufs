@@ -67,8 +67,8 @@ func TestVerifyBackupArtifactReportsVerifiedCheckpoint(t *testing.T) {
 	if !report.ManifestValid || report.FilesVerified != len(manifest.Files) || report.RecordCounts.Inodes != 1 {
 		t.Fatalf("unexpected verification report: %+v", report)
 	}
-	if len(report.Checks) != 10 {
-		t.Fatalf("checks = %d, want 10", len(report.Checks))
+	if len(report.Checks) != 11 {
+		t.Fatalf("checks = %d, want 11", len(report.Checks))
 	}
 }
 
@@ -197,7 +197,7 @@ func TestVerifyBackupArtifactReportsFailureStages(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			dir, manifest := test.setup(t)
 			report, err := VerifyBackupArtifact(context.Background(), dir, manifest)
-			if err == nil || len(report.Checks) != 10 || checkPassed(report, test.failed) {
+			if err == nil || len(report.Checks) != 11 || checkPassed(report, test.failed) {
 				t.Fatalf("report=%+v err=%v", report, err)
 			}
 		})
@@ -216,6 +216,8 @@ func TestVerifyBackupArtifactSupportsLegacyJSONAndCountsEveryPrefix(t *testing.T
 	writeFixtureValue(t, db, prefixBucketStats+"1", &BucketUsage{})
 	writeFixtureValue(t, db, prefixNS+"1/a", &DirEntry{InodeID: 1})
 	writeFixtureValue(t, db, prefixChunk+"1", &ChunkMeta{ID: 1})
+	writeFixtureValue(t, db, extentPageKey(7, 1, 0), &ExtentPage{InodeID: 7, PageNo: 0})
+	writeFixtureValue(t, db, prefixExtentMeta+"700", &ExtentMetaV2{ID: ExtentIDV2(700)})
 	writeFixtureValue(t, db, prefixNode+"1", &NodeInfo{})
 	writeFixtureValue(t, db, prefixPolicy+"b", &PlacementPolicy{})
 	writeFixtureValue(t, db, prefixRepair+"1", &RepairTask{})
@@ -242,7 +244,7 @@ func TestVerifyBackupArtifactSupportsLegacyJSONAndCountsEveryPrefix(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, count := range map[string]int64{"Buckets": report.RecordCounts.Buckets, "BucketByRoot": report.RecordCounts.BucketByRoot, "BucketStats": report.RecordCounts.BucketStats, "DirectoryEntries": report.RecordCounts.DirectoryEntries, "Inodes": report.RecordCounts.Inodes, "Chunks": report.RecordCounts.Chunks, "Nodes": report.RecordCounts.Nodes, "Policies": report.RecordCounts.Policies, "RepairTasks": report.RecordCounts.RepairTasks, "AuditRecords": report.RecordCounts.AuditRecords, "BucketPolicies": report.RecordCounts.BucketPolicies, "Quotas": report.RecordCounts.Quotas, "QuotaUsage": report.RecordCounts.QuotaUsage, "FreeInodes": report.RecordCounts.FreeInodes, "WriteAttempts": report.RecordCounts.WriteAttempts, "WriteAttemptStates": report.RecordCounts.WriteAttemptStates, "BackgroundTasks": report.RecordCounts.BackgroundTasks, "BackgroundTaskQueue": report.RecordCounts.BackgroundTaskQueue, "RaftNodeOps": report.RecordCounts.RaftNodeOps} {
+	for name, count := range map[string]int64{"Buckets": report.RecordCounts.Buckets, "BucketByRoot": report.RecordCounts.BucketByRoot, "BucketStats": report.RecordCounts.BucketStats, "DirectoryEntries": report.RecordCounts.DirectoryEntries, "Inodes": report.RecordCounts.Inodes, "Chunks": report.RecordCounts.Chunks, "ExtentMeta": report.RecordCounts.ExtentMeta, "ExtentPages": report.RecordCounts.ExtentPages, "Nodes": report.RecordCounts.Nodes, "Policies": report.RecordCounts.Policies, "RepairTasks": report.RecordCounts.RepairTasks, "AuditRecords": report.RecordCounts.AuditRecords, "BucketPolicies": report.RecordCounts.BucketPolicies, "Quotas": report.RecordCounts.Quotas, "QuotaUsage": report.RecordCounts.QuotaUsage, "FreeInodes": report.RecordCounts.FreeInodes, "WriteAttempts": report.RecordCounts.WriteAttempts, "WriteAttemptStates": report.RecordCounts.WriteAttemptStates, "BackgroundTasks": report.RecordCounts.BackgroundTasks, "BackgroundTaskQueue": report.RecordCounts.BackgroundTaskQueue, "RaftNodeOps": report.RecordCounts.RaftNodeOps} {
 		if count != 1 {
 			t.Fatalf("%s = %d, want 1", name, count)
 		}

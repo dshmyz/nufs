@@ -140,9 +140,29 @@
 - [x] 修复机制 extent 版（TriggerRepair 的 extent 语义 + 队列）
 - [x] 心跳降级检测 extent 版（把 `ExtentLifecycle` 接进上报/降级路径）
 - [x] bucket 配额按 extent 聚合（重建路径按 extent 聚合 + Unlink/Link 模型感知——见下注）
-- [ ] 备份/恢复按 extent 清单
+- [x] 备份/恢复按 extent 清单（`backup_verify.go` 模型感知——见下注）
 - [x] S3 multipart 合并落 extent（gateway/s3/multipart.go——见下注）
 - [x] 孤儿 GC 认 extent 布局
+
+> 2026-08-16 完成（本刀，§1.4 收官——全部 ❌ 闭环）。备份本体=整 Pebble checkpoint
+> 归档（V2 行随原始字节天然入账），真正 deferred 的是**校验层**：`inspectBackupCheckpoint`
+> 只 decode V1 `InodeMeta`，V2 布局行（inline/pages）得出空 ChunkMap → `inode_chunk_references`
+> 交叉校验空转，V2 backing chunk 从归档丢失 verify 照样 PASS。本刀改 V2-first 模型感知
+> decode：inline/pages 收集被引用 extent，新增 `extent_references` 交叉校验——被 inode 引用的
+> extent 必须有 `/extent-meta/` + `/chunk/`（数据在 `ID==ExtentID` 的 chunk 行）双行；
+> `/extent-meta/`、`/extent-page/` 两个 keyspace 首次入账 `RecordCounts`（`ExtentMeta`/
+> `ExtentPages`，manifest 升 `BackupFormatVersion` 1→2，旧 v1 清单与新 verify 严格 record-count
+> 相等不再成立，须 re-manifest）。**顺带修复**生产 latent bug：`collectBackupFiles` 排除
+> `LOCK`——fresh checkpoint（`CreateStandaloneCheckpoint`/raft `CreateBackupCheckpoint`）
+> 出生时无 LOCK，而 `BuildBackupManifest` 内含 read-only `pebble.Open` 会补写 LOCK，导致同一
+> 份 artifact build 时 N 文件、verify 时 N+1 文件 → `file set mismatch`（coordinator
+> `verifyArtifact` 与 S3 `Publish` 的 `VerifyBackupArtifact` 都撞此坑）。marker.format-version
+> 不可排除——它是 checkpoint 出生即有的组成部分，pebble 靠它识别目录为数据库，去掉后 restore
+> fetch 的副本 `pebble.Open` 报 "database does not exist"。测试：`backup_extent_test.go` 真库
+> fixture（V1 ChunkMap + V2 inline + V2 pages 三型文件）——PASS 记数断言 + 删 backing chunk/删
+> extent-meta 行→build 拒绝 + golden round-trip（Publish→Restore→重开 `ResolveExtents` 回原
+> extent ID 集）；回归钩双验（V1-only decode → 两拒绝测试红；names 去掉 extent_references →
+> 11-check 计数断言红）已实际 revert 验证。
 
 > 2026-08-16 完成（本刀）。`handleCompleteMultipartUpload` 的 501 stub 改为真合并：按
 > complete 请求顺序用 `io.MultiReader` 流式拼装 staged parts（磁盘 part `os.Open`，
