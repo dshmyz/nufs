@@ -39,6 +39,10 @@ type ConversionEligibility struct {
 	ExtentCreated int64
 	// Size is the logical file size (from the inline extent's LogicalLen).
 	Size int64
+	// OwnerNodes are the datanodes holding a replica of the backing chunk.
+	// Recorded on the task so the datanode ConversionWorker (whose source
+	// read must be LOCAL) only leases tasks whose chunk data it holds.
+	OwnerNodes []uint64
 }
 
 // ScanV2Inlines iterates over all inodes that have a V2 inline extent layout.
@@ -115,11 +119,30 @@ func (s *PebbleStore) ECConversionEligible(ctx context.Context, id InodeID, in *
 		return nil, false, nil
 	}
 
+	// Owner nodes = the chunk's replica holders: these are the datanodes
+	// whose local stores hold the source data the ConversionWorker reads
+	// (ConvertReplica's read must be local). Recording them on the task lets
+	// the worker's owner-filtered lease pick a holder instead of dead-lettering
+	// on a non-holder's local read failure.
+	ownerNodes := make([]uint64, 0, len(chunk.Replicas))
+	seen := make(map[uint64]struct{}, len(chunk.Replicas))
+	for _, r := range chunk.Replicas {
+		if r.NodeID == 0 {
+			continue
+		}
+		if _, dup := seen[uint64(r.NodeID)]; dup {
+			continue
+		}
+		seen[uint64(r.NodeID)] = struct{}{}
+		ownerNodes = append(ownerNodes, uint64(r.NodeID))
+	}
+
 	return &ConversionEligibility{
 		Inode:         id,
 		Extent:        ext.ID,
 		ExtentCreated: created,
 		Size:          ext.LogicalLen,
+		OwnerNodes:    ownerNodes,
 	}, true, nil
 }
 
@@ -141,12 +164,13 @@ func (s *PebbleStore) SubmitConversion(ctx context.Context, elig *ConversionElig
 
 	now := time.Now().UnixNano()
 	task := &BackgroundTask{
-		ID:        taskID,
-		Type:      TaskECConvert,
-		State:     TaskQueued,
-		Target:    taskID,
-		NextRunAt: now,
-		CreatedAt: now,
+		ID:         taskID,
+		Type:       TaskECConvert,
+		State:      TaskQueued,
+		Target:     taskID,
+		NextRunAt:  now,
+		CreatedAt:  now,
+		OwnerNodes: elig.OwnerNodes,
 	}
 	return s.PutBackgroundTask(ctx, task)
 }

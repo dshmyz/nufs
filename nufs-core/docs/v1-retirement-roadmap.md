@@ -321,6 +321,38 @@
   > `metadata/backup_extent_test.go`、`metadata/ec_extent_marking_test.go`、smoke
   > `TestRepair_EndToEnd_EC`；门禁 `verify-docker -l fast` 全绿。
 
+### 1.6 自动 EC 转换（replicas → 6+3） ✅（2026-08-17 闭环）
+
+> §14 转换管线的自动调度 + 消费两端完成（scheduler `2d10df7` + datanode
+> ConversionWorker 本刀），`SubmitConversion → TaskECConvert → datanode 消费 → 发布`
+> 端到端闭环：
+>
+> - **调度器**（`metadata/ec_conversion_scheduler.go`）：周期扫描 V2 inline extent，
+>   四条件判定可转换（idle≥30d + 非 EC + Ready + chunk 无 EC），入队
+>   `TaskECConvert`，`OwnerNodes` = chunk 副本持有节点（owner 路由租约）。
+> - **消费端**（`datanode/ec_convert_worker.go`）：`LeaseBackgroundTaskForNode`
+>   owner 过滤租约 → `ECService.ConvertToEC` → `CompleteBackgroundTask`；失败
+>   `FailBackgroundTask(err,3)` 重试后 dead-letter。`cmd/datanode` 经
+>   `-ec-convert-interval`（默认 30s）接线。
+> - **租约正确性**：`LeaseBackgroundTask` 原只租 TaskQueued 队首 → 非持有节点可能
+>   租走转换任务（源读失败）且 retrying 永不重租，静默卡死。本刀修两处：
+>   `leaseBackgroundTask` 扫 TaskQueued + TaskRetrying 双前缀（nextRunAt 到期才取）
+>   并按 `OwnerNodes` 过滤；`LeaseBackgroundTaskForNode` 供 worker 专用。repair/gc/
+>   scrub 任务不设 OwnerNodes，语义不变。
+> - **发布缺陷修复**（`metadata/ec_lifecycle.go` `SwitchChunkToEC`）：转换发布重建
+>   ChunkMeta.Replicas 时只填 NodeID/ShardIndex、Addr 为空 → 网关 serving read 拨
+>   `Replicas[i].Addr` 失败（"empty addr for node X"），转换后 chunk 不可读
+>   （`RecordDirect` 直写保留分配地址故无此问题）。修复：发布时从节点注册表
+>   `GetNode` 解析各 shard 属主地址（best-effort）。
+> - **窗口读回退（有意不修）**：转换后 chunk.Size 保持 MaxChunkSize 分配 cap（字面长
+>   度在源 inline extent，stripe 无 OriginalLength 字段）→ `readECWindow` 窗口数学
+>   永远越界 → 回退 9× 全量读。正确性已字节级验证；~1× 窗口读需 stripe 携带字面长度，
+>   单独立刀。
+> - 测试：metadata `background_task_test.go`（owner 路由 + retrying 重租）、
+>   `ec_conversion_scheduler_test.go`、`ec_profile_test.go`（发布 Replicas 带 Addr）、
+>   datanode `ec_convert_worker_test.go`（成功/所有权/失败重试/解析）、smoke
+>   `TestECConversionWorker_EndToEnd`（PUT → 转换 → S3 GET 字节精确）。
+
 ---
 
 ## 阶段 2：V2.1 存储引擎默认化 + v1 引擎退役（删 ①） ✅ 完成

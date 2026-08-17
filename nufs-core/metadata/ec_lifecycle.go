@@ -388,10 +388,21 @@ func (s *ECStore) SwitchChunkToEC(ctx context.Context, stripeID string) (*ChunkM
 		ECStripeID: st.StripeID,
 	}
 	for _, sh := range st.Shards {
-		layout.Replicas = append(layout.Replicas, ReplicaInfo{
+		rep := ReplicaInfo{
 			NodeID:     NodeID(sh.NodeID),
 			ShardIndex: sh.Index,
-		})
+		}
+		// The gateway serving read dials Replicas[i].Addr, so the published
+		// layout must carry each shard owner's live address (RecordDirect does
+		// this by preserving allocated Replicas; conversion rebuilds them here
+		// and must resolve the addresses from the node registry the same way).
+		// Best-effort: an unregistered owner leaves Addr empty (same observable
+		// behavior as before this fill) rather than failing a completed
+		// conversion — in a healthy cluster every owner came from ListNodes.
+		if info, err := s.store.GetNode(ctx, NodeID(sh.NodeID)); err == nil && info != nil {
+			rep.Addr = info.Addr
+		}
+		layout.Replicas = append(layout.Replicas, rep)
 	}
 	// Cross-check the materialized landing copy against the authoritative
 	// stripe: same shard count and same node per shard index. A mismatch

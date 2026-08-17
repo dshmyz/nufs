@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -129,6 +130,60 @@ func TestSwitchChunkToEC_ProfileAndStripePointer(t *testing.T) {
 	for i, sh := range resolved {
 		if sh.Index != layout.Replicas[i].ShardIndex || sh.NodeID != uint64(layout.Replicas[i].NodeID) {
 			t.Fatalf("resolved shard %d = %+v, want to match replica %+v", i, sh, layout.Replicas[i])
+		}
+	}
+}
+
+// TestSwitchChunkToEC_PublishedReplicasCarryAddr proves the publish layout
+// resolves each shard owner's live address from the node registry: the gateway
+// serving read dials Replicas[i].Addr to fetch shards, so a conversion whose
+// published replicas carry no Addr makes the converted chunk unreadable (the
+// defect fixed by resolving Addr here — RecordDirect preserves allocated
+// addresses, conversion rebuilds them and must resolve them the same way).
+func TestSwitchChunkToEC_PublishedReplicasCarryAddr(t *testing.T) {
+	store := newV2TestPebbleStore(t)
+	ec := NewECStore(store)
+	ctx := context.Background()
+
+	for _, id := range []NodeID{1, 2, 3} {
+		if err := store.RegisterNode(ctx, &NodeInfo{
+			ID: id, Addr: fmt.Sprintf("10.0.0.%d:5000", id),
+			State: NodeOnline, CapacityGB: 10000, Tier: TierHot,
+			Zone: "z", Rack: "r", MachineID: "m", ShardDiskCount: 3,
+		}); err != nil {
+			t.Fatalf("RegisterNode(%d): %v", id, err)
+		}
+	}
+
+	const cid = ChunkID(778)
+	if err := store.putMsgpack(chunkMetadataKey(cid),
+		&ChunkMeta{ID: cid, Size: 4096, State: ChunkReady, Tier: TierHot}); err != nil {
+		t.Fatalf("seed chunk: %v", err)
+	}
+
+	st, err := ec.BeginConversion("stripe-prof-2", uint64(cid), 3, 0xCAFE)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := ec.PlanShards(st, testDisks([]uint64{1, 2, 3}, 3)); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if err := ec.MarkSyncing(st); err != nil {
+		t.Fatalf("mark syncing: %v", err)
+	}
+	if err := ec.CompleteConversion(st, time.Now()); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	layout, err := ec.SwitchChunkToEC(ctx, st.StripeID)
+	if err != nil {
+		t.Fatalf("SwitchChunkToEC: %v", err)
+	}
+	for _, rep := range layout.Replicas {
+		want := fmt.Sprintf("10.0.0.%d:5000", rep.NodeID)
+		if rep.Addr != want {
+			t.Fatalf("replica node %d addr = %q, want %q (serving read dials this)",
+				rep.NodeID, rep.Addr, want)
 		}
 	}
 }

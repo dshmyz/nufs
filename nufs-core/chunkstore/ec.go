@@ -165,12 +165,16 @@ func (s *DatanodeChunkStore) writeECShardDirect(ctx context.Context, chunk *meta
 // Two paths:
 //
 //   - V2.1 window read: when the chunk carries an ECStripeID and chunk.Size
-//     is a trustworthy literal length (converted chunks — ConvertToEC keeps
-//     the literal size), readECWindow serves exactly [offset, offset+length)
-//     from the data shard(s) that own its bytes: ~1× transport amplification
-//     on the healthy path, and a window-sized reconstruction from peers when
-//     an owner is unreachable.  The MaxChunkSize allocation cap is NOT a
-//     length, so a cap-sized metadata record falls back to the full read.
+//     is a trustworthy literal length, readECWindow serves exactly
+//     [offset, offset+length) from the data shard(s) that own its bytes: ~1×
+//     transport amplification on the healthy path, and a window-sized
+//     reconstruction from peers when an owner is unreachable.  The
+//     MaxChunkSize allocation cap is NOT a length, so a cap-sized metadata
+//     record falls back to the full read — and both the direct-EC write path
+//     and conversion currently leave chunk.Size at the allocation cap (the
+//     literal lives in the inline extent / source chunk, not the converted
+//     chunk row), so window reads are only an optimization for chunks that
+//     carry a literal size today.
 //   - Full read (window not attempted, window read failed, or an unknown
 //     literal length): every shard is fetched in full and the whole stripe is
 //     decoded, then the requested range is trimmed. The V1 whole-shard

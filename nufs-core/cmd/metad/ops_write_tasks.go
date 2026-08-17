@@ -112,12 +112,23 @@ func (h *opsHandlers) handleLeaseBackgroundTask(w http.ResponseWriter, r *http.R
 		Type       metadata.BackgroundTaskType `json:"type"`
 		Owner      string                      `json:"owner"`
 		LeaseNanos int64                       `json:"lease_nanos"`
+		// NodeID, when set, restricts the lease to tasks whose OwnerNodes
+		// include this datanode (the conversion worker's owner-routed lease).
+		NodeID *uint64 `json:"node_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	task, err := h.store.LeaseBackgroundTask(r.Context(), req.Type, req.Owner, time.Duration(req.LeaseNanos))
+	var (
+		task *metadata.BackgroundTask
+		err  error
+	)
+	if req.NodeID != nil {
+		task, err = h.store.LeaseBackgroundTaskForNode(r.Context(), req.Type, *req.NodeID, req.Owner, time.Duration(req.LeaseNanos))
+	} else {
+		task, err = h.store.LeaseBackgroundTask(r.Context(), req.Type, req.Owner, time.Duration(req.LeaseNanos))
+	}
 	if err != nil {
 		writeJSONErrorC(w, http.StatusNotFound, "entry_not_found", err.Error())
 		return

@@ -41,6 +41,14 @@ type BackgroundTask struct {
 	LastError      string
 	CreatedAt      int64
 	UpdatedAt      int64
+
+	// OwnerNodes lists the datanodes permitted to lease this task (e.g. the
+	// replica holders of a chunk targeted for EC conversion, whose local
+	// stores hold the source data). Empty = any node may lease (legacy rows,
+	// operator-created tasks, repair/gc/scrub tasks). Enforced only by
+	// LeaseBackgroundTaskForNode; the node-agnostic LeaseBackgroundTask
+	// treats it as advisory.
+	OwnerNodes []uint64
 }
 
 func backgroundTaskKey(id string) string {
@@ -97,6 +105,22 @@ func (s *PebbleStore) GetBackgroundTask(_ context.Context, id string) (*Backgrou
 }
 
 func (s *PebbleStore) LeaseBackgroundTask(ctx context.Context, taskType BackgroundTaskType, owner string, lease time.Duration) (*BackgroundTask, error) {
+	// Node-agnostic lease: no owner-node filter. A task carrying a non-empty
+	// OwnerNodes list is still eligible for any leaser here (only the ForNode
+	// variant enforces the filter); repair/gc/scrub tasks never set
+	// OwnerNodes, so their semantics are unchanged.
+	return s.leaseBackgroundTask(ctx, taskType, 0, owner, lease)
+}
+
+// LeaseBackgroundTaskForNode leases the first eligible queued (or due-retry)
+// task of taskType whose OwnerNodes includes nodeID. A task with no OwnerNodes
+// (legacy rows, operator-created tasks) is eligible for any node. Returns
+// ErrEntryNotFound when no eligible task is available.
+func (s *PebbleStore) LeaseBackgroundTaskForNode(ctx context.Context, taskType BackgroundTaskType, nodeID uint64, owner string, lease time.Duration) (*BackgroundTask, error) {
+	return s.leaseBackgroundTask(ctx, taskType, nodeID, owner, lease)
+}
+
+func (s *PebbleStore) leaseBackgroundTask(ctx context.Context, taskType BackgroundTaskType, nodeID uint64, owner string, lease time.Duration) (*BackgroundTask, error) {
 	if s.closed.Load() {
 		return nil, ErrServiceClosed
 	}
@@ -106,34 +130,55 @@ func (s *PebbleStore) LeaseBackgroundTask(ctx context.Context, taskType Backgrou
 
 	var leased *BackgroundTask
 	now := time.Now().UnixNano()
-	err := s.scanPrefix(backgroundTaskQueuePrefix(taskType, TaskQueued), func(key, value []byte) error {
+	// Scan queued then retrying. A retrying task becomes re-leasable once its
+	// NextRunAt backoff has elapsed; without this the retry state was a dead
+	// end (never scanned) and a single transient failure stranded the task
+	// forever, silently.
+	for _, state := range []BackgroundTaskState{TaskQueued, TaskRetrying} {
 		if leased != nil {
-			return nil
+			break
 		}
-		nextRunAt, id, err := backgroundTaskFromQueueKey(string(key))
-		if err != nil || nextRunAt > now {
+		err := s.scanPrefix(backgroundTaskQueuePrefix(taskType, state), func(key, value []byte) error {
+			if leased != nil {
+				return nil
+			}
+			nextRunAt, id, err := backgroundTaskFromQueueKey(string(key))
+			if err != nil || nextRunAt > now {
+				return nil
+			}
+			task, err := s.GetBackgroundTask(ctx, id)
+			if err != nil {
+				return nil
+			}
+			if nodeID != 0 && len(task.OwnerNodes) > 0 && !containsUint64(task.OwnerNodes, nodeID) {
+				return nil
+			}
+			task.State = TaskLeased
+			task.LeaseOwner = owner
+			task.NextRunAt = now + int64(lease)
+			if err := s.PutBackgroundTask(ctx, task); err != nil {
+				return err
+			}
+			leased = task
 			return nil
-		}
-		task, err := s.GetBackgroundTask(ctx, id)
+		})
 		if err != nil {
-			return nil
+			return nil, err
 		}
-		task.State = TaskLeased
-		task.LeaseOwner = owner
-		task.NextRunAt = now + int64(lease)
-		if err := s.PutBackgroundTask(ctx, task); err != nil {
-			return err
-		}
-		leased = task
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	if leased == nil {
 		return nil, ErrEntryNotFound
 	}
 	return leased, nil
+}
+
+func containsUint64(xs []uint64, v uint64) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *PebbleStore) CompleteBackgroundTask(ctx context.Context, id string) error {

@@ -1192,6 +1192,28 @@ func (c *HTTPClient) LeaseBackgroundTask(ctx context.Context, taskType Backgroun
 	return &task, nil
 }
 
+// LeaseBackgroundTaskForNode leases a task of taskType restricted to those
+// whose OwnerNodes include nodeID (the datanode ConversionWorker's
+// owner-routed lease). The server ignores node_id when the task has no
+// OwnerNodes (empty = any node may lease).
+func (c *HTTPClient) LeaseBackgroundTaskForNode(ctx context.Context, taskType BackgroundTaskType, nodeID uint64, owner string, lease time.Duration) (*BackgroundTask, error) {
+	req := map[string]interface{}{
+		"type":        taskType,
+		"owner":       owner,
+		"lease_nanos": int64(lease),
+		"node_id":     nodeID,
+	}
+	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/background-tasks/lease", req)
+	if err != nil {
+		return nil, err
+	}
+	var task BackgroundTask
+	if err := c.readResponse(resp, &task); err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
 func (c *HTTPClient) CompleteBackgroundTask(ctx context.Context, id string) error {
 	resp, err := c.doRequestWithRetry(ctx, http.MethodPost, "/api/v1/background-tasks/"+url.PathEscape(id)+"/complete", nil)
 	if err != nil {

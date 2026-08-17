@@ -194,6 +194,56 @@ func TestSubmitConversion_Idempotent(t *testing.T) {
 	}
 }
 
+func TestECConversionEligible_OwnerNodesFromReplicas(t *testing.T) {
+	store := newV2TestPebbleStore(t)
+	ctx := context.Background()
+
+	old := time.Now().Add(-31 * 24 * time.Hour).UnixNano()
+	extID := seedV2InlineInode(t, store, 200, 0x10000000010, 4096, old)
+
+	// Backing chunk with an RF=3 replica set plus a duplicate and a zero
+	// (unassigned) entry to prove dedup + skip-0 on the OwnerNodes projection.
+	if err := store.putMsgpack(
+		fmt.Sprintf("%s%d", prefixChunk, ChunkID(extID)),
+		&ChunkMeta{ID: ChunkID(extID), Size: 4096, State: ChunkReady,
+			Replicas: []ReplicaInfo{
+				{NodeID: 1}, {NodeID: 2}, {NodeID: 1}, {NodeID: 0},
+			}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	ins := NewInodeStoreV2(store)
+	in, err := ins.Get(200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elig, ok, err := store.ECConversionEligible(ctx, 200, in, in.InlineExtent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected eligible")
+	}
+	want := []uint64{1, 2}
+	if len(elig.OwnerNodes) != len(want) || elig.OwnerNodes[0] != 1 || elig.OwnerNodes[1] != 2 {
+		t.Fatalf("OwnerNodes = %v, want %v", elig.OwnerNodes, want)
+	}
+
+	// SubmitConversion propagates OwnerNodes onto the task so the datanode
+	// worker's owner-routed lease can restrict it to replica holders.
+	if err := store.SubmitConversion(ctx, elig); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetBackgroundTask(ctx, fmt.Sprintf("ec-convert-%d", uint64(elig.Extent)))
+	if err != nil {
+		t.Fatalf("GetBackgroundTask: %v", err)
+	}
+	if len(task.OwnerNodes) != 2 || task.OwnerNodes[0] != 1 || task.OwnerNodes[1] != 2 {
+		t.Fatalf("task OwnerNodes = %v, want %v", task.OwnerNodes, want)
+	}
+}
+
 func TestECConversionScheduler_RunOnce(t *testing.T) {
 	store := newV2TestPebbleStore(t)
 	ctx := context.Background()

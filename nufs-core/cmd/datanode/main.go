@@ -75,6 +75,7 @@ func main() {
 		gcScanInterval       = flag.Duration("gc-scan-interval", 0, "Background orphan-chunk GC scan cadence (0 = disabled; uses only the manual POST /api/v1/gc/scan endpoint)")
 		gcGraceWindow        = flag.Duration("gc-grace-window", 10*time.Minute, "Minimum local chunk age before the background orphan scan will delete it (protects in-flight writes not yet committed to metadata)")
 		scrubInterval        = flag.Duration("scrub-interval", 0, "Background data integrity scan cadence (0 = disabled; the scrub reads every local chunk and verifies its CRC32C checksum)")
+		ecConvertInterval    = flag.Duration("ec-convert-interval", 30*time.Second, "Background EC conversion task poll cadence (consumes metad TaskECConvert background tasks whose chunk replica lives on this node)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logJSON              = flag.Bool("log-json", false, "JSON log output")
 	)
@@ -155,6 +156,7 @@ func main() {
 		GCScanInterval:     *gcScanInterval,
 		GCGraceWindow:      *gcGraceWindow,
 		ScrubInterval:      *scrubInterval,
+		ECConvertInterval:  *ecConvertInterval,
 		LogLevel:           *logLevel,
 	})
 }
@@ -677,6 +679,14 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 		return disks
 	})
 	opsServer.SetECService(ecService)
+	// Datanode-side EC conversion consumer (§14): poll metad for TaskECConvert
+	// background tasks this node is allowed to own (its chunk replica lives on
+	// this node — the conversion source read must be LOCAL), run the 5-step
+	// replication→EC transaction via ECService.ConvertToEC, and complete/fail
+	// the task. Owner-routed lease (OwnerNodes from the scheduler's enqueue)
+	// prevents a non-holder from leasing and dead-lettering the task.
+	conversionWorker := datanode.NewConversionWorker(metaStore, ecService, uint64(cfg.NodeID), cfg.ECConvertInterval)
+	conversionWorker.Start(ctx)
 	// V2.1 capacity alerts: no DiskManager callback exists (disk==nil), so poll
 	// the unified capacity overview on a timer and push any level transition
 	// through the same NotifyCapacityAlert ring+webhook path as V1.
@@ -796,6 +806,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 	// outlive the stores), then close the stores exactly once.
 	srv.Stop()
 	repairWorker.Stop()
+	conversionWorker.Stop()
 	replicator.Stop()
 	heartbeat.Stop()
 	healer.Stop()

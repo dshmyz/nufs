@@ -169,6 +169,12 @@ type Config struct {
 	// Default in the scrub worker: 6h.
 	ScrubInterval time.Duration
 
+	// ECConvertInterval is the cadence for the background EC conversion worker
+	// (consumes metad TaskECConvert background tasks whose chunk replica lives
+	// on this node and runs the §14 replication→EC transaction). Default in
+	// the worker: 30s.
+	ECConvertInterval time.Duration
+
 	// LogLevel is the initial log level (debug/info/warn/error).
 	// Can be changed at runtime via SIGHUP signal.
 	LogLevel string
