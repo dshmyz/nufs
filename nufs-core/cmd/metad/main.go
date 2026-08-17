@@ -58,6 +58,7 @@ func main() {
 		gcInterval           = flag.Duration("gc-interval", 10*time.Minute, "GC scan interval")
 		gcDryRun             = flag.Bool("gc-dry-run", false, "GC dry-run mode (no deletes)")
 		scrubInterval        = flag.Duration("scrub-interval", 1*time.Hour, "Scrub interval")
+		ecConversionInterval = flag.Duration("ec-conversion-interval", 1*time.Hour, "EC conversion scheduler interval (0 disables auto-EC)")
 		autoBalanceInterval  = flag.Duration("auto-balance-interval", 0, "Auto rebalance interval (0 disables periodic auto balance)")
 		autoBalanceThreshold = flag.Float64("auto-balance-threshold", 0.15, "Auto rebalance imbalance threshold")
 		autoBalanceMax       = flag.Int("auto-balance-max-migrations", 10, "Maximum migrations per auto rebalance pass")
@@ -401,6 +402,7 @@ func main() {
 		metadata.WithGCInterval(*gcInterval),
 		metadata.WithGCDryRun(*gcDryRun),
 		metadata.WithScrubInterval(*scrubInterval),
+		metadata.WithECConversionInterval(*ecConversionInterval),
 		metadata.WithAutoBalanceInterval(*autoBalanceInterval),
 		metadata.WithAutoBalanceThreshold(*autoBalanceThreshold),
 		metadata.WithAutoBalanceMaxConcurrentMigrations(*autoBalanceMax),

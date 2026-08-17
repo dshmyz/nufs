@@ -18,6 +18,7 @@ const (
 	TaskRebalance     BackgroundTaskType = "rebalance"
 	TaskWriteRecovery BackgroundTaskType = "write_recovery"
 	TaskWriteGC       BackgroundTaskType = "write_gc"
+	TaskECConvert     BackgroundTaskType = "ec_convert"
 
 	TaskQueued     BackgroundTaskState = "queued"
 	TaskLeased     BackgroundTaskState = "leased"

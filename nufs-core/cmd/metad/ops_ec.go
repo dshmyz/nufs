@@ -380,3 +380,22 @@ func (h *opsHandlers) handleECIsOrphan(w http.ResponseWriter, r *http.Request) {
 		Orphaned bool `json:"orphaned"`
 	}{Orphaned: orphaned})
 }
+
+// handleECConversionQueue: GET /api/v1/ec/convert/queue
+//
+// Returns the queued EC conversion background tasks (eligible extents
+// discovered by the ECConversionScheduler, awaiting datanode-side processing).
+// Read-only; no mutation. Used by operators and the future ConversionWorker
+// datanode-side poll loop.
+func (h *opsHandlers) handleECConversionQueue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	tasks, err := h.store.ConversionQueue(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, tasks)
+}

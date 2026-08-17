@@ -238,6 +238,7 @@ type ServiceBundle struct {
 	GC           *ChunkGC
 	Scrub        *Scrubber
 	ExtentScrub  *ExtentScrubber
+	ECConversion *ECConversionScheduler
 	Raft         *RaftNode
 	Lifecycle    *LifecycleEngine
 	Audit        *AuditLogger
@@ -268,6 +269,9 @@ func (sb *ServiceBundle) Close() error {
 	}
 	if sb.ExtentScrub != nil {
 		sb.ExtentScrub.Stop()
+	}
+	if sb.ECConversion != nil {
+		sb.ECConversion.Stop()
 	}
 	if sb.GC != nil {
 		sb.GC.Stop()
@@ -386,6 +390,12 @@ func NewPebbleServiceBundle(store *PebbleStore, opts ...ServiceOption) (*Service
 		bundle.ExtentScrub.Start(sopts.ScrubInterval)
 	}
 
+	// EC conversion scheduler (replicas→EC auto-discovery)
+	if sopts.ECConversionInterval > 0 {
+		bundle.ECConversion = NewECConversionScheduler(store)
+		bundle.ECConversion.Start(sopts.ECConversionInterval)
+	}
+
 	// Lifecycle engine
 	if len(sopts.LifecycleRules) > 0 {
 		bundle.Lifecycle = NewLifecycleEngine(store)
@@ -433,6 +443,7 @@ type serviceOptions struct {
 	AutoBalanceInterval                time.Duration
 	AutoBalanceThreshold               float64
 	AutoBalanceMaxConcurrentMigrations int
+	ECConversionInterval               time.Duration
 }
 
 func defaultServiceOptions() *serviceOptions {
@@ -443,6 +454,7 @@ func defaultServiceOptions() *serviceOptions {
 		ScrubInterval:                      1 * time.Hour,
 		AutoBalanceThreshold:               0.15,
 		AutoBalanceMaxConcurrentMigrations: 10,
+		ECConversionInterval:               1 * time.Hour,
 	}
 }
 
@@ -490,4 +502,10 @@ func WithAutoBalanceThreshold(threshold float64) ServiceOption {
 // WithAutoBalanceMaxConcurrentMigrations caps migration plans per auto-balance pass.
 func WithAutoBalanceMaxConcurrentMigrations(n int) ServiceOption {
 	return func(o *serviceOptions) { o.AutoBalanceMaxConcurrentMigrations = n }
+}
+
+// WithECConversionInterval sets the replicas→EC conversion scan interval.
+// A non-positive interval disables the scheduler.
+func WithECConversionInterval(d time.Duration) ServiceOption {
+	return func(o *serviceOptions) { o.ECConversionInterval = d }
 }

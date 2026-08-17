@@ -157,6 +157,7 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, dataSt
 	// *remote* metadata authority, not the in-process Pebble stand-in.
 	mux.HandleFunc("/api/v1/ec/convert/resolve-landing", mut(s.handleECResolveLanding))
 	mux.HandleFunc("/api/v1/ec/convert/is-orphan", mut(s.handleECIsOrphan))
+	mux.HandleFunc("/api/v1/ec/convert/queue", s.handleECConversionQueue)
 
 	// EC write-path direct authority (Program 10): the gateway queries where
 	// each shard of a direct EC write lands (plan-write) and later reports the
