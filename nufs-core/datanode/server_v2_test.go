@@ -856,3 +856,135 @@ func TestV2Store_Delete_CleansShardDiskOf(t *testing.T) {
 		t.Fatal("shardDiskOf entry should have been removed")
 	}
 }
+
+// newTestMultiStoreWithSmall builds a V2Store over n data-stream stores plus
+// the matching per-disk small-file stores (mirroring runDataNodeV21's
+// AttachSmallStores wiring), so small-stream behavior can be exercised.
+func newTestMultiStoreWithSmall(t *testing.T, n int) (*V2Store, []*segment.SmallStore) {
+	t.Helper()
+	v, _ := newTestMultiStore(t, n)
+	smallStores := make([]*segment.SmallStore, n)
+	iface := make([]storage.Store, n)
+	for i := 0; i < n; i++ {
+		s, err := segment.NewSmallStore(segment.Config{
+			Dir:         v.disks[i].dir,
+			UseMemIndex: true,
+		})
+		if err != nil {
+			t.Fatalf("NewSmallStore disk %d: %v", i, err)
+		}
+		smallStores[i] = s
+		iface[i] = s
+	}
+	if err := v.AttachSmallStores(iface); err != nil {
+		t.Fatalf("AttachSmallStores: %v", err)
+	}
+	t.Cleanup(func() {
+		for _, s := range smallStores {
+			s.Close()
+		}
+	})
+	return v, smallStores
+}
+
+// TestV2StoreDiskStatsIncludesSmall verifies the per-disk observability
+// aggregation folds the small-file stream in: after writing a small chunk,
+// the owning disk's DiskStats UsedBytes/ChunkCount include it, and the
+// per-disk sum stays consistent with the node-level Stats().
+func TestV2StoreDiskStatsIncludesSmall(t *testing.T) {
+	v, _ := newTestMultiStoreWithSmall(t, 2)
+
+	// A small write (<= SmallFileThreshold) routes to the small stream.
+	payload := []byte("small-stream payload")
+	if err := v.Write(metadata.ChunkID(7), payload); err != nil {
+		t.Fatalf("write small chunk: %v", err)
+	}
+
+	ds := v.DiskStats()
+	if len(ds) != 2 {
+		t.Fatalf("DiskStats len=%d, want 2", len(ds))
+	}
+	var perDiskBytes, perDiskChunks int64
+	for _, d := range ds {
+		perDiskBytes += d.UsedBytes
+		perDiskChunks += d.ChunkCount
+	}
+	if perDiskBytes != int64(len(payload)) {
+		t.Fatalf("DiskStats UsedBytes sum=%d, want %d (small write not folded in)", perDiskBytes, len(payload))
+	}
+	if perDiskChunks != 1 {
+		t.Fatalf("DiskStats ChunkCount sum=%d, want 1", perDiskChunks)
+	}
+
+	// Node-level Stats() must agree with the per-disk aggregation.
+	totalBytes, chunkCount := v.Stats()
+	if totalBytes != perDiskBytes || chunkCount != perDiskChunks {
+		t.Fatalf("Stats()=(%d,%d) disagrees with DiskStats sum (%d,%d)",
+			totalBytes, chunkCount, perDiskBytes, perDiskChunks)
+	}
+
+	// The chunk really is on the small stream (guard against the test
+	// silently passing because routing changed).
+	v.mu.RLock()
+	loc, ok := v.locOf[metadata.ChunkID(7)]
+	v.mu.RUnlock()
+	if !ok || !loc.small {
+		t.Fatalf("chunk 7 not routed to small stream: %+v (ok=%v)", loc, ok)
+	}
+}
+
+// TestV2StoreReadWriteBytesIncludesSmall verifies ReadWriteBytes counts
+// bytes served by the small-file stream on both directions.
+func TestV2StoreReadWriteBytesIncludesSmall(t *testing.T) {
+	v, _ := newTestMultiStoreWithSmall(t, 1)
+
+	payload := []byte("small io payload")
+	if err := v.Write(metadata.ChunkID(9), payload); err != nil {
+		t.Fatalf("write small chunk: %v", err)
+	}
+	if _, _, err := v.Read(metadata.ChunkID(9), 0, 0); err != nil {
+		t.Fatalf("read small chunk: %v", err)
+	}
+
+	read, write := v.ReadWriteBytes()
+	if write != int64(len(payload)) {
+		t.Fatalf("ReadWriteBytes write=%d, want %d", write, len(payload))
+	}
+	if read != int64(len(payload)) {
+		t.Fatalf("ReadWriteBytes read=%d, want %d", read, len(payload))
+	}
+}
+
+// TestV2StoreWriteErrorRateIncludesSmall verifies the rolling write-error
+// window counts small-stream failures: closing the small store's engine
+// makes subsequent small writes fail, the first WriteErrorRate call reports
+// a non-zero rate, and the swap semantics zero the window for the next
+// cycle.
+func TestV2StoreWriteErrorRateIncludesSmall(t *testing.T) {
+	v, smallStores := newTestMultiStoreWithSmall(t, 1)
+
+	// Sanity: the routing works while the engine is open.
+	if err := v.Write(metadata.ChunkID(11), []byte("ok")); err != nil {
+		t.Fatalf("warmup small write: %v", err)
+	}
+	if rate := v.WriteErrorRate(); rate != 0 {
+		t.Fatalf("WriteErrorRate after success=%v, want 0", rate)
+	}
+
+	// Close the small engine so small writes fail (the data stream stays
+	// healthy - without folding small failures in, the rate would stay 0).
+	if err := smallStores[0].Close(); err != nil {
+		t.Fatalf("close small engine: %v", err)
+	}
+	if err := v.Write(metadata.ChunkID(12), []byte("will fail")); err == nil {
+		t.Fatal("write to closed small engine unexpectedly succeeded")
+	}
+
+	if rate := v.WriteErrorRate(); rate <= 0 || rate > 1 {
+		t.Fatalf("WriteErrorRate after small-stream failure=%v, want in (0,1]", rate)
+	}
+	// The window is swap-consumed: the next cycle reports 0 again.
+	if rate := v.WriteErrorRate(); rate != 0 {
+		t.Fatalf("WriteErrorRate second call=%v, want 0 (window consumed)", rate)
+	}
+}

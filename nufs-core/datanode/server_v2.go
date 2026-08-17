@@ -1662,11 +1662,16 @@ func (v *V2Store) ChunkStateSnapshot() map[metadata.ChunkID]metadata.ReplicaStat
 }
 
 // DiskStats returns per-disk usage and health, used by the heartbeat
-// reporter and the management interface.
+// reporter and the management interface. UsedBytes/ChunkCount fold in the
+// disk's small-file stream (it shares the physical dir, so TotalBytes and
+// OnDiskBytes already cover it physically); the EC-shard stream stays
+// excluded, matching the node-level Stats() "logical live footprint"
+// semantic (shard bytes are redundancy, not primary data). Health
+// (Failed/State) remains driven by the data stream's failCount.
 func (v *V2Store) DiskStats() []DiskStatsItem {
 	out := make([]DiskStatsItem, len(v.disks))
 	for i, b := range v.disks {
-		out[i] = DiskStatsItem{
+		item := DiskStatsItem{
 			Index:       i,
 			UsedBytes:   b.usedByts.Load(),
 			TotalBytes:  detectCapacityBytes(b.dir),
@@ -1675,6 +1680,11 @@ func (v *V2Store) DiskStats() []DiskStatsItem {
 			Failed:      v.diskFailed(i),
 			State:       v.diskState(i),
 		}
+		if i < len(v.small) {
+			item.UsedBytes += v.small[i].usedByts.Load()
+			item.ChunkCount += v.small[i].extCount.Load()
+		}
+		out[i] = item
 	}
 	return out
 }
@@ -1810,14 +1820,21 @@ func (v *V2Store) probeDisk(i int) {
 }
 
 // WriteErrorRate returns the aggregate write error rate (0.0-1.0) across
-// all disks, as a rolling window since the last call. Like the legacy
-// ChunkStore, the per-disk write-op/error counters are reset (Swap'd to 0)
-// so each heartbeat reports the rate within its own cycle rather than a
-// lifetime cumulative ratio. Disk health (diskFailed) is unaffected — it
-// uses its own persistent failCount.
+// all disks, as a rolling window since the last call. Both the data stream
+// and the small-file stream contribute ops/errors (the small stream keeps
+// the same per-backend writeOps/writeErr counters); the EC-shard stream
+// records neither and is out of this metric. Like the legacy ChunkStore,
+// the per-disk write-op/error counters are reset (Swap'd to 0) so each
+// heartbeat reports the rate within its own cycle rather than a lifetime
+// cumulative ratio. Disk health (diskFailed) is unaffected — it uses its
+// own persistent failCount.
 func (v *V2Store) WriteErrorRate() float64 {
 	var ops, errs int64
 	for _, b := range v.disks {
+		ops += b.writeOps.Swap(0)
+		errs += b.writeErr.Swap(0)
+	}
+	for _, b := range v.small {
 		ops += b.writeOps.Swap(0)
 		errs += b.writeErr.Swap(0)
 	}
@@ -1883,12 +1900,18 @@ func (v *V2Store) QuiesceWrites(ctx context.Context) (func(), error) {
 }
 
 // ReadWriteBytes returns the cumulative bytes read and written on the
-// serving path since startup, across all disks. The heartbeat samples
-// these to compute a live DiskIO utilization — something the legacy
+// serving path since startup, across all disks. Both the data stream and
+// the small-file stream contribute (reads of small extents go through
+// backendAt, which lands on the small backend's readByts). The heartbeat
+// samples these to compute a live DiskIO utilization — something the legacy
 // ChunkStore's DiskManager counters never feed (RecordRead/RecordWrite
 // have no serving-path callers), so V2.1 produces a real metric.
 func (v *V2Store) ReadWriteBytes() (read int64, write int64) {
 	for _, b := range v.disks {
+		read += b.readByts.Load()
+		write += b.writeByts.Load()
+	}
+	for _, b := range v.small {
 		read += b.readByts.Load()
 		write += b.writeByts.Load()
 	}
