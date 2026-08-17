@@ -51,7 +51,12 @@ type opsHandlers struct {
 // requireLeader checks if this node is the Raft leader. If not, it
 // sends an HTTP 307 redirect to the leader's ops address and returns
 // false. Callers (mutating handlers) should return immediately after
-// this returns false. Read-only handlers can skip the check.
+// this returns false. Data-plane read handlers (lookup/readdir/inode/
+// extent) are also gated: a follower's local DB read is only as fresh
+// as its FSM application lag, so serving reads locally would violate
+// read-after-write consistency (the ReadIndex fallback in the store is
+// best-effort only). Control-plane reads (status/metrics/queue) skip
+// the check — they tolerate staleness by design.
 func (h *opsHandlers) requireLeader(w http.ResponseWriter, r *http.Request) bool {
 	return requireLeaderRedirect(w, r, h.store)
 }
@@ -169,25 +174,29 @@ func registerOpsHandlers(mux *http.ServeMux, store *metadata.PebbleStore, dataSt
 	// (doesn't need leader check; followers already consume from their local EventBus)
 	mux.HandleFunc("/api/v1/watch", s.handleWatch)
 
-	// Namespace — readdir/lookup/readlink are read-only, no leader check
+	// Namespace — readdir/lookup/readlink are reads but still leader-gated:
+	// a follower-local read is only as fresh as its FSM application lag
+	// (see requireLeader).
 	mux.HandleFunc("/api/v1/namespace/mkdir", mut(s.handleMkDir))
 	mux.HandleFunc("/api/v1/namespace/rmdir", mut(s.handleRmDir))
-	mux.HandleFunc("/api/v1/namespace/readdir", s.handleReadDir)
+	mux.HandleFunc("/api/v1/namespace/readdir", mut(s.handleReadDir))
 	mux.HandleFunc("/api/v1/namespace/createfile", mut(s.handleCreateFile))
 	mux.HandleFunc("/api/v1/namespace/create-node", mut(s.handleCreateNode))
 	mux.HandleFunc("/api/v1/namespace/unlink", mut(s.handleUnlink))
-	mux.HandleFunc("/api/v1/namespace/lookup", s.handleLookup)
+	mux.HandleFunc("/api/v1/namespace/lookup", mut(s.handleLookup))
 	mux.HandleFunc("/api/v1/namespace/rename", mut(s.handleRename))
 	mux.HandleFunc("/api/v1/namespace/symlink", mut(s.handleSymlink))
-	mux.HandleFunc("/api/v1/namespace/readlink", s.handleReadlink)
+	mux.HandleFunc("/api/v1/namespace/readlink", mut(s.handleReadlink))
 	mux.HandleFunc("/api/v1/namespace/link", mut(s.handleLink))
-	mux.HandleFunc("/api/v1/inodes/", s.handleInodesByID) // read-only
+	mux.HandleFunc("/api/v1/inodes/", mut(s.handleInodesByID)) // read + sub-resource writes
 
 	// V2.1 extent-layout surface (roadmap stage 1 §1.3): the /extents/{id}
 	// top-level read is registered separately from the inode sub-resources
 	// (extents/inline/promote/append-extent), which dispatch inside
-	// handleInodesByID. Mutating sub-resources gate on requireLeader.
-	mux.HandleFunc("/api/v1/extents/", s.handleExtentByID)
+	// handleInodesByID. Both are leader-gated: extent rows are written via
+	// Raft (inline/promote/replace), so a follower-local extent read could
+	// observe a stale pre-write row.
+	mux.HandleFunc("/api/v1/extents/", mut(s.handleExtentByID))
 
 	// Repair + rebalance (all mutating)
 	mux.HandleFunc("/api/v1/repair/queue", s.handleRepairQueue) // read-only

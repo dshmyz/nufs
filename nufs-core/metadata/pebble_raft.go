@@ -1494,7 +1494,11 @@ func (n *RaftNode) NodeID() string {
 }
 
 // LeaderAddr returns the address of the current leader.
+// Empty string when Raft is not configured (nil raft handle).
 func (n *RaftNode) LeaderAddr() string {
+	if n.raft == nil {
+		return ""
+	}
 	addr, _ := n.raft.LeaderWithID()
 	return string(addr)
 }
@@ -1512,6 +1516,9 @@ func (n *RaftNode) LeaderAddr() string {
 // falling back to the Raft bind address, which may not be reachable
 // on the ops HTTP port.
 func (n *RaftNode) LeaderOpsAddr() string {
+	if n.raft == nil {
+		return ""
+	}
 	addr, id := n.raft.LeaderWithID()
 	if addr == "" {
 		return ""
@@ -1759,10 +1766,14 @@ func (n *RaftNode) applyTrustedAutoForward(entry *RaftLogEntry, timeout time.Dur
 	return n.applyTrusted(entry, timeout)
 }
 
-// ReadIndex performs a consistent read on a follower by verifying the
-// node's log is caught up to the leader's commit index. This allows
-// followers to serve read requests without forwarding to the leader,
-// reducing leader load and cross-AZ latency.
+// ReadIndex attempts a consistent read on this node by verifying it is
+// the Raft leader (hashicorp/raft's VerifyLeader). On the leader, the
+// local FSM is at least as fresh as every committed write, so the
+// subsequent local read is linearizable. On a follower VerifyLeader
+// always fails ("node is not the leader"); callers that read anyway are
+// serving from a possibly-lagging FSM and must tolerate staleness —
+// data-plane HTTP reads avoid this by leader-redirecting first
+// (ops_handlers requireLeader), so this fallback is best-effort only.
 //
 // Returns an error if this node has been removed from the cluster or
 // the verification times out.

@@ -228,6 +228,17 @@ type PebbleStore struct {
 	chunkIDMax     atomic.Uint64
 	chunkIDMaxInit atomic.Bool
 
+	// inodeIDMaxInit gates the one-time cold-cache scan in ensureInodeIDMax,
+	// which raises inodeSeq strictly above the largest inode ID already
+	// committed to this store. inodeSeq is a process-local counter reset to
+	// RootInodeID at every store construction and never raft-replicated, so a
+	// newly elected leader or restarted process could otherwise re-issue IDs
+	// another leader already committed — silently overwriting an unrelated
+	// inode row (the multi-metad leader-failover drill's 36/99 corruption).
+	// The counter itself is the "largest minted" high mark once seeded; see
+	// ensureInodeIDMax / nextInodeID.
+	inodeIDMaxInit atomic.Bool
+
 	closed atomic.Bool
 	mu     sync.RWMutex
 	cfg    PebbleStoreConfig
@@ -762,6 +773,15 @@ func (s *PebbleStore) nextInodeID() InodeID {
 	}
 	s.inodeFreeMu.Unlock()
 
+	// Seed the counter above the largest inode ID already committed to this
+	// store before minting a fresh ID (cold-cache scan, once per process).
+	// Without this, a newly elected raft leader or restarted process re-mints
+	// from RootInodeID+1 and silently overwrites inode rows a previous leader
+	// already committed — the multi-metad leader-failover drill's 36/99
+	// corruption. The free-list path above does not need the scan: recycled
+	// IDs are always ≤ the committed maximum and their rows are already
+	// deleted (they only enter the list via a committed Unlink/RmDir).
+	s.ensureInodeIDMax()
 	return InodeID(s.inodeSeq.Add(1))
 }
 
@@ -1300,6 +1320,37 @@ func buildNamespaceConditional(nsKey string, ops []batchOp) (*ConditionalBatch, 
 	return buildNamespaceConditionalOps(nsKey, ops, nil, nil)
 }
 
+// buildNamespaceConditionalWithInodeGuard is the create-path form of
+// buildNamespaceConditional: same atomic nsKey-absence create semantics, plus
+// a second precondition requiring the freshly minted /inode/<id> row to be
+// absent. The inode guard is defense-in-depth against inode-ID reuse: if a
+// stale ID ever collides with a live row (e.g. the cold-scan seeding window
+// in ensureInodeIDMax), the create fails with ErrEntryExists instead of
+// silently overwriting another object's inode row (the multi-metad
+// leader-failover drill's 36/99 corruption). It never blocks a legitimate
+// create: fresh IDs mint strictly above every committed row, and recycled
+// free-list IDs only enter the list via a committed Unlink/RmDir that deleted
+// their row. It must NOT be used on Link — a hard link's target inode is
+// required to exist.
+func buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey string, ops []batchOp) (*ConditionalBatch, error) {
+	mutations := make([]BatchOp, 0, len(ops))
+	for _, op := range ops {
+		data, err := marshalValue(op.Value, codecMsgpack)
+		if err != nil {
+			return nil, fmt.Errorf("marshal namespace mutation %q: %w", op.Key, err)
+		}
+		mutations = append(mutations, BatchOp{Key: []byte(op.Key), Value: data})
+	}
+	return &ConditionalBatch{
+		Version: conditionalBatchVersion,
+		Preconditions: []ConditionalPrecondition{
+			{Key: []byte(nsKey), ExpectAbsent: true},
+			{Key: []byte(inodeKey), ExpectAbsent: true},
+		},
+		Mutations: mutations,
+	}, nil
+}
+
 // buildNamespaceConditionalOps is the general form: it encodes the mutations
 // and (optionally) raw deletes, and attaches a single precondition on nsKey.
 // When preCmp is ExpectAbsent the check is absence (create semantics); when
@@ -1373,7 +1424,8 @@ func (s *PebbleStore) MkDir(ctx context.Context, parent InodeID, name string, mo
 	// precondition makes the existence check and the insert atomic, so a
 	// concurrent same-name create fails with ErrEntryExists instead of
 	// leaving an orphan inode / lost parent NLink update.
-	conditional, err := buildNamespaceConditional(nsKey, ops)
+	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+	conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
 	if err != nil {
 		return nil, err
 	}
@@ -1604,7 +1656,8 @@ func (s *PebbleStore) CreateFile(ctx context.Context, parent InodeID, name strin
 		{Key: nsKey, Value: entry},
 	}
 	s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
-	conditional, err := buildNamespaceConditional(nsKey, ops)
+	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+	conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
 	if err != nil {
 		return nil, err
 	}
@@ -1652,7 +1705,8 @@ func (s *PebbleStore) CreateNode(ctx context.Context, parent InodeID, name strin
 		{Key: nsKey, Value: entry},
 	}
 	s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
-	conditional, err := buildNamespaceConditional(nsKey, ops)
+	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+	conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
 	if err != nil {
 		return nil, err
 	}
@@ -2009,7 +2063,8 @@ func (s *PebbleStore) Symlink(ctx context.Context, parent InodeID, name string, 
 		{Key: nsKey, Value: entry},
 	}
 	s.addBucketStatsOp(bucketRoot, int64(len(target)), 1, &ops)
-	conditional, err := buildNamespaceConditional(nsKey, ops)
+	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+	conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
 	if err != nil {
 		return nil, err
 	}
@@ -2389,6 +2444,67 @@ func (s *PebbleStore) ensureChunkIDMax() uint64 {
 	s.chunkIDMax.Store(max)
 	s.chunkIDMaxInit.Store(true)
 	return max
+}
+
+// parseInodeKeyID extracts the inode ID from a canonical /inode/<id> key.
+// Mirrors parseChunkTombstoneKey: a strict round-trip check rejects any
+// non-decimal or oddly-shaped key so a malformed row can never skew the
+// cold-scan maximum.
+func parseInodeKeyID(key string) (InodeID, error) {
+	id, err := strconv.ParseUint(strings.TrimPrefix(key, prefixInode), 10, 64)
+	if err != nil || id == 0 || prefixInode+strconv.FormatUint(id, 10) != key {
+		return 0, fmt.Errorf("invalid inode key %q", key)
+	}
+	return InodeID(id), nil
+}
+
+// ensureInodeIDMax raises inodeSeq to at least the largest inode ID already
+// committed to this store, derived from the raft-replicated /inode/ keys — the
+// same durable source that chunk-ID minting uses. inodeSeq is process-local
+// and reset to RootInodeID at every store construction, so without this a
+// newly elected raft leader or restarted process re-mints IDs a previous
+// leader already committed, silently overwriting unrelated inode rows (the
+// multi-metad leader-failover drill's 36/99 corruption). The first call scans
+// the committed inode keys (cold cache); later calls are served from the
+// counter itself, which nextInodeID's Add(1) keeps current, so steady-state
+// minting stays O(1).
+//
+// Lazy (first mint, not store construction): at construction time a raft FSM
+// has replayed nothing, so an eager scan would permanently under-seed. By the
+// first mint the election + leader-redirect + retry budget has given the FSM
+// ample time to catch up (the same reasoning that makes ensureChunkIDMax's
+// lazy scan the authoritative fix for chunk IDs).
+//
+// The raise is an upward-only CompareAndSwap loop, NOT an unconditional
+// Store: inodeSeq is the "largest minted" counter, and a concurrent
+// nextInodeID Add(1) may already have advanced it — Store would roll the
+// counter back and mint a colliding ID in-process. (ensureChunkIDMax may
+// Store unconditionally because chunkIDMax is only a comparison floor, never
+// the live minting counter.)
+func (s *PebbleStore) ensureInodeIDMax() uint64 {
+	if s.inodeIDMaxInit.Load() {
+		return s.inodeSeq.Load()
+	}
+	// Cold cache: scan the committed inode rows for the largest existing ID.
+	var max uint64
+	_ = s.scanPrefix(prefixInode, func(key, _ []byte) error {
+		id, err := parseInodeKeyID(string(key))
+		if err == nil && uint64(id) > max {
+			max = uint64(id)
+		}
+		return nil
+	})
+	for {
+		cur := s.inodeSeq.Load()
+		if cur >= max {
+			break
+		}
+		if s.inodeSeq.CompareAndSwap(cur, max) {
+			break
+		}
+	}
+	s.inodeIDMaxInit.Store(true)
+	return s.inodeSeq.Load()
 }
 
 // advanceChunkIDMax raises the in-memory high mark when a batch mints IDs

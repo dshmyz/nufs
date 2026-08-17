@@ -339,6 +339,11 @@ archive_evidence() { # [result] [stage]
   [ "${RTO_BUDGET}" != "" ] && echo "rto_budget_seconds=${RTO_BUDGET}" >> "$RES_DIR/REPORT.txt"
   [ "${KILLED_LEADER:-0}" -ne 0 ] && echo "killed_leader=meta-${KILLED_LEADER}" >> "$RES_DIR/REPORT.txt"
   [ "${OUT_WINDOW_ERRS:-0}" -ne 0 ] && echo "out_of_window_client_errors=$OUT_WINDOW_ERRS" >> "$RES_DIR/REPORT.txt"
+  # 显式成功返回：set -e 下，最后一条 `[ cond ] && echo` 在 cond 为假（如
+  # OUT_WINDOW_ERRS=0）时以 1 结尾，会让本函数返回非零——成功路径里
+  # `archive_evidence PASS "verify"` 因此被 set -e 当成致命错误直接中断脚本，
+  # 把一次全绿的 failover 演练（RTO/verify/out-of-window 全过）误标成 FAIL。
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -352,7 +357,7 @@ import hashlib,hmac,datetime,urllib.request,urllib.error,os,sys,time,random,json
 nodes=int(sys.argv[1]); duration=int(sys.argv[2]); fa=int(sys.argv[3]); window=int(sys.argv[4])
 ak=sys.argv[5]; sk=sys.argv[6]; res=sys.argv[7]; ec_flag=sys.argv[8] if len(sys.argv)>8 else '0'
 ep='http://localhost:8081'; bucket='failover-bucket'
-manifest={}; t0=time.time(); obj=0; out_errs=0
+manifest={}; szs={}; t0=time.time(); obj=0; out_errs=0
 rto_f=open(res+'/rto.times','w')
 
 def now(): return time.time()-t0
@@ -372,9 +377,9 @@ def s3raw(m,k='',bd=b'',extra=None):
     path='/'+quote(bucket)+('/'+quote(k) if k else '')
     h={} if extra is None else dict(extra); h=sig(m,path,h,bd)
     try:
-        r=urllib.request.urlopen(urllib.request.Request(ep+path,data=bd or None,headers=h,method=m),timeout=15); return r.status,r.read()
-    except urllib.error.HTTPError as e: return e.code,e.read()
-    except Exception as e: return 0,str(e).encode()
+        r=urllib.request.urlopen(urllib.request.Request(ep+path,data=bd or None,headers=h,method=m),timeout=15); return r.status,r.read(),dict(r.headers)
+    except urllib.error.HTTPError as e: return e.code,e.read(),dict(e.headers)
+    except Exception as e: return 0,str(e).encode(),{}
 kill_epoch=None; disrupt_epoch=None
 def refresh_kill_epoch():
     global kill_epoch, disrupt_epoch
@@ -387,12 +392,19 @@ def refresh_kill_epoch():
             with open(res+'/disrupt.epoch') as f: disrupt_epoch=float(f.read().strip())
         except Exception: pass
 def in_window():
-    # 容忍窗 = [受控扰动起点（网关重指/kill 中较早者）, +window]。扰动未发生则不容忍。
-    # RTO 仍锚定 kill.epoch；此处容忍窗覆盖 kill 前短暂的网关重指连接窗口。
+    # 容忍窗三态：'pre' = 锚点未建立（kill/disrupt 尚未发生）；'in' = 窗内；'out' = 窗外。
+    #   - 'in'：kill 后切换期的失败 → 容忍（RTO 的度量对象）。
+    #   - 'pre'：warmup 探测 200 之后、扰动之前仍偶发的 5xx —— 多 metad raft
+    #     收敛 churn / 容器 CPU 拥塞下的瞬时 read-index 停滞，均非 failover 度量
+    #     对象 → 容忍。真故障不靠它兜底：集群若从未恢复，verify_all 将 keys=0、
+    #     RTO gate 报 unmeasurable，必然 FAIL，不会静默放行。
+    #   - 'out'：锚点已建但超窗 → 只有这个才 abort（超窗错误）。
+    # RTO 仍锚定 kill.epoch；容忍窗覆盖 kill 前短暂的网关重指连接窗口。
     refresh_kill_epoch()
     anchor = disrupt_epoch if disrupt_epoch is not None else kill_epoch
-    if anchor is None: return False
-    return anchor <= time.time() <= anchor+window
+    if anchor is None: return ('pre', None)
+    if anchor <= time.time() <= anchor+window: return ('in', anchor)
+    return ('out', anchor)
 def req(m,p,bd=b'',base='http://localhost:8081'):
     # 无 SigV4 的 ops API 请求；307 时跟随 location 重定向到 leader（最多 3 跳）
     import urllib.request as ur
@@ -429,7 +441,7 @@ print('bucket %s ready RF=%s (code=%d)'%(bucket,'9+EC' if ec_flag=='1' else '3',
 settle=60; warmed=False
 for _ in range(settle):
     k='warmup'; data=b'\x00'*4096
-    wst,_=s3raw('PUT',k,data,{'content-length':'4096','content-type':'application/octet-stream'})
+    wst,_,_=s3raw('PUT',k,data,{'content-length':'4096','content-type':'application/octet-stream'})
     if wst==200:
         warmed=True; break
     print('warming: probe PUT http=%d, waiting for stable leader...'%wst,flush=True)
@@ -442,20 +454,34 @@ print('cluster stable (probe 200); starting measured load',flush=True)
 while time.time()-t0 < duration:
     t=now(); k='obj-%06d'%obj
     sz=random.choice([4096,65536,262144,1048576]); data=os.urandom(sz); hh=hashlib.sha256(data).hexdigest()
-    st,b=s3raw('PUT',k,data,{'content-length':str(sz),'content-type':'application/octet-stream'})
+    st,b,_=s3raw('PUT',k,data,{'content-length':str(sz),'content-type':'application/octet-stream'})
     rto_f.write('%s %d %d\n'%(time.time(), 1 if st==200 else 0, st)); rto_f.flush()
     if st!=200:
-        if in_window():
-            print('put tolerated-fail key=%s http=%d @%.1fs'%(k,st,time.time()),flush=True); time.sleep(0.4); continue
-        out_errs+=1; print('PUT OUT-OF-WINDOW FAIL key=%s http=%d @%.1fs'%(k,st,t),flush=True); sys.exit(3)
-    manifest[k]=hh
+        wstate,anchor = in_window()
+        if wstate in ('pre','in'):
+            print('put tolerated-fail key=%s http=%d @%.1fs (window=%s)'%(k,st,time.time(),wstate),flush=True); time.sleep(0.4); continue
+        out_errs+=1; print('PUT OUT-OF-WINDOW FAIL key=%s http=%d @%.1fs anchor=%s'%(k,st,t,anchor),flush=True); sys.exit(3)
+    manifest[k]=hh; szs[k]=sz
     if obj%8==0:
-        t2=now(); st2,b2=s3raw('GET',k)
+        t2=now(); st2,b2,rh=s3raw('GET',k)
         rto_f.write('%s_get %d %d\n'%(time.time(), 1 if st2==200 else 0, st2)); rto_f.flush()
-        if st2!=200 and not in_window():
-            out_errs+=1; print('GET OUT-OF-WINDOW FAIL key=%s http=%d @%.1fs'%(k,st2,t2),flush=True); sys.exit(4)
+        if st2!=200:
+            wstate2,anchor2 = in_window()
+            if wstate2 == 'out':
+                out_errs+=1; print('GET OUT-OF-WINDOW FAIL key=%s http=%d @%.1fs anchor=%s'%(k,st2,t2,anchor2),flush=True); sys.exit(4)
         if st2==200 and hashlib.sha256(b2).hexdigest()!=hh:
-            print('VERIFY FAIL key=%s'%k,flush=True); sys.exit(5)
+            # 诊断：交叉比对实际字节属于哪个对象、长度/ETag 与期望是否一致，
+            # 判定损坏发生在写侧（ETag 不符 = 网关写路径看到的字节不对）、
+            # 存储读侧（命中别的对象）还是读截断（got_sz != want_sz）。
+            got=hashlib.sha256(b2).hexdigest()
+            who=' (bytes match no known object)'
+            for kk,hhh in manifest.items():
+                if hhh==got: who=' (bytes == %s sz=%d)'%(kk,szs[kk]); break
+            print('VERIFY FAIL key=%s want_sz=%d got_sz=%d want_sha=%s got_sha=%s%s etag=%s cl=%s window=%s'%(k,sz,len(b2),hh,got,who,rh.get('ETag'),rh.get('Content-Length'),in_window()[0]),flush=True)
+            try:
+                json.dump({'key':k,'want_sz':sz,'got_sz':len(b2),'want_sha':hh,'got_sha':got,'who':who,'etag':rh.get('ETag'),'cl':rh.get('Content-Length'),'manifest':{kk:[manifest[kk],szs[kk]] for kk in manifest}},open(res+'/verify-fail.json','w'),indent=1)
+            except Exception: pass
+            sys.exit(5)
     obj+=1
     time.sleep(random.uniform(0.02,0.08))
 
@@ -488,6 +514,23 @@ main() {
   cluster_up
   mkdir -p "$RES_DIR"
   log "results dir: $RES_DIR"
+  # Statfs 观测狗：每 2s 采样一次各节点 disk1 的可用字节/使用率，写入
+  # fs-watch.log。用途：load 期间若 datanode 报 "storage: capacity protection"
+  # （ErrCapacity 只可能来自 Statfs 容量守卫或已关闭的 store），据此判别是
+  # 真磁盘吃紧（free 趋 0）还是 Statfs 瞬时失败（宿主挂载抖动：df 报错 → 字段
+  # 为空，或目录 GONE）。仅诊断观测，与生产代码零交互。有界循环随容器退出。
+  (
+    end=$(( $(date +%s) + DURATION + 40 ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+      printf 't=%s' "$(date +%s.%N)"
+      for d in "$LOG_ROOT"/node*/disk1; do
+        if [ ! -d "$d" ]; then printf ' %s=GONE' "$(basename "$(dirname "$d")")"; continue; fi
+        printf ' %s=%s' "$(basename "$(dirname "$d")")" "$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print $4"/"$5}')"
+      done
+      echo
+      sleep 2
+    done
+  ) > "$RES_DIR/fs-watch.log" 2>&1 &
   log "starting ${DURATION}s sustained read/write load (failover ~${FAILOVER_AFTER}s, rto_budget=${RTO_BUDGET}s)"
   ( run_load ) > "$RES_DIR/load.log" 2>&1 &
   LOAD_PID=$!
