@@ -57,4 +57,4 @@ exec docker run --rm \
   -e VERIFY_LEVEL="${VERIFY_LEVEL:-fast}" \
   -w "$SRC_DIR" \
   "$GO_IMAGE" \
-  bash "$SRC_DIR/scripts/verify.sh" "$@"
+  bash -c 'apt-get update -qq && apt-get install -y -qq python3 lsof >/dev/null 2>&1 && exec bash "$@"' _ "$SRC_DIR/scripts/verify.sh" "$@"

@@ -39,6 +39,7 @@ STEP_N=0
 step() { STEP_N=$((STEP_N+1)); printf '\n\033[1;36m[%d] %s\033[0m\n' "$STEP_N" "$*"; }
 pass() { printf '  \033[32mPASS:\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL:\033[0m %s\n' "$*"; FAILED=1; }
+skip() { printf '  \033[33mSKIP:\033[0m %s\n' "$*"; }
 isok() { [ "$FAILED" -eq 0 ]; }
 
 usage() { sed -n '2,30p' "$0"; exit 0; }
@@ -150,10 +151,16 @@ if [ "$LEVEL" = "drill" ] || [ "$LEVEL" = "full" ]; then
   fi
 
   step "drill: network-fault-injection (partition/loss/latency via S3 gateway)"
-  if bash scripts/soak/run-v21-network-faults.sh ; then
-    pass "network-fault-injection drill"
+  if ! command -v docker >/dev/null 2>&1; then
+    skip "network-fault-injection drill (requires Docker — skipped in containerized verify)"
+  elif [ ! -f scripts/soak/run-v21-network-faults.sh ]; then
+    skip "network-fault-injection drill (script not found at scripts/soak/)"
   else
-    fail "network-fault-injection drill"
+    if bash scripts/soak/run-v21-network-faults.sh ; then
+      pass "network-fault-injection drill"
+    else
+      fail "network-fault-injection drill"
+    fi
   fi
 fi
 
