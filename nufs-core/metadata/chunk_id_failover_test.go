@@ -2,8 +2,11 @@ package metadata
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 // TestChunkIDNoReuseAfterStoreReopen is the decisive regression test for the
@@ -254,4 +257,58 @@ func TestRaftClusterChunkIDNoReuseAcrossFailover(t *testing.T) {
 		}
 	}
 	t.Logf("chunk-ID high mark across raft cluster = %d", hwm)
+}
+
+// TestAllocateChunks_RetriesOutcomeUnknown proves the allocation retry loop
+// covers "outcome unknown + not yet observable in the FSM" — the window a slow
+// leader opens right after failover when its apply lags past the conditional
+// wait. The first attempt times out unresolved, reconciliation finds nothing
+// committed, and the loop retries with a fresh batch instead of failing the
+// caller (previously it returned the outcome-unknown error).
+func TestAllocateChunks_RetriesOutcomeUnknown(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if err := store.RegisterNode(ctx, &NodeInfo{ID: 1, Addr: "node:9001", CapacityGB: 10, Tier: TierHot}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	if err := store.CreateBucket(ctx, "fs", PlacementPolicy{ReplicationFactor: 1}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	file, err := store.CreateFile(ctx, bucket.RootInode, "f.bin", 0o644)
+	if err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+
+	var applyCalls atomic.Int32
+	node := &RaftNode{
+		conditionalLeaderHook: func() bool { return true },
+		conditionalApplyHook: func([]byte, time.Duration) raft.ApplyFuture {
+			n := applyCalls.Add(1)
+			future := newControlledConditionalFuture()
+			if n >= 2 {
+				future.Resolve(nil, nil) // second attempt "commits"
+			}
+			// First attempt never resolves: applyConditionalAccepted waits
+			// out its 10s window and returns ErrRaftConditionalOutcomeUnknown.
+			return future
+		},
+	}
+	store.SetRaftNode(node)
+	t.Cleanup(func() { store.SetRaftNode(nil) })
+
+	chunks, err := store.AllocateChunksBatch(ctx, file.ID, []int64{0}, PlacementPolicy{ReplicationFactor: 1})
+	if err != nil {
+		t.Fatalf("AllocateChunksBatch after unknown-outcome retry: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("allocated %d chunks, want 1", len(chunks))
+	}
+	if got := applyCalls.Load(); got != 2 {
+		t.Fatalf("conditional apply calls = %d, want 2 (first unknown, second commit)", got)
+	}
 }

@@ -2242,6 +2242,13 @@ func (s *PebbleStore) allocateChunksConditionally(ctx context.Context, inodeID I
 	}
 	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
 	started := time.Now()
+	// outcomeUnknownRetries bounds how often an outcome-unknown apply (each
+	// one waits the full conditional window) is retried before the caller
+	// learns the outcome is unknown. Unlike a fast collision retry, one retry
+	// is enough for the FSM to catch up and reconcile to confirm; more would
+	// multiply the wait by the conditional window for no extra correctness.
+	const outcomeUnknownRetries = 1
+	unknownRetries := 0
 	for attempt := 0; attempt < allocationConditionalAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -2294,7 +2301,20 @@ func (s *PebbleStore) allocateChunksConditionally(ctx context.Context, inodeID I
 				s.inCache.del(inodeID)
 				return chunks, nil
 			}
-			return nil, err
+			// The outcome is unknown AND not yet observable in the FSM (a
+			// slow leader whose apply lagged past the conditional wait — e.g.
+			// right after a failover under CPU contention). Retry once: the
+			// next iteration re-reads the inode, so if the previous batch did
+			// commit the fresh conditional appends new IDs on top of it, and
+			// if it did not the retry just re-submits. The inode-key
+			// precondition keeps a duplicate append from ever landing. A
+			// second unknown means the leader cannot commit at all — surface
+			// the outcome-unknown error for the caller's reconcile path.
+			unknownRetries++
+			if unknownRetries > outcomeUnknownRetries {
+				return nil, err
+			}
+			continue
 		}
 		if !errors.Is(err, ErrBackupMetadataConflict) {
 			if err == nil {
