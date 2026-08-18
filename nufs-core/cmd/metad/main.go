@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -70,6 +71,7 @@ func main() {
 		authToken            = flag.String("auth-token", "", "Bearer token for ops API auth (empty = no auth)")
 		tokenSigningKey      = flag.String("token-signing-key", "", "HMAC key for signing mount auth tokens (shared with nufs-fuse: must be set to authenticate mounts)")
 		tokenSigningKeyPrev  = flag.String("token-signing-key-previous", "", "Superseded HMAC key still accepted for verification during a key rotation (never used to mint new tokens)")
+		credentialSecretKey  = flag.String("credential-secret-key", "", "32-byte hex key for sealing registry secrets; required for the S3 gateway credential sync (empty = credentials stay hash-only)")
 		devSeedCred          = flag.String("dev-seed-cred", "", "Dev only: seed a credential as <access-key>:<secret-key> on startup (never use in production)")
 		allowInsecureDev     = flag.Bool("allow-insecure-dev", false, "Allow running without auth, TLS, or multi-node Raft (dev only)")
 		backupEnabled        = flag.Bool("backup-enabled", false, "Enable leader-only metadata backups")
@@ -150,10 +152,23 @@ func main() {
 	})
 	log := logging.Named("metad")
 
+	// Parse the credential encryption key (hex, 32 bytes) once up front so a
+	// malformed value fails fast instead of surfacing as an unsealable-secret
+	// mystery later. Empty is legal: registry secrets stay hash-only, fuse
+	// mounts keep working, and only the S3 gateway sync is unavailable.
+	var credentialKey []byte
+	if *credentialSecretKey != "" {
+		credentialKey, err = hex.DecodeString(*credentialSecretKey)
+		if err != nil || len(credentialKey) != 32 {
+			fmt.Fprintf(os.Stderr, "invalid --credential-secret-key: want 32-byte hex key (64 hex chars), got %d bytes\n", len(credentialKey))
+			os.Exit(1)
+		}
+	}
+
 	// Warn when secrets are passed via CLI (visible in ps(1)).
 	// Prefer env vars or --config file for production deployments.
 	for _, arg := range os.Args[1:] {
-		if strings.HasPrefix(arg, "--token-signing-key=") || strings.HasPrefix(arg, "--auth-token=") {
+		if strings.HasPrefix(arg, "--token-signing-key=") || strings.HasPrefix(arg, "--auth-token=") || strings.HasPrefix(arg, "--credential-secret-key=") {
 			log.Warn("secret passed via CLI flag — visible in ps(1); prefer env or --config file in production")
 			break
 		}
@@ -197,12 +212,13 @@ func main() {
 		os.Exit(1)
 	}
 	if err := metadata.ValidateProductionConfig(metadata.ProductionValidationConfig{
-		Mode:             runtimeMode(*allowInsecureDev),
-		JWTSecret:        *authToken,
-		RaftNodeCount:    raftNodeCount,
-		TLSEnabled:       *tlsCert != "",
-		AllowInsecureDev: *allowInsecureDev,
-		TokenSigningKey:  *tokenSigningKey,
+		Mode:                runtimeMode(*allowInsecureDev),
+		JWTSecret:           *authToken,
+		RaftNodeCount:       raftNodeCount,
+		TLSEnabled:          *tlsCert != "",
+		AllowInsecureDev:    *allowInsecureDev,
+		TokenSigningKey:     *tokenSigningKey,
+		CredentialSecretKey: *credentialSecretKey,
 	}); err != nil {
 		log.Error("production config validation failed", "error", err)
 		os.Exit(1)
@@ -281,7 +297,16 @@ func main() {
 			log.Error("failed to hash dev seed secret", "error", err)
 			os.Exit(1)
 		}
-		if err := store.PutCredential(context.Background(), metadata.Credential{AccessKey: ak, SecretHash: hash}); err != nil {
+		cred := metadata.Credential{AccessKey: ak, SecretHash: hash}
+		if credentialKey != nil {
+			sealed, sealErr := metadata.SealSecret(credentialKey, sk)
+			if sealErr != nil {
+				log.Error("failed to seal dev seed secret", "error", sealErr)
+				os.Exit(1)
+			}
+			cred.SecretCiphertext = sealed
+		}
+		if err := store.PutCredential(context.Background(), cred); err != nil {
 			log.Error("failed to seed dev credential", "access_key", ak, "error", err)
 			os.Exit(1)
 		}
@@ -481,7 +506,7 @@ func main() {
 		})
 	}
 	registerOpsHandlers(mux, store, dataStore, bundle, advertiseOpsURL, backupDeps...)
-	stopAuthTokenLimiter := registerOpsAuthHandlers(mux, store, *tokenSigningKey)
+	stopAuthTokenLimiter := registerOpsAuthHandlers(mux, store, *tokenSigningKey, credentialKey)
 	defer stopAuthTokenLimiter()
 
 	admin := newAdminServer(store, bundle)

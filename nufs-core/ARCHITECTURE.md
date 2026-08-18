@@ -313,7 +313,14 @@ S3 兼容 API:
 
 认证:
   - AWS Signature V4 签名验证
-  - 匿名模式 (无 CredentialStore 时)
+  - 凭据源 = metad 注册表（Phase 2 收敛）：nufs-cli `auth add` 写入注册表 →
+    网关经 --meta-auth-token 拉取 `/api/v1/auth/credentials`（明文由 metad 用
+    --credential-secret-key 加密存储、受信端点解密下发）→ 内存 CredentialStore
+    TTL 轮询刷新；吊销延迟 ≤ 同步间隔。principal = 注册表绑定的 principal
+    （CreateBucket 的 owner 即验证后的 principal）。
+  - 匿名模式 (注册表为空时)
+  - 旧本地源 --access-key/--secret-key/--credentials-file 已废弃，仅作同步
+    不可用时的回退
 ```
 
 #### 2.3.2 FUSE 网关 (仅 Linux)

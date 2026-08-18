@@ -56,8 +56,11 @@ func (gw *Gateway) handleCreateBucket(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	// Set default bucket policy: creator is the owner with full access
-	owner := r.Header.Get("X-Owner")
+	// Set default bucket policy: creator is the owner with full access.
+	// The owner is the verified request principal (from the SigV4 credential
+	// via route()), never a client-supplied header. Unauthenticated creators
+	// are recorded as anonymous.
+	owner := string(requestPrincipal(r.Context()))
 	if owner == "" {
 		owner = "anonymous"
 	}

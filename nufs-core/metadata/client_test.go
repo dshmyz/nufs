@@ -534,3 +534,50 @@ func TestHTTPClientCreateNodeRoundTrip(t *testing.T) {
 		t.Fatalf("decoded meta = %+v", meta)
 	}
 }
+
+func TestHTTPClientListGatewayCredentials(t *testing.T) {
+	seenToken := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/auth/credentials" {
+			http.NotFound(w, r)
+			return
+		}
+		seenToken = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[
+			{"access_key":"ak-1","secret_key":"sk-one","principal":"svc-1"},
+			{"access_key":"ak-2","secret_key":"sk-two","principal":"ak-2"}
+		]`))
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, time.Second)
+	creds, err := c.ListGatewayCredentials(context.Background(), "ops-token-123")
+	if err != nil {
+		t.Fatalf("ListGatewayCredentials: %v", err)
+	}
+	if seenToken != "Bearer ops-token-123" {
+		t.Fatalf("Authorization = %q, want Bearer ops-token-123", seenToken)
+	}
+	if len(creds) != 2 {
+		t.Fatalf("len(creds) = %d, want 2", len(creds))
+	}
+	if creds[0].AccessKey != "ak-1" || creds[0].SecretKey != "sk-one" || creds[0].Principal != "svc-1" {
+		t.Fatalf("creds[0] = %+v", creds[0])
+	}
+	if creds[1].Principal != "ak-2" {
+		t.Fatalf("creds[1] principal = %q, want fallback ak-2", creds[1].Principal)
+	}
+}
+
+func TestHTTPClientListGatewayCredentialsErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"no leader available"}`, http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, time.Second)
+	if _, err := c.ListGatewayCredentials(context.Background(), "ops"); err == nil {
+		t.Fatal("expected error on 503, got nil")
+	}
+}

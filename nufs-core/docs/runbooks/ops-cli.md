@@ -138,3 +138,31 @@ nufs-cli write-attempts --state failed
   （repair 队列深度与最老任务时间戳，`ops_prometheus.go` 挂出），补上原来
   「规则写了但没人发」的 repair 维度可观测。
 - 上完线后在真实 Prometheus 里做一次**告警触发链路**复验，把 E3 从 ⚠️ 升为 ✅。
+
+## 6. 凭证管理：`auth`（mount auth Phase 1/2）
+
+metad 是唯一认证权威；FUSE 挂载与 S3 网关的凭证都来自同一个注册表（`/cred/`，
+raft 复制）。`nufs-cli auth` 即该注册表的唯一管理入口（替代旧的 S3 网关本地
+YAML/flags）。
+
+```bash
+# 注册/更新一个凭证（S3 网关 + FUSE 共用；principal 缺省 = access key）
+nufs-cli --mode=remote --meta-addr=metad-1:8091 --auth-token=<ops-token> \
+    auth add app-server-1 --secret 's3cr3t' --principal app-server-1
+
+# 吊销：S3 网关在下一个 credential-sync-interval（默认 60s）内失效该 key
+nufs-cli --mode=remote --meta-addr=metad-1:8091 --auth-token=<ops-token> \
+    auth del app-server-1
+
+# 查看注册表（只回 access_key + principal，不回 secret）
+nufs-cli --mode=remote --meta-addr=metad-1:8091 --auth-token=<ops-token> auth list
+```
+
+配套：
+- metad 需配 `--token-signing-key`（FUSE token 交换）与 `--credential-secret-key`
+  （32 字节 hex，用于加密存储明文 secret 供 S3 网关 SigV4 同步；缺省时凭证只存
+  哈希，FUSE 可用但 S3 网关不可用）。
+- S3 网关配 `--meta-auth-token=<ops-token>` 即启用注册表同步；`auth del` 的吊销
+  延迟 ≤ `--credential-sync-interval`。
+- 桶策略管理用 `nufs-cli acl get/set/delete <bucket>`（同样 remote + ops token）。
+

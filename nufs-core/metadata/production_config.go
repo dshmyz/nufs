@@ -24,6 +24,12 @@ type ProductionValidationConfig struct {
 	// Required in production: without it the fuse cannot authenticate, and a
 	// dev-default value would allow forging tokens.
 	TokenSigningKey string
+	// CredentialSecretKey is the 32-byte hex key metad uses to seal registry
+	// secrets for the S3 gateway credential sync. Required in production:
+	// without it secrets are stored hash-only and the S3 gateway cannot
+	// authenticate any client. It is not a dev default; an empty value is
+	// rejected here.
+	CredentialSecretKey string
 }
 
 func ValidateProductionConfig(cfg ProductionValidationConfig) error {
@@ -44,6 +50,9 @@ func ValidateProductionConfig(cfg ProductionValidationConfig) error {
 		strings.Contains(cfg.TokenSigningKey, "dev-token-key") ||
 		strings.Contains(cfg.TokenSigningKey, "change-in-production") {
 		errs = append(errs, "production token signing key is empty or uses a dev default")
+	}
+	if cfg.CredentialSecretKey == "" {
+		errs = append(errs, "production credential secret key is required (S3 gateway credential sync)")
 	}
 	if cfg.S3CredentialPath == "" {
 		errs = append(errs, "production S3 credential source is required")

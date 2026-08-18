@@ -28,6 +28,7 @@ type mockMetaService struct {
 	chunks             map[metadata.ChunkID]*metadata.ChunkMeta
 	attempts           map[string]*metadata.ObjectWriteAttempt
 	tasks              map[string]*metadata.BackgroundTask
+	policies           map[string]*metadata.BucketPolicy
 	nextID             uint64
 	lookupHook         func(context.Context, metadata.InodeID, string) (*metadata.InodeMeta, error)
 	unlinkHook         func(context.Context, metadata.InodeID, string) error
@@ -43,6 +44,7 @@ func newMockMetaService() *mockMetaService {
 		chunks:   make(map[metadata.ChunkID]*metadata.ChunkMeta),
 		attempts: make(map[string]*metadata.ObjectWriteAttempt),
 		tasks:    make(map[string]*metadata.BackgroundTask),
+		policies: make(map[string]*metadata.BucketPolicy),
 		nextID:   100,
 	}
 	return m
@@ -639,13 +641,26 @@ func (m *mockMetaService) RemoveXAttr(_ context.Context, _ metadata.InodeID, _ s
 	return nil
 }
 
-func (m *mockMetaService) SetBucketPolicy(_ context.Context, _ string, _ metadata.BucketPolicy) error {
+func (m *mockMetaService) SetBucketPolicy(_ context.Context, bucket string, policy metadata.BucketPolicy) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p := policy
+	p.Bucket = bucket
+	m.policies[bucket] = &p
 	return nil
 }
 func (m *mockMetaService) GetBucketPolicy(_ context.Context, bucket string) (*metadata.BucketPolicy, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if p, ok := m.policies[bucket]; ok {
+		return p, nil
+	}
 	return nil, metadata.ErrAccessDenied
 }
-func (m *mockMetaService) DeleteBucketPolicy(_ context.Context, _ string) error {
+func (m *mockMetaService) DeleteBucketPolicy(_ context.Context, bucket string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.policies, bucket)
 	return nil
 }
 

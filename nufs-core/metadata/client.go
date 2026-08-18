@@ -76,6 +76,30 @@ type ExchangeCredentialResult struct {
 	TTLSeconds int64  `json:"ttl_seconds"`
 }
 
+// ListGatewayCredentials fetches every registered credential (with its
+// plaintext secret, unsealed by metad from the registry's sealed blobs) for
+// the S3 gateway credential sync. opsToken is the operator static bearer
+// (--auth-token) — deliberately a per-request header, not SetAuthToken: a
+// mount token is data-plane scoped and metad rejects it on this operator-only
+// route. The returned secrets are the trust boundary for SigV4 verification
+// and should only be held in memory by the gateway.
+func (c *HTTPClient) ListGatewayCredentials(ctx context.Context, opsToken string) ([]GatewayCredential, error) {
+	resp, err := c.doFollowRedirectsWithBearer(ctx, http.MethodGet, "/api/v1/auth/credentials", nil, opsToken)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		data, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("metad: list gateway credentials: %s (status=%d)", string(data), resp.StatusCode)
+	}
+	var out []GatewayCredential
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode gateway credentials: %w", err)
+	}
+	return out, nil
+}
+
 // ExchangeCredential presents an accessKey/secretKey to metad and receives a
 // short-lived, principal-bound signed bearer token plus the verified
 // principal. This is how a fuse mount establishes its identity: metad is the
@@ -266,9 +290,17 @@ func (c *HTTPClient) doRequestWithRetry(ctx context.Context, method, path string
 // success; on error (network failure or redirect exhaustion) the Body is closed
 // and an error is returned.
 func (c *HTTPClient) doFollowRedirects(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
+	return c.doFollowRedirectsWithBearer(ctx, method, path, body, "")
+}
+
+// doFollowRedirectsWithBearer is doFollowRedirects with an explicit
+// request-level bearer (used by the S3 gateway credential sync, which must
+// present the operator static token rather than a data-plane mount token).
+// An empty bearer falls back to the instance-level auth token.
+func (c *HTTPClient) doFollowRedirectsWithBearer(ctx context.Context, method, path string, body interface{}, bearer string) (*http.Response, error) {
 	currentBase := c.baseURL
 	for hop := 0; hop < leaderRedirectMaxHops; hop++ {
-		resp, err := c.doRequestAt(ctx, method, path, body, currentBase)
+		resp, err := c.doRequestAtWithBearer(ctx, method, path, body, currentBase, bearer)
 		if err != nil {
 			return nil, err
 		}
@@ -332,6 +364,10 @@ func (c *HTTPClient) doRequest(ctx context.Context, method, path string, body in
 }
 
 func (c *HTTPClient) doRequestAt(ctx context.Context, method, path string, body interface{}, baseURL string) (*http.Response, error) {
+	return c.doRequestAtWithBearer(ctx, method, path, body, baseURL, "")
+}
+
+func (c *HTTPClient) doRequestAtWithBearer(ctx context.Context, method, path string, body interface{}, baseURL, bearer string) (*http.Response, error) {
 	var reqBody io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -346,7 +382,11 @@ func (c *HTTPClient) doRequestAt(ctx context.Context, method, path string, body 
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c.addHeaders(req)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	} else {
+		c.addHeaders(req)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

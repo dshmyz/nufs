@@ -73,6 +73,12 @@ Commands (remote only):
   locks --inode <id>       List advisory locks for an inode (remote only)
   backups [status]         Show metadata backup status/list (remote only)
   write-attempts [--state S]  Show object write recovery state (remote only)
+  auth add <ak> --secret <sk> [--principal <name>]  Register a credential (metad registry)
+  auth del <ak>            Delete a credential (revokes the key: S3 gateway drops it within one sync interval)
+  auth list                List registered credentials (access key + principal)
+  acl get <bucket>         Show a bucket's access policy (remote only)
+  acl set <bucket> <file>  Set a bucket's access policy from a JSON file (remote only)
+  acl delete <bucket>      Delete a bucket's access policy (remote only)
 
 Tools (dispatched to subcommands):
   backup [flags]           Metadata backup (was nufs-backup)

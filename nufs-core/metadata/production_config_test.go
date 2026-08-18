@@ -4,12 +4,13 @@ import "testing"
 
 func TestValidateProductionConfigRejectsDevSecret(t *testing.T) {
 	err := ValidateProductionConfig(ProductionValidationConfig{
-		Mode:             RuntimeProduction,
-		JWTSecret:        "dev-secret-change-in-production",
-		S3CredentialPath: "/etc/nufs/s3.yaml",
-		RaftNodeCount:    3,
-		TLSEnabled:       true,
-		TokenSigningKey:  "a-long-production-token-key",
+		Mode:                RuntimeProduction,
+		JWTSecret:           "dev-secret-change-in-production",
+		S3CredentialPath:    "/etc/nufs/s3.yaml",
+		RaftNodeCount:       3,
+		TLSEnabled:          true,
+		TokenSigningKey:     "a-long-production-token-key",
+		CredentialSecretKey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
 	})
 	if err == nil {
 		t.Fatal("expected production config with dev secret to fail")
@@ -18,12 +19,13 @@ func TestValidateProductionConfigRejectsDevSecret(t *testing.T) {
 
 func TestValidateProductionConfigRejectsSingleNodeRaft(t *testing.T) {
 	err := ValidateProductionConfig(ProductionValidationConfig{
-		Mode:             RuntimeProduction,
-		JWTSecret:        "a-long-production-secret-value",
-		S3CredentialPath: "/etc/nufs/s3.yaml",
-		RaftNodeCount:    1,
-		TLSEnabled:       true,
-		TokenSigningKey:  "a-long-production-token-key",
+		Mode:                RuntimeProduction,
+		JWTSecret:           "a-long-production-secret-value",
+		S3CredentialPath:    "/etc/nufs/s3.yaml",
+		RaftNodeCount:       1,
+		TLSEnabled:          true,
+		TokenSigningKey:     "a-long-production-token-key",
+		CredentialSecretKey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
 	})
 	if err == nil {
 		t.Fatal("expected single-node production raft to fail")
@@ -32,12 +34,13 @@ func TestValidateProductionConfigRejectsSingleNodeRaft(t *testing.T) {
 
 func TestValidateProductionConfigRejectsMissingTokenSigningKey(t *testing.T) {
 	err := ValidateProductionConfig(ProductionValidationConfig{
-		Mode:             RuntimeProduction,
-		JWTSecret:        "a-long-production-secret-value",
-		S3CredentialPath: "/etc/nufs/s3.yaml",
-		RaftNodeCount:    3,
-		TLSEnabled:       true,
-		TokenSigningKey:  "dev-token-key-change-in-production",
+		Mode:                RuntimeProduction,
+		JWTSecret:           "a-long-production-secret-value",
+		S3CredentialPath:    "/etc/nufs/s3.yaml",
+		RaftNodeCount:       3,
+		TLSEnabled:          true,
+		TokenSigningKey:     "dev-token-key-change-in-production",
+		CredentialSecretKey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
 	})
 	if err == nil {
 		t.Fatal("expected production config with dev token key to fail")
@@ -54,5 +57,21 @@ func TestValidateProductionConfigAllowsExplicitDevMode(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("dev config should pass: %v", err)
+	}
+}
+
+func TestValidateProductionConfigRejectsMissingCredentialSecretKey(t *testing.T) {
+	err := ValidateProductionConfig(ProductionValidationConfig{
+		Mode:             RuntimeProduction,
+		JWTSecret:        "a-long-production-secret-value",
+		S3CredentialPath: "/etc/nufs/s3.yaml",
+		RaftNodeCount:    3,
+		TLSEnabled:       true,
+		TokenSigningKey:  "a-long-production-token-key",
+		// CredentialSecretKey deliberately omitted: the S3 gateway credential
+		// sync would have nothing to unseal.
+	})
+	if err == nil {
+		t.Fatal("expected production config without credential secret key to fail")
 	}
 }

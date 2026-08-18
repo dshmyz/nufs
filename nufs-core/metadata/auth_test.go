@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -214,5 +215,136 @@ func TestParseTokenAny_SkipsEmptyKeys(t *testing.T) {
 	}
 	if _, err := ParseTokenAny(tok, "", ""); err == nil {
 		t.Fatal("ParseTokenAny with only empty keys succeeded")
+	}
+}
+
+func TestCredential_SealOpenRoundTrip(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	secret := "s3cr3t-ÄÖ-密钥"
+
+	sealed, err := SealSecret(key, secret)
+	if err != nil {
+		t.Fatalf("SealSecret: %v", err)
+	}
+	if len(sealed) != 12+len(secret)+16 { // nonce + plaintext + GCM tag
+		t.Fatalf("sealed length = %d, want %d", len(sealed), 12+len(secret)+16)
+	}
+	if string(sealed) == secret {
+		t.Fatal("sealed output equals plaintext secret")
+	}
+
+	opened, err := OpenSecret(key, sealed)
+	if err != nil {
+		t.Fatalf("OpenSecret: %v", err)
+	}
+	if opened != secret {
+		t.Fatalf("OpenSecret = %q, want %q", opened, secret)
+	}
+
+	// Same secret under the same key seals differently (random nonce) but opens
+	// back to the same value.
+	sealed2, _ := SealSecret(key, secret)
+	if bytes.Equal(sealed, sealed2) {
+		t.Fatal("two seals of the same secret are identical (nonce not random?)")
+	}
+	if opened2, err := OpenSecret(key, sealed2); err != nil || opened2 != secret {
+		t.Fatalf("OpenSecret(sealed2) = %q, %v", opened2, err)
+	}
+
+	// Wrong key → error.
+	wrong := make([]byte, 32)
+	if _, err := OpenSecret(wrong, sealed); err == nil {
+		t.Fatal("OpenSecret with wrong key succeeded")
+	}
+
+	// Tampered ciphertext → error (GCM auth tag).
+	tampered := append([]byte(nil), sealed...)
+	tampered[len(tampered)-1] ^= 0x01
+	if _, err := OpenSecret(key, tampered); err == nil {
+		t.Fatal("OpenSecret with tampered ciphertext succeeded")
+	}
+
+	// Empty / malformed → error.
+	if _, err := OpenSecret(key, nil); err == nil {
+		t.Fatal("OpenSecret(nil) succeeded")
+	}
+	if _, err := OpenSecret(key, []byte("short")); err == nil {
+		t.Fatal("OpenSecret(short) succeeded")
+	}
+
+	// Wrong key length → error.
+	if _, err := SealSecret([]byte("short"), secret); err == nil {
+		t.Fatal("SealSecret with short key succeeded")
+	}
+}
+
+func TestCredential_SealedSecretRoundTripsThroughStore(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = 0xAB
+	}
+	hash, err := hashSecret("registry-secret")
+	if err != nil {
+		t.Fatalf("hashSecret: %v", err)
+	}
+	sealed, err := SealSecret(key, "registry-secret")
+	if err != nil {
+		t.Fatalf("SealSecret: %v", err)
+	}
+	cred := Credential{AccessKey: "ak-sealed", Principal: "svc-1", SecretHash: hash, SecretCiphertext: sealed}
+	if err := store.PutCredential(ctx, cred); err != nil {
+		t.Fatalf("PutCredential: %v", err)
+	}
+
+	got, err := store.GetCredential(ctx, "ak-sealed")
+	if err != nil {
+		t.Fatalf("GetCredential: %v", err)
+	}
+	if got.SecretHash != hash {
+		t.Fatalf("secret hash changed through the store")
+	}
+	opened, err := OpenSecret(key, got.SecretCiphertext)
+	if err != nil {
+		t.Fatalf("OpenSecret after store round-trip: %v", err)
+	}
+	if opened != "registry-secret" {
+		t.Fatalf("opened = %q, want registry-secret", opened)
+	}
+	// Authenticate still works on the hash (the fuse path is unaffected by
+	// whether a sealed blob exists).
+	p, err := store.Authenticate(ctx, "ak-sealed", "registry-secret")
+	if err != nil || p != "svc-1" {
+		t.Fatalf("Authenticate = %q, %v", p, err)
+	}
+}
+
+func TestCredential_HashOnlyCredentialAuthenticatesButNotSealed(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// A credential written before --credential-secret-key existed has no sealed
+	// blob: it still authenticates mounts (hash path) but OpenSecret must fail.
+	hash, _ := hashSecret("legacy-secret")
+	if err := store.PutCredential(ctx, Credential{AccessKey: "ak-legacy", SecretHash: hash}); err != nil {
+		t.Fatalf("PutCredential: %v", err)
+	}
+	if _, err := store.Authenticate(ctx, "ak-legacy", "legacy-secret"); err != nil {
+		t.Fatalf("Authenticate on hash-only credential: %v", err)
+	}
+	got, err := store.GetCredential(ctx, "ak-legacy")
+	if err != nil {
+		t.Fatalf("GetCredential: %v", err)
+	}
+	if len(got.SecretCiphertext) != 0 {
+		t.Fatalf("hash-only credential unexpectedly carries a sealed blob")
+	}
+	if _, err := OpenSecret(make([]byte, 32), got.SecretCiphertext); err == nil {
+		t.Fatal("OpenSecret on empty ciphertext succeeded")
 	}
 }

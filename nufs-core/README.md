@@ -122,9 +122,10 @@ make verify-docker  # 同一门禁，但跑在 Linux 容器里（macOS 宿主端
                     #  = scripts/verify-docker.sh，复用宿主 Go 缓存，无需网络
 ```
 
-安全约束：`gateway/s3/auth.go` 视为不可动（AWS 签名 `providedSig` 不进入任何日志/错误串），
-提交前后保持 `git diff HEAD -- gateway/s3/auth.go` 为空。`deploy/install.sh` 与挂载脚本
-只做构建与文件安装，不触碰任何源码。
+安全约束：`gateway/s3/auth.go` 的 SigV4 `providedSig` 不进入任何日志/错误串（保持该约束）。
+Phase 2（S3 网关凭证收敛）在 `metadata/auth.go` 增加了 AES-GCM 加密存储（`SealSecret`/`OpenSecret`），
+明文 secret 只通过受信端点 `/api/v1/auth/credentials`（ops bearer + leader gate）下发给 S3 网关，
+网关仅内存持有。`deploy/install.sh` 与挂载脚本只做构建与文件安装，不触碰任何源码。
 
 ---
 

@@ -2,6 +2,8 @@ package metadata
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -42,6 +44,17 @@ type Credential struct {
 	// deciding factor here, and the constant-time compare in Authenticate
 	// protects the token endpoint against timing side channels.
 	SecretHash string `json:"secret_hash"`
+	// SecretCiphertext is the same secret sealed with the credential
+	// encryption key (AES-256-GCM, nonce||ct+tag, see SealSecret). It is
+	// kept alongside the hash for consumers that mathematically need the
+	// plaintext secret — the S3 gateway's SigV4 verification derives its
+	// signing key from the raw secret (gateway/s3/auth.go) — and is only
+	// ever released through the ops-authenticated /api/v1/auth/credentials
+	// endpoint, never through the public token exchange. Empty for
+	// credentials registered before the key was configured: they keep
+	// working for token exchange (hash path) but are not visible to the
+	// S3 gateway.
+	SecretCiphertext []byte `json:"secret_ciphertext,omitempty"`
 }
 
 // CredentialService is the interface for persisting access credentials.
@@ -145,6 +158,17 @@ func (s *PebbleStore) Authenticate(_ context.Context, accessKey, secretKey strin
 	return cred.Principal, nil
 }
 
+// GatewayCredential is one entry of the S3 gateway credential sync: the
+// plaintext secret + bound principal as released by metad's
+// /api/v1/auth/credentials endpoint (ops-authenticated). It is shared between
+// the metadata HTTP client (fetch side) and the S3 gateway's CredentialStore
+// (consume side).
+type GatewayCredential struct {
+	AccessKey string `json:"access_key"`
+	SecretKey string `json:"secret_key"`
+	Principal string `json:"principal"`
+}
+
 // ========== Secret hashing (stdlib-only, high-entropy secrets) ==========
 
 // hashSecret derives a salted SHA-256 hash ("salt$hexhash") of a secret. The
@@ -166,6 +190,67 @@ func hashSecret(secret string) (string, error) {
 // result is format-compatible with the Authenticate hash check.
 func HashSecret(secret string) (string, error) {
 	return hashSecret(secret)
+}
+
+// ========== Secret sealing (AES-256-GCM, stdlib-only) ==========
+//
+// The credential registry keeps secrets as salted hashes for authentication,
+// but SigV4 verification on the S3 gateway needs the plaintext secret to
+// derive signing keys. Rather than storing plaintext, metad stores the secret
+// sealed with a dedicated credential encryption key (--credential-secret-key,
+// never shared with clients) and releases it only through the
+// ops-authenticated gateway-credentials endpoint.
+
+// SealSecret encrypts a secret for at-rest storage in the credential registry.
+// Output format: 12-byte random nonce followed by the AES-256-GCM ciphertext
+// (which includes the authentication tag). key must be 32 bytes.
+func SealSecret(key []byte, secret string) ([]byte, error) {
+	if len(key) != 32 {
+		return nil, errors.New("auth: credential encryption key must be 32 bytes")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("auth: new cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("auth: new gcm: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("auth: generate nonce: %w", err)
+	}
+	return gcm.Seal(nonce, nonce, []byte(secret), nil), nil
+}
+
+// OpenSecret decrypts a sealed secret produced by SealSecret. It returns an
+// error for malformed or tampered ciphertext and for ciphertext sealed with a
+// different key (e.g. after a credential encryption key rotation).
+func OpenSecret(key []byte, ciphertext []byte) (string, error) {
+	if len(key) != 32 {
+		return "", errors.New("auth: credential encryption key must be 32 bytes")
+	}
+	if len(ciphertext) == 0 {
+		return "", errors.New("auth: empty sealed secret")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("auth: new cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("auth: new gcm: %w", err)
+	}
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return "", errors.New("auth: malformed sealed secret")
+	}
+	nonce, sealed := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plain, err := gcm.Open(nil, nonce, sealed, nil)
+	if err != nil {
+		return "", fmt.Errorf("auth: unseal secret: %w", err)
+	}
+	return string(plain), nil
 }
 
 func verifySecretHash(stored, secret string) bool {

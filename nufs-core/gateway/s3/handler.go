@@ -9,6 +9,22 @@ import (
 	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
+// gatewayPrincipalKey carries the verified request principal through route()
+// to handlers that bind ownership (CreateBucket's default-policy owner). It is
+// the S3-gateway analogue of the fuse's verified-token principal: the caller's
+// identity comes from a verified credential, never from a client-supplied
+// header.
+type gatewayPrincipalKey struct{}
+
+// requestPrincipal returns the principal bound to the authenticated request,
+// or PrincipalAnonymous when auth is disabled.
+func requestPrincipal(ctx context.Context) metadata.Principal {
+	if p, ok := ctx.Value(gatewayPrincipalKey{}).(metadata.Principal); ok {
+		return p
+	}
+	return metadata.PrincipalAnonymous
+}
+
 // Gateway is the S3-compatible HTTP handler that routes requests
 // to the metadata service and data nodes.
 type Gateway struct {
@@ -219,7 +235,7 @@ func (gw *Gateway) route(w http.ResponseWriter, r *http.Request) {
 
 	// Authenticate the request — identify the principal
 	principal := metadata.PrincipalAnonymous
-	hasAuth := gw.creds.HasCredentials()
+	hasAuth := gw.creds.AuthEnabled()
 	if hasAuth {
 		accessKey, err := gw.creds.VerifySignatureV4(r)
 		if err != nil {
@@ -228,7 +244,11 @@ func (gw *Gateway) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if accessKey != "anonymous" && accessKey != "" {
-			principal = metadata.Principal(accessKey)
+			// Use the principal bound to the credential in the metad registry
+			// (falls back to the access key itself for locally-configured
+			// creds), matching the fuse: identity comes from the verified
+			// credential, not from the access key's string value.
+			principal = metadata.Principal(gw.creds.PrincipalFor(accessKey))
 		}
 
 		// RBAC authorization check
@@ -259,6 +279,11 @@ func (gw *Gateway) route(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	// Carry the verified principal to handlers that bind ownership (e.g. the
+	// CreateBucket default-policy owner). Unauthenticated requests see
+	// PrincipalAnonymous.
+	r = r.WithContext(context.WithValue(r.Context(), gatewayPrincipalKey{}, principal))
 
 	// Route to handler (same logic regardless of auth mode)
 	if bucket == "" {

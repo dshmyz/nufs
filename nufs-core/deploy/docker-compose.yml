@@ -21,6 +21,15 @@ services:
       - --ops-addr=0.0.0.0:8091
       - --raft=false
       - --allow-insecure-dev
+      # Auth: seed the S3 gateway's credential into the metad registry so both
+      # fuse (token exchange) and the S3 gateway (SigV4 sync) authenticate
+      # against the single registry. --credential-secret-key lets metad seal
+      # the plaintext secret for the gateway's credential sync. In production
+      # use `nufs-cli auth add` instead of --dev-seed-cred.
+      - --token-signing-key=dev-token-key
+      - --auth-token=dev-ops-token
+      - --credential-secret-key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+      - --dev-seed-cred=AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
       - --log-level=info
       - --log-json=true
     ports:
@@ -129,11 +138,14 @@ services:
       - --listen=0.0.0.0:8080
       - --meta-addr=metad:8091
       - --part-dir=/var/lib/dfs/parts
-      - --access-key=AKIAIOSFODNN7EXAMPLE
-      - --secret-key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+      # Credentials come from the metad registry (seeded via --dev-seed-cred
+      # above): --meta-auth-token enables the registry credential sync. The
+      # legacy --access-key/--secret-key/--credentials-file sources are
+      # deprecated and removed here.
+      - --meta-auth-token=dev-ops-token
+      - --credential-sync-interval=30s
       - --rate-limit=1000
       - --rate-limit-burst=2000
-      - --credentials-file=/etc/nufs/credentials.yaml
       - --log-level=info
       - --log-json=true
     ports:
@@ -142,7 +154,6 @@ services:
       - metad
     volumes:
       - nufs-data:/var/lib/dfs
-      - ${NUFS_CREDENTIALS_FILE:-./credentials/s3.yaml}:/etc/nufs/credentials.yaml:ro
     restart: unless-stopped
 
   prometheus:

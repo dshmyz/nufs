@@ -19,9 +19,11 @@ func main() {
 		configPath          = flag.String("config", "", "Path to YAML config file")
 		listenAddr          = flag.String("listen", ":8080", "HTTP listen address")
 		metaAddr            = flag.String("meta-addr", "localhost:8091", "Metadata service address (host:port)")
-		accessKey           = flag.String("access-key", "", "Access key for auth (empty = anonymous)")
-		secretKey           = flag.String("secret-key", "", "Secret key for auth")
-		credentialsFile     = flag.String("credentials-file", "", "Path to YAML credentials file (hot-reloadable)")
+		metaAuthToken       = flag.String("meta-auth-token", "", "Operator bearer token for the metad credential sync (--auth-token of metad). When set, the gateway pulls its credentials from the metad registry instead of local files/flags.")
+		credentialSyncInt   = flag.Duration("credential-sync-interval", 60*time.Second, "How often to refresh credentials from the metad registry (0 = startup pull only)")
+		accessKey           = flag.String("access-key", "", "DEPRECATED: local access key fallback when --meta-auth-token is unset (empty = anonymous)")
+		secretKey           = flag.String("secret-key", "", "DEPRECATED: local secret key fallback when --meta-auth-token is unset")
+		credentialsFile     = flag.String("credentials-file", "", "DEPRECATED: YAML credentials file fallback (hot-reloadable) when --meta-auth-token is unset")
 		partDir             = flag.String("part-dir", "/var/lib/nufs-s3/parts", "Multipart upload temp directory (empty=in-memory)")
 		maxObjectSize       = flag.Int64("max-object-size", gos3.DefaultMaxObjectSize, "Maximum single-shot PUT body size in bytes (5 GiB by default)")
 		gracefulTimeout     = flag.Duration("graceful-timeout", 30*time.Second, "Max time to wait for in-flight requests on shutdown")
@@ -49,17 +51,56 @@ func main() {
 	meta := metadata.NewHTTPClient("http://"+*metaAddr, 30*time.Second)
 	defer meta.Close()
 
-	creds := gos3.NewCredentialStore()
-	if *accessKey != "" && *secretKey != "" {
-		creds.AddCredential(*accessKey, *secretKey)
-		log.Info("auth enabled (CLI credentials)")
+	// When an operator token is configured, every metad call (data plane and
+	// the credential sync) carries it: metad's BearerAuth gates non-public
+	// routes (including the mutating bucket/ACL routes the gateway needs) with
+	// that exact operator credential. The gateway already holds it to pull the
+	// credential registry, so reusing it for the data plane is consistent with
+	// the trust model — the S3 gateway is an operator-side service.
+	if *metaAuthToken != "" {
+		meta.SetAuthToken(*metaAuthToken)
 	}
-	if *credentialsFile != "" {
-		if err := creds.LoadCredentials(*credentialsFile); err != nil {
-			log.Error("failed to load credentials file", "error", err)
-			os.Exit(1)
+
+	creds := gos3.NewCredentialStore()
+	var credSync *gos3.CredentialSyncer
+	syncOK := false
+	if *metaAuthToken != "" {
+		// Primary credential source: the metad registry, pulled on start and
+		// refreshed on --credential-sync-interval. The initial pull decides
+		// whether sync is authoritative; on failure we fall back to the
+		// legacy local sources below (never start anonymous when creds exist
+		// in the registry but the sync hiccuped at boot).
+		fetch := func(ctx context.Context) ([]metadata.GatewayCredential, error) {
+			return meta.ListGatewayCredentials(ctx, *metaAuthToken)
 		}
-		log.Info("auth enabled (hot-reloadable credentials)", "file", *credentialsFile)
+		credSync = gos3.NewCredentialSyncer(creds, fetch, *credentialSyncInt)
+		if err := credSync.SyncOnce(context.Background()); err != nil {
+			log.Warn("metad credential sync initial pull failed; falling back to local credentials", "error", err)
+		} else {
+			log.Info("auth enabled (metad registry sync)", "count", creds.Count(), "interval", *credentialSyncInt)
+			syncOK = true
+			// Pin auth mode: once the registry is authoritative, revoking the
+			// last credential must reject requests, not flip the gateway to
+			// anonymous.
+			creds.SetAuthMode(true)
+		}
+	}
+	if !syncOK {
+		// Deprecated local credential sources, only consulted when the metad
+		// registry sync is not configured or failed at boot.
+		if *accessKey != "" && *secretKey != "" {
+			log.Warn("--access-key/--secret-key are deprecated; use `nufs-cli auth add` + --meta-auth-token to manage credentials in the metad registry")
+			creds.AddCredential(*accessKey, *secretKey)
+			log.Info("auth enabled (local CLI credentials, deprecated)")
+		}
+		if *credentialsFile != "" {
+			log.Warn("--credentials-file is deprecated; use the metad registry credential sync (--meta-auth-token)")
+			if err := creds.LoadCredentials(*credentialsFile); err != nil {
+				log.Error("failed to load credentials file", "error", err)
+				os.Exit(1)
+			}
+			log.Info("auth enabled (hot-reloadable credentials, deprecated)", "file", *credentialsFile)
+		}
 	}
 	if !creds.HasCredentials() {
 		log.Warn("running in anonymous mode (no auth)")
@@ -94,6 +135,21 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Preload bucket policies from the metad registry so authorization works
+	// from the first request (not just after this process created buckets).
+	gw.LoadPolicies(ctx)
+
+	// Metad credential registry sync (when authoritative): refresh on
+	// --credential-sync-interval so registry-side adds/revocations reach the
+	// gateway within one interval. Run() re-pulls immediately, then ticks.
+	if syncOK && credSync != nil {
+		go func() {
+			if err := credSync.Run(ctx); err != nil && err != context.Canceled {
+				log.Error("credential sync stopped", "error", err)
+			}
+		}()
+	}
 
 	// Hot-reload: rate limit via main config file.
 	if *configPath != "" {

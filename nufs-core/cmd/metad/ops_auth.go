@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -22,6 +23,12 @@ import (
 //   - /api/v1/auth/creds/{accessKey} — operator management of the credential
 //     registry (nufs-cli `auth cred`). These are NOT public: they sit behind
 //     the ops API's static bearer auth and the leader boundary.
+//   - GET /api/v1/auth/credentials — the S3 gateway's credential sync source.
+//     Also operator-gated (static bearer + leader boundary): it returns the
+//     plaintext secrets the gateway needs for SigV4 verification, decrypted
+//     from the registry's sealed blobs. Holding the ops bearer already grants
+//     the ability to rewrite the registry, so releasing the secrets to the
+//     same boundary is consistent with the existing trust model.
 //
 // The signing key is only ever held here (metad); clients never learn it.
 // They read `principal` from the token response and present the opaque token
@@ -34,10 +41,11 @@ import (
 // allows ~10 requests then backs off to a couple per second per source IP,
 // which is ample for legitimate mounts (they exchange once per token TTL) while
 // throttling blind credential guessing.
-func registerOpsAuthHandlers(mux *http.ServeMux, store *metadata.PebbleStore, signingKey string) (stopAuthLimiter func()) {
+func registerOpsAuthHandlers(mux *http.ServeMux, store *metadata.PebbleStore, signingKey string, credKey []byte) (stopAuthLimiter func()) {
 	s := &opsAuthHandlers{
 		store:      store,
 		signingKey: signingKey,
+		credKey:    credKey,
 		// Tight per-IP budget for credential-guess attempts. The general ops
 		// limiter (100/s) still applies on top; this is the first, stricter gate.
 		tokenLimiter: metadata.NewRateLimiter(2, 10),
@@ -56,12 +64,14 @@ func registerOpsAuthHandlers(mux *http.ServeMux, store *metadata.PebbleStore, si
 	mux.HandleFunc("/api/v1/auth/token", s.handleAuthToken)
 	mux.HandleFunc("/api/v1/auth/creds", mut(s.handleCredsList))
 	mux.HandleFunc("/api/v1/auth/creds/", mut(s.handleCreds))
+	mux.HandleFunc("/api/v1/auth/credentials", mut(s.handleGatewayCredentials))
 	return stopAuthLimiter
 }
 
 type opsAuthHandlers struct {
 	store        *metadata.PebbleStore
 	signingKey   string
+	credKey      []byte // --credential-secret-key; nil => seal disabled (hash-only creds)
 	tokenLimiter *metadata.RateLimiter
 }
 
@@ -204,6 +214,20 @@ func (h *opsAuthHandlers) handleCreds(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cred := metadata.Credential{AccessKey: name, SecretHash: hash}
+		if h.credKey != nil {
+			sealed, sealErr := metadata.SealSecret(h.credKey, req.SecretKey)
+			if sealErr != nil {
+				writeJSONError(w, http.StatusInternalServerError, sealErr.Error())
+				return
+			}
+			cred.SecretCiphertext = sealed
+		} else {
+			// No --credential-secret-key configured: the credential still works
+			// for token exchange (hash path) but is not visible to the S3
+			// gateway, which needs the plaintext secret for SigV4.
+			slog.Warn("credential stored without sealed secret (no --credential-secret-key); S3 gateway cannot use it",
+				"access_key", name)
+		}
 		if req.Principal != "" {
 			cred.Principal = metadata.Principal(req.Principal)
 		}
@@ -231,4 +255,52 @@ func (h *opsAuthHandlers) handleCreds(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// gatewayCredentialResponse is one entry of the S3 gateway credential sync.
+// The secret here is decrypted from the registry's sealed blob on demand; the
+// response only exists inside the metad→gateway trust boundary (this route is
+// static-bearer + leader-gated, never in the data-plane allowlist).
+type gatewayCredentialResponse struct {
+	AccessKey string `json:"access_key"`
+	SecretKey string `json:"secret_key"`
+	Principal string `json:"principal"`
+}
+
+// handleGatewayCredentials returns every credential with its plaintext secret
+// sealed-blob decrypted, for the S3 gateway's SigV4 credential sync
+// (GET /api/v1/auth/credentials, operator-only). Credentials that carry no
+// sealed blob (registered before --credential-secret-key, or with sealing
+// disabled) are skipped — they remain usable for fuse token exchange.
+func (h *opsAuthHandlers) handleGatewayCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if len(h.credKey) == 0 {
+		writeJSONError(w, http.StatusServiceUnavailable, "credential encryption key not configured")
+		return
+	}
+	creds, err := h.store.ListCredentials(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]gatewayCredentialResponse, 0, len(creds))
+	for _, c := range creds {
+		secret, err := metadata.OpenSecret(h.credKey, c.SecretCiphertext)
+		if err != nil {
+			// No sealed blob or stale key: the credential still authenticates
+			// mounts (hash path) but cannot be released to the S3 gateway.
+			slog.Warn("skipping credential without unsealable secret",
+				"access_key", c.AccessKey, "error", err)
+			continue
+		}
+		out = append(out, gatewayCredentialResponse{
+			AccessKey: c.AccessKey,
+			SecretKey: secret,
+			Principal: string(c.Principal),
+		})
+	}
+	writeJSON(w, out)
 }

@@ -24,7 +24,7 @@ type clusterStatsResponse struct {
 
 // handleClusterStats handles GET /admin/cluster/stats
 func (gw *Gateway) handleClusterStats(w http.ResponseWriter, r *http.Request) {
-	if gw.creds.HasCredentials() {
+	if gw.creds.AuthEnabled() {
 		_, err := gw.creds.VerifySignatureV4(r)
 		if err != nil {
 			requestID := w.Header().Get("x-amz-request-id")
@@ -78,7 +78,7 @@ func (gw *Gateway) handleClusterStats(w http.ResponseWriter, r *http.Request) {
 
 // handleAdminBuckets handles GET /admin/buckets
 func (gw *Gateway) handleAdminBuckets(w http.ResponseWriter, r *http.Request) {
-	if gw.creds.HasCredentials() {
+	if gw.creds.AuthEnabled() {
 		_, err := gw.creds.VerifySignatureV4(r)
 		if err != nil {
 			requestID := w.Header().Get("x-amz-request-id")
@@ -117,7 +117,7 @@ func writeJSONError(w http.ResponseWriter, statusCode int, msg string) {
 
 // handleGetBucketPolicy handles GET /admin/policy/{bucket}
 func (gw *Gateway) handleGetBucketPolicy(w http.ResponseWriter, r *http.Request) {
-	if gw.creds.HasCredentials() {
+	if gw.creds.AuthEnabled() {
 		_, err := gw.creds.VerifySignatureV4(r)
 		if err != nil {
 			writeJSONError(w, http.StatusForbidden, err.Error())
@@ -146,22 +146,24 @@ func (gw *Gateway) handleGetBucketPolicy(w http.ResponseWriter, r *http.Request)
 
 // handleSetBucketPolicy handles PUT /admin/policy/{bucket}
 func (gw *Gateway) handleSetBucketPolicy(w http.ResponseWriter, r *http.Request) {
-	if gw.creds.HasCredentials() {
+	if gw.creds.AuthEnabled() {
 		accessKey, err := gw.creds.VerifySignatureV4(r)
 		if err != nil {
 			writeJSONError(w, http.StatusForbidden, err.Error())
 			return
 		}
-		// Only bucket owner or admin can set policy
+		// Only bucket owner or admin can set policy. The caller identity is the
+		// principal bound to the verified credential (not the raw access key).
+		principal := metadata.Principal(gw.creds.PrincipalFor(accessKey))
 		bucket := r.URL.Query().Get("bucket")
 		if bucket == "" {
 			writeJSONError(w, http.StatusBadRequest, "missing bucket parameter")
 			return
 		}
 		owner := gw.acl.OwnerOf(bucket)
-		if owner != "" && owner != accessKey {
+		if owner != "" && owner != string(principal) {
 			// Check if the user has admin permission
-			if err := gw.acl.CheckAccess(bucket, metadata.Principal(accessKey), metadata.PermAdmin); err != nil {
+			if err := gw.acl.CheckAccess(bucket, principal, metadata.PermAdmin); err != nil {
 				writeJSONError(w, http.StatusForbidden, "only bucket owner or admin can set policy")
 				return
 			}
@@ -188,16 +190,17 @@ func (gw *Gateway) handleSetBucketPolicy(w http.ResponseWriter, r *http.Request)
 
 // handleDeleteBucketPolicy handles DELETE /admin/policy/{bucket}
 func (gw *Gateway) handleDeleteBucketPolicy(w http.ResponseWriter, r *http.Request) {
-	if gw.creds.HasCredentials() {
+	if gw.creds.AuthEnabled() {
 		accessKey, err := gw.creds.VerifySignatureV4(r)
 		if err != nil {
 			writeJSONError(w, http.StatusForbidden, err.Error())
 			return
 		}
+		principal := metadata.Principal(gw.creds.PrincipalFor(accessKey))
 		bucket := r.URL.Query().Get("bucket")
 		owner := gw.acl.OwnerOf(bucket)
-		if owner != "" && owner != accessKey {
-			if err := gw.acl.CheckAccess(bucket, metadata.Principal(accessKey), metadata.PermAdmin); err != nil {
+		if owner != "" && owner != string(principal) {
+			if err := gw.acl.CheckAccess(bucket, principal, metadata.PermAdmin); err != nil {
 				writeJSONError(w, http.StatusForbidden, "only bucket owner or admin can delete policy")
 				return
 			}

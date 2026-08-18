@@ -12,28 +12,91 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dshmyz/nufs/nufs-core/metadata"
 	"gopkg.in/yaml.v3"
 )
 
+// gatewayCredential is one entry of the in-memory credential table: the
+// plaintext secret SigV4 verification needs, plus the RBAC principal bound to
+// the access key (from the metad credential registry; defaults to the access
+// key itself for locally-added credentials).
+type gatewayCredential struct {
+	secretKey string
+	principal string
+}
+
 // CredentialStore holds access key / secret key pairs for authentication.
-// Safe for concurrent use: hot-reload safe via LoadCredentials.
+// Safe for concurrent use: hot-reload safe via LoadCredentials and
+// ReplaceAll (the metad credential-sync path).
 type CredentialStore struct {
 	mu          sync.RWMutex
-	credentials map[string]string // accessKey -> secretKey
+	credentials map[string]gatewayCredential // accessKey -> credential
+	// authMode, once enabled (metad registry sync authoritative), keeps the
+	// gateway in verify-signatures mode even when the registry is temporarily
+	// empty. Without it, revoking the last credential would flip the gateway
+	// back to anonymous (no auth at all) — the opposite of revocation.
+	authMode bool
 }
 
 // NewCredentialStore creates a new credential store.
 func NewCredentialStore() *CredentialStore {
 	return &CredentialStore{
-		credentials: make(map[string]string),
+		credentials: make(map[string]gatewayCredential),
 	}
 }
 
-// AddCredential adds an access key / secret key pair.
+// AddCredential adds an access key / secret key pair. The RBAC principal
+// defaults to the access key.
 func (cs *CredentialStore) AddCredential(accessKey, secretKey string) {
+	cs.AddCredentialWithPrincipal(accessKey, secretKey, accessKey)
+}
+
+// AddCredentialWithPrincipal adds an access key / secret key pair with an
+// explicit RBAC principal.
+func (cs *CredentialStore) AddCredentialWithPrincipal(accessKey, secretKey, principal string) {
+	if principal == "" {
+		principal = accessKey
+	}
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	cs.credentials[accessKey] = secretKey
+	cs.credentials[accessKey] = gatewayCredential{secretKey: secretKey, principal: principal}
+}
+
+// ReplaceAll atomically replaces the entire credential table with the given
+// set — a full swap, the source of truth for the metad credential sync.
+// An empty list clears the table (returns the gateway to anonymous mode).
+func (cs *CredentialStore) ReplaceAll(creds []metadata.GatewayCredential) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	clear(cs.credentials)
+	for _, c := range creds {
+		if c.AccessKey == "" || c.SecretKey == "" {
+			continue
+		}
+		principal := c.Principal
+		if principal == "" {
+			principal = c.AccessKey
+		}
+		cs.credentials[c.AccessKey] = gatewayCredential{secretKey: c.SecretKey, principal: principal}
+	}
+}
+
+// PrincipalFor returns the RBAC principal bound to an access key, falling
+// back to the access key itself when the key is unknown (or anonymous).
+func (cs *CredentialStore) PrincipalFor(accessKey string) string {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if c, ok := cs.credentials[accessKey]; ok && c.principal != "" {
+		return c.principal
+	}
+	return accessKey
+}
+
+// Count returns the number of configured credentials.
+func (cs *CredentialStore) Count() int {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return len(cs.credentials)
 }
 
 // credentialFile is the YAML format for LoadCredentials.
@@ -62,7 +125,7 @@ func (cs *CredentialStore) LoadCredentials(path string) error {
 	clear(cs.credentials)
 	for _, c := range cf.Credentials {
 		if c.AccessKey != "" && c.SecretKey != "" {
-			cs.credentials[c.AccessKey] = c.SecretKey
+			cs.credentials[c.AccessKey] = gatewayCredential{secretKey: c.SecretKey, principal: c.AccessKey}
 		}
 	}
 	return nil
@@ -75,11 +138,25 @@ func (cs *CredentialStore) HasCredentials() bool {
 	return len(cs.credentials) > 0
 }
 
-// Count returns the number of configured credentials.
-func (cs *CredentialStore) Count() int {
+// SetAuthMode pins the gateway into verify-signatures mode (used by the metad
+// registry sync once it is authoritative). After a successful sync, auth stays
+// on even if the registry is emptied by revocations; only a process without a
+// credential source ever sees the anonymous (no-auth) mode.
+func (cs *CredentialStore) SetAuthMode(enabled bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.authMode = enabled
+}
+
+// AuthEnabled reports whether the gateway requires signatures: either authMode
+// is pinned, or at least one credential is configured. It is what route() and
+// the admin handlers gate on, replacing the bare HasCredentials() check so
+// "all credentials revoked" means "every request is rejected", never "auth is
+// off".
+func (cs *CredentialStore) AuthEnabled() bool {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	return len(cs.credentials)
+	return cs.authMode || len(cs.credentials) > 0
 }
 
 // VerifySignatureV4 verifies AWS Signature Version 4.
@@ -176,8 +253,8 @@ func (cs *CredentialStore) verifyPresignedURL(r *http.Request) (string, error) {
 func (cs *CredentialStore) getCredential(accessKey string) (string, bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	s, ok := cs.credentials[accessKey]
-	return s, ok
+	c, ok := cs.credentials[accessKey]
+	return c.secretKey, ok
 }
 
 // parseAuthHeader parses the AWS Signature V4 Authorization header.
