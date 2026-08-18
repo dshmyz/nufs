@@ -326,3 +326,93 @@ func TestInodeIDFreeListReuseAfterReopen(t *testing.T) {
 	}
 	t.Logf("OK: recycled inode ID %d reused after reopen, new object readable", recycledID)
 }
+
+// TestCreateFile_ReseedOnInodeKeyConflict proves the re-seed-on-conflict
+// retry: a create whose first attempt mints a stale inode ID (under-seeded
+// cold-cache scan right after leader election — the FSM had not yet replayed a
+// prior leader's inodes) hits the inode-key ExpectAbsent guard, then re-seeds
+// the inode high-water mark and succeeds on the second attempt with a fresh ID.
+//
+// The test forces the under-seeded state directly: inode rows 3 and 5 are
+// committed (as if by a prior leader) while inodeSeq is pinned low AND marked
+// initialized (as if the cold scan ran before those rows were applied). The
+// first CreateFile would mint 3 and conflict on the inode key; the retry must
+// mint 6 and succeed.
+func TestCreateFile_ReseedOnInodeKeyConflict(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if err := store.CreateBucket(ctx, "fs", PlacementPolicy{ReplicationFactor: 1}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+
+	// Commit inode rows 3 and 5 directly (a prior leader's already-committed
+	// files whose rows this process's cold scan has not yet seen).
+	seed := func(id InodeID) {
+		now := time.Now().UnixNano()
+		if err := store.putMsgpack(fmt.Sprintf("%s%d", prefixInode, id), &InodeMeta{
+			ID: id, Type: FileRegular, Mode: 0o644, NLink: 1,
+			CTime: now, MTime: now, ATime: now,
+		}); err != nil {
+			t.Fatalf("seed inode %d: %v", id, err)
+		}
+	}
+	seed(3)
+	seed(5)
+
+	// Simulate the under-seeded state: counter below the committed max, but the
+	// one-time scan already ran (so ensureInodeIDMax is a no-op until reseeded).
+	store.inodeSeq.Store(2)
+	store.inodeIDMaxInit.Store(true)
+
+	f, err := store.CreateFile(ctx, bucket.RootInode, "fresh.bin", 0o644)
+	if err != nil {
+		t.Fatalf("CreateFile (should re-seed and retry): %v", err)
+	}
+	if f.ID != 6 {
+		t.Fatalf("CreateFile returned inode %d, want 6 (above the committed max 5)", f.ID)
+	}
+	if got := store.inodeSeq.Load(); got != 6 {
+		t.Fatalf("inodeSeq = %d, want 6", got)
+	}
+
+	// The committed row is really there (the second attempt's mutation landed).
+	got, err := store.GetInode(ctx, 6)
+	if err != nil || got == nil || got.ID != 6 {
+		t.Fatalf("GetInode(6) = %+v, %v", got, err)
+	}
+}
+
+// TestCreateFile_ReseedDoesNotMaskGenuineSameNameConflict proves the retry
+// never converts a real ErrEntryExists (the file name already exists — nsKey
+// precondition) into a success: the re-seeded second attempt fails on the same
+// nsKey and the original error surfaces.
+func TestCreateFile_ReseedDoesNotMaskGenuineSameNameConflict(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if err := store.CreateBucket(ctx, "fs", PlacementPolicy{ReplicationFactor: 1}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	bucket, err := store.GetBucket(ctx, "fs")
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	if _, err := store.CreateFile(ctx, bucket.RootInode, "dup.bin", 0o644); err != nil {
+		t.Fatalf("first CreateFile: %v", err)
+	}
+
+	// Pin the counter below the committed max with the scan "done" — a
+	// same-name create will now conflict on the nsKey first, reseed, and still
+	// conflict. It must keep returning ErrEntryExists.
+	store.inodeSeq.Store(2)
+	store.inodeIDMaxInit.Store(true)
+
+	if _, err := store.CreateFile(ctx, bucket.RootInode, "dup.bin", 0o644); !errors.Is(err, ErrEntryExists) {
+		t.Fatalf("CreateFile(dup) = %v, want ErrEntryExists (retry must not mask it)", err)
+	}
+}

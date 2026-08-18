@@ -1311,6 +1311,48 @@ func (s *PebbleStore) applyNamespaceConditional(ctx context.Context, conditional
 	return err
 }
 
+// applyNamespaceCreate runs a namespace conditional create up to twice: the
+// first attempt, and — if it fails with conflictErr on the inode-key
+// precondition — a re-seeded retry with a freshly minted ID. mkConditional
+// must allocate a new inode ID (and rebuild the batch) on every call.
+//
+// The retry exists because ensureInodeIDMax's cold-cache scan reads the FSM's
+// currently-applied maximum: a newly elected raft leader whose FSM has not yet
+// replayed a prior leader's inodes can under-read it, mint a stale ID, and hit
+// the inode-key ExpectAbsent guard — surfacing as ErrEntryExists even though
+// the file name is new (the create-path inode-ID failover test flakes on
+// exactly this window). Re-seeding after the conflict re-scans against the
+// now-caught-up FSM, so the second attempt mints above the true committed
+// maximum. A genuine same-name conflict (the nsKey precondition) fails again
+// on retry and still returns conflictErr — the retry never masks a real
+// ErrEntryExists.
+func (s *PebbleStore) applyNamespaceCreate(ctx context.Context, conflictErr error, mkConditional func() (*ConditionalBatch, error)) error {
+	conditional, err := mkConditional()
+	if err != nil {
+		return err
+	}
+	if err := s.applyNamespaceConditional(ctx, conditional, conflictErr); err == nil || !errors.Is(err, conflictErr) {
+		return err
+	}
+	s.reseedInodeIDMax()
+	conditional, err = mkConditional()
+	if err != nil {
+		return err
+	}
+	return s.applyNamespaceConditional(ctx, conditional, conflictErr)
+}
+
+// reseedInodeIDMax forces a fresh cold-cache scan of the committed inode
+// maximum. Used after an inode-key precondition conflict to pick up inode rows
+// that were committed but not yet applied when the first scan ran. Safe under
+// concurrency: ensureInodeIDMax raises inodeSeq via CompareAndSwap only, never
+// lowering it, so a concurrent mint that already advanced the counter is
+// untouched.
+func (s *PebbleStore) reseedInodeIDMax() {
+	s.inodeIDMaxInit.Store(false)
+	s.ensureInodeIDMax()
+}
+
 // buildNamespaceConditional turns a set of msgpack-valued mutations (inode
 // key, nsKey entry, parent NLink++) into an atomic ConditionalBatch whose
 // single precondition requires nsKey to be absent. On conflict the mutation
@@ -1388,51 +1430,52 @@ func (s *PebbleStore) MkDir(ctx context.Context, parent InodeID, name string, mo
 	}
 
 	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
-
-	inodeID := s.nextInodeID()
-	now := time.Now().UnixNano()
-	meta := &InodeMeta{
-		ID:    inodeID,
-		Type:  FileDirectory,
-		Mode:  mode,
-		NLink: 2,
-		CTime: now,
-		MTime: now,
-		ATime: now,
-	}
-	entry := &DirEntry{InodeID: inodeID, Type: FileDirectory, Name: name}
-
-	// Update parent + inherit BucketRoot
-	var parentMeta InodeMeta
-	parentKey := fmt.Sprintf("%s%d", prefixInode, parent)
-	pExists, _ := s.getValue(parentKey, &parentMeta)
-	if pExists {
-		meta.BucketRoot = parentMeta.BucketRoot
-		parentMeta.NLink++
-		parentMeta.MTime = now
-	}
-
-	ops := []batchOp{
-		{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
-		{Key: nsKey, Value: entry},
-	}
-	if pExists {
-		ops = append(ops, batchOp{Key: parentKey, Value: &parentMeta})
-	}
-
+	var created *InodeMeta
 	// All mutations ride a single conditional batch; the nsKey ExpectAbsent
 	// precondition makes the existence check and the insert atomic, so a
 	// concurrent same-name create fails with ErrEntryExists instead of
 	// leaving an orphan inode / lost parent NLink update.
-	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
-	conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
-	if err != nil {
+	if err := s.applyNamespaceCreate(ctx, ErrEntryExists, func() (*ConditionalBatch, error) {
+		inodeID := s.nextInodeID()
+		now := time.Now().UnixNano()
+		meta := &InodeMeta{
+			ID:    inodeID,
+			Type:  FileDirectory,
+			Mode:  mode,
+			NLink: 2,
+			CTime: now,
+			MTime: now,
+			ATime: now,
+		}
+		entry := &DirEntry{InodeID: inodeID, Type: FileDirectory, Name: name}
+
+		// Update parent + inherit BucketRoot
+		var parentMeta InodeMeta
+		parentKey := fmt.Sprintf("%s%d", prefixInode, parent)
+		pExists, _ := s.getValue(parentKey, &parentMeta)
+		if pExists {
+			meta.BucketRoot = parentMeta.BucketRoot
+			parentMeta.NLink++
+			parentMeta.MTime = now
+		}
+
+		ops := []batchOp{
+			{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
+			{Key: nsKey, Value: entry},
+		}
+		if pExists {
+			ops = append(ops, batchOp{Key: parentKey, Value: &parentMeta})
+		}
+		inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+		conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
+		if err == nil {
+			created = meta
+		}
+		return conditional, err
+	}); err != nil {
 		return nil, err
 	}
-	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
-		return nil, err
-	}
-	return meta, nil
+	return created, nil
 }
 
 func (s *PebbleStore) RmDir(ctx context.Context, parent InodeID, name string) error {
@@ -1641,31 +1684,33 @@ func (s *PebbleStore) CreateFile(ctx context.Context, parent InodeID, name strin
 	}
 
 	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
-
-	inodeID := s.nextInodeID()
-	now := time.Now().UnixNano()
 	bucketRoot := s.getBucketRoot(parent)
-	meta := &InodeMeta{
-		ID: inodeID, Type: FileRegular, Mode: mode, NLink: 1,
-		BucketRoot: bucketRoot,
-		CTime:      now, MTime: now, ATime: now,
-	}
-	entry := &DirEntry{InodeID: inodeID, Type: FileRegular, Name: name}
-	ops := []batchOp{
-		{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
-		{Key: nsKey, Value: entry},
-	}
-	s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
-	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
-	conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
-	if err != nil {
+	var created *InodeMeta
+	if err := s.applyNamespaceCreate(ctx, ErrEntryExists, func() (*ConditionalBatch, error) {
+		inodeID := s.nextInodeID()
+		now := time.Now().UnixNano()
+		meta := &InodeMeta{
+			ID: inodeID, Type: FileRegular, Mode: mode, NLink: 1,
+			BucketRoot: bucketRoot,
+			CTime:      now, MTime: now, ATime: now,
+		}
+		entry := &DirEntry{InodeID: inodeID, Type: FileRegular, Name: name}
+		ops := []batchOp{
+			{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
+			{Key: nsKey, Value: entry},
+		}
+		s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
+		inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+		conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
+		if err == nil {
+			created = meta
+		}
+		return conditional, err
+	}); err != nil {
 		return nil, err
 	}
-	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
-		return nil, err
-	}
-	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", inodeID)})
-	return meta, nil
+	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", created.ID)})
+	return created, nil
 }
 
 // CreateNode creates a special (non-regular) namespace entry — FIFO, char or
@@ -1690,31 +1735,33 @@ func (s *PebbleStore) CreateNode(ctx context.Context, parent InodeID, name strin
 	}
 
 	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
-
-	inodeID := s.nextInodeID()
-	now := time.Now().UnixNano()
 	bucketRoot := s.getBucketRoot(parent)
-	meta := &InodeMeta{
-		ID: inodeID, Type: ftype, Mode: mode, Rdev: rdev, NLink: 1,
-		BucketRoot: bucketRoot,
-		CTime:      now, MTime: now, ATime: now,
-	}
-	entry := &DirEntry{InodeID: inodeID, Type: ftype, Name: name}
-	ops := []batchOp{
-		{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
-		{Key: nsKey, Value: entry},
-	}
-	s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
-	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
-	conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
-	if err != nil {
+	var created *InodeMeta
+	if err := s.applyNamespaceCreate(ctx, ErrEntryExists, func() (*ConditionalBatch, error) {
+		inodeID := s.nextInodeID()
+		now := time.Now().UnixNano()
+		meta := &InodeMeta{
+			ID: inodeID, Type: ftype, Mode: mode, Rdev: rdev, NLink: 1,
+			BucketRoot: bucketRoot,
+			CTime:      now, MTime: now, ATime: now,
+		}
+		entry := &DirEntry{InodeID: inodeID, Type: ftype, Name: name}
+		ops := []batchOp{
+			{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
+			{Key: nsKey, Value: entry},
+		}
+		s.addBucketStatsOp(bucketRoot, 0, 1, &ops)
+		inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+		conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
+		if err == nil {
+			created = meta
+		}
+		return conditional, err
+	}); err != nil {
 		return nil, err
 	}
-	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
-		return nil, err
-	}
-	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", inodeID)})
-	return meta, nil
+	s.publishEvent(Event{Type: EventSet, Key: fmt.Sprintf("inode:%d", created.ID)})
+	return created, nil
 }
 func (s *PebbleStore) Unlink(ctx context.Context, parent InodeID, name string) error {
 	if s.closed.Load() {
@@ -2048,30 +2095,32 @@ func (s *PebbleStore) Symlink(ctx context.Context, parent InodeID, name string, 
 	}
 
 	nsKey := fmt.Sprintf("%s%d/%s", prefixNS, parent, name)
-
-	inodeID := s.nextInodeID()
-	now := time.Now().UnixNano()
 	bucketRoot := s.getBucketRoot(parent)
-	meta := &InodeMeta{
-		ID: inodeID, Type: FileSymlink, Mode: 0777, NLink: 1, Symlink: target,
-		BucketRoot: bucketRoot,
-		CTime:      now, MTime: now, ATime: now,
-	}
-	entry := &DirEntry{InodeID: inodeID, Type: FileSymlink, Name: name}
-	ops := []batchOp{
-		{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
-		{Key: nsKey, Value: entry},
-	}
-	s.addBucketStatsOp(bucketRoot, int64(len(target)), 1, &ops)
-	inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
-	conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
-	if err != nil {
+	var created *InodeMeta
+	if err := s.applyNamespaceCreate(ctx, ErrEntryExists, func() (*ConditionalBatch, error) {
+		inodeID := s.nextInodeID()
+		now := time.Now().UnixNano()
+		meta := &InodeMeta{
+			ID: inodeID, Type: FileSymlink, Mode: 0777, NLink: 1, Symlink: target,
+			BucketRoot: bucketRoot,
+			CTime:      now, MTime: now, ATime: now,
+		}
+		entry := &DirEntry{InodeID: inodeID, Type: FileSymlink, Name: name}
+		ops := []batchOp{
+			{Key: fmt.Sprintf("%s%d", prefixInode, inodeID), Value: meta},
+			{Key: nsKey, Value: entry},
+		}
+		s.addBucketStatsOp(bucketRoot, int64(len(target)), 1, &ops)
+		inodeKey := fmt.Sprintf("%s%d", prefixInode, inodeID)
+		conditional, err := buildNamespaceConditionalWithInodeGuard(nsKey, inodeKey, ops)
+		if err == nil {
+			created = meta
+		}
+		return conditional, err
+	}); err != nil {
 		return nil, err
 	}
-	if err := s.applyNamespaceConditional(ctx, conditional, ErrEntryExists); err != nil {
-		return nil, err
-	}
-	return meta, nil
+	return created, nil
 }
 func (s *PebbleStore) Readlink(ctx context.Context, id InodeID) (string, error) {
 	if s.closed.Load() {
