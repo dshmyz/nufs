@@ -695,16 +695,36 @@ type PebbleFSM struct {
 	snapshotMu       sync.RWMutex
 	lastAppliedIndex uint64
 	lastAppliedTerm  uint64
-	syncStopCh       chan struct{}
-	syncInterval     time.Duration
-	syncMu           sync.Mutex
-	syncWG           sync.WaitGroup
+	// lastConsumedIndex is the linearizability watermark: every log entry
+	// raft has delivered to this FSM, whether or not the apply succeeded.
+	// It is distinct from lastAppliedIndex (the checkpoint watermark, which
+	// only advances on a successful apply): a conditional-conflict or
+	// apply-error entry is consumed by raft but never applied, so
+	// lastAppliedIndex legitimately stays behind it — but the leader
+	// catch-up gate must not wedge on such an entry.
+	lastConsumedIndex uint64
+	syncStopCh        chan struct{}
+	syncInterval      time.Duration
+	syncMu            sync.Mutex
+	syncWG            sync.WaitGroup
+
+	// applyDelayHook is a test hook that runs before every applied entry
+	// (data entries only). It lets tests deterministically reproduce the
+	// post-failover apply-lag window — an entry committed to raft but not
+	// yet applied to the FSM — by blocking the apply loop until released.
+	applyDelayHook func(*raft.Log)
 }
 
 // Apply applies a committed Raft log entry to the Pebble store.
 func (f *PebbleFSM) Apply(l *raft.Log) interface{} {
 	f.snapshotMu.RLock()
 	defer f.snapshotMu.RUnlock()
+
+	if h := f.applyDelayHook; h != nil && len(l.Data) > 0 {
+		h(l)
+	}
+
+	f.recordConsumed(l)
 
 	if len(l.Data) == 0 {
 		f.recordApplied(l)
@@ -786,6 +806,14 @@ func (f *PebbleFSM) Apply(l *raft.Log) interface{} {
 func (f *PebbleFSM) recordApplied(l *raft.Log) {
 	f.lastAppliedIndex = l.Index
 	f.lastAppliedTerm = l.Term
+}
+
+// recordConsumed advances the consumed watermark for every entry raft has
+// delivered to the FSM, regardless of apply outcome. Kept under the same
+// snapshotMu as lastAppliedIndex so a snapshot restore can reset both
+// coherently.
+func (f *PebbleFSM) recordConsumed(l *raft.Log) {
+	f.lastConsumedIndex = l.Index
 }
 
 func (f *PebbleFSM) invalidateInodeCache(entry *RaftLogEntry) {
@@ -1150,6 +1178,7 @@ func metaNodeOpsKey(serverID string) string {
 type RaftNode struct {
 	raft         *raft.Raft
 	fsm          *PebbleFSM
+	logs         raft.LogStore
 	raftDir      string
 	nodeID       string
 	bindAddr     string
@@ -1423,7 +1452,7 @@ func NewRaftNode(store *PebbleStore, cfg RaftNodeConfig) (*RaftNode, error) {
 		peerOps = make(map[string]string)
 	}
 	node := &RaftNode{
-		raft: r, fsm: fsm, raftDir: cfg.RaftDir,
+		raft: r, fsm: fsm, logs: logStore, raftDir: cfg.RaftDir,
 		nodeID: cfg.NodeID, bindAddr: cfg.BindAddr,
 		advertiseOps: cfg.AdvertiseOpsAddr,
 		peerOps:      peerOps,
@@ -2100,6 +2129,106 @@ func (n *RaftNode) EnsurePeers(peers []RaftPeer) (added, already int, err error)
 // Stats returns Raft statistics.
 func (n *RaftNode) Stats() map[string]string {
 	return n.raft.Stats()
+}
+
+// CommitIndex returns the highest committed log index as reported by raft.
+func (n *RaftNode) CommitIndex() uint64 {
+	if n.raft == nil {
+		return 0
+	}
+	stats := n.raft.Stats()
+	if v := stats["commit_index"]; v != "" {
+		if idx, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return idx
+		}
+	}
+	return 0
+}
+
+// CaughtUp reports whether the local FSM has been delivered every data entry
+// it should. Configuration and barrier entries are consumed by the raft core
+// and never reach our FSM, so comparing lastAppliedIndex against the raft
+// commit/applied watermark would stay false forever after any membership
+// change (the watermark runs ahead of the FSM by exactly the number of such
+// entries). We scan the committed range past the FSM's *consumed* position
+// (every entry raft has delivered, successful or not — see recordConsumed)
+// and report "not caught up" only while a data (LogCommand) entry remains
+// undelivered. An entry that errored or conditionally conflicted is consumed
+// even though it never applied, so it must not wedge the gate.
+func (n *RaftNode) CaughtUp() bool {
+	if n.raft == nil || n.fsm == nil || n.logs == nil {
+		return true
+	}
+	n.fsm.snapshotMu.RLock()
+	consumed := n.fsm.lastConsumedIndex
+	n.fsm.snapshotMu.RUnlock()
+	commit := n.CommitIndex()
+	for idx := consumed + 1; idx <= commit; idx++ {
+		var l raft.Log
+		if err := n.logs.GetLog(idx, &l); err != nil {
+			break // log truncated (covered by a snapshot) — the FSM has it
+		}
+		if l.Type == raft.LogCommand {
+			return false // a data entry the FSM has not been delivered yet
+		}
+		// Configuration / barrier / noop entries are handled by the raft core
+		// and never applied to our FSM — skip them.
+	}
+	return true
+}
+
+// WaitCatchUp blocks until the local FSM has applied every entry committed
+// as of the call — the linearizability gate for leader-served reads. A newly
+// elected leader serves reads from its local FSM, which can lag committed
+// entries by the apply-lag window; without this gate, a client redirected to
+// the new leader reads stale rows (read-after-write violation of the same
+// class the follower-read fix addresses).
+//
+// Fast path: if the FSM is already caught up it returns immediately — zero
+// raft round trips on the hot read path. Slow path: it polls until the
+// FSM's applied index reaches the raft commit index (the background apply
+// loop is what advances it; a raft Barrier cannot help here because
+// hashicorp/raft never delivers LogBarrier entries to the FSM, so they
+// cannot advance the applied index). A nil return means the FSM is
+// linearizable with every write acknowledged before the call. Only the
+// leader can wait for catch-up; on a follower the call fails so the caller
+// can serve 503/redirect instead of a stale read.
+func (n *RaftNode) WaitCatchUp(ctx context.Context, timeout time.Duration) error {
+	if n.raft == nil || n.fsm == nil {
+		return nil
+	}
+	if n.CaughtUp() {
+		return nil
+	}
+	if !n.IsLeader() {
+		return fmt.Errorf("not leader; only the leader can wait for FSM catch-up")
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if n.CaughtUp() {
+			return nil
+		}
+		if !n.IsLeader() {
+			return fmt.Errorf("lost leadership while waiting for FSM catch-up")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			n.fsm.snapshotMu.RLock()
+			applied := n.fsm.lastAppliedIndex
+			consumed := n.fsm.lastConsumedIndex
+			n.fsm.snapshotMu.RUnlock()
+			return fmt.Errorf("raft FSM catch-up timed out after %v (fsm applied %d, consumed %d, committed %d)",
+				timeout, applied, consumed, n.CommitIndex())
+		case <-ticker.C:
+		}
+	}
 }
 
 // Peers returns the current raft configuration membership as id -> address.

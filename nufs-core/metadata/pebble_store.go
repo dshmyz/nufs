@@ -1127,40 +1127,60 @@ func (s *PebbleStore) CreateBucket(ctx context.Context, name string, policy Plac
 		return ErrBucketExists
 	}
 
-	rootID := s.nextInodeID()
-	now := time.Now().UnixNano()
-	root := &InodeMeta{
-		ID:         rootID,
-		Type:       FileDirectory,
-		Mode:       0755,
-		NLink:      2,
-		BucketRoot: rootID,
-		CTime:      now,
-		MTime:      now,
-		ATime:      now,
-	}
-	info := &BucketInfo{
-		Name:         name,
-		RootInode:    rootID,
-		Policy:       policy,
-		CreationDate: time.Now(),
-	}
-	ops := []batchOp{
-		{Key: fmt.Sprintf("%s%d", prefixInode, rootID), Value: root},
-		{Key: bucketKey, Value: info},
-		{Key: fmt.Sprintf("%s%s", prefixPolicy, name), Value: &policy},
-		// Reverse index: rootInode → bucket name, so FUSE can look up
-		// a bucket's policy by inode.BucketRoot without scanning all
-		// buckets (P1.5: avoid full ListBuckets in resolveChunkPolicy).
-		{Key: fmt.Sprintf("%s%d", prefixBucketByRoot, rootID), Value: name},
-	}
-	if s.cfg.UseBucketStats {
-		ops = append(ops, batchOp{
-			Key:   s.bucketStatsKey(rootID),
-			Value: &BucketUsage{Name: name},
-		})
-	}
-	if err := s.applyBatchMsgpack(ops, nil); err != nil {
+	// The create is a conditional batch with ExpectAbsent preconditions on both
+	// the bucket row and the freshly minted /inode/<id> row (the same guard the
+	// namespace create paths use). The inode guard is defense-in-depth against
+	// inode-ID reuse: under the under-seeded cold-scan window (a newly elected
+	// raft leader whose FSM has not yet replayed a prior leader's inodes), a
+	// stale mint would otherwise silently overwrite a live inode row with the
+	// bucket root — the multi-metad leader-failover drill's 36/99 corruption.
+	// A genuine same-name conflict (bucket-key precondition) fails again on the
+	// re-seeded retry and maps to ErrBucketExists below; an inode-key conflict
+	// only means the guard caught a stale mint and the retry re-mints above it.
+	var info *BucketInfo
+	if err := s.applyNamespaceCreate(ctx, ErrEntryExists, func() (*ConditionalBatch, error) {
+		rootID := s.nextInodeID()
+		now := time.Now().UnixNano()
+		root := &InodeMeta{
+			ID:         rootID,
+			Type:       FileDirectory,
+			Mode:       0755,
+			NLink:      2,
+			BucketRoot: rootID,
+			CTime:      now,
+			MTime:      now,
+			ATime:      now,
+		}
+		info = &BucketInfo{
+			Name:         name,
+			RootInode:    rootID,
+			Policy:       policy,
+			CreationDate: time.Now(),
+		}
+		ops := []batchOp{
+			{Key: fmt.Sprintf("%s%d", prefixInode, rootID), Value: root},
+			{Key: bucketKey, Value: info},
+			{Key: fmt.Sprintf("%s%s", prefixPolicy, name), Value: &policy},
+			// Reverse index: rootInode → bucket name, so FUSE can look up
+			// a bucket's policy by inode.BucketRoot without scanning all
+			// buckets (P1.5: avoid full ListBuckets in resolveChunkPolicy).
+			{Key: fmt.Sprintf("%s%d", prefixBucketByRoot, rootID), Value: name},
+		}
+		if s.cfg.UseBucketStats {
+			ops = append(ops, batchOp{
+				Key:   s.bucketStatsKey(rootID),
+				Value: &BucketUsage{Name: name},
+			})
+		}
+		return buildNamespaceConditionalWithInodeGuard(bucketKey, fmt.Sprintf("%s%d", prefixInode, rootID), ops)
+	}); err != nil {
+		// If the bucket row exists now, the conflict was a genuine duplicate
+		// (or a raced concurrent same-name create), not a stale inode mint.
+		if exists, getErr := s.getValue(bucketKey, &existing); getErr != nil {
+			return getErr
+		} else if exists {
+			return ErrBucketExists
+		}
 		return err
 	}
 	s.bucketCache.Store(name, info)
@@ -1327,6 +1347,23 @@ func (s *PebbleStore) applyNamespaceConditional(ctx context.Context, conditional
 // on retry and still returns conflictErr — the retry never masks a real
 // ErrEntryExists.
 func (s *PebbleStore) applyNamespaceCreate(ctx context.Context, conflictErr error, mkConditional func() (*ConditionalBatch, error)) error {
+	// Gate the first mint on FSM catch-up: a newly elected leader whose FSM
+	// has not yet replayed a prior leader's inodes under-reads the cold-cache
+	// scan and mints a stale ID. The re-seed retry below only shrinks that
+	// window (a retry can still race a multi-entry lag and surface a spurious
+	// conflictErr for a brand-new name); waiting for the FSM to apply every
+	// entry committed so far closes it. Zero cost when caught up (the fast
+	// path has no raft round trips). The re-seed retry stays as defense in
+	// depth against a commit that lands between the wait and the apply.
+	if s.raft != nil {
+		timeout, err := conditionalRaftApplyTimeout(ctx)
+		if err != nil {
+			return err
+		}
+		if err := s.raft.WaitCatchUp(ctx, timeout); err != nil {
+			return fmt.Errorf("namespace create before FSM catch-up: %w", err)
+		}
+	}
 	conditional, err := mkConditional()
 	if err != nil {
 		return err
@@ -2286,6 +2323,24 @@ func (s *PebbleStore) allocateChunksConditionally(ctx context.Context, inodeID I
 		}
 		err = s.applyAllocationConditional(ctx, conditional)
 		if errors.Is(err, ErrRaftConditionalOutcomeUnknown) {
+			// The batch may have committed while its FSM apply lagged past
+			// the conditional wait. Reconcile against a CAUGHT-UP FSM so
+			// "not committed" is a reliable verdict: without this, a
+			// late-arriving apply of attempt 1 lands first (FSMs apply in
+			// log-index order), the retry's precondition fails, and the next
+			// retry appends on top of it — leaving two chunk refs at the
+			// same offset, the first of whose replicas were never written
+			// (ghost ref: the caller completes a 200 PUT whose object reads
+			// the unwritten ghost first).
+			if s.raft != nil {
+				timeout, werr := conditionalRaftApplyTimeout(ctx)
+				if werr != nil {
+					return nil, werr
+				}
+				if werr := s.raft.WaitCatchUp(ctx, timeout); werr != nil {
+					return nil, fmt.Errorf("allocate chunks: reconcile before FSM catch-up: %w", werr)
+				}
+			}
 			committed, reconcileErr := s.reconcileAllocation(inodeKey, &next, chunks, conditional)
 			if reconcileErr != nil {
 				return nil, reconcileErr
@@ -3868,6 +3923,22 @@ func (s *PebbleStore) LeaderOpsAddr() string {
 		return ""
 	}
 	return s.raft.LeaderOpsAddr()
+}
+
+// WaitReadFresh blocks until the local FSM has applied every entry committed
+// as of the call — the linearizability gate for leader-served reads. A
+// freshly elected leader can serve a local read while its FSM still lags
+// committed entries by the apply-lag window; without this gate a client
+// 307-redirected to the new leader reads stale rows. Returns immediately
+// (zero raft round trips) when the FSM is already caught up; in the catch-up
+// window it submits a raft Barrier. Non-raft (single-node) stores are always
+// fresh. Returns an error (caller should 503/redirect) if the barrier fails,
+// times out, or the context is cancelled.
+func (s *PebbleStore) WaitReadFresh(ctx context.Context, timeout time.Duration) error {
+	if s.raft == nil {
+		return nil
+	}
+	return s.raft.WaitCatchUp(ctx, timeout)
 }
 
 // applyBatch commits multiple key-value pairs atomically via Raft or directly.

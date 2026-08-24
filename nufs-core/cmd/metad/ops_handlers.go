@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/dshmyz/nufs/nufs-core/internal/version"
 	"github.com/dshmyz/nufs/nufs-core/metadata"
@@ -61,6 +62,12 @@ func (h *opsHandlers) requireLeader(w http.ResponseWriter, r *http.Request) bool
 	return requireLeaderRedirect(w, r, h.store)
 }
 
+// leaderCatchUpTimeout bounds how long a leader waits for its FSM to apply
+// every entry committed before the request (see requireLeaderRedirect). It
+// matches the conditional-apply horizon: both are the failover window where
+// a freshly elected leader's FSM lags committed entries.
+const leaderCatchUpTimeout = 10 * time.Second
+
 // requireLeaderRedirect is the shared leader-gate helper: if store is the Raft
 // leader it returns true; otherwise it 307-redirects the request to the
 // leader's ops address (or 503s when no leader is known) and returns false.
@@ -68,6 +75,16 @@ func (h *opsHandlers) requireLeader(w http.ResponseWriter, r *http.Request) bool
 // leader-redirect logic has a single implementation.
 func requireLeaderRedirect(w http.ResponseWriter, r *http.Request, store *metadata.PebbleStore) bool {
 	if store.IsLeader() {
+		// A freshly elected leader can serve a local read while its FSM still
+		// lags entries committed by the previous leader (the apply-lag
+		// window). Wait until the FSM has applied everything committed before
+		// this request, so a leader-served read is linearizable — otherwise
+		// the follower-read fix merely moves the staleness from "follower"
+		// to "new leader during catch-up". 503 (retryable) on failure.
+		if err := store.WaitReadFresh(r.Context(), leaderCatchUpTimeout); err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "leader still catching up after failover")
+			return false
+		}
 		return true
 	}
 	leaderAddr := store.LeaderOpsAddr()
