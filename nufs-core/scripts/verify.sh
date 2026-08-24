@@ -168,6 +168,26 @@ fi
 
 # ---- 6. 上线前长时/高 count 门禁（仅 full） ----
 if [ "$LEVEL" = "full" ]; then
+  # 发布前「备份非 stale」门禁(full 生效)。NUFS 回滚路径是 restore 到新
+  # cluster-id(见 rollback.md / compatibility-matrix.md),发布时必须有非 stale
+  # 的 committed backup。CI 里没有常驻生产集群,故仅在 operator 显式提供
+  # 端点时执行真实校验;否则如实 SKIP 并提示,绝不假装 PASS —— 真实发布前
+  # 必须由 operator 用 scripts/check-backup-freshness.sh 对活集群执行。
+  step "release: backup freshness (pre-release operator gate)"
+  if [ -n "${NUFS_BACKUP_GATE_ENDPOINT:-}" ]; then
+    if bash scripts/check-backup-freshness.sh \
+        --endpoint "$NUFS_BACKUP_GATE_ENDPOINT" \
+        --backup-interval "${NUFS_BACKUP_GATE_INTERVAL:-1h}" \
+        --margin "${NUFS_BACKUP_GATE_MARGIN:-1h}" \
+        ${NUFS_BACKUP_GATE_AUTH:+--auth-token "$NUFS_BACKUP_GATE_AUTH"} ; then
+      pass "backup-freshness gate"
+    else
+      fail "backup-freshness gate (stale or unreadable backup)"
+    fi
+  else
+    skip "backup-freshness gate (set NUFS_BACKUP_GATE_ENDPOINT to a live cluster to run it before release)"
+  fi
+
   step "P0 storage correctness (race, 20x)"
   if make test-storage-p0 >/dev/null 2>&1; then pass "test-storage-p0"; else fail "test-storage-p0"; fi
 

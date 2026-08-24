@@ -166,3 +166,22 @@ nufs-cli --mode=remote --meta-addr=metad-1:8091 --auth-token=<ops-token> auth li
   延迟 ≤ `--credential-sync-interval`。
 - 桶策略管理用 `nufs-cli acl get/set/delete <bucket>`（同样 remote + ops token）。
 
+### 6.1 `--credential-secret-key` 轮换
+
+`--credential-secret-key` 加密注册表里 S3 网关用的明文 secret。轮换它是破坏性
+操作：**旧密钥加密的凭证在新密钥下全部无法解密**，注册表同步对 S3 网关会返回
+空列表。网关侧 auth 是 pin 住的（`SetAuthMode(true)`），空列表 ≠ 匿名 —— 网关
+会**拒绝所有请求（403）**并打出启动警告；若在运行中轮换，同步后同样全拒。
+
+轮换步骤（避免服务中断）：
+
+1. 在旧密钥下先增补一份同 principal 的新凭证（`nufs-cli auth add <name> --secret '<新secret>'`）。
+2. 等 S3 网关一个 `--credential-sync-interval` 周期同步到新凭证（启动日志
+   `count` ≥ 1），确认网关对新 secret 可正常签名访问。
+3. 重启所有 metad，换 `--credential-secret-key=<新hex>`；旧凭证不再可解密，但
+   第 1 步写入的新凭证仍在，网关同步结果保持非空。
+4. 用旧 secret 的客户端切换到新 secret；之后按需 `auth del` 清理旧凭证。
+
+若在步骤 3 前误轮换（网关 403 全拒）：恢复 metad 旧 `--credential-secret-key`
+重启，网关下一个同步周期即恢复。
+
