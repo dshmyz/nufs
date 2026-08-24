@@ -58,6 +58,7 @@ jobs:
               -e 's/wJalrXUtnFEMI\/K7MDENG\/bPxRfiCYEXAMPLEKEY[0-9]*/[REDACTED]/g' \
               "$log" > "$sanitized_dir/$(basename "$log")"
           done
+          python3 "$GITHUB_WORKSPACE/nufs-core/scripts/sanitize-ci-log.py" "$sanitized_dir"
 
       - name: Upload sanitized core diagnostics on failure
         if: failure()
@@ -106,6 +107,7 @@ jobs:
             -e 's/AKIAIOSFODNN[0-9]EXAMPLE/[REDACTED]/g' \
             -e 's/wJalrXUtnFEMI\/K7MDENG\/bPxRfiCYEXAMPLEKEY[0-9]*/[REDACTED]/g' \
             "$RUNNER_TEMP/nufs-admin-test.log" > "$sanitized_dir/nufs-admin-test.log"
+          python3 "$GITHUB_WORKSPACE/nufs-core/scripts/sanitize-ci-log.py" "$sanitized_dir"
 
       - name: Upload sanitized admin diagnostics on failure
         if: failure()
@@ -163,6 +165,7 @@ jobs:
               -e 's/wJalrXUtnFEMI\/K7MDENG\/bPxRfiCYEXAMPLEKEY[0-9]*/[REDACTED]/g' \
               "$log" > "$sanitized_dir/$(basename "$log")"
           done
+          python3 "$GITHUB_WORKSPACE/nufs-core/scripts/sanitize-ci-log.py" "$sanitized_dir"
 
       - name: Upload sanitized frontend diagnostics on failure
         if: failure()
@@ -224,6 +227,7 @@ jobs:
               sanitize_file "$source" "$sanitized_dir/$(basename "$source_dir")/$relative_path"
             done < <(find "$source_dir" -type f -print0)
           done
+          python3 "$GITHUB_WORKSPACE/nufs-core/scripts/sanitize-ci-log.py" "$sanitized_dir"
 
       - name: Upload sanitized production gate diagnostics on failure
         if: failure()
