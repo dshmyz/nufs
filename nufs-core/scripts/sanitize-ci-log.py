@@ -10,6 +10,7 @@ from pathlib import Path
 
 PATTERNS = [
     (re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic|aws4-hmac-sha256)\s+)[^\s]+"), r"\1[REDACTED]"),
+    (re.compile(r'''(?i)(["']?authorization["']?\s*[:=]\s*["']?(?:bearer|basic|aws4-hmac-sha256)\s+["']?)[^"'\s,;}]+'''), r"\1[REDACTED]"),
     (re.compile(r'''(?i)(["']?(?:secret|token|password|passwd|api[-_]?key|access[-_]?key|secret[-_]?key)["']?\s*[:=]\s*["']?)[^"'\s,;}]+'''), r"\1[REDACTED]"),
     (re.compile(r'''(?i)(["']?(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN)["']?\s*[:=]\s*["']?)[^"'\s,;}]+'''), r"\1[REDACTED]"),
     (re.compile(r"(?i)(ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_:-]+"), "[REDACTED]"),
