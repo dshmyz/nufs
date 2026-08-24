@@ -17,7 +17,9 @@ DEPLOY_DIR="$REPO_ROOT/deploy"
 NETEM_DIR="$REPO_ROOT/deploy/netem"
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose.e2e.yml"
 TEST_BUCKET="network-fault-test"
-S3_ENDPOINT="http://localhost:8180"
+S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8180}"
+RESULTS_DIR="${NUFS_NETWORK_RESULTS:-$REPO_ROOT/.drill-results/network-faults-$(date +%Y%m%dT%H%M%S)}"
+FAILURES=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -27,6 +29,12 @@ NC='\033[0m' # No Color
 log() { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 fail() { echo -e "${RED}[-]${NC} $*"; exit 1; }
+
+require_command() { command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"; }
+
+mkdir -p "$RESULTS_DIR"
+require_command docker
+require_command curl
 
 # Check if docker compose file exists
 if [ ! -f "$COMPOSE_FILE" ]; then
@@ -72,8 +80,10 @@ fi
 # Create test bucket
 log "Creating test bucket..."
 if ! curl -sf -X PUT "$S3_ENDPOINT/$TEST_BUCKET" > /dev/null 2>&1; then
-    # Bucket may already exist, that's OK
-    warn "Bucket may already exist (OK)"
+    # A pre-existing bucket is fine, but an unavailable gateway is not.
+    if ! curl -sf "$S3_ENDPOINT/$TEST_BUCKET" > /dev/null 2>&1; then
+        fail "S3 gateway is unavailable at $S3_ENDPOINT"
+    fi
 fi
 
 # Helper function: write test data using curl
@@ -211,6 +221,7 @@ scenario_partition_leader() {
         log "  ✓ All baseline data preserved"
     else
         warn "  ✗ Some baseline data lost"
+        return 1
     fi
 }
 
@@ -299,6 +310,7 @@ scenario_partition_minority() {
         log "  ✓ All baseline data preserved"
     else
         warn "  ✗ Some baseline data lost"
+        return 1
     fi
 }
 
@@ -370,6 +382,7 @@ scenario_loss_latency() {
         log "  ✓ All baseline data preserved"
     else
         warn "  ✗ Some baseline data lost"
+        return 1
     fi
 }
 
@@ -378,9 +391,9 @@ log "=== E2 Network Fault Injection Drill ==="
 log "Starting at $(date)"
 
 # Run scenarios
-scenario_partition_leader
-scenario_partition_minority
-scenario_loss_latency
+if ! scenario_partition_leader; then FAILURES=$((FAILURES + 1)); fi
+if ! scenario_partition_minority; then FAILURES=$((FAILURES + 1)); fi
+if ! scenario_loss_latency; then FAILURES=$((FAILURES + 1)); fi
 
 # Final cleanup
 log "Cleaning up..."
@@ -389,3 +402,7 @@ docker compose -f docker-compose.e2e.yml down -v
 
 log "=== Drill Complete ==="
 log "Finished at $(date)"
+printf 'result=%s\nfailures=%s\nendpoint=%s\n' \
+    "$([ "$FAILURES" -eq 0 ] && echo PASS || echo FAIL)" "$FAILURES" "$S3_ENDPOINT" \
+    | tee "$RESULTS_DIR/REPORT.txt"
+[ "$FAILURES" -eq 0 ]
