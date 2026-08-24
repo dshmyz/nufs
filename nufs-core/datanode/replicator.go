@@ -80,16 +80,16 @@ func newConnPool(tls tlsutil.Config, dials, open *atomic.Int64) *connPool {
 // get returns an idle connection for addr, dialing a new one if none idle.
 func (p *connPool) get(addr string) (*Client, error) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	stack := p.idle[addr]
 	if len(stack) > 0 {
 		c := stack[len(stack)-1]
 		p.idle[addr] = stack[:len(stack)-1]
-		p.mu.Unlock()
 		return c, nil
 	}
-	p.mu.Unlock()
 
-	// Dial new connection
+	// Keep the pool lock while dialing so concurrent callers that miss the
+	// same endpoint's idle stack cannot all create duplicate connections.
 	p.dials.Add(1)
 	c := NewClient(addr)
 	if p.tls.Enabled() {
