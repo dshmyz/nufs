@@ -77,7 +77,16 @@ func main() {
 		if err := credSync.SyncOnce(context.Background()); err != nil {
 			log.Warn("metad credential sync initial pull failed; falling back to local credentials", "error", err)
 		} else {
-			log.Info("auth enabled (metad registry sync)", "count", creds.Count(), "interval", *credentialSyncInt)
+			// Classify the boot-time posture explicitly: a successful sync
+			// with ZERO credentials means auth is pinned on and every request
+			// will be rejected (403) — never report that as "anonymous mode".
+			posture := gos3.StartupAuthPosture(true, creds.Count())
+			if posture == gos3.AuthPostureSyncedEmpty {
+				log.Warn("metad credential sync returned zero credentials — auth is pinned on and EVERY request will be rejected (403); check `nufs-cli auth list` and that --credential-secret-key matches the metad deployment's key",
+					"count", creds.Count(), "interval", *credentialSyncInt)
+			} else {
+				log.Info("auth enabled (metad registry sync)", "count", creds.Count(), "interval", *credentialSyncInt)
+			}
 			syncOK = true
 			// Pin auth mode: once the registry is authoritative, revoking the
 			// last credential must reject requests, not flip the gateway to
@@ -103,7 +112,13 @@ func main() {
 		}
 	}
 	if !creds.HasCredentials() {
-		log.Warn("running in anonymous mode (no auth)")
+		// With the registry authoritative, an empty credential set is a locked
+		// gate (auth pinned, 403 on every request), not an open one.
+		if syncOK {
+			log.Warn("auth is pinned on (metad registry sync) but zero credentials are loaded — every request will be rejected (403)")
+		} else {
+			log.Warn("running in anonymous mode (no auth)")
+		}
 	}
 
 	health := func(ctx context.Context) error {

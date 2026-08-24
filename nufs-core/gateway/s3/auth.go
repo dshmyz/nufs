@@ -131,6 +131,60 @@ func (cs *CredentialStore) LoadCredentials(path string) error {
 	return nil
 }
 
+// AuthPosture classifies the gateway's boot-time auth posture after the
+// credential source is resolved. Startup logging derives its wording from it
+// so operators never mistake a locked-shut gateway for an open one.
+type AuthPosture int
+
+const (
+	// AuthPostureSynced: the metad registry sync is authoritative and
+	// returned at least one credential.
+	AuthPostureSynced AuthPosture = iota
+	// AuthPostureSyncedEmpty: the registry sync succeeded but returned zero
+	// credentials (fresh registry, or a rotated --credential-secret-key on
+	// metad that makes every stored secret undecryptable). Auth is pinned
+	// on — every request is rejected with 403 — so this must never be
+	// reported as "anonymous mode".
+	AuthPostureSyncedEmpty
+	// AuthPostureLocal: the registry sync was not configured or failed at
+	// boot; credentials came from the legacy local sources.
+	AuthPostureLocal
+	// AuthPostureAnonymous: no credential source produced anything; the
+	// gateway serves unauthenticated.
+	AuthPostureAnonymous
+)
+
+// StartupAuthPosture classifies the boot-time auth posture from whether the
+// metad registry is authoritative and how many credentials it produced.
+func StartupAuthPosture(syncAuthoritative bool, credentialCount int) AuthPosture {
+	switch {
+	case syncAuthoritative && credentialCount > 0:
+		return AuthPostureSynced
+	case syncAuthoritative:
+		return AuthPostureSyncedEmpty
+	case credentialCount > 0:
+		return AuthPostureLocal
+	default:
+		return AuthPostureAnonymous
+	}
+}
+
+// String returns a log-safe description of the posture.
+func (p AuthPosture) String() string {
+	switch p {
+	case AuthPostureSynced:
+		return "auth enabled (metad registry sync)"
+	case AuthPostureSyncedEmpty:
+		return "auth pinned on (metad registry sync) but zero credentials — every request will be rejected (403)"
+	case AuthPostureLocal:
+		return "auth enabled (local credentials)"
+	case AuthPostureAnonymous:
+		return "running in anonymous mode (no auth)"
+	default:
+		return "auth posture unknown"
+	}
+}
+
 // HasCredentials returns true if at least one credential is configured.
 func (cs *CredentialStore) HasCredentials() bool {
 	cs.mu.RLock()
