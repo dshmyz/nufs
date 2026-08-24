@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: Core tests and vet
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: nufs-core
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.25
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+          cache-dependency-path: nufs-core/go.sum
+
+      - name: Run core tests
+        shell: bash
+        run: |
+          set -o pipefail
+          go test ./... 2>&1 | tee "$RUNNER_TEMP/nufs-core-test.log"
+
+      - name: Run core vet
+        shell: bash
+        run: |
+          set -o pipefail
+          go vet ./... 2>&1 | tee "$RUNNER_TEMP/nufs-core-vet.log"
+
+      - name: Upload core diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-diagnostics
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/nufs-core-*.log
+
+  admin:
+    name: Admin tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: nufs-admin
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: true
+          cache-dependency-path: nufs-admin/go.sum
+
+      - name: Run admin tests
+        shell: bash
+        run: |
+          set -o pipefail
+          go test ./... 2>&1 | tee "$RUNNER_TEMP/nufs-admin-test.log"
+
+      - name: Upload admin diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-diagnostics
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/nufs-admin-test.log
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: nufs-admin/web
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: nufs-admin/web/package-lock.json
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: |
+          set -o pipefail
+          npm ci 2>&1 | tee "$RUNNER_TEMP/nufs-frontend-npm-ci.log"
+
+      - name: Build frontend
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run build 2>&1 | tee "$RUNNER_TEMP/nufs-frontend-build.log"
+
+      - name: Upload frontend diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-diagnostics
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/nufs-frontend-*.log
+
+  production-fast:
+    name: Production fast gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: nufs-core
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.25
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+          cache-dependency-path: nufs-core/go.sum
+
+      - name: Run production fast gate
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/verify.sh --level fast 2>&1 | tee "$RUNNER_TEMP/nufs-verify.log"
+
+      - name: Upload production gate diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-fast-diagnostics
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/nufs-verify.log
+            /tmp/nufs-verify-testlogs/
+            nufs-core/.drill-results/
