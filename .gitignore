@@ -60,6 +60,12 @@ nufs-core/metad
 # Raft runtime checkpoints
 nufs-core/metadata/raft-checkpoint-*/
 
+# Test-run checkpoint residue (backup_checkpoint_test / restore test dirs)
+nufs-core/metadata/test-checkpoint-*/
+
+# Soak-drill evidence (run-v21-* output); archived in release notes instead
+nufs-core/.drill-results/
+
 # IDE / tooling directories
 .codegraph/
 .mimocode/

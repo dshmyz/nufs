@@ -602,7 +602,7 @@ main() {
   if [ "$LOAD_RC" -ne 0 ] && [ "$OUT_WINDOW_ERRS" -eq 0 ]; then
     archive_evidence FAIL "load-driver-rc=$LOAD_RC"
     log "evidence: $RES_DIR"
-    [ "$CLEANUP" -eq 1 ] && cluster_down; rm -rf "$LOG_ROOT"
+    [ "$CLEANUP" -eq 1 ] && { cluster_down; rm -rf "$LOG_ROOT"; }
     die "load driver failed rc=$LOAD_RC — see $RES_DIR/load.log"
   fi
 
@@ -615,7 +615,7 @@ main() {
   if [ -n "$missing" ]; then
     log "RESULT: FAIL — metad nodes DOWN beyond killed leader: $missing"
     archive_evidence FAIL "unscheduled-metad-down"
-    [ "$CLEANUP" -eq 1 ] && cluster_down; rm -rf "$LOG_ROOT"
+    [ "$CLEANUP" -eq 1 ] && { cluster_down; rm -rf "$LOG_ROOT"; }
     die "unscheduled metad down: $missing"
   fi
 

@@ -475,11 +475,17 @@ main() {
   ts="$(date +%Y%m%d-%H%M%S)"
   if ! mkdir -p "$RESULTS_ROOT" 2>/dev/null; then RESULTS_ROOT="$LOG_ROOT/results"; mkdir -p "$RESULTS_ROOT"; fi
   RES_DIR="$RESULTS_ROOT/chaos-soak-$ts"
-  mkdir -p "$RES_DIR"
   log "results dir: $RES_DIR"
 
   build_bins
   cluster_up
+  # RES_DIR is created *after* cluster_up: cluster_up does `rm -rf "$LOG_ROOT"`
+  # then recreates only $LOG_ROOT/{run,log}/..., so an early mkdir under
+  # LOG_ROOT/results would be wiped before the load phase could write to it
+  # (the same trap run-v21-leader-failover.sh documents). When RESULTS_ROOT
+  # (/var/log/nufs-tests) is not writable we fall back to LOG_ROOT/results and
+  # place RES_DIR exactly there.
+  mkdir -p "$RES_DIR"
 
   log "starting ${DURATION}s write load (crash ~${CRASH_AFTER}s, net-fault=${NET_FAULT_SECS}s)"
   ( run_load ) > "$RES_DIR/load.log" 2>&1 &
