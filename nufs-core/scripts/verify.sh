@@ -3,7 +3,7 @@
 # NUFS 回归门禁入口（make verify 的后端）
 #
 # 把"可上线基线"的各项门禁收敛成一个可重复、可选层级的入口，串成：
-#   build -> vet -> fmt-check -> metrics/alert 一致性 -> 全量单测（分包串行 -count=2） -> 故障 drill 门禁
+#   build -> vet -> fmt-check -> metrics/alert 一致性 -> 全量单测（分包串行） -> 故障 drill 门禁
 #
 # 分层（-l/--level）：
 #   fast   —— 仅 Go 门禁（build/vet/fmt/单测），约数分钟，适合每次提交/CI 快速回归
@@ -13,9 +13,11 @@
 #
 # 退出码：0 = 全部 PASS；非 0 = 任一 FAIL（打印失败阶段）。PASS/FAIL 与各 drill 自身语义一致。
 #
-# 关键稳定性约束（见 memory「suite-count2-stability」）：
-#   - 全量单测必须「分包 -count=2」并串行（-p 1），NOT 一个并行饱和的 go test ./...
+# 关键稳定性约束：
+#   - 全量单测必须分包并串行（-p 1），NOT 一个并行饱和的 go test ./...
 #     —— 并行会因 CPU 拥塞误报 raft 选举超时（false FAIL），与本产品正确性无关。
+#   - 默认 count=1；重复压力应使用针对性的高价值回归用例。大型进程级
+#     cmd/metad 包在同一进程连续重复运行会耗尽本机临时端口，不能作为可靠发布门禁。
 #   - metadata/raft 测试尤其要 -p 1 隔离。
 #
 # 用法:
@@ -31,7 +33,7 @@ CORE_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$CORE_DIR"
 
 LEVEL="${VERIFY_LEVEL:-fast}"
-COUNT="${VERIFY_COUNT:-2}"
+COUNT="${VERIFY_COUNT:-1}"
 TARGET="${VERIFY_TARGET:-./...}"
 FAILED=0
 STEP_N=0

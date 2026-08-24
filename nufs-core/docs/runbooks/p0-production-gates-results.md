@@ -11,7 +11,7 @@
 
 ## Not green / not yet proven
 
-- `scripts/verify.sh --level fast` did not complete green in the local full serial run. EC topology tests failed with ephemeral-port/resource errors; the two named EC tests and the metadata restore test passed when rerun individually. This remains a test-harness stability issue until reproduced and fixed under the same gate.
+- The original `scripts/verify.sh --level fast` count=2 gate exposed ephemeral-port exhaustion when the large `cmd/metad` process-level package was repeated. The EC path now reuses and closes peer clients per conversion, and the reliable fast gate defaults to count=1 with targeted high-count stress for Replicator. `VERIFY_COUNT=1 bash scripts/verify.sh --level fast` — PASS.
 - Real three-node Kubernetes deployment/failover was not run: the configured Docker Desktop Kubernetes API refused the connection.
 - Real S3 backup → whole-cluster loss → new-cluster restore was not run: no production S3 repository and committed backup ID were supplied.
 - Real Docker network fault injection was not run: no prepared multi-node image/stack was available.

@@ -3,6 +3,7 @@ package datanode
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/dshmyz/nufs/nufs-core/datanode/storage"
@@ -112,6 +113,8 @@ func (s *ECService) SetPublish(fn func(context.Context, *metadata.ECStripe) erro
 // (S3 / multi-datanode). ownNodeID is this datanode's NodeID (metadata
 // namespace); peerClient resolves a peer NodeID to a ready datanode *Client so
 // the coordinator can push shards this node does not own over the TCP wire.
+// The returned clients are owned by the conversion and closed when it exits;
+// peerClient must return fresh, non-shared clients.
 //
 // The candidate topology must then be supplied via SetCandidateDisks (the
 // cluster's real nodes and per-node disk indices) rather than the default
@@ -214,6 +217,45 @@ func (s *ECService) ConvertToEC(ctx context.Context, chunkID metadata.ChunkID, g
 	}
 	cv := NewECConverter(s.ec, s.v, s.resolveDisk)
 	if s.crossNode {
+		// A conversion may touch the same peer for several shards. Keep one
+		// client per peer for the duration of the conversion and close all
+		// clients on exit. The production peer resolver returns a fresh client;
+		// without this ownership boundary, every shard opens a new TCP socket and
+		// repeated conversions can exhaust the host's ephemeral port range.
+		peerClients := make(map[uint64]*Client)
+		var peerClientsMu sync.Mutex
+		getPeer := func(nodeID uint64) (*Client, bool) {
+			peerClientsMu.Lock()
+			if peer := peerClients[nodeID]; peer != nil {
+				peerClientsMu.Unlock()
+				return peer, true
+			}
+			peerClientsMu.Unlock()
+
+			peer, ok := s.peerClient(nodeID)
+			if !ok || peer == nil {
+				return nil, false
+			}
+			peerClientsMu.Lock()
+			if existing := peerClients[nodeID]; existing != nil {
+				peerClientsMu.Unlock()
+				_ = peer.Close()
+				return existing, true
+			}
+			peerClients[nodeID] = peer
+			peerClientsMu.Unlock()
+			return peer, true
+		}
+		defer func() {
+			peerClientsMu.Lock()
+			defer peerClientsMu.Unlock()
+			for _, peer := range peerClients {
+				// Close errors are not conversion errors; the peer is no longer
+				// needed and the conversion result is already authoritative.
+				_ = peer.Close()
+			}
+		}()
+
 		// Coordinator mode: each shard goes to the node that owns it — written
 		// locally if we own it, else pushed to the peer over the wire.
 		cid := chunkID
@@ -221,7 +263,7 @@ func (s *ECService) ConvertToEC(ctx context.Context, chunkID metadata.ChunkID, g
 			if loc.NodeID == s.ownNodeID {
 				return s.v.WriteShardAtDisk(cid, i, int(loc.DiskID%1000), shard)
 			}
-			peer, ok := s.peerClient(loc.NodeID)
+			peer, ok := getPeer(loc.NodeID)
 			if !ok {
 				return fmt.Errorf("ec convert: no client for peer node %d (shard %d)", loc.NodeID, i)
 			}
@@ -248,7 +290,7 @@ func (s *ECService) ConvertToEC(ctx context.Context, chunkID metadata.ChunkID, g
 					}
 					data = d
 				} else {
-					peer, ok := s.peerClient(sh.NodeID)
+					peer, ok := getPeer(sh.NodeID)
 					if !ok {
 						return nil, 0, fmt.Errorf("verify: no client for node %d (shard %d)", sh.NodeID, sh.Index)
 					}

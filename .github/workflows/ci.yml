@@ -34,6 +34,12 @@ jobs:
           set -o pipefail
           go test ./... 2>&1 | tee "$RUNNER_TEMP/nufs-core-test.log"
 
+      - name: Stress replicator connection reuse
+        shell: bash
+        run: |
+          set -o pipefail
+          go test ./datanode -run '^TestReplicator_(ConnectionReuse|PoolClosesOnStop|PoolReconnectsAfterFailure)$' -count=20 2>&1 | tee "$RUNNER_TEMP/nufs-replicator-test.log"
+
       - name: Run core vet
         shell: bash
         run: |
