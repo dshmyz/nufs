@@ -52,6 +52,7 @@ spec:
               containerPort: {{ .Values.metad.service.port }}
             - name: raft
               containerPort: {{ .Values.metad.service.raftPort }}
+          command: ["/usr/local/bin/metad"]
           args:
             - "--data-dir=/data/metadata"
             - "--ops-addr=0.0.0.0:{{ .Values.metad.service.port }}"

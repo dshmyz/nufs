@@ -23,6 +23,7 @@ spec:
         - name: s3gateway
           image: "{{ .Values.global.imageRegistry }}{{ .Values.s3gateway.image.repository }}:{{ .Values.s3gateway.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.s3gateway.image.pullPolicy }}
+          command: ["/usr/local/bin/nufs-s3"]
           ports:
             - name: http
               containerPort: {{ .Values.s3gateway.service.port }}
