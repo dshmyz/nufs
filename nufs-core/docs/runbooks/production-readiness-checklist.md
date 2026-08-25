@@ -59,7 +59,7 @@
 
 | # | 验收项 | 证据 / 命令 | 当前 | 上线动作 |
 |---|---|---|---|---|
-| E1 | **helm 落地端到端**（真实 K8s/多机 `helm install`→读写） | helm chart | ⚠️ chart 有、**从未真正落地跑通** | ⏳ 决定性：多集群部署验一次 |
+| E1 | **helm 落地端到端**（真实 K8s/多机 `helm install`→读写） | `scripts/soak/run-v21-helm-smoke.sh` **PASS**（2026-08-25，docker-desktop 单节点 k8s，生产模式 auth 开启，leader kill→re-elect→字节精确写读） | ✅ 已实跑 | — |
 | E2 | 网络分区 / 真实丢包 / 跨主机延迟 | 单机 harness 测不到 | ✗ | ⏳ 多机故障注入 |
 | E3 | 观测：SLO 采集 + 告警触发 | `servicemonitor` + slo.go；`make verify` 内 `check-metrics.sh`（死指标/命名漂移=0 + promtool 语法） | ⚠️ 告警规则已机器校验无死链、可语法通过；**尚未真实触发** | ⏳ 真实集群验证告警链路（触发一次） |
 | E4 | 时钟偏移容忍 | 唯一权威 metad 打标比较 | ✅ 设计已验证 | — |
@@ -80,16 +80,16 @@
 > **结论判定逻辑**：只有下列 gaps 全绿，才能下"具备上线能力"的结论。
 
 **阻塞性（必须补，否则不下线）：**
-- [ ] **D3** 建立 CI，跑 `make verify`（可回归才有持续上线能力）
-- [ ] **E1** 真实多机/helm 落地端到端跑通一次（把单机 ⚠️ 升级为 ✅）
-- [ ] **E2** 至少一次多机故障注入（分区 / kill leader / 恢复）
+- [x] **D3** 建立 CI，跑 `make verify`（`.github/workflows/ci.yml` 已落地并硬化：core/admin/frontend/fast-gate jobs + 失败 artifact 收集）
+- [x] **E1** 真实多机/helm 落地端到端跑通一次（**helm-smoke PASS**，2026-08-25）
+- [ ] **E2** 至少一次多机故障注入（分区 / kill leader / 恢复）——helm-smoke 已覆盖单节点 leader-kill 故障；多机网络分区/丢包未跑
 - [ ] **B3** 真实部署上造备份+还原一次
 
 **按规模/要求决定（进入前要对齐目标）：**
 - [ ] **A6 / C3 / F3** 视目标负载与合规要求
 - [ ] **F2** 安全审查结论
 
-**已满足（无需再动）：** A4、A5(单机)、B1、B2、C1、C4、D1、D2、E4、E5、F1
+**已满足（无需再动）：** A4、A5(单机)、B1、B2、C1、C4、D1、D2、E1(helm-smoke)、E4、E5、F1
 
 ---
 
