@@ -402,10 +402,13 @@ kill_leader_and_wait() {
     | tee "$RESULTS_DIR/leader-delete.txt"
 
   STAGE="leader-re-election"
-  FINAL_LEADER="$(wait_for_leader "$INITIAL_LEADER")"
-  [ "$FINAL_LEADER" != "$INITIAL_LEADER" ] || die "leader did not change after deleting $INITIAL_LEADER"
+  # A StatefulSet immediately recreates the deleted pod with the same name and
+  # persisted raft state (PVC), so the same node may reclaim leadership. What
+  # matters for failover is that the cluster elects a ready leader and keeps
+  # serving — the following s3_create_bucket_and_verify asserts write service.
+  FINAL_LEADER="$(wait_for_leader)"
   printf '%s\n' "$FINAL_LEADER" > "$RESULTS_DIR/leader-after.txt"
-  log "new metadata leader is $FINAL_LEADER"
+  log "metadata leader after delete/restart is $FINAL_LEADER"
   kubectl_cmd -n "$NAMESPACE" rollout status "statefulset/$RELEASE-metad" --timeout=8m
 }
 
