@@ -282,19 +282,29 @@ start_port_forwards() {
 }
 
 leader_from_status() {
-  local status="$1"
-  printf '%s\n' "$status" | grep -oE "${RELEASE}-metad-[0-9]+" | head -n 1 || true
+  local status="$1" uri host
+  # cluster/status reports the leader as leader_uri IP:port (the raft advertise
+  # address resolves to the leader pod's IP), not a pod name — so map the IP
+  # back to the metad pod the failover step needs to delete.
+  uri="$(printf '%s\n' "$status" | grep -oE '"leader_uri"[[:space:]]*:[[:space:]]*"[^"]*"' |
+    head -n 1 | sed -E 's/.*"leader_uri"[[:space:]]*:[[:space:]]*"([^"]*)"/\1/')"
+  [ -n "$uri" ] || return 0
+  host="${uri%:*}"
+  kubectl_cmd -n "$NAMESPACE" get pod \
+    -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=metad" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}' \
+    2>/dev/null | awk -v ip="$host" '$2==ip {print $1; exit}' || true
 }
 
 wait_for_leader() { # [different-from]
-  local previous="${1:-}" status candidate readiness end auth
-  auth=""
-  [ -n "$AUTH_TOKEN" ] && auth="-H Authorization: Bearer $AUTH_TOKEN"
+  local previous="${1:-}" status candidate readiness end
+  local -a auth=()
+  [ -n "$AUTH_TOKEN" ] && auth=(-H "Authorization: Bearer $AUTH_TOKEN")
   end=$((SECONDS + 120))
   until false; do
-    status="$(curl --connect-timeout 2 --max-time 5 -fsS $auth "$METAD_ENDPOINT/api/v1/cluster/status" 2>/dev/null || true)"
+    status="$(curl --connect-timeout 2 --max-time 5 -fsS "${auth[@]}" "$METAD_ENDPOINT/api/v1/cluster/status" 2>/dev/null || true)"
     candidate="$(leader_from_status "$status")"
-    readiness="$(curl --connect-timeout 2 --max-time 5 -fsS $auth "$METAD_ENDPOINT/api/v1/cluster/readiness" 2>/dev/null || true)"
+    readiness="$(curl --connect-timeout 2 --max-time 5 -fsS "${auth[@]}" "$METAD_ENDPOINT/api/v1/cluster/readiness" 2>/dev/null || true)"
     if [ -n "$candidate" ] && [ "$candidate" != "$previous" ] &&
       [[ "$readiness" != *'"status":"not_ready"'* ]]; then
       printf '%s\n' "$status" > "$RESULTS_DIR/cluster-status-${candidate}.json"
@@ -355,17 +365,19 @@ except urllib.error.HTTPError as e:
 PYEOF
 }
 
-s3_create_bucket_and_verify() { # object suffix
-  local suffix="$1" bucket object downloaded hash
+s3_create_bucket_and_verify() { # object-suffix create-bucket(yes|no)
+  local suffix="$1" create_bucket="$2" bucket object downloaded hash
   bucket="helm-smoke-${NAMESPACE##*-}"
   object="payload-$suffix.txt"
   printf '%s\n' "nufs helm smoke payload namespace=$NAMESPACE release=$RELEASE" > "$RESULTS_DIR/payload.txt"
   PAYLOAD_HASH="$(sha256_file "$RESULTS_DIR/payload.txt")"
 
   if [ -n "$AUTH_TOKEN" ]; then
-    STAGE="s3-create-bucket"
-    s3_sigv4_request PUT "/$bucket" "" "$RESULTS_DIR/s3-create-bucket-$suffix.txt" \
-      || die "SigV4 bucket create failed (see s3-create-bucket-$suffix.txt)"
+    if [ "$create_bucket" = "yes" ]; then
+      STAGE="s3-create-bucket"
+      s3_sigv4_request PUT "/$bucket" "" "$RESULTS_DIR/s3-create-bucket-$suffix.txt" \
+        || die "SigV4 bucket create failed (see s3-create-bucket-$suffix.txt)"
+    fi
     STAGE="s3-write-$suffix"
     s3_sigv4_request PUT "/$bucket/$object" "$RESULTS_DIR/payload.txt" "$RESULTS_DIR/s3-put-$suffix.txt" \
       || die "SigV4 object PUT failed (see s3-put-$suffix.txt)"
@@ -374,9 +386,11 @@ s3_create_bucket_and_verify() { # object suffix
     s3_sigv4_request GET "/$bucket/$object" "" "$downloaded" \
       || die "SigV4 object GET failed"
   else
-    STAGE="s3-create-bucket"
-    curl --connect-timeout 5 --max-time 30 -fsS -X PUT "$GATEWAY_ENDPOINT/$bucket" \
-      > "$RESULTS_DIR/s3-create-bucket-$suffix.txt"
+    if [ "$create_bucket" = "yes" ]; then
+      STAGE="s3-create-bucket"
+      curl --connect-timeout 5 --max-time 30 -fsS -X PUT "$GATEWAY_ENDPOINT/$bucket" \
+        > "$RESULTS_DIR/s3-create-bucket-$suffix.txt"
+    fi
     STAGE="s3-write-$suffix"
     curl --connect-timeout 5 --max-time 90 --retry 3 --retry-all-errors -fsS -X PUT \
       --data-binary "@$RESULTS_DIR/payload.txt" "$GATEWAY_ENDPOINT/$bucket/$object" \
@@ -401,6 +415,16 @@ kill_leader_and_wait() {
   kubectl_cmd -n "$NAMESPACE" delete pod "$INITIAL_LEADER" --wait=true --timeout=90s \
     | tee "$RESULTS_DIR/leader-delete.txt"
 
+  STAGE="leader-recovery"
+  kubectl_cmd -n "$NAMESPACE" rollout status "statefulset/$RELEASE-metad" --timeout=8m
+
+  # kubectl port-forward to a Service pins to a single backing pod; deleting
+  # the pinned leader pod kills the forward. Restart the forwards now that all
+  # metad pods are Ready again so the post-failover wait can reach the cluster.
+  STAGE="port-forward-restart"
+  stop_port_forwards
+  start_port_forwards
+
   STAGE="leader-re-election"
   # A StatefulSet immediately recreates the deleted pod with the same name and
   # persisted raft state (PVC), so the same node may reclaim leadership. What
@@ -409,7 +433,6 @@ kill_leader_and_wait() {
   FINAL_LEADER="$(wait_for_leader)"
   printf '%s\n' "$FINAL_LEADER" > "$RESULTS_DIR/leader-after.txt"
   log "metadata leader after delete/restart is $FINAL_LEADER"
-  kubectl_cmd -n "$NAMESPACE" rollout status "statefulset/$RELEASE-metad" --timeout=8m
 }
 
 collect_diagnostics() {
@@ -437,6 +460,7 @@ stop_port_forwards() {
   for pid in "${PORT_FORWARD_PIDS[@]:-}"; do
     wait "$pid" >/dev/null 2>&1 || true
   done
+  PORT_FORWARD_PIDS=()
 }
 
 write_report() { # exit status
@@ -538,8 +562,8 @@ install_chart
 wait_for_workloads
 start_port_forwards
 seed_registry_credential
-s3_create_bucket_and_verify before-failover
+s3_create_bucket_and_verify before-failover yes
 kill_leader_and_wait
-s3_create_bucket_and_verify after-failover
+s3_create_bucket_and_verify after-failover no
 STAGE="complete"
 log "PASS: S3 write/read and leader failover checks completed"
