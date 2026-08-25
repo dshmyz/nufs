@@ -215,7 +215,6 @@ func main() {
 		Mode:                runtimeMode(*allowInsecureDev),
 		JWTSecret:           *authToken,
 		RaftNodeCount:       raftNodeCount,
-		TLSEnabled:          *tlsCert != "",
 		AllowInsecureDev:    *allowInsecureDev,
 		TokenSigningKey:     *tokenSigningKey,
 		CredentialSecretKey: *credentialSecretKey,

@@ -17,7 +17,6 @@ type ProductionValidationConfig struct {
 	Mode             RuntimeMode
 	JWTSecret        string
 	RaftNodeCount    int
-	TLSEnabled       bool
 	AllowInsecureDev bool
 	// TokenSigningKey is the HMAC key metad uses to sign mount auth tokens.
 	// Required in production: without it the fuse cannot authenticate, and a
@@ -55,9 +54,6 @@ func ValidateProductionConfig(cfg ProductionValidationConfig) error {
 	}
 	if cfg.RaftNodeCount < 3 {
 		errs = append(errs, "production Raft requires at least 3 nodes")
-	}
-	if !cfg.TLSEnabled {
-		errs = append(errs, "production TLS must be enabled")
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("invalid production config: %s", strings.Join(errs, "; "))

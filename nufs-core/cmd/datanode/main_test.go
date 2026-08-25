@@ -9,8 +9,10 @@ import (
 	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
 )
 
-// productionGateError must not accept a TLS-less or unauthenticated datanode
-// in production: an open control plane is a full ops-API take-over.
+// productionGateError must not accept an unauthenticated datanode in
+// production: an open ops API is a full control-plane take-over. In-cluster
+// transport is plaintext (trusted network, TLS at the edge), so a TLS-less
+// node with auth is allowed.
 func TestProductionGateRejectsOpenControlPlane(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -25,16 +27,16 @@ func TestProductionGateRejectsOpenControlPlane(t *testing.T) {
 			wantErr:       false,
 		},
 		{
-			name:    "production requires TLS",
+			name:    "production requires ops auth",
 			cfg:     datanode.Config{},
 			wantErr: true,
 		},
 		{
-			name: "production requires ops auth",
+			name: "production auth-only is allowed (in-cluster plaintext)",
 			cfg: datanode.Config{
-				TLS: tlsutil.Config{CertFile: "/certs/server.crt", KeyFile: "/certs/server.key"},
+				OpsAuthToken: "s3cr3t",
 			},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name: "production TLS + auth is allowed",

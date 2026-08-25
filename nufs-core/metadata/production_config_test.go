@@ -7,7 +7,6 @@ func TestValidateProductionConfigRejectsDevSecret(t *testing.T) {
 		Mode:                RuntimeProduction,
 		JWTSecret:           "dev-secret-change-in-production",
 		RaftNodeCount:       3,
-		TLSEnabled:          true,
 		TokenSigningKey:     "a-long-production-token-key",
 		CredentialSecretKey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
 	})
@@ -21,7 +20,6 @@ func TestValidateProductionConfigRejectsSingleNodeRaft(t *testing.T) {
 		Mode:                RuntimeProduction,
 		JWTSecret:           "a-long-production-secret-value",
 		RaftNodeCount:       1,
-		TLSEnabled:          true,
 		TokenSigningKey:     "a-long-production-token-key",
 		CredentialSecretKey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
 	})
@@ -35,7 +33,6 @@ func TestValidateProductionConfigRejectsMissingTokenSigningKey(t *testing.T) {
 		Mode:                RuntimeProduction,
 		JWTSecret:           "a-long-production-secret-value",
 		RaftNodeCount:       3,
-		TLSEnabled:          true,
 		TokenSigningKey:     "dev-token-key-change-in-production",
 		CredentialSecretKey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
 	})
@@ -49,7 +46,6 @@ func TestValidateProductionConfigAllowsExplicitDevMode(t *testing.T) {
 		Mode:             RuntimeDev,
 		JWTSecret:        "dev-secret-change-in-production",
 		RaftNodeCount:    1,
-		TLSEnabled:       false,
 		AllowInsecureDev: true,
 	})
 	if err != nil {
@@ -65,7 +61,6 @@ func TestValidateProductionConfigAllowsValidProduction(t *testing.T) {
 		Mode:                RuntimeProduction,
 		JWTSecret:           "a-long-production-secret-value",
 		RaftNodeCount:       3,
-		TLSEnabled:          true,
 		TokenSigningKey:     "a-long-production-token-key",
 		CredentialSecretKey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
 	})
@@ -79,7 +74,6 @@ func TestValidateProductionConfigRejectsMissingCredentialSecretKey(t *testing.T)
 		Mode:            RuntimeProduction,
 		JWTSecret:       "a-long-production-secret-value",
 		RaftNodeCount:   3,
-		TLSEnabled:      true,
 		TokenSigningKey: "a-long-production-token-key",
 		// CredentialSecretKey deliberately omitted: the S3 gateway credential
 		// sync would have nothing to unseal.

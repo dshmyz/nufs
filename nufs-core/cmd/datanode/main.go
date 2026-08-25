@@ -270,16 +270,14 @@ func readMachineID() string {
 // with an open control plane in a production (non-dev) setting. With the
 // explicit --allow-insecure-dev opt-out, no error is returned.
 //
-// Besides requiring TLS (the historical gate), a production datanode must also
-// carry an ops auth token: without it the HTTP ops API (disk adopt/retire/
-// migrate, decommission, EC convert, repair …) is completely unauthenticated,
-// a full control-plane take-over. Mirrors metad's ValidateProductionConfig.
+// A production datanode must carry an ops auth token: without it the HTTP ops
+// API (disk adopt/retire/migrate, decommission, EC convert, repair …) is
+// completely unauthenticated, a full control-plane take-over. In-cluster
+// transport stays plaintext (trusted network; TLS terminates at the edge),
+// mirroring metad's ValidateProductionConfig.
 func productionGateError(cfg datanode.Config) error {
 	if cfg.AllowInsecureDev {
 		return nil
-	}
-	if cfg.TLS.CertFile == "" || cfg.TLS.KeyFile == "" {
-		return fmt.Errorf("production datanode requires TLS; refusing to start in plaintext (set --tls-cert/--tls-key)")
 	}
 	if cfg.OpsAuthToken == "" {
 		return fmt.Errorf("production datanode requires ops authentication; refusing to start with an open ops API (set --ops-auth-token)")
