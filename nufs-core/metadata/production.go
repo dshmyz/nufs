@@ -455,9 +455,11 @@ func (lm *LeaseManager) checkExpiredNodes() {
 		// which promotes only NodeOffline → NodeOnline). Read the current record
 		// and preserve any sticky state instead of overwriting it.
 		sticky := false
+		var current *NodeInfo
 		if raw, ok, err := lm.store.getRawBytes(oldest.key); err == nil && ok {
 			var cur NodeInfo
 			if err := unmarshalValue(raw, &cur); err == nil {
+				current = &cur
 				switch cur.State {
 				case NodeMaint, NodeFailed:
 					// Never touch maintenance/failed; only an explicit operator
@@ -483,8 +485,20 @@ func (lm *LeaseManager) checkExpiredNodes() {
 			continue
 		}
 
-		// Mark node offline
+		// Mark node offline. Base the snapshot on the persisted record so
+		// identity fields (address, rack/zone, capacity, EC shard-disk count)
+		// survive the state flip: HeartbeatLiveness promotes NodeOffline →
+		// NodeOnline from the stored record and the heartbeat report carries no
+		// address, so writing a bare NodeInfo here would permanently blank the
+		// node's routable address after any liveness lapse (e.g. a leader
+		// failover that drops heartbeats past the lease TTL), breaking every
+		// subsequent write through buildReplicas.
 		info := &NodeInfo{ID: oldest.nodeID, State: NodeOffline, LastSeen: now}
+		if current != nil {
+			current.State = NodeOffline
+			current.LastSeen = now
+			info = current
+		}
 		data, err := marshalValue(info, codecMsgpack)
 		if err != nil {
 			slog.Error("lease: marshal node", "node_id", oldest.nodeID, "error", err)

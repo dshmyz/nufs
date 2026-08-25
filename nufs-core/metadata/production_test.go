@@ -129,6 +129,18 @@ func TestLeaseManager_ExpiresOfflineNodes(t *testing.T) {
 	if node.State != NodeOffline {
 		t.Fatalf("expected NodeOffline, got %d", node.State)
 	}
+
+	// The offline snapshot must preserve the node's identity so a later
+	// heartbeat (which promotes offline → online from the stored record and
+	// carries no address) can still route to it. This is the regression behind
+	// the leader-failover "dial tcp: missing address" write failures: a bare
+	// NodeInfo here blanked Addr permanently after any liveness lapse.
+	if node.Addr != "node1:9001" {
+		t.Fatalf("expected address to survive offline marking, got %q", node.Addr)
+	}
+	if node.CapacityGB != 100 {
+		t.Fatalf("expected capacity to survive offline marking, got %d", node.CapacityGB)
+	}
 }
 
 // TestLeaseManager_PreservesOperatorStates proves that lease expiry never
