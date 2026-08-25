@@ -35,6 +35,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
             - name: data
               containerPort: {{ .Values.datanode.service.dataPort }}
@@ -56,6 +60,7 @@ spec:
               exec /usr/local/bin/datanode \
                 --node-id=auto \
                 --listen=0.0.0.0:{{ .Values.datanode.service.dataPort }} \
+                --register-addr=$(POD_IP):{{ .Values.datanode.service.dataPort }} \
                 --ops-addr=0.0.0.0:{{ .Values.datanode.service.opsPort }} \
                 --data-dir=/data \
                 --metadata={{ .Release.Name }}-metad:{{ .Values.metad.service.port }} \

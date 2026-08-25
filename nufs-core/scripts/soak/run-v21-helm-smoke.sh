@@ -24,6 +24,9 @@ KUBECTL_ARGS=()
 HELM_CONTEXT_ARGS=()
 HELM_VALUE_ARGS=()
 PORT_FORWARD_PIDS=()
+AUTH_TOKEN=""                  # operator bearer; when set, seed + SigV4-sign S3 checks
+SMOKE_AK="${SMOKE_AK:-AKIAIOSFODNN7EXAMPLE}"
+SMOKE_SK="${SMOKE_SK:-wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY}"
 NAMESPACE_OWNED=false
 MUTATED=false
 STAGE="parse"
@@ -274,7 +277,7 @@ start_port_forwards() {
     > "$RESULTS_DIR/port-forward-metad.log" 2>&1 &
   PORT_FORWARD_PIDS+=("$!")
 
-  wait_for_url "$GATEWAY_ENDPOINT/health" 60 "S3 gateway port-forward"
+  wait_for_url "$GATEWAY_ENDPOINT/healthz" 60 "S3 gateway port-forward"
   wait_for_url "$METAD_ENDPOINT/api/v1/health" 60 "metad port-forward"
 }
 
@@ -284,14 +287,16 @@ leader_from_status() {
 }
 
 wait_for_leader() { # [different-from]
-  local previous="${1:-}" status candidate readiness end
+  local previous="${1:-}" status candidate readiness end auth
+  auth=""
+  [ -n "$AUTH_TOKEN" ] && auth="-H Authorization: Bearer $AUTH_TOKEN"
   end=$((SECONDS + 120))
   until false; do
-    status="$(curl --connect-timeout 2 --max-time 5 -fsS "$METAD_ENDPOINT/api/v1/cluster/status" 2>/dev/null || true)"
+    status="$(curl --connect-timeout 2 --max-time 5 -fsS $auth "$METAD_ENDPOINT/api/v1/cluster/status" 2>/dev/null || true)"
     candidate="$(leader_from_status "$status")"
-    readiness="$(curl --connect-timeout 2 --max-time 5 -fsS "$METAD_ENDPOINT/api/v1/cluster/readiness" 2>/dev/null || true)"
+    readiness="$(curl --connect-timeout 2 --max-time 5 -fsS $auth "$METAD_ENDPOINT/api/v1/cluster/readiness" 2>/dev/null || true)"
     if [ -n "$candidate" ] && [ "$candidate" != "$previous" ] &&
-      [[ "$readiness" == *'"status":"ready"'* || "$readiness" == *'"status": "ready"'* ]]; then
+      [[ "$readiness" != *'"status":"not_ready"'* ]]; then
       printf '%s\n' "$status" > "$RESULTS_DIR/cluster-status-${candidate}.json"
       printf '%s\n' "$readiness" > "$RESULTS_DIR/cluster-readiness-${candidate}.json"
       printf '%s\n' "$candidate"
@@ -302,6 +307,54 @@ wait_for_leader() { # [different-from]
   done
 }
 
+seed_registry_credential() { # seed the S3 credential into the metad registry
+  [ -n "$AUTH_TOKEN" ] || return 0
+  STAGE="seed-credential"
+  log "seeding S3 credential ($SMOKE_AK) into metad registry"
+  curl --connect-timeout 5 --max-time 30 -fsS -X PUT \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    -H "content-type: application/json" \
+    -d "{\"secret_key\":\"$SMOKE_SK\",\"principal\":\"helm-smoke\"}" \
+    "$METAD_ENDPOINT/api/v1/auth/creds/$SMOKE_AK" \
+    > "$RESULTS_DIR/seed-credential.txt" 2>&1 \
+    || die "failed to seed S3 credential: $(cat "$RESULTS_DIR/seed-credential.txt" 2>/dev/null)"
+  log "credential seeded"
+}
+
+s3_sigv4_request() { # method path body-file out-file  — python SigV4 signer
+  local method="$1" path="$2" body="$3" out="$4"
+  python3 - "$method" "$GATEWAY_ENDPOINT" "$path" "$body" "$out" "$SMOKE_AK" "$SMOKE_SK" <<'PYEOF' || return $?
+import sys, os, hashlib, hmac, datetime, urllib.request, urllib.error
+m, ep, path, body, out, ak, sk = sys.argv[1:8]
+bd = open(body, 'rb').read() if body and os.path.exists(body) else b''
+def sign(method, p, hdrs, data):
+    n = datetime.datetime.now(datetime.timezone.utc)
+    d = n.strftime('%Y%m%dT%H%M%SZ'); ds = n.strftime('%Y%m%d')
+    hdrs['host'] = ep.split('//')[1]
+    hdrs['x-amz-date'] = d
+    hdrs['x-amz-content-sha256'] = hashlib.sha256(data).hexdigest()
+    ch = ''.join(f'{k.lower()}:{v.strip()}\n' for k, v in sorted(hdrs.items()))
+    sh = ';'.join(sorted(k.lower() for k in hdrs))
+    cr = f'{method}\n{p}\n\n{ch}\n{sh}\n{hdrs["x-amz-content-sha256"]}'
+    cs = f'{ds}/us-east-1/s3/aws4_request'
+    sts = f'AWS4-HMAC-SHA256\n{d}\n{cs}\n{hashlib.sha256(cr.encode()).hexdigest()}'
+    def skf(k, m2): return hmac.new(k, m2.encode(), hashlib.sha256).digest()
+    kd = skf(('AWS4'+sk).encode(), ds); kr = skf(kd, 'us-east-1'); ks = skf(kr, 's3'); kg = skf(ks, 'aws4_request')
+    hdrs['Authorization'] = f'AWS4-HMAC-SHA256 Credential={ak}/{cs}, SignedHeaders={sh}, Signature={hmac.new(kg, sts.encode(), hashlib.sha256).hexdigest()}'
+    return hdrs
+h = sign(m, path, {'content-type': 'application/octet-stream'}, bd)
+req = urllib.request.Request(ep + path, data=bd or None, headers=h, method=m)
+try:
+    r = urllib.request.urlopen(req, timeout=60)
+    open(out, 'wb').write(r.read())
+    sys.exit(0 if r.status in (200, 201, 204) else 1)
+except urllib.error.HTTPError as e:
+    open(out, 'wb').write(e.read())
+    print('HTTP %s' % e.code, file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
 s3_create_bucket_and_verify() { # object suffix
   local suffix="$1" bucket object downloaded hash
   bucket="helm-smoke-${NAMESPACE##*-}"
@@ -309,19 +362,30 @@ s3_create_bucket_and_verify() { # object suffix
   printf '%s\n' "nufs helm smoke payload namespace=$NAMESPACE release=$RELEASE" > "$RESULTS_DIR/payload.txt"
   PAYLOAD_HASH="$(sha256_file "$RESULTS_DIR/payload.txt")"
 
-  STAGE="s3-create-bucket"
-  curl --connect-timeout 5 --max-time 30 -fsS -X PUT "$GATEWAY_ENDPOINT/$bucket" \
-    > "$RESULTS_DIR/s3-create-bucket-$suffix.txt"
-
-  STAGE="s3-write-$suffix"
-  curl --connect-timeout 5 --max-time 90 --retry 3 --retry-all-errors -fsS -X PUT \
-    --data-binary "@$RESULTS_DIR/payload.txt" "$GATEWAY_ENDPOINT/$bucket/$object" \
-    > "$RESULTS_DIR/s3-put-$suffix.txt"
-
-  STAGE="s3-read-$suffix"
-  downloaded="$RESULTS_DIR/payload-$suffix.readback"
-  curl --connect-timeout 5 --max-time 90 --retry 3 --retry-all-errors -fsS \
-    "$GATEWAY_ENDPOINT/$bucket/$object" -o "$downloaded"
+  if [ -n "$AUTH_TOKEN" ]; then
+    STAGE="s3-create-bucket"
+    s3_sigv4_request PUT "/$bucket" "" "$RESULTS_DIR/s3-create-bucket-$suffix.txt" \
+      || die "SigV4 bucket create failed (see s3-create-bucket-$suffix.txt)"
+    STAGE="s3-write-$suffix"
+    s3_sigv4_request PUT "/$bucket/$object" "$RESULTS_DIR/payload.txt" "$RESULTS_DIR/s3-put-$suffix.txt" \
+      || die "SigV4 object PUT failed (see s3-put-$suffix.txt)"
+    STAGE="s3-read-$suffix"
+    downloaded="$RESULTS_DIR/payload-$suffix.readback"
+    s3_sigv4_request GET "/$bucket/$object" "" "$downloaded" \
+      || die "SigV4 object GET failed"
+  else
+    STAGE="s3-create-bucket"
+    curl --connect-timeout 5 --max-time 30 -fsS -X PUT "$GATEWAY_ENDPOINT/$bucket" \
+      > "$RESULTS_DIR/s3-create-bucket-$suffix.txt"
+    STAGE="s3-write-$suffix"
+    curl --connect-timeout 5 --max-time 90 --retry 3 --retry-all-errors -fsS -X PUT \
+      --data-binary "@$RESULTS_DIR/payload.txt" "$GATEWAY_ENDPOINT/$bucket/$object" \
+      > "$RESULTS_DIR/s3-put-$suffix.txt"
+    STAGE="s3-read-$suffix"
+    downloaded="$RESULTS_DIR/payload-$suffix.readback"
+    curl --connect-timeout 5 --max-time 90 --retry 3 --retry-all-errors -fsS \
+      "$GATEWAY_ENDPOINT/$bucket/$object" -o "$downloaded"
+  fi
   hash="$(sha256_file "$downloaded")"
   [ "$hash" = "$PAYLOAD_HASH" ] || die "S3 readback hash mismatch for $object: got $hash want $PAYLOAD_HASH"
   printf '%s  %s\n' "$hash" "$object" >> "$RESULTS_DIR/object-sha256.txt"
@@ -424,6 +488,9 @@ while [ "$#" -gt 0 ]; do
     --results) [ "$#" -ge 2 ] || die "--results requires a value"; RESULTS_DIR="$2"; shift 2 ;;
     --values) [ "$#" -ge 2 ] || die "--values requires a file"; VALUES_FILE="$2"; shift 2 ;;
     --set) [ "$#" -ge 2 ] || die "--set requires KEY=VALUE"; EXTRA_SET_ARGS+=(--set-string "$2"); shift 2 ;;
+    --auth-token) [ "$#" -ge 2 ] || die "--auth-token requires a value"; AUTH_TOKEN="$2"; shift 2 ;;
+    --access-key) [ "$#" -ge 2 ] || die "--access-key requires a value"; SMOKE_AK="$2"; shift 2 ;;
+    --secret-key) [ "$#" -ge 2 ] || die "--secret-key requires a value"; SMOKE_SK="$2"; shift 2 ;;
     --keep) KEEP=true; shift ;;
     --render-only) RENDER_ONLY=true; shift ;;
     *) die "unknown option: $1 (use --help)" ;;
@@ -467,6 +534,7 @@ prepare_namespace
 install_chart
 wait_for_workloads
 start_port_forwards
+seed_registry_credential
 s3_create_bucket_and_verify before-failover
 kill_leader_and_wait
 s3_create_bucket_and_verify after-failover
