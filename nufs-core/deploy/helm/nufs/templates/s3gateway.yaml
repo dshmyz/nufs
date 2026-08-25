@@ -31,9 +31,8 @@ spec:
               set -e
               exec /usr/local/bin/nufs-s3 \
                 --listen=0.0.0.0:{{ .Values.s3gateway.service.port }} \
-                --meta-addr=https://{{ .Release.Name }}-metad:{{ .Values.metad.service.port }} \
+                --meta-addr={{ .Release.Name }}-metad:{{ .Values.metad.service.port }} \
                 --meta-auth-token="$(cat /etc/nufs-secret/auth-token)" \
-                --meta-tls-ca=/etc/nufs-secret/ca.crt \
                 "$@"
           {{- else }}
           command: ["/usr/local/bin/nufs-s3"]

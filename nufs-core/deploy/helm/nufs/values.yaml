@@ -10,10 +10,9 @@ global:
   #                         --meta-auth-token, datanode metadata/ops auth)
   #   token-signing-key     metad mount-token HMAC key
   #   credential-secret-key metad registry sealing key (32-byte hex)
-  #   ca.crt                CA that signed tls.crt (gateway -> metad trust)
-  #   tls.crt, tls.key      metad ops-server TLS certificate + key
-  # When empty, components run without auth/TLS (development only); production
-  # deployments and the production smoke require it.
+  # When empty, components run without auth (development only); production
+  # deployments and the production smoke require it. In-cluster transport is
+  # plaintext (trusted network); TLS terminates at the edge/ingress.
   security:
     secretName: ""
 

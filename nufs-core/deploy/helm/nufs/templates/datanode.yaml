@@ -65,10 +65,10 @@ spec:
                 --trace-enabled=true \
                 --trace-endpoint={{ .Values.observability.tracing.endpoint }} \
                 --trace-insecure={{ .Values.observability.tracing.insecure }} {{- end }} \
-                {{- if .Values.global.security.secretName }} \
+                {{- if .Values.global.security.secretName }}
                 --metadata-auth-token="$(cat /etc/nufs-secret/auth-token)" \
                 --ops-auth-token="$(cat /etc/nufs-secret/auth-token)" \
-                {{- end }} \
+                {{- end }}
                 --log-json=true \
                 "$@"
           volumeMounts:

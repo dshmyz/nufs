@@ -62,8 +62,6 @@ spec:
                 --auth-token="$(cat /etc/nufs-secret/auth-token)" \
                 --token-signing-key="$(cat /etc/nufs-secret/token-signing-key)" \
                 --credential-secret-key="$(cat /etc/nufs-secret/credential-secret-key)" \
-                --tls-cert=/etc/nufs-secret/tls.crt \
-                --tls-key=/etc/nufs-secret/tls.key \
                 "$@"
           {{- else }}
           command: ["/usr/local/bin/metad"]
@@ -78,15 +76,16 @@ spec:
             - "--raft-dir=/data/raft"
             {{- if .Values.metad.config.raftEnabled }}
             - "--raft-bootstrap=true"
-            # Only the ordinal-0 pod ({{ .Release.Name }}-metad-0) may seed the
-            # cluster. --raft-bootstrap is passed to every replica, but metad
-            # defers to --raft-bootstrap-owner: any non-owner with
-            # --raft-bootstrap=true skips its own seed and is pulled in as a
-            # voter by the owner's reconcile loop. Without this, all replicas
-            # seed their own 1-voter singleton, win independent elections with
-            # conflicting terms, and the cluster never converges (re-election
-            # stalls after a leader kill).
-            - "--raft-bootstrap-owner={{ .Release.Name }}-metad-0"
+            # Only the ordinal-0 pod may seed the cluster. --raft-bootstrap is
+            # passed to every replica, but metad defers to
+            # --raft-bootstrap-owner: any non-owner with --raft-bootstrap=true
+            # skips its own seed and is pulled in as a voter by the owner's
+            # reconcile loop. Without this, all replicas seed their own 1-voter
+            # singleton, win independent elections with conflicting terms, and
+            # the cluster never converges (re-election stalls after a leader
+            # kill). The owner is the node ID (meta-1 = the ordinal-0 pod), not
+            # the pod name — metad maps each pod to meta-<ordinal+1>.
+            - "--raft-bootstrap-owner=meta-1"
             - "--raft-bootstrap-peers={{- range $i := until (int .Values.metad.replicaCount) }}{{- if $i }},{{- end }}meta-{{ add $i 1 }}={{ $.Release.Name }}-metad-{{ $i }}.{{ $.Release.Name }}-metad-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.metad.service.raftPort }}{{- end }}"
             - "--raft-peer-ops={{- range $i := until (int .Values.metad.replicaCount) }}{{- if $i }},{{- end }}meta-{{ add $i 1 }}=http://{{ $.Release.Name }}-metad-{{ $i }}.{{ $.Release.Name }}-metad-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.metad.service.port }}{{- end }}"
             - "--advertise-ops-addr=http://$(POD_NAME).{{ .Release.Name }}-metad-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.metad.service.port }}"
