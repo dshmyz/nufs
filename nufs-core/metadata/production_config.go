@@ -16,7 +16,6 @@ const (
 type ProductionValidationConfig struct {
 	Mode             RuntimeMode
 	JWTSecret        string
-	S3CredentialPath string
 	RaftNodeCount    int
 	TLSEnabled       bool
 	AllowInsecureDev bool
@@ -53,9 +52,6 @@ func ValidateProductionConfig(cfg ProductionValidationConfig) error {
 	}
 	if cfg.CredentialSecretKey == "" {
 		errs = append(errs, "production credential secret key is required (S3 gateway credential sync)")
-	}
-	if cfg.S3CredentialPath == "" {
-		errs = append(errs, "production S3 credential source is required")
 	}
 	if cfg.RaftNodeCount < 3 {
 		errs = append(errs, "production Raft requires at least 3 nodes")
