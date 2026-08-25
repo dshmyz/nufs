@@ -23,16 +23,34 @@ spec:
         - name: s3gateway
           image: "{{ .Values.global.imageRegistry }}{{ .Values.s3gateway.image.repository }}:{{ .Values.s3gateway.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.s3gateway.image.pullPolicy }}
+          {{- if .Values.global.security.secretName }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              exec /usr/local/bin/nufs-s3 \
+                --listen=0.0.0.0:{{ .Values.s3gateway.service.port }} \
+                --meta-addr=https://{{ .Release.Name }}-metad:{{ .Values.metad.service.port }} \
+                --meta-auth-token="$(cat /etc/nufs-secret/auth-token)" \
+                --meta-tls-ca=/etc/nufs-secret/ca.crt \
+                "$@"
+          {{- else }}
           command: ["/usr/local/bin/nufs-s3"]
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.s3gateway.service.port }}
           env:
-            - name: NUFS_METAD_ADDR
-              value: "{{ .Release.Name }}-metad:{{ .Values.metad.service.port }}"
             {{- if .Values.s3gateway.config.rbac.enabled }}
             - name: NUFS_RBAC_ENABLED
               value: "true"
+            {{- end }}
+          volumeMounts:
+            {{- if .Values.global.security.secretName }}
+            - name: nufs-secret
+              mountPath: /etc/nufs-secret
+              readOnly: true
             {{- end }}
           resources:
             {{- toYaml .Values.s3gateway.resources | nindent 12 }}
@@ -48,6 +66,12 @@ spec:
               port: http
             initialDelaySeconds: 3
             periodSeconds: 10
+      volumes:
+        {{- if .Values.global.security.secretName }}
+        - name: nufs-secret
+          secret:
+            secretName: {{ .Values.global.security.secretName }}
+        {{- end }}
       {{- with .Values.s3gateway.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

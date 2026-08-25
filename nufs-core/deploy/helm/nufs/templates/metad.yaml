@@ -52,7 +52,22 @@ spec:
               containerPort: {{ .Values.metad.service.port }}
             - name: raft
               containerPort: {{ .Values.metad.service.raftPort }}
+          {{- if .Values.global.security.secretName }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              exec /usr/local/bin/metad \
+                --auth-token="$(cat /etc/nufs-secret/auth-token)" \
+                --token-signing-key="$(cat /etc/nufs-secret/token-signing-key)" \
+                --credential-secret-key="$(cat /etc/nufs-secret/credential-secret-key)" \
+                --tls-cert=/etc/nufs-secret/tls.crt \
+                --tls-key=/etc/nufs-secret/tls.key \
+                "$@"
+          {{- else }}
           command: ["/usr/local/bin/metad"]
+          {{- end }}
           args:
             - "--data-dir=/data/metadata"
             - "--ops-addr=0.0.0.0:{{ .Values.metad.service.port }}"
@@ -105,6 +120,11 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.global.security.secretName }}
+            - name: nufs-secret
+              mountPath: /etc/nufs-secret
+              readOnly: true
+            {{- end }}
             {{- if .Values.metad.backup.enabled }}
             - name: backup-tmp
               mountPath: {{ .Values.metad.backup.localTmpDir }}
@@ -129,6 +149,11 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:
+        {{- if .Values.global.security.secretName }}
+        - name: nufs-secret
+          secret:
+            secretName: {{ .Values.global.security.secretName }}
+        {{- end }}
         {{- if .Values.metad.backup.enabled }}
         - name: backup-tmp
           emptyDir: {}

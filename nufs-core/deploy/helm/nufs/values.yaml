@@ -5,6 +5,17 @@ global:
   imageRegistry: ""
   imagePullSecrets: []
   storageClass: ""
+  # Shared production-security Secret. Must contain the keys:
+  #   auth-token            operator bearer (metad --auth-token, gateway
+  #                         --meta-auth-token, datanode metadata/ops auth)
+  #   token-signing-key     metad mount-token HMAC key
+  #   credential-secret-key metad registry sealing key (32-byte hex)
+  #   ca.crt                CA that signed tls.crt (gateway -> metad trust)
+  #   tls.crt, tls.key      metad ops-server TLS certificate + key
+  # When empty, components run without auth/TLS (development only); production
+  # deployments and the production smoke require it.
+  security:
+    secretName: ""
 
 # metad service configuration
 metad:

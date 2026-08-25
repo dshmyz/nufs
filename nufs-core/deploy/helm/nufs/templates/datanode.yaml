@@ -65,11 +65,20 @@ spec:
                 --trace-enabled=true \
                 --trace-endpoint={{ .Values.observability.tracing.endpoint }} \
                 --trace-insecure={{ .Values.observability.tracing.insecure }} {{- end }} \
+                {{- if .Values.global.security.secretName }} \
+                --metadata-auth-token="$(cat /etc/nufs-secret/auth-token)" \
+                --ops-auth-token="$(cat /etc/nufs-secret/auth-token)" \
+                {{- end }} \
                 --log-json=true \
                 "$@"
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.global.security.secretName }}
+            - name: nufs-secret
+              mountPath: /etc/nufs-secret
+              readOnly: true
+            {{- end }}
             {{- if .Values.datanode.config.tls.enabled }}
             - name: tls
               mountPath: /tls
@@ -90,6 +99,11 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:
+        {{- if .Values.global.security.secretName }}
+        - name: nufs-secret
+          secret:
+            secretName: {{ .Values.global.security.secretName }}
+        {{- end }}
         {{- if .Values.datanode.config.tls.enabled }}
         - name: tls
           secret:
