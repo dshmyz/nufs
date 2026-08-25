@@ -11,6 +11,7 @@ import (
 	gos3 "github.com/dshmyz/nufs/nufs-core/gateway/s3"
 	"github.com/dshmyz/nufs/nufs-core/internal/config"
 	"github.com/dshmyz/nufs/nufs-core/internal/logging"
+	"github.com/dshmyz/nufs/nufs-core/internal/tlsutil"
 	"github.com/dshmyz/nufs/nufs-core/metadata"
 )
 
@@ -20,6 +21,8 @@ func main() {
 		listenAddr          = flag.String("listen", ":8080", "HTTP listen address")
 		metaAddr            = flag.String("meta-addr", "localhost:8091", "Metadata service address (host:port)")
 		metaAuthToken       = flag.String("meta-auth-token", "", "Operator bearer token for the metad credential sync (--auth-token of metad). When set, the gateway pulls its credentials from the metad registry instead of local files/flags.")
+		metaTLSCA           = flag.String("meta-tls-ca", "", "CA certificate file to trust the metad's TLS server cert (enables HTTPS to metad)")
+		metaTLSSkipVerify   = flag.Bool("meta-tls-skip-verify", false, "Skip TLS server cert verification when connecting to metad (test only; prefer --meta-tls-ca in production)")
 		credentialSyncInt   = flag.Duration("credential-sync-interval", 60*time.Second, "How often to refresh credentials from the metad registry (0 = startup pull only)")
 		accessKey           = flag.String("access-key", "", "DEPRECATED: local access key fallback when --meta-auth-token is unset (empty = anonymous)")
 		secretKey           = flag.String("secret-key", "", "DEPRECATED: local secret key fallback when --meta-auth-token is unset")
@@ -48,8 +51,18 @@ func main() {
 
 	log.Info("starting S3 gateway", "meta", *metaAddr, "listen", *listenAddr, "max_object_size", *maxObjectSize)
 
-	meta := metadata.NewHTTPClient("http://"+*metaAddr, 30*time.Second)
+	metaScheme := "http"
+	if *metaTLSCA != "" || *metaTLSSkipVerify {
+		metaScheme = "https"
+	}
+	meta := metadata.NewHTTPClient(metaScheme+"://"+*metaAddr, 30*time.Second)
 	defer meta.Close()
+	if *metaTLSCA != "" || *metaTLSSkipVerify {
+		if err := meta.EnableTLS(tlsutil.Config{CAFile: *metaTLSCA, SkipVerify: *metaTLSSkipVerify}); err != nil {
+			log.Error("metad TLS config", "error", err)
+			os.Exit(1)
+		}
+	}
 
 	// When an operator token is configured, every metad call (data plane and
 	// the credential sync) carries it: metad's BearerAuth gates non-public
