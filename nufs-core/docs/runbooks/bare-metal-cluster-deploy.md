@@ -2,6 +2,12 @@
 
 NUFS 裸机完整集群部署：3 metad（raft quorum）+ 3 datanode（RF=3）+ 1 S3 网关，生产模式（认证开启，无 --allow-insecure-dev）。
 
+> **有现成自动化，嫌手工命令多直接用它**：
+> - 部署脚本（按 IP 自动识别角色，支持 flag / `--config` 双模式）：[deploy/vm/deploy.sh](../deploy/vm/deploy.sh)（配置模板 [cluster.env.example](../deploy/vm/cluster.env.example)）
+> - Ansible 一条命令部署：[deploy/ansible/site.yml](../deploy/ansible/site.yml)（清单 [inventory.ini](../deploy/ansible/inventory.ini)，已有二进制用 `-e build_binaries=false -e binaries_dir=<目录>`）
+>
+> 下方保留手工步骤，用于理解/排障。
+
 ## 端口规划（单机多进程，或跨机改 IP）
 
 | 组件 | ops | raft | data/chunk | datanode ops |

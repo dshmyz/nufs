@@ -1,0 +1,25 @@
+---
+# 停止所有节点上的 NUFS 服务（s3/datanode 先停，metad 后停）
+# 用法: ansible-playbook -i inventory.ini down.yml
+
+- name: Tear down NUFS on all nodes
+  hosts: all
+  gather_facts: false
+  become: "{{ need_sudo | default(true) }}"
+  vars:
+    deploy_env:
+      NUFS_BIN: "{{ bin_dir }}"
+      NUFS_RUN_DIR: "{{ run_dir }}"
+      LC_ALL: "C.UTF-8"
+      LANG: "C.UTF-8"
+  tasks:
+    - name: run deploy.sh down
+      command: "{{ deploy_dir }}/deploy.sh down"
+      environment: "{{ deploy_env }}"
+      register: down_result
+      changed_when: false
+      ignore_errors: true
+    - name: show result
+      debug:
+        msg: "{{ down_result.stdout }}"
+      when: down_result is defined
