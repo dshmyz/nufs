@@ -5,13 +5,7 @@
 - name: Tear down NUFS on all nodes
   hosts: all
   gather_facts: false
-  become: "{{ need_sudo | default(true) }}"
-  vars:
-    deploy_env:
-      NUFS_BIN: "{{ bin_dir }}"
-      NUFS_RUN_DIR: "{{ run_dir }}"
-      LC_ALL: "C.UTF-8"
-      LANG: "C.UTF-8"
+  become: "{{ need_sudo }}"
   tasks:
     - name: run deploy.sh down
       command: "{{ deploy_dir }}/deploy.sh down"

@@ -1,0 +1,76 @@
+---
+# 通用步骤：编译/取二进制 → 分发到所有节点 → 生成每节点 YAML 配置。
+# 被 metad/datanode/s3 三个模块 playbook 各自 import（幂等，可重复跑）。
+#
+# 已有安装包：-e build_binaries=false -e binaries_dir=/path/to/已构建二进制
+
+- name: Build binaries
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    core_dir: "{{ playbook_dir + '/../../' }}"   # nufs-core
+    build_binaries: true   # 控制机编译；已有二进制时 -e build_binaries=false
+  tasks:
+    - name: create binaries dir
+      file:
+        path: "{{ binaries_dir }}"
+        state: directory
+    - name: build metad
+      command: "go build -o {{ binaries_dir }}/metad ./cmd/metad"
+      args:
+        chdir: "{{ core_dir }}"
+      when: build_binaries | bool
+    - name: build datanode
+      command: "go build -o {{ binaries_dir }}/datanode ./cmd/datanode"
+      args:
+        chdir: "{{ core_dir }}"
+      when: build_binaries | bool
+    - name: build nufs-s3
+      command: "go build -o {{ binaries_dir }}/nufs-s3 ./cmd/nufs-s3"
+      args:
+        chdir: "{{ core_dir }}"
+      when: build_binaries | bool
+    - name: check binaries exist
+      stat:
+        path: "{{ binaries_dir }}/{{ item }}"
+      loop: [metad, datanode, nufs-s3]
+      register: binstat
+    - name: fail if any binary missing
+      fail:
+        msg: "{{ item.item }} 缺失（binaries_dir={{ binaries_dir }} 里没有；开编译或放对位置）"
+      loop: "{{ binstat.results }}"
+      when: not item.stat.exists
+
+- name: Distribute to all nodes
+  hosts: all
+  become: "{{ need_sudo }}"
+  tasks:
+    - name: create base dirs
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ bin_dir }}"
+        - "{{ deploy_dir }}"
+        - "{{ data_root }}"
+        - "{{ run_dir }}"
+    - name: copy binaries
+      copy:
+        src: "{{ binaries_dir }}/{{ item }}"
+        dest: "{{ bin_dir }}/{{ item }}"
+        mode: "0755"
+      loop: [metad, datanode, nufs-s3]
+    - name: copy deploy.sh
+      copy:
+        src: "{{ deploy_script_src }}"
+        dest: "{{ deploy_dir }}/deploy.sh"
+        mode: "0755"
+    - name: render cluster.env
+      template:
+        src: cluster.env.j2
+        dest: "{{ deploy_dir }}/cluster.env"
+        mode: "0600"
+    - name: gen-config (per-node YAML)
+      command: "{{ deploy_dir }}/deploy.sh gen-config"
+      environment: "{{ deploy_env }}"

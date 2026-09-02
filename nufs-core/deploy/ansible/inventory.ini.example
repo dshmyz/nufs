@@ -1,0 +1,52 @@
+# ============================================================
+# NUFS Ansible 部署清单模板
+# 用法：cp inventory.ini.example inventory.ini，填真实 IP，然后：
+#   ansible-playbook -i inventory.ini site.yml     # 全量部署
+#   ansible-playbook -i inventory.ini down.yml     # 停止
+# 端口/路径/need_sudo/seed_credentials 在 group_vars/all.yml 里改。
+#
+# 拓扑 A（默认，推荐）：3 台节点，每台 = metad-N + datanode-N，网关挂在节点 A
+# 拓扑 B（独立机器）：metad 和 datanode 各占不同 VM，网关单独一台或挂在某台
+# ============================================================
+
+# ---------- 拓扑 A：3 节点（推荐） ----------
+# 把 <NODE-A-IP> 换成每台 VM 的真实 IP（deploy.sh 靠 IP 自动识别角色）
+[metad_nodes]
+nufs-a ansible_host=<NODE-A-IP> meta_ordinal=1
+nufs-b ansible_host=<NODE-B-IP> meta_ordinal=2
+nufs-c ansible_host=<NODE-C-IP> meta_ordinal=3
+
+[datanode_nodes]
+nufs-a ansible_host=<NODE-A-IP> dn_ordinal=1
+nufs-b ansible_host=<NODE-B-IP> dn_ordinal=2
+nufs-c ansible_host=<NODE-C-IP> dn_ordinal=3
+
+[s3_gateway]
+nufs-a ansible_host=<NODE-A-IP>
+
+# ============================================================
+# 拓扑 B（需要的话取消下面注释，删掉上面对应行）
+# metad 三台独立 VM，datanode 三台独立 VM，网关单独一台
+# ============================================================
+# [metad_nodes]
+# meta-1 ansible_host=<M1-IP> meta_ordinal=1
+# meta-2 ansible_host=<M2-IP> meta_ordinal=2
+# meta-3 ansible_host=<M3-IP> meta_ordinal=3
+#
+# [datanode_nodes]
+# dn-1 ansible_host=<D1-IP> dn_ordinal=1
+# dn-2 ansible_host=<D2-IP> dn_ordinal=2
+# dn-3 ansible_host=<D3-IP> dn_ordinal=3
+#
+# [s3_gateway]
+# gw ansible_host=<GW-IP>
+
+# ============================================================
+# 说明
+# ============================================================
+# - meta_ordinal / dn_ordinal：节点编号（1/2/3），决定端口偏移和 owner
+#   （metad-1 即 owner，须先启动）。inventory 里行的顺序无关紧要。
+# - metad_nodes 必须是奇数台（raft quorum），最少 3 台。
+# - 需要指定 SSH 用户/密钥时，在主机行追加：
+#     nufs-a ansible_host=IP meta_ordinal=1 ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+# - 已有安装包（跳过编译）：命令行加 -e build_binaries=false -e binaries_dir=/path/to/binaries

@@ -1,0 +1,21 @@
+---
+# S3 网关模块：启动网关 + 可选 seed 凭据（生产模式无凭据会 403）。
+# 用法：ansible-playbook -i inventory.ini s3.yml（自动先跑 common）
+
+- name: s3 - import common (build + distribute)
+  import_playbook: common.yml
+
+- name: s3 - start gateway
+  hosts: s3_gateway
+  become: "{{ need_sudo }}"
+  tasks:
+    - name: start
+      command: "{{ deploy_dir }}/deploy.sh start"
+      environment: "{{ deploy_env }}"
+      changed_when: false
+    - name: seed S3 credentials
+      command: "{{ deploy_dir }}/deploy.sh seed-cred {{ item.access_key }} {{ item.secret_key }}"
+      environment: "{{ deploy_env }}"
+      loop: "{{ seed_credentials | default([]) }}"
+      when: seed_credentials | default([]) | length > 0
+      changed_when: false

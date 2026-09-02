@@ -1,0 +1,37 @@
+---
+# metad 模块：owner（meta_ordinal=1）先启动并等待当选 → 其余节点启动。
+# 用法：ansible-playbook -i inventory.ini metad.yml（自动先跑 common）
+
+- name: metad - import common (build + distribute)
+  import_playbook: common.yml
+
+- name: metad - start owner first and wait leader
+  hosts: metad_nodes
+  become: "{{ need_sudo }}"
+  tasks:
+    - name: start on owner
+      command: "{{ deploy_dir }}/deploy.sh start"
+      environment: "{{ deploy_env }}"
+      when: meta_ordinal | int == 1
+      changed_when: false
+    - name: wait for owner to become leader
+      shell: >-
+        curl -fsS -H "Authorization: Bearer {{ auth_token }}"
+        http://{{ ansible_host }}:{{ metad_ops_port }}/api/v1/cluster/status
+        | grep -q '"is_leader"[[:space:]]*:[[:space:]]*true'
+      register: leadercheck
+      until: leadercheck.rc == 0
+      retries: 30
+      delay: 2
+      when: meta_ordinal | int == 1
+      changed_when: false
+
+- name: metad - start remaining nodes
+  hosts: metad_nodes
+  become: "{{ need_sudo }}"
+  tasks:
+    - name: start
+      command: "{{ deploy_dir }}/deploy.sh start"
+      environment: "{{ deploy_env }}"
+      when: meta_ordinal | int != 1
+      changed_when: false

@@ -1,26 +1,19 @@
 ---
-# NUFS 多节点集群 Ansible 部署
+# NUFS 多节点集群一键部署
 #
-# 用法:
-#   ansible-playbook -i inventory.ini site.yml
+# 用法: ansible-playbook -i inventory.ini site.yml
 #
-# 流程（复用 deploy/vm/deploy.sh 作为执行核心，Ansible 负责分发/顺序/密钥）:
-#   1. 控制机编译 3 个二进制到 binaries_dir/（已有安装包时 build_binaries=false 跳过）
-#   2. 生成/复用三把密钥（<playbook_dir>/secrets/，首次生成后保留）
-#   3. 分发二进制 + deploy.sh + cluster.env 到每台节点
-#   4. 每台节点 gen-config 生成 YAML 配置
-#   5. metad-1（owner）所在节点先 start，等它当选 leader
-#   6. 其余节点 start
-#   7. 在 owner 节点跑 verify（raft quorum + datanode 注册）
+# 只部署某个模块（各自会先跑 common 的构建+分发）:
+#   ansible-playbook -i inventory.ini metad.yml
+#   ansible-playbook -i inventory.ini datanode.yml
+#   ansible-playbook -i inventory.ini s3.yml
 #
 # 可覆盖参数（-e k=v）:
 #   need_sudo=false     免 sudo（本机/测试）
+#   build_binaries=false  binaries_dir=<已有二进制目录>   已有安装包时跳过编译
 #   data_root=... bin_dir=... deploy_dir=... run_dir=...
-#   build_binaries=false  core_dir=<nufs-core 绝对路径>  binaries_dir=<已有二进制目录>
-# 密钥默认自动生成存到 secrets/；要固定密钥，直接编辑 secrets/ 下文件。
 #
-# 说明：deploy.sh 按节点本机 IP 识别角色，所以 inventory 里的 ansible_host
-# 必须是各节点真实 IP（不能是 DNS 名），与 cluster.env 里一致。
+# 说明：deploy.sh 按节点本机 IP 识别角色，inventory 的 ansible_host 必须填真实 IP。
 
 - name: Validate inventory
   hosts: localhost
@@ -42,187 +35,25 @@
         that: groups['s3_gateway'] | length == 1
         fail_msg: "s3_gateway 必须恰好 1 台，当前 {{ groups['s3_gateway'] | length }} 台"
 
-- name: Build binaries on controller
-  hosts: localhost
-  connection: local
-  gather_facts: false
-  vars:
-    core_dir: "{{ playbook_dir + '/../../' }}"   # nufs-core
-    binaries_dir: "{{ playbook_dir + '/staging' }}"  # 二进制目录，可用 -e binaries_dir=<已有目录> 指向现成安装包
-    build_binaries: true   # 控制机编译；已有二进制时 -e build_binaries=false，直接用 binaries_dir 里的
-  tasks:
-    - name: create binaries dir
-      file:
-        path: "{{ binaries_dir }}"
-        state: directory
-    - name: build metad
-      command: "go build -o {{ binaries_dir }}/metad ./cmd/metad"
-      args:
-        chdir: "{{ core_dir }}"
-      when: build_binaries | bool
-    - name: build datanode
-      command: "go build -o {{ binaries_dir }}/datanode ./cmd/datanode"
-      args:
-        chdir: "{{ core_dir }}"
-      when: build_binaries | bool
-    - name: build nufs-s3
-      command: "go build -o {{ binaries_dir }}/nufs-s3 ./cmd/nufs-s3"
-      args:
-        chdir: "{{ core_dir }}"
-      when: build_binaries | bool
-    - name: check binaries exist
-      stat:
-        path: "{{ binaries_dir }}/{{ item }}"
-      loop: [metad, datanode, nufs-s3]
-      register: binstat
-    - name: fail if any binary missing
-      fail:
-        msg: "{{ item.item }} 缺失（binaries_dir={{ binaries_dir }} 里没有；开编译或放对位置）"
-      loop: "{{ binstat.results }}"
-      when: not item.stat.exists
+- name: metad 模块
+  import_playbook: metad.yml
 
-- name: Prepare all nodes (binaries + script + cluster.env + gen-config)
-  hosts: all
-  gather_facts: false
-  become: "{{ need_sudo | default(true) }}"
-  vars:
-    binaries_dir: "{{ playbook_dir + '/staging' }}"
-    deploy_script_src: "{{ playbook_dir + '/../vm/deploy.sh' }}"
-    # 密钥：首次用 password lookup 生成并持久化到 secrets/，之后复用
-    auth_token: "{{ lookup('ansible.builtin.password', playbook_dir + '/secrets/auth_token chars=hexdigits length=32') }}"
-    token_signing_key: "{{ lookup('ansible.builtin.password', playbook_dir + '/secrets/token_signing_key chars=hexdigits length=32') }}"
-    credential_secret_key: "{{ lookup('ansible.builtin.password', playbook_dir + '/secrets/credential_secret_key chars=hexdigits length=64') }}"
-    # 按 ordinal 排序的节点列表（inventory 顺序无关）
-    metad_hosts: "{{ groups['metad_nodes'] | map('extract', hostvars) | list | sort(attribute='meta_ordinal') }}"
-    datanode_hosts: "{{ groups['datanode_nodes'] | map('extract', hostvars) | list | sort(attribute='dn_ordinal') }}"
-    gateway_host: "{{ groups['s3_gateway'] | map('extract', hostvars) | list | first }}"
-    owner_host: "{{ (metad_hosts | first).inventory_hostname }}"
-    metad1_ip: "{{ (metad_hosts | first).ansible_host | default((metad_hosts | first).inventory_hostname) }}"
-    deploy_env:
-      NUFS_BIN: "{{ bin_dir }}"
-      NUFS_RUN_DIR: "{{ run_dir }}"
-      # deploy.sh 输出中文，需 UTF-8 locale，否则 Ansible 严格 UTF-8 校验会拒绝模块结果
-      LC_ALL: "C.UTF-8"
-      LANG: "C.UTF-8"
-  tasks:
-    - name: create base dirs
-      file:
-        path: "{{ item }}"
-        state: directory
-      loop:
-        - "{{ bin_dir }}"
-        - "{{ deploy_dir }}"
-        - "{{ data_root }}"
-        - "{{ run_dir }}"
-    - name: copy binaries
-      copy:
-        src: "{{ binaries_dir }}/{{ item }}"
-        dest: "{{ bin_dir }}/{{ item }}"
-        mode: "0755"
-      loop: [metad, datanode, nufs-s3]
-    - name: copy deploy.sh
-      copy:
-        src: "{{ deploy_script_src }}"
-        dest: "{{ deploy_dir }}/deploy.sh"
-        mode: "0755"
-    - name: render cluster.env
-      template:
-        src: cluster.env.j2
-        dest: "{{ deploy_dir }}/cluster.env"
-        mode: "0600"
-    - name: gen-config (per-node YAML)
-      command: "{{ deploy_dir }}/deploy.sh gen-config"
-      environment: "{{ deploy_env }}"
+- name: datanode 模块
+  import_playbook: datanode.yml
 
-- name: Start owner (metad-1) and wait for leadership
-  hosts: all
-  gather_facts: false
-  become: "{{ need_sudo | default(true) }}"
-  vars:
-    auth_token: "{{ lookup('ansible.builtin.password', playbook_dir + '/secrets/auth_token chars=hexdigits length=32') }}"
-    metad_hosts: "{{ groups['metad_nodes'] | map('extract', hostvars) | list | sort(attribute='meta_ordinal') }}"
-    owner_host: "{{ (metad_hosts | first).inventory_hostname }}"
-    metad1_ip: "{{ (metad_hosts | first).ansible_host | default((metad_hosts | first).inventory_hostname) }}"
-    deploy_env:
-      NUFS_BIN: "{{ bin_dir }}"
-      NUFS_RUN_DIR: "{{ run_dir }}"
-      # deploy.sh 输出中文，需 UTF-8 locale，否则 Ansible 严格 UTF-8 校验会拒绝模块结果
-      LC_ALL: "C.UTF-8"
-      LANG: "C.UTF-8"
-  tasks:
-    - name: start on owner node
-      command: "{{ deploy_dir }}/deploy.sh start"
-      environment: "{{ deploy_env }}"
-      when: inventory_hostname == owner_host
-    - name: wait for metad-1 to become leader
-      shell: >-
-        curl -fsS -H "Authorization: Bearer {{ auth_token }}"
-        http://{{ metad1_ip }}:{{ metad_ops_port }}/api/v1/cluster/status
-        | grep -q '"is_leader"[[:space:]]*:[[:space:]]*true'
-      register: leadercheck
-      until: leadercheck.rc == 0
-      retries: 30
-      delay: 2
-      when: inventory_hostname == owner_host
-      changed_when: false
+- name: s3 模块
+  import_playbook: s3.yml
 
-- name: Start remaining nodes
-  hosts: all
-  gather_facts: false
-  become: "{{ need_sudo | default(true) }}"
-  vars:
-    metad_hosts: "{{ groups['metad_nodes'] | map('extract', hostvars) | list | sort(attribute='meta_ordinal') }}"
-    owner_host: "{{ (metad_hosts | first).inventory_hostname }}"
-    deploy_env:
-      NUFS_BIN: "{{ bin_dir }}"
-      NUFS_RUN_DIR: "{{ run_dir }}"
-      # deploy.sh 输出中文，需 UTF-8 locale，否则 Ansible 严格 UTF-8 校验会拒绝模块结果
-      LC_ALL: "C.UTF-8"
-      LANG: "C.UTF-8"
+- name: Final verify on owner node
+  hosts: metad_nodes
+  become: "{{ need_sudo }}"
   tasks:
-    - name: start
-      command: "{{ deploy_dir }}/deploy.sh start"
-      environment: "{{ deploy_env }}"
-      when: inventory_hostname != owner_host
-
-- name: Verify cluster from owner node
-  hosts: all
-  gather_facts: false
-  become: "{{ need_sudo | default(true) }}"
-  vars:
-    metad_hosts: "{{ groups['metad_nodes'] | map('extract', hostvars) | list | sort(attribute='meta_ordinal') }}"
-    owner_host: "{{ (metad_hosts | first).inventory_hostname }}"
-    deploy_env:
-      NUFS_BIN: "{{ bin_dir }}"
-      NUFS_RUN_DIR: "{{ run_dir }}"
-      # deploy.sh 输出中文，需 UTF-8 locale，否则 Ansible 严格 UTF-8 校验会拒绝模块结果
-      LC_ALL: "C.UTF-8"
-      LANG: "C.UTF-8"
-  tasks:
-    - name: run verify until cluster ready
+    - name: run full verify (raft quorum + datanode registration)
       command: "{{ deploy_dir }}/deploy.sh verify"
       environment: "{{ deploy_env }}"
-      register: verify_result
-      until: verify_result.rc == 0
+      register: vf
+      until: vf.rc == 0
       retries: 10
       delay: 5
-      when: inventory_hostname == owner_host
+      when: meta_ordinal | int == 1
       changed_when: false
-    - name: seed S3 credentials
-      command: "{{ deploy_dir }}/deploy.sh seed-cred {{ item.access_key }} {{ item.secret_key }}"
-      environment: "{{ deploy_env }}"
-      loop: "{{ seed_credentials | default([]) }}"
-      when:
-        - inventory_hostname == owner_host
-        - seed_credentials | default([]) | length > 0
-      changed_when: false
-    - name: show status
-      command: "{{ deploy_dir }}/deploy.sh status"
-      environment: "{{ deploy_env }}"
-      register: status_result
-      when: inventory_hostname == owner_host
-      changed_when: false
-    - name: print cluster status
-      debug:
-        msg: "集群就绪。节点状态：\n{{ status_result.stdout }}"
-      when: inventory_hostname == owner_host

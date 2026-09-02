@@ -1,0 +1,15 @@
+---
+# datanode 模块：启动全部 datanode（deploy.sh start 幂等）。
+# 用法：ansible-playbook -i inventory.ini datanode.yml（自动先跑 common）
+
+- name: datanode - import common (build + distribute)
+  import_playbook: common.yml
+
+- name: datanode - start
+  hosts: datanode_nodes
+  become: "{{ need_sudo }}"
+  tasks:
+    - name: start
+      command: "{{ deploy_dir }}/deploy.sh start"
+      environment: "{{ deploy_env }}"
+      changed_when: false
