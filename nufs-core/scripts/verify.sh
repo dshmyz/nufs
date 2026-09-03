@@ -30,6 +30,9 @@ set -euo pipefail
 # ---- 定位仓库根（scripts/.. 即 nufs-core/） ----
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
+# 单模块合并后 go.mod 在仓库根（CORE_DIR 的父目录）；Go 命令从这里跑，
+# 脚本本身的相对路径（scripts/, soak/, deploy/ 等）仍以 CORE_DIR 为基准。
+MODULE_ROOT="$(dirname "$CORE_DIR")"
 cd "$CORE_DIR"
 
 LEVEL="${VERIFY_LEVEL:-fast}"
@@ -64,11 +67,11 @@ echo "== NUFS verify: level=$LEVEL count=$COUNT target=$TARGET cwd=$(pwd) =="
 
 # ---- 0. build ----
 step "build"
-if go build ./... ; then pass "go build ./..."; else fail "go build ./..."; fi
+if ( cd "$MODULE_ROOT" && go build ./... ) ; then pass "go build ./..."; else fail "go build ./..."; fi
 
 # ---- 1. vet ----
 step "vet"
-if go vet "$TARGET" ; then pass "go vet $TARGET"; else fail "go vet $TARGET"; fi
+if ( cd "$MODULE_ROOT" && go vet "$TARGET" ) ; then pass "go vet $TARGET"; else fail "go vet $TARGET"; fi
 
 # ---- 2. fmt check（不改文件，只查） ----
 step "gofmt check"
@@ -89,20 +92,20 @@ if [ "$LEVEL" = "fast" ] || [ "$LEVEL" = "drill" ]; then
 fi
 if [ "$TARGET" = "./..." ]; then
   # 按包逐个跑，-p 1 串行，避免并行 CPU 拥塞导致的 raft 选举假失败
-  pkgs="$(go list ./... 2>/dev/null)"
+  pkgs="$(cd "$MODULE_ROOT" && go list ./... 2>/dev/null)"
   pkg_fail=0
   VTEST_DIR="${VERIFY_TEST_LOG_DIR:-/tmp/nufs-verify-testlogs}"
   mkdir -p "$VTEST_DIR"
   while IFS= read -r p; do
     printf '    %-55s ' "$p"
     slog="${VTEST_DIR}/$(echo "$p" | tr '/' '_').log"
-    if go test -count="$COUNT" $SHORT_FLAG -timeout 300s -p 1 "$p" >"$slog" 2>&1; then
+    if ( cd "$MODULE_ROOT" && go test -count="$COUNT" $SHORT_FLAG -timeout 300s -p 1 "$p" >"$slog" 2>&1 ); then
       printf '\033[32mPASS\033[0m\n'
     else
       # 一次有界重试：吸收少见的一次性 flake（端口/调度/临时资源瞬态），避免把
       # 真门禁刷红；仍保留首跑日志，若二次仍 FAIL 才判 FAIL（真 bug 不会躲过两次）。
       printf '\033[33mRETRY\033[0m '
-      if go test -count="$COUNT" $SHORT_FLAG -timeout 300s -p 1 "$p" >"$slog.r2" 2>&1; then
+      if ( cd "$MODULE_ROOT" && go test -count="$COUNT" $SHORT_FLAG -timeout 300s -p 1 "$p" >"$slog.r2" 2>&1 ); then
         printf '\033[32mPASS (retry)\033[0m\n      first-attempt log kept: %s\n' "$slog"
       else
         printf '\033[31mFAIL\033[0m\n'
@@ -117,7 +120,7 @@ if [ "$TARGET" = "./..." ]; then
   done <<< "$pkgs"
   [ "$pkg_fail" -eq 0 ] && pass "all packages -count=$COUNT" || fail "one or more packages -count=$COUNT"
 else
-  if go test -count="$COUNT" $SHORT_FLAG -timeout 600s -p 1 "$TARGET" ; then pass "$TARGET -count=$COUNT"; else fail "$TARGET -count=$COUNT"; fi
+  if ( cd "$MODULE_ROOT" && go test -count="$COUNT" $SHORT_FLAG -timeout 600s -p 1 "$TARGET" ) ; then pass "$TARGET -count=$COUNT"; else fail "$TARGET -count=$COUNT"; fi
 fi
 
 # ---- 5. 故障 drill 门禁（仅 drill/full） ----

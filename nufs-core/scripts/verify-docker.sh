@@ -43,11 +43,11 @@ BIN_DIR=/nufs-bin   # drill 进程的 Linux 二进制落这里，不污染宿主
 # 本地已缓存、与 go.mod(1.25) 兼容的 golang 镜像（无新拉取）
 GO_IMAGE="${NUFS_VERIFY_GO_IMAGE:-golang:1.26}"
 
-echo "== NUFS verify (Docker) image=$GO_IMAGE src=$CORE_DIR bin->container-local =="
+echo "== NUFS verify (Docker) image=$GO_IMAGE src=$(dirname "$CORE_DIR") bin->container-local =="
 echo "   mounts: GOMODCACHE=$GOMODCACHE_HOST (ro), GOCACHE=nufs-verify-gocache (named volume, rw)"
 
 exec docker run --rm \
-  -v "$CORE_DIR":"$SRC_DIR" \
+  -v "$(dirname "$CORE_DIR")":"$SRC_DIR" \
   -v "$GOMODCACHE_HOST":"$MOD":ro \
   -v nufs-verify-gocache:"$CACHE" \
   -e GOMODCACHE="$MOD" \
@@ -57,4 +57,4 @@ exec docker run --rm \
   -e VERIFY_LEVEL="${VERIFY_LEVEL:-fast}" \
   -w "$SRC_DIR" \
   "$GO_IMAGE" \
-  bash -c 'apt-get update -qq && apt-get install -y -qq python3 lsof >/dev/null 2>&1 && exec bash "$@"' _ "$SRC_DIR/scripts/verify.sh" "$@"
+  bash -c 'apt-get update -qq && apt-get install -y -qq python3 lsof >/dev/null 2>&1 && exec bash "$@"' _ "$SRC_DIR/$(basename "$CORE_DIR")/scripts/verify.sh" "$@"
