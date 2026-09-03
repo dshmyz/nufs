@@ -541,3 +541,57 @@ sudo mount -t nufs none /mnt/nufs -o meta=10.0.0.11:18091
 | PUT 报 "bucket not found" | 网关不自动建桶 | 先建桶（§4） |
 | 内嵌控制台打开 401 | 数据端点要 token | 页面内输入 auth_token（保存到浏览器本地） |
 | down 后立刻 start 报 pebble 错 | 旧进程还没释放 DB 锁 | deploy.sh 已内置等待；若手动 kill 请等进程退出再 start |
+
+---
+
+## 9. 参数速查（不配置会怎样）
+
+**三色标识**：🟢 有安全默认｜🟡 有默认但部署应显式覆盖｜🔴 必须配否则拒启/集群不成立
+
+### metad
+
+| 参数 | 默认 | 类型 | 说明 |
+|---|---|---|---|
+| `--node-id` | `1` | 🔴 多机 | 节点编号；2/3 号不配会撞 |
+| `--data-dir` | `<安装目录>/data/metadata` | 🟡 | 元数据落点（安装目录=二进制所在目录） |
+| `--raft-dir` | `<安装目录>/data/raft` | 🟡 | raft 状态落点 |
+| `--backup-local-dir` | `<安装目录>/data/backup-tmp` | 🟢 | 备份暂存 |
+| `--ops-addr` | `0.0.0.0:8091` | 🟡 | 多机同机跑要改端口避免撞 |
+| `--advertise-ops-addr` | `http://<hostname>:8091` | 🔴 跨机 | hostname 未必可路由 |
+| `--raft` | `true` | 🟢 | 关掉=单机 |
+| `--raft-addr` | `0.0.0.0:7000` | 🟢 | 端口撞才改 |
+| `--raft-advertise-addr` | 同 raft-addr | 🔴 跨机 | 默认 advertise `0.0.0.0` 对端连不上 |
+| `--raft-bootstrap` | `false` | 🔴 集群 | 首节点要 true |
+| `--raft-bootstrap-owner` | 无 | 🔴 多机 | 不配多节点直接拒启（防三分裂） |
+| `--raft-bootstrap-peers` / `--raft-peer-ops` | 空 | 🔴 集群 | 不配=单节点；三台须一致 |
+| `--auth-token` / `--token-signing-key` / `--credential-secret-key` | 空 | 🔴 生产 | 空=生产校验拒启 |
+| `--log-file` | `""`（stderr） | 🟢 | 落盘用 lumberjack 轮转 |
+| `--log-max-size` / `--log-max-backups` | `100` / `7` | 🟢 | 仅 --log-file 非空时生效 |
+| `--log-format` / `--log-level` | `text` / `info` | 🟢 | |
+
+### datanode
+
+| 参数 | 默认 | 类型 | 说明 |
+|---|---|---|---|
+| `--node-id` | `auto` | 🟢 | 自动 |
+| `--data-dir` | **必填（无默认）** | 🔴 | 存储后端；逗号分隔多盘 JBOD；裸跑缺省即拒启 |
+| `--listen` | `0.0.0.0:9100` | 🟡 | 多机同机跑要改端口 |
+| `--register-addr` | 同 listen | 🔴 跨机 | 必须填能被网关路由到的地址 |
+| `--ops-addr` | `0.0.0.0:8091` | 🟡 | datanode 管理端口 |
+| `--metadata` | `localhost:8091` | 🔴 集群 | 指向 metad |
+| `--metadata-auth-token` / `--ops-auth-token` | 空 | 🔴 生产 | |
+| `--capacity` | `1000` | 🟢 | 上报容量 GB |
+| `--rack` / `--zone` | `rack-1` / `zone-1` | 🟢 | 拓扑标签，影响副本放置 |
+| `--log-file` / 轮转 | stderr / 100MB×7 | 🟢 | 原生日志轮转（与 metad 对齐） |
+
+### S3 网关
+
+| 参数 | 默认 | 类型 | 说明 |
+|---|---|---|---|
+| `--listen` | `:8080` | 🟡 | 对外端口 |
+| `--meta-addr` | `localhost:8091` | 🔴 集群 | 指向 metad（HA 用 VIP/代理） |
+| `--meta-auth-token` | 空 | 🔴 生产 | 无凭据时网关全 403 |
+| `--part-dir` | `/var/lib/nufs-s3/parts` | 🟢 | 分片上传暂存 |
+| `--log-file` / 轮转 | stderr / 100MB×7 | 🟢 | |
+
+> **部署层总帮你传**：deploy.sh / Ansible 会为每个组件显式填上 🔴 和 🟡 的参数（路径、端口、密钥、log-file 等），所以按文档部署不需要手工逐条配。裸跑二进制才需要自己对这些参数负责。
