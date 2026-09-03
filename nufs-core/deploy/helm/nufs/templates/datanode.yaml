@@ -74,7 +74,7 @@ spec:
                 --metadata-auth-token="$(cat /etc/nufs-secret/auth-token)" \
                 --ops-auth-token="$(cat /etc/nufs-secret/auth-token)" \
                 {{- end }}
-                --log-json=true \
+                --log-format=json \
                 "$@"
           volumeMounts:
             - name: data

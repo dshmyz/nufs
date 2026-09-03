@@ -25,8 +25,11 @@ seed_credentials: []
 # seed_credentials:
 #   - { access_key: TESTAK000000000000, secret_key: test-secret-value }
 
-# ---- 控制器侧路径（相对 playbook_dir）----
-binaries_dir: "{{ playbook_dir + '/staging' }}"
+# ---- 控制器侧 ----
+# 默认不构建：直接复用 make package / make build-linux 的产物（nufs-core/bin/linux-amd64）。
+# 想用别处二进制：-e binaries_dir=<目录>；想由 ansible 现场构建：-e build_binaries=true
+build_binaries: false
+binaries_dir: "{{ playbook_dir + '/../../bin/linux-amd64' }}"
 deploy_script_src: "{{ playbook_dir + '/../vm/deploy.sh' }}"
 
 # ---- 派生：deploy.sh 执行环境（中文输出需 UTF-8 locale）----

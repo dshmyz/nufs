@@ -7,9 +7,11 @@
 # 参数从一份 IP 清单 + 三把密钥自动生成——只需要在 cluster.env 里填 IP 和密钥。
 #
 # 用法:
+#   ./deploy.sh quickstart               # 一键：自动生成本地配置(127.0.0.1)+密钥，起 3 节点集群
 #   ./deploy.sh gen-keys                 # 生成三把密钥，粘贴进 cluster.env
 #   ./deploy.sh install                  # 编译 + 安装 3 个二进制到 /usr/local/bin
 #   ./deploy.sh gen-config               # 生成本机角色的 YAML 配置（$DATA_ROOT/config）
+#   ./deploy.sh gen-default-config       # 生成默认模块配置到 $DIR/config/（直接编辑，不依赖 cluster.env）
 #   ./deploy.sh start                    # 启动本机服务：有 YAML 用 --config，否则用 flag 参数
 #   ./deploy.sh status                   # 本机进程状态
 #   ./deploy.sh verify                   # 全集群校验：raft quorum + datanode 注册
@@ -48,23 +50,48 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${NUFS_ENV_FILE:-$DIR/cluster.env}"
 CMD="${1:-help}"
-# gen-keys/help 不需要 cluster.env（gen-keys 是第一步，此时还没建 env）
+# gen-keys/quickstart/gen-default-config/help 不需要 cluster.env（前三个是第一步，此时还没建 env）
 NEED_ENV=1
-case "$CMD" in gen-keys|help|--help|-h) NEED_ENV=0 ;; esac
+case "$CMD" in gen-keys|quickstart|gen-default-config|help|--help|-h) NEED_ENV=0 ;; esac
+CONFIG_ONLY=0
 if [ "$NEED_ENV" = 1 ]; then
-  [ -f "$ENV_FILE" ] || { echo "缺少 ${ENV_FILE}（先 cp cluster.env.example cluster.env 并填写）" >&2; exit 1; }
-  # shellcheck source=cluster.env
-  source "$ENV_FILE"
-  LOG_DIR="$DATA_ROOT/log"
-  # 网关/datanode 的 metad 访问地址。默认指向 metad-1（与 runbook 一致）；
-  # 若要 metad 单机故障时网关不中断，设 METAD_SERVICE_ADDR=<VIP 或代理>:port，
-  # 让 3 台 metad 挂在稳定地址后面（keepalived VIP / 反向代理 / DNS 轮询到存活节点）。
-  METAD_ADDR="${METAD_SERVICE_ADDR:-${METAD_IPS[0]}:$METAD_OPS_PORT}"
-  CONFIG_DIR="$DATA_ROOT/config"
+  if [ -f "$ENV_FILE" ]; then
+    # shellcheck source=cluster.env
+    source "$ENV_FILE"
+    LOG_DIR="$DATA_ROOT/log"
+    # 网关/datanode 的 metad 访问地址。默认指向 metad-1（与 runbook 一致）；
+    # 若要 metad 单机故障时网关不中断，设 METAD_SERVICE_ADDR=<VIP 或代理>:port，
+    # 让 3 台 metad 挂在稳定地址后面（keepalived VIP / 反向代理 / DNS 轮询到存活节点）。
+    METAD_ADDR="${METAD_SERVICE_ADDR:-${METAD_IPS[0]}:$METAD_OPS_PORT}"
+    CONFIG_DIR="$DATA_ROOT/config"
+  elif [ -d "$DIR/config" ] && compgen -G "$DIR/config/metad*.yaml" >/dev/null; then
+    # 配置目录模式：不依赖 cluster.env，直接读 $DIR/config/ 下的每模块 YAML
+    # （用 ./deploy.sh gen-default-config 生成默认，或自己放 metadN/datanodeN/s3.yaml）
+    CONFIG_ONLY=1
+    CONFIG_DIR="$DIR/config"
+    LOG_DIR="$DIR/log"
+    DATA_ROOT="$DIR"
+  else
+    echo "缺少 ${ENV_FILE}（先 cp cluster.env.example cluster.env 并填写；或把每模块配置放 $DIR/config/）" >&2
+    exit 1
+  fi
 fi
 
-BIN="${NUFS_BIN:-/usr/local/bin}"
-RUN_DIR="${NUFS_RUN_DIR:-/var/run/nufs}"
+# 二进制目录：NUFS_BIN 显式指定 > 脚本旁有 bin/（自包含解压包）> 默认 /usr/local/bin
+if [ -n "${NUFS_BIN:-}" ]; then
+  BIN="$NUFS_BIN"
+elif [ -d "$DIR/bin" ]; then
+  BIN="$DIR/bin"
+else
+  BIN=/usr/local/bin
+fi
+if [ -n "${NUFS_RUN_DIR:-}" ]; then
+  RUN_DIR="$NUFS_RUN_DIR"
+elif [ "$CONFIG_ONLY" = 1 ]; then
+  RUN_DIR="$DIR/run"   # 配置目录模式默认免 root（pidfile 放包内）
+else
+  RUN_DIR=/var/run/nufs
+fi
 
 log() { printf '\033[1m[deploy]\033[0m %s\n' "$*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
@@ -85,7 +112,23 @@ LOCAL_IPS="$(local_ips)"
 is_local() { for ip in $LOCAL_IPS; do [ "$ip" = "$1" ] && return 0; done; return 1; }
 
 detect_roles() {
-  local roles=""
+  local roles="" f n
+  if [ "$CONFIG_ONLY" = 1 ]; then
+    # 配置目录模式：按 $CONFIG_DIR 下的 YAML 文件名识别角色
+    for f in "$CONFIG_DIR"/metad[0-9]*.yaml; do
+      [ -e "$f" ] || continue
+      n="${f##*metad}"; n="${n%%.yaml}"
+      roles="$roles metad:$n"
+    done
+    for f in "$CONFIG_DIR"/datanode[0-9]*.yaml; do
+      [ -e "$f" ] || continue
+      n="${f##*datanode}"; n="${n%%.yaml}"
+      roles="$roles datanode:$n"
+    done
+    [ -e "$CONFIG_DIR/s3.yaml" ] && roles="$roles s3:"
+    echo "$roles"
+    return
+  fi
   local i
   for i in "${!METAD_IPS[@]}"; do
     is_local "${METAD_IPS[$i]}" && roles="$roles metad:$((i+1))"
@@ -128,7 +171,7 @@ metad_args() {
     --raft-bootstrap-peers="$(metad_peers)" --raft-peer-ops="$(metad_peer_ops)"
     --auth-token="$AUTH_TOKEN" --token-signing-key="$TOKEN_SIGNING_KEY"
     --credential-secret-key="$CRED_SECRET_KEY"
-    --log-level="${NUFS_LOG_LEVEL:-info}" --log-json=true --log-file="$LOG_DIR/metad$n.log")
+    --log-level="${NUFS_LOG_LEVEL:-info}" --log-format="${NUFS_LOG_FORMAT:-json}" --log-file="$LOG_DIR/metad$n.log")
 }
 datanode_args() {
   local n=$1 ip=$2
@@ -140,13 +183,13 @@ datanode_args() {
     --ops-addr="0.0.0.0:$ops_port" "${data_arg[@]}"
     --metadata="$METAD_ADDR" --metadata-auth-token="$AUTH_TOKEN" --ops-auth-token="$AUTH_TOKEN"
     --rack="rack-$n" --zone="${NUFS_ZONE:-zone-1}" --capacity="${NUFS_CAPACITY_GB:-1000}"
-    --log-level="${NUFS_LOG_LEVEL:-info}" --log-json=true)
+    --log-level="${NUFS_LOG_LEVEL:-info}" --log-format="${NUFS_LOG_FORMAT:-json}")
 }
 s3_args() {
   CMD_ARGS=("$BIN/nufs-s3" --listen=":$S3_PORT"
     --meta-addr="$METAD_ADDR" --meta-auth-token="$AUTH_TOKEN"
     --part-dir="$DATA_ROOT/s3-parts"
-    --log-level="${NUFS_LOG_LEVEL:-info}" --log-json=true)
+    --log-level="${NUFS_LOG_LEVEL:-info}" --log-format="${NUFS_LOG_FORMAT:-json}")
 }
 
 # ---------- 进程管理（后台进程 + pidfile） ----------
@@ -163,7 +206,7 @@ run_cmd() { # kind idx
   local name="${kind}${idx:-}"
   local cf="$CONFIG_DIR/$name.yaml"
   local binname=metad; case "$kind" in datanode) binname=datanode;; s3) binname=nufs-s3;; esac
-  if [ "${NUFS_NO_CONFIG:-}" != 1 ] && [ -f "$cf" ]; then
+  if [ "$CONFIG_ONLY" = 1 ] || { [ "${NUFS_NO_CONFIG:-}" != 1 ] && [ -f "$cf" ]; }; then
     CMD_ARGS=("$BIN/$binname" --config="$cf")
     MODE=config
   else
@@ -198,7 +241,7 @@ auth_token: "$AUTH_TOKEN"
 token_signing_key: "$TOKEN_SIGNING_KEY"
 credential_secret_key: "$CRED_SECRET_KEY"
 log_level: "${NUFS_LOG_LEVEL:-info}"
-log_json: true
+log_format: "${NUFS_LOG_FORMAT:-json}"
 log_file: "$LOG_DIR/metad$n.log"
 EOF
 }
@@ -222,7 +265,7 @@ rack: "rack-$n"
 zone: "${NUFS_ZONE:-zone-1}"
 capacity: ${NUFS_CAPACITY_GB:-1000}
 log_level: "${NUFS_LOG_LEVEL:-info}"
-log_json: true
+log_format: "${NUFS_LOG_FORMAT:-json}"
 EOF
 }
 
@@ -234,7 +277,7 @@ meta_addr: "$METAD_ADDR"
 meta_auth_token: "$AUTH_TOKEN"
 part_dir: "$DATA_ROOT/s3-parts"
 log_level: "${NUFS_LOG_LEVEL:-info}"
-log_json: true
+log_format: "${NUFS_LOG_FORMAT:-json}"
 EOF
 }
 
@@ -301,7 +344,30 @@ gen_unit() { # kind idx -> 写 /etc/systemd/system/nufs-<name>.service
 json_bool() { grep -oE '"is_leader"[[:space:]]*:[[:space:]]*(true|false)' <<<"$1" | tail -1 | grep -oE '(true|false)$'; }
 json_uri()  { grep -oE '"leader_uri"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$1" | tail -1 | sed -E 's/^.*"([^"]*)"$/\1/'; }
 
+# 配置目录模式：从 $CONFIG_DIR 的 YAML 反推 cluster.env 同款变量，供 verify/seed-cred 复用
+load_topology_from_config() {
+  local -a mip=() dip=() f ops n
+  for f in "$CONFIG_DIR"/metad[0-9]*.yaml; do
+    [ -e "$f" ] || continue
+    n="${f##*metad}"; n="${n%%.yaml}"
+    ops="$(grep '^ops_addr:' "$f" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+    [ -n "$ops" ] || ops="127.0.0.1:18091"
+    mip[$((n-1))]="${ops%%:*}"
+    [ "$n" = 1 ] && METAD_OPS_PORT="${ops##*:}"   # 基准端口 = metad1 的 ops 端口
+  done
+  for f in "$CONFIG_DIR"/datanode[0-9]*.yaml; do
+    [ -e "$f" ] || continue
+    n="${f##*datanode}"; n="${n%%.yaml}"
+    dip[$((n-1))]="x"
+  done
+  METAD_IPS=("${mip[@]}")
+  DATANODE_IPS=("${dip[@]}")
+  AUTH_TOKEN="$(grep '^auth_token:' "$CONFIG_DIR"/metad1.yaml 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+  METAD_ADDR="${METAD_IPS[0]:-127.0.0.1}:$METAD_OPS_PORT"
+}
+
 cmd_verify() {
+  if [ "$CONFIG_ONLY" = 1 ]; then load_topology_from_config; fi
   log "=== 1/3 校验 metad raft quorum ==="
   local leaders=0 leader_idx=-1 uri="" u body l i ip port
   for i in "${!METAD_IPS[@]}"; do
@@ -346,6 +412,47 @@ CRED_SECRET_KEY=$(openssl rand -hex 32)
 EOF
 }
 
+cmd_quickstart() {
+  # 一键：没有 cluster.env 就按示例生成（127.0.0.1 + 自动密钥），然后起本地 3 节点集群
+  local template="$DIR/cluster.env.example"
+  [ -f "$template" ] || die "缺少 $template（quickstart 用它生成 cluster.env）"
+  if [ -f "$ENV_FILE" ]; then
+    log "$ENV_FILE 已存在，跳过生成（删除它可重新生成）"
+  else
+    sed -e "s/^AUTH_TOKEN=$/AUTH_TOKEN=$(openssl rand -hex 16)/" \
+        -e "s/^TOKEN_SIGNING_KEY=$/TOKEN_SIGNING_KEY=$(openssl rand -hex 16)/" \
+        -e "s/^CRED_SECRET_KEY=$/CRED_SECRET_KEY=$(openssl rand -hex 32)/" \
+        "$template" > "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    log "已生成单机演示配置 $ENV_FILE（127.0.0.1，自动密钥）"
+  fi
+  # quickstart 在 NEED_ENV=0 分支运行，这里补上 env 派生变量
+  # shellcheck source=cluster.env
+  source "$ENV_FILE"
+  LOG_DIR="$DATA_ROOT/log"
+  METAD_ADDR="${METAD_SERVICE_ADDR:-${METAD_IPS[0]}:$METAD_OPS_PORT}"
+  CONFIG_DIR="$DATA_ROOT/config"
+  cmd_start
+  # 用安全轮询等集群就绪（cmd_verify 内部 die 会 exit，不能放进 until）
+  local attempt=0 mip="${METAD_IPS[0]}" oport=$METAD_OPS_PORT
+  log "等待 metad-1 当选 leader（最多 ~40s）..."
+  until curl -fsS -H "Authorization: Bearer $AUTH_TOKEN" "http://$mip:$oport/api/v1/cluster/status" 2>/dev/null \
+      | grep -q '"is_leader"[[:space:]]*:[[:space:]]*true'; do
+    attempt=$((attempt+1))
+    [ "$attempt" -ge 20 ] && die "metad-1 未在 40s 内当选 leader"
+    sleep 2
+  done
+  log "leader 已当选，等待 ${#DATANODE_IPS[@]} 个 datanode 注册..."
+  attempt=0
+  until [ "$(curl -fsS -H "Authorization: Bearer $AUTH_TOKEN" "http://$mip:$oport/api/v1/nodes" 2>/dev/null | grep -o '"id":' | wc -l | tr -d ' ')" -ge "${#DATANODE_IPS[@]}" ]; do
+    attempt=$((attempt+1))
+    [ "$attempt" -ge 20 ] && break
+    sleep 2
+  done
+  cmd_verify
+  log "=== quickstart 完成：集群已就绪 ==="
+}
+
 cmd_install() {
   local repo="${NUFS_CORE:-$DIR/../../}"
   (cd "$repo" && go build -o bin/metad ./cmd/metad \
@@ -376,9 +483,34 @@ cmd_gen_config() {
   log "注意：start 会优先用这些 YAML；改 cluster.env 后需重跑 gen-config，或直接编辑 YAML"
 }
 
+cmd_gen_default_config() {
+  # 生成 127.0.0.1 三节点默认模块配置到 $DIR/config/（无需 cluster.env，直接编辑这些 YAML）
+  METAD_IPS=(127.0.0.1 127.0.0.1 127.0.0.1)
+  DATANODE_IPS=(127.0.0.1 127.0.0.1 127.0.0.1)
+  S3_IP=127.0.0.1
+  METAD_OPS_PORT=18091; METAD_RAFT_PORT=17001
+  DATANODE_CHUNK_PORT=9103; DATANODE_OPS_PORT=18096; S3_PORT=8081
+  DATA_ROOT=/var/lib/nufs
+  LOG_DIR="$DATA_ROOT/log"
+  METAD_ADDR="${METAD_IPS[0]}:$METAD_OPS_PORT"
+  AUTH_TOKEN="$(openssl rand -hex 16)"
+  TOKEN_SIGNING_KEY="$(openssl rand -hex 16)"
+  CRED_SECRET_KEY="$(openssl rand -hex 32)"
+  mkdir -p "$DIR/config"
+  local i
+  for i in 1 2 3; do
+    emit_metad_yaml "$i" 127.0.0.1 > "$DIR/config/metad$i.yaml"
+    emit_datanode_yaml "$i" 127.0.0.1 > "$DIR/config/datanode$i.yaml"
+  done
+  emit_s3_yaml > "$DIR/config/s3.yaml"
+  chmod 600 "$DIR/config"/*.yaml
+  log "已生成默认模块配置到 $DIR/config/（127.0.0.1 三节点，自动密钥）"
+  log "直接编辑这些 YAML 后 ./deploy.sh start；多机时把各文件 IP 改成真实值"
+}
+
 cmd_start() {
   local roles; roles="$(detect_roles)"
-  [ -z "$roles" ] && die "本机 IP 不在 cluster.env 任何角色清单里。本机 IP: $LOCAL_IPS"
+  [ -z "$roles" ] && die "本机没有要跑的角色（$DIR/config 无 metadN/datanodeN/s3.yaml，或 IP 不在 cluster.env 清单里）"
   log "本机角色:$roles"
   # metad 先起（owner 机先跑 start 可保证选举确定），再 datanode/s3
   local kind idx
@@ -435,6 +567,7 @@ cmd_dump() {
 
 cmd_seed_cred() {
   local ak="${1:-TESTAK000000000000}" sk="${2:-test-secret-value}"
+  if [ "$CONFIG_ONLY" = 1 ]; then load_topology_from_config; fi
   curl -fsS -X PUT "http://$METAD_ADDR/api/v1/auth/creds/$ak" \
     -H "Authorization: Bearer $AUTH_TOKEN" -H "content-type: application/json" \
     -d "{\"secret_key\":\"$sk\",\"principal\":\"deploy\"}" >/dev/null \
@@ -474,9 +607,11 @@ cmd_systemd() {
 usage() { sed -n '2,45p' "$0"; exit 0; }
 
 case "${1:-help}" in
+  quickstart)       cmd_quickstart ;;
   gen-keys)        cmd_gen_keys ;;
   install)         cmd_install ;;
   gen-config)      cmd_gen_config ;;
+  gen-default-config) cmd_gen_default_config ;;
   start)           cmd_start ;;
   status)          cmd_status ;;
   verify)          cmd_verify ;;

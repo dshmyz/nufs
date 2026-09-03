@@ -4,7 +4,7 @@ NUFS 裸机完整集群部署：3 metad（raft quorum）+ 3 datanode（RF=3）+ 
 
 > **有现成自动化，嫌手工命令多直接用它**：
 > - 部署脚本（按 IP 自动识别角色，支持 flag / `--config` 双模式）：[deploy/vm/deploy.sh](../deploy/vm/deploy.sh)（配置模板 [cluster.env.example](../deploy/vm/cluster.env.example)）
-> - Ansible 一条命令部署：[deploy/ansible/site.yml](../deploy/ansible/site.yml)（清单 [inventory.ini](../deploy/ansible/inventory.ini)，已有二进制用 `-e build_binaries=false -e binaries_dir=<目录>`）
+> - Ansible 一条命令部署：[deploy/ansible/site.yml](../deploy/ansible/site.yml)（清单 [inventory.ini](../deploy/ansible/inventory.ini)；默认复用 `make package` 产物，不现场构建）
 >
 > 下方保留手工步骤，用于理解/排障。
 
@@ -115,6 +115,6 @@ rclone cat nufs:test-bucket/obj.txt
 ## 运维
 
 - 备份/回滚：生产模式建议启用 metad backup（`--backup-enabled` + S3 仓库），测试环境可跳过
-- 日志：各进程 stdout 即日志，可重定向到文件；`--log-json=true` 输出结构化日志
+- 日志：各进程 stdout 即日志，可重定向到文件；`--log-format=json` 输出结构化日志
 - 停止：按 gateway → datanode → metad（非 leader 先）顺序 kill
 - 重启：metad 按 1/2/3 顺序起（owner 先），raft 状态在 `--raft-dir` 持久化

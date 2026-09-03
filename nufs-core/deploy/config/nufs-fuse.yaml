@@ -16,7 +16,7 @@ backend: "dfs"                        # "dfs" (distributed filesystem) or "s3" (
 
 # ── Logging ────────────────────────────────────────────────────────
 log_level:  "info"                    # debug | info | warn | error
-log_json:   false                     # true = structured JSON output
+log_format: "text"                    # text|json
 log_file:   ""                        # log file path (default: nufs-{mountpoint}.log; empty = that default)
 log_max_size:     100                 # max log file size in MB before rotation
 log_max_backups:  7                   # max rotated log files to keep

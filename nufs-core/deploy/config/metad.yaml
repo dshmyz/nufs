@@ -11,7 +11,7 @@ cache_dir: ""
 ops_addr: "0.0.0.0:8091"
 node_id: 1
 log_level: "info"
-log_json: false
+log_format: "text"
 log_file: ""                      # log file path (empty = stderr)
 log_max_size: 100                 # max log file size in MB before rotation
 log_max_backups: 7                # max rotated log files to keep

@@ -115,7 +115,7 @@ spec:
             - "--trace-endpoint={{ .Values.observability.tracing.endpoint }}"
             - "--trace-insecure={{ .Values.observability.tracing.insecure }}"
             {{- end }}
-            - "--log-json=true"
+            - "--log-format=json"
           volumeMounts:
             - name: data
               mountPath: /data

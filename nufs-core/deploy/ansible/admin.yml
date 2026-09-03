@@ -1,0 +1,106 @@
+---
+# 管理台模块（可选）：部署 NUFS Admin Web 控制台
+#
+# 用法：
+#   1) inventory 里加 [admin] 组（通常挂在 metad-1 所在节点，或单独一台）
+#   2) ansible-playbook -i inventory.ini admin.yml
+#
+# 前置：控制机有 go + node（本 playbook 会在控制机构建 admin-server 和前端）；
+#       或已有产物时 -e admin_artifacts_dir=<含 admin-server 与 web/dist 的目录> 跳过构建
+# 覆盖：-e admin_port=8090 -e cluster_name=nufs -e admin_jwt_secret=<换掉>
+# 默认登录账号：admin / password（改密码请改 users.yaml 的 bcrypt 哈希）
+
+- name: admin - build artifacts on controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    admin_artifacts_dir: "{{ playbook_dir + '/staging-admin' }}"   # 可用 -e 覆盖
+    repo_dir: "{{ playbook_dir + '/../../..' }}"                    # 仓库根（nufs-admin 在根下）
+  tasks:
+    - name: create artifacts dir
+      file:
+        path: "{{ admin_artifacts_dir }}"
+        state: directory
+    - name: build admin-server
+      command: "go build -o {{ admin_artifacts_dir }}/admin-server ./nufs-admin/cmd/admin-server"
+      args:
+        chdir: "{{ repo_dir }}"
+    - name: build web dist
+      command: "npm run build"
+      args:
+        chdir: "{{ repo_dir }}/nufs-admin/web"
+    - name: stage web dist
+      copy:
+        src: "{{ repo_dir }}/nufs-admin/web/dist"
+        dest: "{{ admin_artifacts_dir }}/web/"
+        remote_src: true
+
+- name: admin - deploy to admin host
+  hosts: admin
+  become: "{{ need_sudo }}"
+  vars:
+    admin_artifacts_dir: "{{ playbook_dir + '/staging-admin' }}"   # 可用 -e 覆盖
+    admin_dir: "/opt/nufs-admin"                                   # 可用 -e 覆盖
+    metad_hosts: "{{ groups['metad_nodes'] | map('extract', hostvars) | list | sort(attribute='meta_ordinal') }}"
+    auth_token: "{{ lookup('ansible.builtin.password', playbook_dir + '/secrets/auth_token chars=hexdigits length=32') }}"
+    metad1_ip: "{{ (metad_hosts | first).ansible_host | default((metad_hosts | first).inventory_hostname) }}"
+  tasks:
+    - name: create admin dirs
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ admin_dir }}"
+        - "{{ admin_dir }}/web"
+        - "{{ admin_dir }}/web/dist"
+    - name: copy admin-server
+      copy:
+        src: "{{ admin_artifacts_dir }}/admin-server"
+        dest: "{{ admin_dir }}/admin-server"
+        mode: "0755"
+    - name: copy web dist
+      copy:
+        src: "{{ admin_artifacts_dir }}/web/dist/"
+        dest: "{{ admin_dir }}/web/dist/"
+    - name: render clusters.yaml (metad_ops_url + metad_token 自动填入)
+      copy:
+        content: |
+          clusters:
+            - name: "{{ cluster_name | default('nufs') }}"
+              region: "{{ cluster_region | default('default') }}"
+              metad_ops_url: "http://{{ metad1_ip }}:{{ metad_ops_port }}"
+              metad_token: "{{ auth_token }}"
+              description: "NUFS cluster (deployed by ansible)"
+          server:
+            listen: ":{{ admin_port | default(8090) }}"
+            jwt_secret: "{{ admin_jwt_secret | default('change-me-in-production') }}"
+          auth:
+            users_file: "{{ admin_dir }}/users.yaml"
+          database:
+            dsn: ""
+        dest: "{{ admin_dir }}/clusters.yaml"
+        mode: "0600"
+    - name: render users.yaml (默认 admin/password，改密码请换哈希)
+      copy:
+        content: |
+          - username: admin
+            password_hash: "$2a$10$C1fIBvuhyyKfjm6OLXlBO.qaV./ApqD3SSMpfpjssvknjjhsF6NnS"
+        dest: "{{ admin_dir }}/users.yaml"
+        mode: "0600"
+    - name: start admin-server
+      shell: |
+        cd {{ admin_dir }}
+        NUFS_ADMIN_CONFIG={{ admin_dir }}/clusters.yaml nohup ./admin-server > admin.log 2>&1 &
+        echo $! > admin.pid
+      args:
+        executable: /bin/bash
+      changed_when: false
+    - name: wait for admin to come up
+      uri:
+        url: "http://127.0.0.1:{{ admin_port | default(8090) }}/"
+        status_code: 200
+      register: admin_up
+      until: admin_up.status == 200
+      retries: 10
+      delay: 2

@@ -24,6 +24,10 @@ nufs-c ansible_host=<NODE-C-IP> dn_ordinal=3
 [s3_gateway]
 nufs-a ansible_host=<NODE-A-IP>
 
+# 管理台（可选）：部署 nufs-admin Web 控制台（ansible-playbook -i inventory.ini admin.yml）
+[admin]
+nufs-a ansible_host=<NODE-A-IP>
+
 # ============================================================
 # 拓扑 B（需要的话取消下面注释，删掉上面对应行）
 # metad 三台独立 VM，datanode 三台独立 VM，网关单独一台
@@ -49,4 +53,5 @@ nufs-a ansible_host=<NODE-A-IP>
 # - metad_nodes 必须是奇数台（raft quorum），最少 3 台。
 # - 需要指定 SSH 用户/密钥时，在主机行追加：
 #     nufs-a ansible_host=IP meta_ordinal=1 ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
-# - 已有安装包（跳过编译）：命令行加 -e build_binaries=false -e binaries_dir=/path/to/binaries
+# - 二进制来源：默认复用 make package 产物（nufs-core/bin/linux-amd64），部署时不再现场构建。
+#   别处二进制：-e binaries_dir=<目录>；要 ansible 现场构建：-e build_binaries=true

@@ -41,12 +41,12 @@ func main() {
 		writeGCLimit        = flag.Int("write-gc-limit", 100, "Max write attempts to garbage collect per worker tick")
 		writeGCAbandonAge   = flag.Duration("write-gc-abandon-age", time.Hour, "Age after which pending/allocated write attempts are considered abandoned")
 		logLevel            = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
-		logJSON             = flag.Bool("log-json", false, "JSON log output")
+		logFormat           = flag.String("log-format", "text", "Log output format (text|json)")
 	)
 	_ = configPath
 	config.Preload()
 	flag.Parse()
-	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})
+	logging.Init(logging.Config{Level: *logLevel, JSON: *logFormat == "json", AddSource: true})
 	log := logging.Named("nufs-s3")
 
 	log.Info("starting S3 gateway", "meta", *metaAddr, "listen", *listenAddr, "max_object_size", *maxObjectSize)

@@ -1,3 +1,4 @@
 # 构建产物与密钥，勿提交
 staging/
+staging-admin/
 secrets/

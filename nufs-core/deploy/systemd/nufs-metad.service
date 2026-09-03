@@ -14,7 +14,7 @@ ExecStart=/usr/local/bin/metad \
     --raft-addr=0.0.0.0:7000 \
     --raft-dir=/var/lib/dfs/raft \
     --log-level=info \
-    --log-json=true \
+    --log-format=json \
     --auth-token=${NUFS_METAD_TOKEN}
 
 Restart=always

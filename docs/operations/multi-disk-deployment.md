@@ -52,7 +52,7 @@ ExecStart=/usr/local/bin/datanode \
     --zone=${ZONE:-zone1} \
     --capacity=${CAPACITY_GB:-500} \
     --log-level=${LOG_LEVEL:-info} \
-    --log-json=${LOG_JSON:-false}
+    --log-format=${LOG_FORMAT:-	ext}
 
 Restart=always
 RestartSec=5

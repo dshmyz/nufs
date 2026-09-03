@@ -24,6 +24,7 @@ cover.html
 
 # Build output directories
 nufs-core/bin/
+nufs-core/dist/
 
 # macOS
 .DS_Store

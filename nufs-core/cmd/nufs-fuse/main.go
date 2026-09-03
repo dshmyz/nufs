@@ -59,7 +59,7 @@ func main() {
 		// Shared flags
 		cacheDir      = flag.String("cache-dir", "", "Cache directory (empty=memory only)")
 		logLevel      = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
-		logJSON       = flag.Bool("log-json", false, "JSON log output")
+		logFormat     = flag.String("log-format", "text", "Log output format (text|json)")
 		logFile       = flag.String("log-file", "", "Log file path (default: nufs-{mountpoint}.log; empty = that default)")
 		logMaxSize    = flag.Int("log-max-size", 100, "Max log file size in MB before rotation")
 		logMaxBackups = flag.Int("log-max-backups", 7, "Max number of rotated log files to keep")
@@ -124,7 +124,7 @@ func main() {
 	}
 	logging.Init(logging.Config{
 		Level:      *logLevel,
-		JSON:       *logJSON,
+		JSON:       *logFormat == "json",
 		AddSource:  true,
 		LogFile:    logFileVal,
 		MaxSize:    int64(*logMaxSize) * 1024 * 1024, // flag is MB, Config takes bytes

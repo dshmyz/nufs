@@ -1,7 +1,10 @@
-.PHONY: build test vet clean docker docker-up docker-down fmt lint help test-storage-p0 test-storage-crash verify verify-docker install install-mount-helper deploy
+.PHONY: build test vet clean docker docker-up docker-down fmt lint help test-storage-p0 test-storage-crash verify verify-docker install install-mount-helper deploy package
 
 # Binary output directory
 BIN_DIR := bin
+
+# Distribution tarball directory
+DIST_DIR := dist
 
 # Go build flags
 GOFLAGS := -trimpath
@@ -35,6 +38,33 @@ build-linux: ## Cross-compile for Linux
 		CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' \
 			-o $(BIN_DIR)/linux-amd64/$$bin ./cmd/$$bin; \
 	done
+
+package: ## 构建并打包（当前平台 + linux/amd64）：bin/ + admin 管理台 + deploy.sh + 配置模板
+	$(MAKE) build
+	$(MAKE) build-linux
+	# admin-server（每平台一份）+ 前端 web（一次构建，两平台共用）
+	@mkdir -p $(BIN_DIR)/admin $(BIN_DIR)/linux-amd64/admin
+	go build -o $(BIN_DIR)/admin/admin-server ./../nufs-admin/cmd/admin-server
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o $(BIN_DIR)/linux-amd64/admin/admin-server ./../nufs-admin/cmd/admin-server
+	@cd ../nufs-admin/web && npm run build >/dev/null
+	@rm -rf $(DIST_DIR)
+	@for plat in native linux; do \
+		case $$plat in \
+		  native) NAME="$(shell go env GOOS)-$(shell go env GOARCH)"; SRCDIR=$(BIN_DIR);; \
+		  linux)  NAME=linux-amd64; SRCDIR=$(BIN_DIR)/linux-amd64;; \
+		esac; \
+		STAGE=$(DIST_DIR)/nufs-$(VERSION)-$$NAME; \
+		mkdir -p $$STAGE/bin $$STAGE/config $$STAGE/admin/web; \
+		for b in $(BINS); do [ -f $$SRCDIR/$$b ] && cp $$SRCDIR/$$b $$STAGE/bin/; done; \
+		cp $$SRCDIR/admin/admin-server $$STAGE/admin/; \
+		cp -R ../nufs-admin/web/dist $$STAGE/admin/web/dist; \
+		cp deploy/vm/deploy.sh deploy/vm/cluster.env.example $$STAGE/; \
+		( cd $$STAGE && ./deploy.sh gen-default-config ); \
+		tar -czf $(DIST_DIR)/nufs-$(VERSION)-$$NAME.tar.gz -C $(DIST_DIR) nufs-$(VERSION)-$$NAME; \
+		rm -rf $$STAGE; \
+	done
+	@echo "Done:"
+	@ls -lh $(DIST_DIR)
 
 test: ## Run all tests
 	go test -race -timeout 120s ./...

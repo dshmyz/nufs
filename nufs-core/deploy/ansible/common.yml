@@ -10,7 +10,6 @@
   gather_facts: false
   vars:
     core_dir: "{{ playbook_dir + '/../../' }}"   # nufs-core
-    build_binaries: true   # 控制机编译；已有二进制时 -e build_binaries=false
   tasks:
     - name: create binaries dir
       file:
@@ -38,7 +37,7 @@
       register: binstat
     - name: fail if any binary missing
       fail:
-        msg: "{{ item.item }} 缺失（binaries_dir={{ binaries_dir }} 里没有；开编译或放对位置）"
+        msg: "{{ item.item }} 缺失（binaries_dir={{ binaries_dir }} 里没有；先在 nufs-core 跑 make package / make build-linux）"
       loop: "{{ binstat.results }}"
       when: not item.stat.exists
 

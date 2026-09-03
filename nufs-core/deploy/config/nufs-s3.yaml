@@ -24,4 +24,4 @@ tls_cert: ""
 tls_key: ""
 
 log_level: "info"
-log_json: false
+log_format: "text"

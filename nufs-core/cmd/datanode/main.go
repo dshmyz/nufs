@@ -77,12 +77,12 @@ func main() {
 		scrubInterval        = flag.Duration("scrub-interval", 0, "Background data integrity scan cadence (0 = disabled; the scrub reads every local chunk and verifies its CRC32C checksum)")
 		ecConvertInterval    = flag.Duration("ec-convert-interval", 30*time.Second, "Background EC conversion task poll cadence (consumes metad TaskECConvert background tasks whose chunk replica lives on this node)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
-		logJSON              = flag.Bool("log-json", false, "JSON log output")
+		logFormat            = flag.String("log-format", "text", "Log output format (text|json)")
 	)
 	_ = configPath
 	config.Preload()
 	flag.Parse()
-	logging.Init(logging.Config{Level: *logLevel, JSON: *logJSON, AddSource: true})
+	logging.Init(logging.Config{Level: *logLevel, JSON: *logFormat == "json", AddSource: true})
 	log := logging.Named("datanode")
 
 	var dirs []string

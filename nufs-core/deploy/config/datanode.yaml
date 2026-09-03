@@ -16,7 +16,7 @@ zone: "zone1"
 capacity_gb: 1000
 
 log_level: "info"
-log_json: false
+log_format: "text"
 
 # OpenTelemetry tracing
 trace_enabled: false
