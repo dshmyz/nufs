@@ -154,6 +154,7 @@ export interface NodeDisk {
   state?: string
   chunks?: number
   bytes?: number
+  total_bytes?: number
   failed?: boolean
 }
 
@@ -170,6 +171,41 @@ export async function nodeDiskAction(clusterId: string, nodeId: string, action: 
 
 export async function nodeGcScan(clusterId: string, nodeId: string): Promise<void> {
   await api.post(`/clusters/${encodePathSegment(clusterId)}/datanode/${encodeURIComponent(nodeId)}/gc/scan`)
+}
+
+// Datanode runtime metrics / alerts (visualization data)
+export interface NodeMetrics {
+  disk?: {
+    total_bytes?: number
+    used_bytes?: number
+    avail_bytes?: number
+    usage_pct?: number
+    chunk_count?: number
+    read_iops?: number
+    write_iops?: number
+    read_bytes?: number
+    write_bytes?: number
+    io_errors?: number
+    disk_state?: string
+  }
+}
+
+export interface NodeAlert {
+  level?: string
+  usage_pct?: number
+  used_bytes?: number
+  total_bytes?: number
+  ts?: string
+}
+
+export async function getNodeMetrics(clusterId: string, nodeId: string): Promise<NodeMetrics> {
+  const resp = await api.get(`/clusters/${encodePathSegment(clusterId)}/datanode/${encodeURIComponent(nodeId)}/metrics`)
+  return resp.data ?? {}
+}
+
+export async function getNodeAlerts(clusterId: string, nodeId: string): Promise<NodeAlert[]> {
+  const resp = await api.get(`/clusters/${encodePathSegment(clusterId)}/datanode/${encodeURIComponent(nodeId)}/admin/alerts`)
+  return Array.isArray(resp.data?.alerts) ? resp.data.alerts : []
 }
 
 // Buckets

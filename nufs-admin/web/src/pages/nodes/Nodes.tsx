@@ -6,8 +6,12 @@ import {
   getNodeDisks,
   nodeDiskAction,
   nodeGcScan,
+  getNodeMetrics,
+  getNodeAlerts,
   NodeInfo,
   NodeDisk,
+  NodeMetrics,
+  NodeAlert,
 } from '../../api/client'
 
 const DISK_ACTIONS = [
@@ -23,6 +27,8 @@ export default function Nodes() {
   const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [disks, setDisks] = useState<Record<string, NodeDisk[]>>({})
+  const [metrics, setMetrics] = useState<Record<string, NodeMetrics>>({})
+  const [alerts, setAlerts] = useState<Record<string, NodeAlert[]>>({})
   const [adoptDir, setAdoptDir] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState<Record<string, boolean>>({})
 
@@ -38,6 +44,37 @@ export default function Nodes() {
   useEffect(() => {
     loadNodes()
   }, [clusterId])
+
+  // 展开节点后轮询指标 + 拉告警（可视化数据）
+  useEffect(() => {
+    if (!clusterId) return
+    const expandedIds = Object.keys(expanded).filter(k => expanded[k])
+    if (expandedIds.length === 0) return
+    const poll = async () => {
+      for (const id of expandedIds) {
+        try {
+          const m = await getNodeMetrics(clusterId, id)
+          setMetrics(prev => ({ ...prev, [id]: m }))
+        } catch { /* 网络/暂不可达，忽略 */ }
+      }
+    }
+    poll()
+    const timer = setInterval(poll, 2000)
+    return () => clearInterval(timer)
+  }, [clusterId, expanded])
+
+  // 展开时拉一次告警
+  useEffect(() => {
+    if (!clusterId) return
+    Object.keys(expanded).filter(k => expanded[k]).forEach(async (id) => {
+      if (alerts[id]) return
+      try {
+        const a = await getNodeAlerts(clusterId, id)
+        setAlerts(prev => ({ ...prev, [id]: a }))
+      } catch { /* ignore */ }
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clusterId, expanded])
 
   const toggleDisks = async (nodeId: string) => {
     if (!clusterId) return
@@ -241,6 +278,25 @@ export default function Nodes() {
                 </div>
               </div>
 
+              {/* 指标条：容量/读写/IO 错误（轮询 /metrics） */}
+              {metrics[nodeId]?.disk && (
+                <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', marginBottom: '12px', padding: '10px 12px', background: '#f8fafc', borderRadius: '8px', fontSize: '13px' }}>
+                  <div>
+                    <div style={{ color: '#5a6478', fontSize: '12px' }}>容量使用率</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <div style={{ width: '110px', height: '8px', background: '#e2e6ec', borderRadius: '4px', overflow: 'hidden' }}>
+                        <div style={{ width: `${Math.min(100, metrics[nodeId].disk!.usage_pct ?? 0)}%`, height: '100%', background: (metrics[nodeId].disk!.usage_pct ?? 0) > 85 ? '#dc2626' : '#1f6feb' }} />
+                      </div>
+                      <b>{(metrics[nodeId].disk!.usage_pct ?? 0).toFixed(1)}%</b>
+                    </div>
+                  </div>
+                  <div><div style={{ color: '#5a6478', fontSize: '12px' }}>读</div><b>{metrics[nodeId].disk!.read_iops ?? 0} IOPS</b></div>
+                  <div><div style={{ color: '#5a6478', fontSize: '12px' }}>写</div><b>{metrics[nodeId].disk!.write_iops ?? 0} IOPS</b></div>
+                  <div><div style={{ color: '#5a6478', fontSize: '12px' }}>IO 错误</div><b style={{ color: (metrics[nodeId].disk!.io_errors ?? 0) > 0 ? '#dc2626' : '#5a6478' }}>{metrics[nodeId].disk!.io_errors ?? 0}</b></div>
+                  <div><div style={{ color: '#5a6478', fontSize: '12px' }}>chunk</div><b>{metrics[nodeId].disk!.chunk_count ?? 0}</b></div>
+                </div>
+              )}
+
               {!disks[nodeId] || disks[nodeId].length === 0 ? (
                 <div style={{ color: '#5a6478', fontSize: '13px', padding: '12px' }}>无磁盘</div>
               ) : (
@@ -251,6 +307,7 @@ export default function Nodes() {
                       <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>目录</th>
                       <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>状态</th>
                       <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>chunk</th>
+                      <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>使用</th>
                       <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}></th>
                     </tr>
                   </thead>
@@ -261,6 +318,18 @@ export default function Nodes() {
                         <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec', fontFamily: 'monospace', fontSize: '12px' }}>{disk.dir}</td>
                         <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec' }}>{disk.state}</td>
                         <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec' }}>{disk.chunks ?? 0}</td>
+                        <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec' }}>
+                          {disk.total_bytes ? (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <div style={{ width: '80px', height: '6px', background: '#e2e6ec', borderRadius: '3px', overflow: 'hidden' }}>
+                                <div style={{ width: `${Math.min(100, (disk.bytes! / disk.total_bytes) * 100)}%`, height: '100%', background: '#1f6feb' }} />
+                              </div>
+                              <span style={{ fontSize: '11px', color: '#5a6478' }}>{(disk.bytes! / disk.total_bytes * 100).toFixed(1)}%</span>
+                            </div>
+                          ) : (
+                            <span style={{ color: '#5a6478' }}>—</span>
+                          )}
+                        </td>
                         <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec' }}>
                           <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
                             {DISK_ACTIONS.map(a => (
@@ -304,6 +373,24 @@ export default function Nodes() {
                   {busy[`${nodeId}:adopt`] ? '采纳中...' : '采纳新磁盘'}
                 </button>
               </div>
+
+              {/* 告警流 */}
+              {alerts[nodeId] && alerts[nodeId].length > 0 && (
+                <div style={{ marginTop: '12px', paddingTop: '10px', borderTop: '1px solid #e2e6ec' }}>
+                  <div style={{ fontSize: '13px', fontWeight: 700, marginBottom: '6px', color: '#5a6478' }}>最近告警</div>
+                  {alerts[nodeId].slice(-6).reverse().map((a, i) => (
+                    <div key={i} style={{ display: 'flex', gap: '10px', alignItems: 'center', fontSize: '12px', padding: '3px 0' }}>
+                      <span style={{
+                        padding: '1px 8px', borderRadius: '3px', fontSize: '11px',
+                        background: a.level === 'critical' ? '#fee2e2' : a.level === 'warning' ? '#fef3c7' : '#e0f2fe',
+                        color: a.level === 'critical' ? '#b91c1c' : a.level === 'warning' ? '#92400e' : '#0369a1',
+                      }}>{a.level}</span>
+                      <span>使用率 {(a.usage_pct ?? 0).toFixed(1)}%</span>
+                      {a.ts && <span style={{ color: '#5a6478' }}>{new Date(a.ts).toLocaleString()}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ))}
     </div>
