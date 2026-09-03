@@ -5,7 +5,7 @@
 listen: "0.0.0.0:9100"
 node_id: "auto"                          # "auto" = hash machine-id, or a number
 data_dir: "/var/lib/dfs/datanode"
-data_dirs: ""                            # comma-separated, enables supervisor mode
+data_dir: ""                              # 逗号分隔即 JBOD 多盘
 base_port: 9101
 metadata: "localhost:8091"               # Metadata service address
 ops_addr: "0.0.0.0:8091"                  # Operations HTTP API address

@@ -65,7 +65,7 @@ for i in 1 2 3; do
   bin/datanode --node-id=$i \
     --listen=127.0.0.1:910$i --register-addr=127.0.0.1:910$i \
     --ops-addr=127.0.0.1:1809$((i+5)) \
-    --data-dirs=$BASE/dn$i \
+    --data-dir=$BASE/dn$i \
     --metadata=127.0.0.1:18091 \
     --metadata-auth-token=$AUTH_TOKEN --ops-auth-token=$AUTH_TOKEN &
 done

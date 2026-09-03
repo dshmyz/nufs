@@ -157,7 +157,7 @@ dn_run() { # node leader —— 显式 --node-id，rack/zone 派生自序数；�
   rk=$(( (n-1) % 3 + 1 )); zn=$(( (n-1) % 3 + 1 ))
   "$DATANODE_BIN" --node-id="$n" --listen="127.0.0.1:$lp" \
     --register-addr="127.0.0.1:$lp" --ops-addr="127.0.0.1:$ops" \
-    --data-dirs="$(node_dirs "$n")" --metadata=127.0.0.1:$(metad_ops "$leader") \
+    --data-dir="$(node_dirs "$n")" --metadata=127.0.0.1:$(metad_ops "$leader") \
     --rack="rack$rk" --zone="zone$zn" \
     --allow-insecure-dev --log-level=info \
     > "$(node_log "$n")" 2>&1 &

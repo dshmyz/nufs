@@ -233,7 +233,7 @@ start_cluster() {
     lp="$(data_pport "$n")"
     "$DATANODE_BIN" --node-id="$n" --listen="127.0.0.1:$lp" \
       --register-addr="127.0.0.1:$lp" --ops-addr="127.0.0.1:$((DATA_BASE+200+$n-1))" \
-      --data-dirs="$(node_dirs "$n")" --metadata="127.0.0.1:$(metad_ops "$leader")" \
+      --data-dir="$(node_dirs "$n")" --metadata="127.0.0.1:$(metad_ops "$leader")" \
       --rack="rack$(( (n-1) % 3 + 1 ))" --zone="zone$(( (n-1) % 3 + 1 ))" \
       --allow-insecure-dev --log-level=info \
       > "$LOG_ROOT/log/datanode$n.log" 2>&1 &

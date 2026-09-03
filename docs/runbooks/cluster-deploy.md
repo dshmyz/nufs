@@ -197,7 +197,7 @@ vi config/*.yaml
 |---|---|---|
 | `capacity`（datanode） | 1000（GB） | 上报的节点容量 |
 | `rack`/`zone` | rack-N / zone-1 | 拓扑标签，影响副本放置 |
-| `data_dirs`（datanode） | 单目录 | **多盘 JBOD**：改成 `"/mnt/disk1,/mnt/disk2"`，磁盘 ID 自动按 `NodeID×1000+序号` 编 |
+| `data_dir`（datanode） | 单目录 | **多盘 JBOD**：改成 `"/mnt/disk1,/mnt/disk2"`，磁盘 ID 自动按 `NodeID×1000+序号` 编 |
 | `log_format` | json | 改 `text` 可读性好些 |
 | `log_level` | info | debug/info/warn/error |
 
@@ -375,7 +375,7 @@ nohup datanode \
   --listen=0.0.0.0:9103 \
   --register-addr=10.0.0.11:9103 \          # ← 必须是网关/其他节点能路由到的地址
   --ops-addr=0.0.0.0:18096 \
-  --data-dir=/var/lib/nufs/datanode1 \      # 多盘 JBOD 换成：--data-dirs=/mnt/disk1,/mnt/disk2
+  --data-dir=/var/lib/nufs/datanode1 \      # 多盘 JBOD 换成：--data-dir=/mnt/disk1,/mnt/disk2
   --metadata=10.0.0.11:18091 \
   --metadata-auth-token=$AUTH_TOKEN \
   --ops-auth-token=$AUTH_TOKEN \
@@ -526,7 +526,7 @@ sudo mount -t nufs none /mnt/nufs -o meta=10.0.0.11:18091
 /opt/nufs/deploy.sh start       # 起（metad-1 所在节点最先）
 ```
 
-- **换盘/加盘**：datanode 控制台 Disks 页（Adopt/Retire/Migrate），或改 `data_dirs` 重启
+- **换盘/加盘**：datanode 控制台 Disks 页（Adopt/Retire/Migrate），或改 `data_dir` 重启
 - **升级**：控制机 `make package` → 重发包 → 各节点 `down && start`（metad-1 先）
 - **监控**：`deploy/monitoring/` 有现成 prometheus/grafana/alerting 配置，指标端点 `:18091/api/v1/metrics`
 - **生产必做**：开启 metad 备份（`--backup-enabled` + S3 仓库参数），并跑一次恢复演练

@@ -176,8 +176,7 @@ metad_args() {
 datanode_args() {
   local n=$1 ip=$2
   local chunk_port=$((DATANODE_CHUNK_PORT+n-1)) ops_port=$((DATANODE_OPS_PORT+n-1))
-  local data_arg=(--data-dir="$DATA_ROOT/datanode$n")
-  [ -n "${NUFS_DATA_DIRS:-}" ] && data_arg=(--data-dirs="$NUFS_DATA_DIRS")
+  local data_arg=(--data-dir="${NUFS_DATA_DIRS:-$DATA_ROOT/datanode$n}")   # 逗号分隔即 JBOD 多盘
   CMD_ARGS=("$BIN/datanode" --node-id="$n"
     --listen="0.0.0.0:$chunk_port" --register-addr="$ip:$chunk_port"
     --ops-addr="0.0.0.0:$ops_port" "${data_arg[@]}"
@@ -249,15 +248,14 @@ EOF
 emit_datanode_yaml() { # n ip -> stdout
   local n=$1 ip=$2
   local chunk_port=$((DATANODE_CHUNK_PORT+n-1)) ops_port=$((DATANODE_OPS_PORT+n-1))
-  local data_key=data_dir data_val="$DATA_ROOT/datanode$n"
-  [ -n "${NUFS_DATA_DIRS:-}" ] && { data_key=data_dirs; data_val="$NUFS_DATA_DIRS"; }
+  local data_val="${NUFS_DATA_DIRS:-$DATA_ROOT/datanode$n}"   # 逗号分隔即 JBOD 多盘
   cat <<EOF
 config_version: 1
 node_id: $n
 listen: "0.0.0.0:$chunk_port"
 register_addr: "$ip:$chunk_port"
 ops_addr: "0.0.0.0:$ops_port"
-$data_key: "$data_val"
+data_dir: "$data_val"
 metadata: "$METAD_ADDR"
 metadata_auth_token: "$AUTH_TOKEN"
 ops_auth_token: "$AUTH_TOKEN"

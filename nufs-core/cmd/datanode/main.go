@@ -45,8 +45,7 @@ func main() {
 		listenAddr           = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
 		registerAddrFlag     = flag.String("register-addr", "", "Address registered with metadata (routable host:port; empty = listen addr)")
 		opsAddr              = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
-		dataDir              = flag.String("data-dir", "/var/lib/nufs/data", "Chunk storage root directory")
-		dataDirs             = flag.String("data-dirs", "", "Comma-separated data directories for JBOD multi-disk mode")
+		dataDir              = flag.String("data-dir", "/var/lib/nufs/data", "Chunk storage root directory; comma-separated for JBOD multi-disk (e.g. /d1,/d2)")
 		machineID            = flag.String("machine-id", "", "Machine identifier for topology placement")
 		metaAddr             = flag.String("metadata", "localhost:8091", "Metadata service HTTP address")
 		rack                 = flag.String("rack", "rack-1", "Rack identifier for topology placement")
@@ -85,16 +84,10 @@ func main() {
 	logging.Init(logging.Config{Level: *logLevel, JSON: *logFormat == "json", AddSource: true})
 	log := logging.Named("datanode")
 
-	var dirs []string
-	if *dataDirs != "" {
-		dirs = splitAndClean(*dataDirs)
-		if len(dirs) == 0 {
-			log.Error("data-dirs is empty")
-			os.Exit(1)
-		}
-	}
-	if len(dirs) == 0 && *dataDir == "" {
-		log.Error("either --data-dir or --data-dirs must be set")
+	// 单个 --data-dir 接受逗号分隔的多盘（JBOD）；单值即单盘。
+	dirs := splitAndClean(*dataDir)
+	if len(dirs) == 0 {
+		log.Error("--data-dir is empty")
 		os.Exit(1)
 	}
 
@@ -103,10 +96,7 @@ func main() {
 		mid = readMachineID()
 	}
 
-	singleDir := *dataDir
-	if len(dirs) == 0 {
-		dirs = []string{singleDir}
-	}
+	singleDir := dirs[0]
 
 	log.Info("starting", "node_id", *nodeID, "addr", *listenAddr, "disks", dirs, "machine", mid)
 	nid, err := resolveNodeID(*nodeID, resolveNodeIDPath(dirs[0]), mid)
@@ -498,7 +488,7 @@ func runDataNodeV21(cfg datanode.Config, dataDirs []string, log *slog.Logger) {
 
 	// Wrap all stores in a V2 adapter and start the TCP server. The
 	// adapter aggregates every disk (least-used placement, per-disk stats
-	// and heartbeat data), so a multi-disk --data-dirs node actually
+	// and heartbeat data), so a multi-disk --data-dir node actually
 	// serves from all of them rather than only the first.
 	v2Store := datanode.NewMultiV2Store(stores, dataDirs...)
 	// Attach the EC shard stores so Program A's EC conversions can place

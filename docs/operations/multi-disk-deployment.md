@@ -1,6 +1,6 @@
 # datanode 多盘部署指南
 
-本文档描述如何使用 `--data-dirs` 在 JBOD（Just a Bunch of Disks）模式下部署 datanode，
+本文档描述如何使用 `--data-dir` 在 JBOD（Just a Bunch of Disks）模式下部署 datanode，
 以及如何通过管理接口进行在线运维操作。
 
 ## 部署架构
@@ -46,7 +46,7 @@ EnvironmentFile=-/etc/default/nufs-datanode
 ExecStart=/usr/local/bin/datanode \
     --node-id=auto \
     --listen=0.0.0.0:9100 \
-    --data-dirs=${DATA_DIRS} \
+    --data-dir=${DATA_DIRS} \
     --metadata=localhost:8091 \
     --rack=${RACK:-rack1} \
     --zone=${ZONE:-zone1} \

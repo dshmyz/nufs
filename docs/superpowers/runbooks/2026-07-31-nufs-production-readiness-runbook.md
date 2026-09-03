@@ -242,7 +242,7 @@ curl -X PUT http://<metad>:9100/api/v1/config \
 
 ## 七、JBOD 多盘运维
 
-> datanode 支持 `--data-dirs=/d1,/d2,/d3` 多盘 JBOD 模式，单进程管理多块磁盘。
+> datanode 支持 `--data-dir=/d1,/d2,/d3` 多盘 JBOD 模式，单进程管理多块磁盘。
 
 ### 部署要点
 
@@ -345,11 +345,11 @@ per-disk 指标通过 heartbeat 的 `DiskStats` 字段上报到 metadata。
 
 ### 从旧版 supervisor 模式迁移
 
-如果之前使用 `--data-dirs` 的 supervisor 模式（每盘一个子进程）：
+如果之前使用 `--data-dir` 的 supervisor 模式（每盘一个子进程）：
 
 1. 停止 supervisor 服务
 2. 对每个磁盘目录，确认数据目录结构一致（`{dir}/chunks/` + `{dir}/wal/`）
-3. 以 JBOD 模式启动：`--data-dirs=/d1,/d2,/d3`
+3. 以 JBOD 模式启动：`--data-dir=/d1,/d2,/d3`
 4. 新进程会自动扫描所有盘并重建内存索引
 5. 向 metadata 重新注册（旧的 N 个 NodeID 变为 1 个）
 

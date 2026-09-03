@@ -2,7 +2,7 @@
 #
 # V2.1 多盘（JBOD）引擎集成测试
 #
-# 启动 metad + datanode-v21-multi（--data-dirs=/d0,/d1，multi-disk profile）+
+# 启动 metad + datanode-v21-multi（--data-dir=/d0,/d1，multi-disk profile）+
 # S3 gateway，通过 S3 API 写入多个对象，验证 multi-disk parity 门禁：
 #   1. V2.1 多盘适配器真正聚合所有磁盘（least-used 放置），数据落在 /d0 与 /d1 两盘；
 #   2. 端到端读写字节精确。

@@ -193,7 +193,7 @@ host_start_datanode() {
   ready_dir
   "$DATANODE_BIN" --node-id=auto --listen="$DN_LISTEN" --register-addr="$DN_REGISTER" \
     --ops-addr="$DN_OPS_ADDR" \
-    --data-dirs="$DN_D0,$DN_D1" --metadata=localhost:8091 \
+    --data-dir="$DN_D0,$DN_D1" --metadata=localhost:8091 \
     --rack=rack1 --zone=zone1 \
     --log-level=info \
     > "$DATANODE_LOG" 2>&1 &
