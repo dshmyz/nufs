@@ -39,13 +39,20 @@ func main() {
 		}
 	}
 
+	// 数据默认落在安装目录（二进制所在目录）的 data/ 下，而非系统全局 /var/lib。
+	// 用 os.Executable() 推导（cwd 是启动目录，会飘），部署时用 --data-dir/--config 显式覆盖。
+	installDir := "."
+	if exe, err := os.Executable(); err == nil {
+		installDir = filepath.Dir(exe)
+	}
+
 	var (
 		configPath           = flag.String("config", "", "Path to YAML config file")
 		nodeID               = flag.String("node-id", "auto", "Unique data node ID or 'auto'")
 		listenAddr           = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
 		registerAddrFlag     = flag.String("register-addr", "", "Address registered with metadata (routable host:port; empty = listen addr)")
 		opsAddr              = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
-		dataDir              = flag.String("data-dir", "/var/lib/nufs/data", "Chunk storage root directory; comma-separated for JBOD multi-disk (e.g. /d1,/d2)")
+		dataDir              = flag.String("data-dir", filepath.Join(installDir, "data"), "Chunk storage root directory; comma-separated for JBOD multi-disk (e.g. /d1,/d2)")
 		machineID            = flag.String("machine-id", "", "Machine identifier for topology placement")
 		metaAddr             = flag.String("metadata", "localhost:8091", "Metadata service HTTP address")
 		rack                 = flag.String("rack", "rack-1", "Rack identifier for topology placement")
