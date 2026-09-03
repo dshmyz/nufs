@@ -45,7 +45,7 @@ func main() {
 		listenAddr           = flag.String("listen", "0.0.0.0:9100", "TCP listen address")
 		registerAddrFlag     = flag.String("register-addr", "", "Address registered with metadata (routable host:port; empty = listen addr)")
 		opsAddr              = flag.String("ops-addr", "0.0.0.0:8091", "Operations HTTP API address")
-		dataDir              = flag.String("data-dir", "/var/lib/dfs/data", "Chunk storage root directory")
+		dataDir              = flag.String("data-dir", "/var/lib/nufs/data", "Chunk storage root directory")
 		dataDirs             = flag.String("data-dirs", "", "Comma-separated data directories for JBOD multi-disk mode")
 		machineID            = flag.String("machine-id", "", "Machine identifier for topology placement")
 		metaAddr             = flag.String("metadata", "localhost:8091", "Metadata service HTTP address")

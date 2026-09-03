@@ -185,7 +185,7 @@ func DefaultConfig() Config {
 	return Config{
 		ListenAddr:          "0.0.0.0:9100",
 		OpsListenAddr:       "0.0.0.0:8091",
-		DataDir:             "/var/lib/dfs/data",
+		DataDir:             "/var/lib/nufs/data",
 		MetadataAddr:        "localhost:8091",
 		MetadataCacheDir:    "",
 		HeartbeatInterval:   10 * time.Second,

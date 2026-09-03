@@ -9,16 +9,16 @@ services:
       target: metad
     container_name: dfs-metad
     command:
-      - "-data-dir=/var/lib/dfs/metadata"
+      - "-data-dir=/var/lib/nufs/metadata"
       - "-node-id=1"
       - "-raft"
       - "-raft-addr=0.0.0.0:7000"
-      - "-raft-dir=/var/lib/dfs/raft"
+      - "-raft-dir=/var/lib/nufs/raft"
       - "-raft-bootstrap"
       - "-ops-addr=0.0.0.0:8091"
     volumes:
-      - metad-data:/var/lib/dfs/metadata
-      - metad-raft:/var/lib/dfs/raft
+      - metad-data:/var/lib/nufs/metadata
+      - metad-raft:/var/lib/nufs/raft
     ports:
       - "8091:8091"   # Operations API
       - "7000:7000"   # Raft consensus
@@ -120,9 +120,9 @@ services:
     container_name: dfs-nufs-s3
     command:
       - "-listen=:8080"
-      - "-meta-dir=/var/lib/dfs/metadata"
+      - "-meta-dir=/var/lib/nufs/metadata"
     volumes:
-      - s3gw-meta:/var/lib/dfs/metadata
+      - s3gw-meta:/var/lib/nufs/metadata
     ports:
       - "8080:8080"
     depends_on:

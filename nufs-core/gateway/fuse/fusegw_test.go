@@ -18,8 +18,8 @@ func TestDefaultMountConfig(t *testing.T) {
 	if c.Mountpoint != "/mnt/dfs" {
 		t.Errorf("Mountpoint = %q, want /mnt/dfs", c.Mountpoint)
 	}
-	if c.MetaDir != "/var/lib/dfs/metadata" {
-		t.Errorf("MetaDir = %q, want /var/lib/dfs/metadata", c.MetaDir)
+	if c.MetaDir != "/var/lib/nufs/metadata" {
+		t.Errorf("MetaDir = %q, want /var/lib/nufs/metadata", c.MetaDir)
 	}
 	if c.ScanTTL != 60*time.Second {
 		t.Errorf("ScanTTL = %v, want 60s", c.ScanTTL)
@@ -39,8 +39,8 @@ func TestMountConfigValidate(t *testing.T) {
 }
 
 func TestMountConfigCacheDir(t *testing.T) {
-	c := &MountConfig{MetaDir: "/var/lib/dfs/metadata"}
-	if d := c.ResolveCacheDir(); d != "/var/lib/dfs/metadata/chunk-cache" {
+	c := &MountConfig{MetaDir: "/var/lib/nufs/metadata"}
+	if d := c.ResolveCacheDir(); d != "/var/lib/nufs/metadata/chunk-cache" {
 		t.Errorf("CacheDir = %q, want meta-dir/chunk-cache", d)
 	}
 

@@ -49,7 +49,7 @@ nufs-cli --mode=remote --meta-addr=metad-1:8091 --auth-token=<token> \
     stat mybucket/docs/2026/report.pdf
 
 # 本地（直接读本机 Pebble 元数据目录）
-nufs-cli --meta-dir=/var/lib/dfs/metadata stat mybucket/docs/2026/report.pdf
+nufs-cli --meta-dir=/var/lib/nufs/metadata stat mybucket/docs/2026/report.pdf
 ```
 
 输出内容：
@@ -92,7 +92,7 @@ nufs-cli --mode=remote --meta-addr=metad-1:8091 --auth-token=<token> \
     kv scan /bucket/ --limit 100
 
 # 本地直连
-nufs-cli --meta-dir=/var/lib/dfs/metadata kv get /node/1
+nufs-cli --meta-dir=/var/lib/nufs/metadata kv get /node/1
 ```
 
 > **安全设计**

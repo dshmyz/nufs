@@ -31,7 +31,7 @@ import (
 
 func main() {
 	var (
-		metaDir   = flag.String("meta-dir", "/var/lib/dfs/metadata", "Pebble metadata directory (local mode)")
+		metaDir   = flag.String("meta-dir", "/var/lib/nufs/metadata", "Pebble metadata directory (local mode)")
 		metaAddr  = flag.String("meta-addr", "localhost:8091", "Metadata HTTP address (remote mode)")
 		mode      = flag.String("mode", "auto", "Connection mode: auto, local, remote")
 		authToken = flag.String("auth-token", "", "Bearer token for metad ops API (remote mode)")

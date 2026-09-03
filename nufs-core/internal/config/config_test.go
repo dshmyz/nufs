@@ -101,7 +101,7 @@ func TestLoadDatanodeConfigEndToEnd(t *testing.T) {
 		path := writeConfig(t, `
 listen: "0.0.0.0:9100"
 node_id: "42"
-data_dir: "/var/lib/dfs/data"
+data_dir: "/var/lib/nufs/data"
 metadata: "metad:8091"
 ops_addr: "0.0.0.0:8092"
 rack: "rack1"
@@ -115,7 +115,7 @@ trace_endpoint: "otel:4317"
 		if err := Load(path); err != nil {
 			t.Fatalf("Load: %v", err)
 		}
-		if *dataDir != "/var/lib/dfs/data" {
+		if *dataDir != "/var/lib/nufs/data" {
 			t.Fatalf("data-dir: %q", *dataDir)
 		}
 		if *listen != "0.0.0.0:9100" {

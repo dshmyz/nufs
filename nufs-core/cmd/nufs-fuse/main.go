@@ -48,7 +48,7 @@ func main() {
 		backend = flag.String("backend", "nufs", "Backend: dfs (distributed filesystem) or s3 (external S3 bucket)")
 
 		// DFS backend flags
-		metaDir  = flag.String("meta-dir", "/var/lib/dfs/metadata", "DFS: Pebble metadata directory (local mode)")
+		metaDir  = flag.String("meta-dir", "/var/lib/nufs/metadata", "DFS: Pebble metadata directory (local mode)")
 		metaAddr = flag.String("meta-addr", "", "DFS: Remote metadata address (host:port)")
 
 		// S3 backend flags

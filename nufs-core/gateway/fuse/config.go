@@ -35,7 +35,7 @@ type MountConfig struct {
 func DefaultMountConfig() *MountConfig {
 	return &MountConfig{
 		Mountpoint:      "/mnt/dfs",
-		MetaDir:         "/var/lib/dfs/metadata",
+		MetaDir:         "/var/lib/nufs/metadata",
 		CacheQuotaBytes: 1 << 30, // 1 GiB
 		MetricsAddr:     "",
 		ScanTTL:         60 * time.Second,

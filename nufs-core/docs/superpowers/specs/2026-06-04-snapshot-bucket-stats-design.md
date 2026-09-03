@@ -148,7 +148,7 @@ No mutex needed — Raft serializes access during restore.
 #### 3. Checkpoint directory cleanup
 
 Checkpoints are created in a temp subdirectory under `RaftDir` (e.g.,
-`/var/lib/dfs/raft/checkpoint/`). Deleted after Persist completes.
+`/var/lib/nufs/raft/checkpoint/`). Deleted after Persist completes.
 Stale checkpoints from crashed processes are cleaned on startup.
 
 #### 4. Snapshot size

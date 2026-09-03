@@ -16,7 +16,7 @@ NUFS 把「元数据」与「数据」严格分离，落盘引擎也完全不同
 
 | 面 | 组件 | 存储引擎 | 目录（默认） | 一致性 |
 |----|------|----------|-------------|--------|
-| 元数据 | `metad` | **Pebble**（LSM-tree KV）+ 可选 hashicorp/raft | `--data-dir` 默认 `/var/lib/dfs/metadata`；`--raft-dir` 默认 `/var/lib/dfs/raft` | raft（多副本）/ 单机 |
+| 元数据 | `metad` | **Pebble**（LSM-tree KV）+ 可选 hashicorp/raft | `--data-dir` 默认 `/var/lib/nufs/metadata`；`--raft-dir` 默认 `/var/lib/nufs/raft` | raft（多副本）/ 单机 |
 | 数据 | `datanode` | **V2.1 segment 引擎**（每盘一个 `segment.Store`） | `--dir`（JBOD 多盘） | 多副本 / EC |
 
 - **metad** 把所有命名空间 / inode / chunk / 配额 / 备份 / 审计等元数据写进一个

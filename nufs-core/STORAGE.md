@@ -213,7 +213,7 @@ type BucketInfo struct {
 ### 4.1 目录结构
 
 ```
-{DataDir}（如 /var/lib/dfs/data）
+{DataDir}（如 /var/lib/nufs/data）
 ├── chunks/                # Chunk 存储目录
 │   ├── 00/               # Shard 0x00
 │   │   ├── 0000000001.dat  # Chunk 数据文件
@@ -728,7 +728,7 @@ Scrubber / LeaseManager      metad                    RepairWorker           Hea
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--data-dir` | `/var/lib/dfs/metadata` | Pebble 数据目录 |
+| `--data-dir` | `/var/lib/nufs/metadata` | Pebble 数据目录 |
 | `--ops-addr` | `0.0.0.0:8091` | HTTP API 监听地址 |
 | `--raft-addr` | `0.0.0.0:7000` | Raft 共识端口 |
 | `--raft` | `true` | 启用 Raft |
@@ -741,7 +741,7 @@ Scrubber / LeaseManager      metad                    RepairWorker           Hea
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--listen` | `0.0.0.0:9100` | Chunk TCP 服务地址 |
-| `--data-dir` | `/var/lib/dfs/data` | Chunk 存储根目录 |
+| `--data-dir` | `/var/lib/nufs/data` | Chunk 存储根目录 |
 | `--metadata` | `localhost:8091` | metad HTTP 地址 |
 | `--capacity` | `1000` | 节点容量 (GB) |
 | `--rack` | `rack-1` | 机架标识 |

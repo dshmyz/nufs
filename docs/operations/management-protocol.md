@@ -100,7 +100,7 @@ CLI 工具按以下顺序查找 socket：
 
 1. 命令行参数中的目录路径（`--data-dir`）
 2. 环境变量 `DATA_DIRS` 中第一个目录
-3. 默认位置 `/var/lib/dfs/data/.datanode.sock`
+3. 默认位置 `/var/lib/nufs/data/.datanode.sock`
 4. 系统临时目录 `/tmp/.datanode.sock`
 
 ## 兼容性

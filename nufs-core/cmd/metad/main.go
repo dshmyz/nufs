@@ -36,7 +36,7 @@ import (
 func main() {
 	var (
 		configPath           = flag.String("config", "", "Path to YAML config file")
-		dataDir              = flag.String("data-dir", "/var/lib/dfs/metadata", "Pebble data directory")
+		dataDir              = flag.String("data-dir", "/var/lib/nufs/metadata", "Pebble data directory")
 		cacheDir             = flag.String("cache-dir", "", "Pebble read cache directory (optional)")
 		nodeID               = flag.String("node-id", "1", "Metadata node ID or StatefulSet pod name ending in -<ordinal>")
 		memTableSize         = flag.Uint64("memtable-size", 256<<20, "Pebble memtable size in bytes")
@@ -45,7 +45,7 @@ func main() {
 		enableRaft           = flag.Bool("raft", true, "Enable Raft consensus")
 		raftAddr             = flag.String("raft-addr", "0.0.0.0:7000", "Raft bind address")
 		raftAdvertiseAddr    = flag.String("raft-advertise-addr", "", "Advertised Raft address for peers (default: raft-addr)")
-		raftDir              = flag.String("raft-dir", "/var/lib/dfs/raft", "Raft data directory")
+		raftDir              = flag.String("raft-dir", "/var/lib/nufs/raft", "Raft data directory")
 		raftBootstrap        = flag.Bool("raft-bootstrap", false, "Bootstrap a new Raft cluster")
 		raftBootstrapOwner   = flag.String("raft-bootstrap-owner", "", "Node ID of the single node allowed to seed the Raft cluster. When set, nodes with --raft-bootstrap=true whose --node-id differs defer to it (start as follower and are added by the owner's reconcile), preventing the all-nodes-bootstrap leadership split in multi-process deploys.")
 		raftBootstrapPeers   = flag.String("raft-bootstrap-peers", "", "Comma-separated Raft bootstrap peers as id=host:port")
@@ -75,7 +75,7 @@ func main() {
 		devSeedCred          = flag.String("dev-seed-cred", "", "Dev only: seed a credential as <access-key>:<secret-key> on startup (never use in production)")
 		allowInsecureDev     = flag.Bool("allow-insecure-dev", false, "Allow running without auth, TLS, or multi-node Raft (dev only)")
 		backupEnabled        = flag.Bool("backup-enabled", false, "Enable leader-only metadata backups")
-		backupLocalDir       = flag.String("backup-local-dir", "/var/lib/dfs/backup-tmp", "Local temporary directory for metadata backups")
+		backupLocalDir       = flag.String("backup-local-dir", "/var/lib/nufs/backup-tmp", "Local temporary directory for metadata backups")
 		backupInterval       = flag.Duration("backup-interval", time.Hour, "Metadata backup interval")
 		backupRetention      = flag.Int("backup-retention", 24, "Number of committed metadata backups to retain")
 		backupS3Bucket       = flag.String("backup-s3-bucket", "", "S3 bucket for metadata backups")

@@ -423,7 +423,7 @@ func findSockPath(args []string) string {
 	}
 	// Check common default locations
 	for _, candidate := range []string{
-		"/var/lib/dfs/data/.datanode.sock",
+		"/var/lib/nufs/data/.datanode.sock",
 		filepath.Join(os.TempDir(), ".datanode.sock"),
 	} {
 		if _, err := os.Stat(candidate); err == nil {

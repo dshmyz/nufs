@@ -361,7 +361,7 @@ metad 启动时自动校验：
 
 ```bash
 # 无 token / 无 TLS / 单节点 → 启动失败
-metad --data-dir=/var/lib/dfs/metadata
+metad --data-dir=/var/lib/nufs/metadata
 # Error: production config validation failed:
 #   - production JWT secret is empty or uses a dev default
 #   - production Raft requires at least 3 nodes

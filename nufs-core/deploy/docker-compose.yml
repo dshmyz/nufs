@@ -17,7 +17,7 @@ services:
     image: nufs:latest
     entrypoint: /usr/local/bin/metad
     command:
-      - --data-dir=/var/lib/dfs/metadata
+      - --data-dir=/var/lib/nufs/metadata
       - --ops-addr=0.0.0.0:8091
       - --raft=false
       - --allow-insecure-dev
@@ -35,7 +35,7 @@ services:
     ports:
       - "8091:8091"
     volumes:
-      - nufs-data:/var/lib/dfs
+      - nufs-data:/var/lib/nufs
 
   # V1 datanodes (legacy ChunkStore). Excluded by default via the
   # "v1" profile — run `docker compose --profile v1 up` to include
@@ -48,7 +48,7 @@ services:
       - --node-id=auto
       - --listen=0.0.0.0:9100
       - --register-addr=datanode-1:9100
-      - --data-dir=/var/lib/dfs/datanode1
+      - --data-dir=/var/lib/nufs/datanode1
       - --metadata=metad:8091
       - --rack=rack1
       - --zone=zone1
@@ -58,7 +58,7 @@ services:
     depends_on:
       - metad
     volumes:
-      - nufs-data:/var/lib/dfs
+      - nufs-data:/var/lib/nufs
     restart: unless-stopped
 
   datanode-2:
@@ -69,7 +69,7 @@ services:
       - --node-id=auto
       - --listen=0.0.0.0:9101
       - --register-addr=datanode-2:9101
-      - --data-dir=/var/lib/dfs/datanode2
+      - --data-dir=/var/lib/nufs/datanode2
       - --metadata=metad:8091
       - --rack=rack1
       - --zone=zone1
@@ -79,7 +79,7 @@ services:
     depends_on:
       - metad
     volumes:
-      - nufs-data:/var/lib/dfs
+      - nufs-data:/var/lib/nufs
     restart: unless-stopped
 
   # V2.1 storage engine data node — V2.1 IS the only engine (V1 storage
@@ -92,7 +92,7 @@ services:
       - --node-id=auto
       - --listen=0.0.0.0:9102
       - --register-addr=datanode-v21:9102
-      - --data-dir=/var/lib/dfs/datanode-v21
+      - --data-dir=/var/lib/nufs/datanode-v21
       - --metadata=metad:8091
       - --rack=rack1
       - --zone=zone1
@@ -102,7 +102,7 @@ services:
     depends_on:
       - metad
     volumes:
-      - nufs-data:/var/lib/dfs
+      - nufs-data:/var/lib/nufs
     restart: unless-stopped
 
   # V2.1 data node in JBOD multi-disk mode (--data-dirs=/d0,/d1). Proves
@@ -118,7 +118,7 @@ services:
       - --node-id=auto
       - --listen=0.0.0.0:9103
       - --register-addr=datanode-v21-multi:9103
-      - --data-dirs=/var/lib/dfs/d0,/var/lib/dfs/d1
+      - --data-dirs=/var/lib/nufs/d0,/var/lib/nufs/d1
       - --metadata=metad:8091
       - --rack=rack1
       - --zone=zone1
@@ -128,7 +128,7 @@ services:
     depends_on:
       - metad
     volumes:
-      - nufs-data:/var/lib/dfs
+      - nufs-data:/var/lib/nufs
     restart: unless-stopped
 
   s3:
@@ -137,7 +137,7 @@ services:
     command:
       - --listen=0.0.0.0:8080
       - --meta-addr=metad:8091
-      - --part-dir=/var/lib/dfs/parts
+      - --part-dir=/var/lib/nufs/parts
       # Credentials come from the metad registry (seeded via --dev-seed-cred
       # above): --meta-auth-token enables the registry credential sync. The
       # legacy --access-key/--secret-key/--credentials-file sources are
@@ -153,7 +153,7 @@ services:
     depends_on:
       - metad
     volumes:
-      - nufs-data:/var/lib/dfs
+      - nufs-data:/var/lib/nufs
     restart: unless-stopped
 
   prometheus:
