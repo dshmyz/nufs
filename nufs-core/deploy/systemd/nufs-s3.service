@@ -17,7 +17,7 @@ ExecStart=/usr/local/bin/nufs-s3 \
     --rate-limit-burst=${RATE_LIMIT_BURST:-2000} \
     --credentials-file=${CREDENTIALS_FILE:-/etc/nufs/credentials.yaml} \
     --log-level=${LOG_LEVEL:-info} \
-    --log-format=${LOG_FORMAT:-	ext}
+    --log-format=${LOG_FORMAT:-text}
 
 Restart=always
 RestartSec=5

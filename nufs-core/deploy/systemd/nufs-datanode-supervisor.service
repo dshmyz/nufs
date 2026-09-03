@@ -9,14 +9,14 @@ User=nufs
 Group=nufs
 EnvironmentFile=-/etc/default/nufs-datanode
 ExecStart=/usr/local/bin/datanode \
-    --data-dirs=${DATA_DIRS} \
+    --data-dir=${DATA_DIRS} \
     --base-port=${BASE_PORT:-9100} \
     --metadata=localhost:8091 \
     --rack=${RACK:-rack1} \
     --zone=${ZONE:-zone1} \
     --capacity=${CAPACITY_GB:-500} \
     --log-level=${LOG_LEVEL:-info} \
-    --log-format=${LOG_FORMAT:-	ext}
+    --log-format=${LOG_FORMAT:-text}
 
 Restart=always
 RestartSec=5
