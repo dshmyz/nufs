@@ -80,11 +80,21 @@ func main() {
 		ecConvertInterval    = flag.Duration("ec-convert-interval", 30*time.Second, "Background EC conversion task poll cadence (consumes metad TaskECConvert background tasks whose chunk replica lives on this node)")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logFormat            = flag.String("log-format", "text", "Log output format (text|json)")
+		logFile              = flag.String("log-file", "", "Log file path (empty = stderr; file is auto-rotated)")
+		logMaxSize           = flag.Int("log-max-size", 100, "Max log file size in MB before rotation")
+		logMaxBackups        = flag.Int("log-max-backups", 7, "Max number of rotated log files to keep")
 	)
 	_ = configPath
 	config.Preload()
 	flag.Parse()
-	logging.Init(logging.Config{Level: *logLevel, JSON: *logFormat == "json", AddSource: true})
+	logging.Init(logging.Config{
+		Level:      *logLevel,
+		JSON:       *logFormat == "json",
+		AddSource:  true,
+		LogFile:    *logFile,
+		MaxSize:    int64(*logMaxSize) * 1024 * 1024, // flag is MB, Config takes bytes
+		MaxBackups: *logMaxBackups,
+	})
 	log := logging.Named("datanode")
 
 	// 单个 --data-dir 接受逗号分隔的多盘（JBOD）；单值即单盘。

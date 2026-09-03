@@ -25,3 +25,6 @@ tls_key: ""
 
 log_level: "info"
 log_format: "text"
+log_file: ""                            # 空=stderr；填路径则落盘并轮转
+log_max_size: 100
+log_max_backups: 7

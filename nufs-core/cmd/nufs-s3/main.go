@@ -42,11 +42,21 @@ func main() {
 		writeGCAbandonAge   = flag.Duration("write-gc-abandon-age", time.Hour, "Age after which pending/allocated write attempts are considered abandoned")
 		logLevel            = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
 		logFormat           = flag.String("log-format", "text", "Log output format (text|json)")
+		logFile             = flag.String("log-file", "", "Log file path (empty = stderr; file is auto-rotated)")
+		logMaxSize          = flag.Int("log-max-size", 100, "Max log file size in MB before rotation")
+		logMaxBackups       = flag.Int("log-max-backups", 7, "Max number of rotated log files to keep")
 	)
 	_ = configPath
 	config.Preload()
 	flag.Parse()
-	logging.Init(logging.Config{Level: *logLevel, JSON: *logFormat == "json", AddSource: true})
+	logging.Init(logging.Config{
+		Level:      *logLevel,
+		JSON:       *logFormat == "json",
+		AddSource:  true,
+		LogFile:    *logFile,
+		MaxSize:    int64(*logMaxSize) * 1024 * 1024, // flag is MB, Config takes bytes
+		MaxBackups: *logMaxBackups,
+	})
 	log := logging.Named("nufs-s3")
 
 	log.Info("starting S3 gateway", "meta", *metaAddr, "listen", *listenAddr, "max_object_size", *maxObjectSize)

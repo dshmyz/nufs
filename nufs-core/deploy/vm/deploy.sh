@@ -182,13 +182,13 @@ datanode_args() {
     --ops-addr="0.0.0.0:$ops_port" "${data_arg[@]}"
     --metadata="$METAD_ADDR" --metadata-auth-token="$AUTH_TOKEN" --ops-auth-token="$AUTH_TOKEN"
     --rack="rack-$n" --zone="${NUFS_ZONE:-zone-1}" --capacity="${NUFS_CAPACITY_GB:-1000}"
-    --log-level="${NUFS_LOG_LEVEL:-info}" --log-format="${NUFS_LOG_FORMAT:-json}")
+    --log-level="${NUFS_LOG_LEVEL:-info}" --log-format="${NUFS_LOG_FORMAT:-json}" --log-file="$LOG_DIR/datanode$n.log")
 }
 s3_args() {
   CMD_ARGS=("$BIN/nufs-s3" --listen=":$S3_PORT"
     --meta-addr="$METAD_ADDR" --meta-auth-token="$AUTH_TOKEN"
     --part-dir="$DATA_ROOT/s3-parts"
-    --log-level="${NUFS_LOG_LEVEL:-info}" --log-format="${NUFS_LOG_FORMAT:-json}")
+    --log-level="${NUFS_LOG_LEVEL:-info}" --log-format="${NUFS_LOG_FORMAT:-json}" --log-file="$LOG_DIR/s3.log")
 }
 
 # ---------- 进程管理（后台进程 + pidfile） ----------
@@ -264,6 +264,7 @@ zone: "${NUFS_ZONE:-zone-1}"
 capacity: ${NUFS_CAPACITY_GB:-1000}
 log_level: "${NUFS_LOG_LEVEL:-info}"
 log_format: "${NUFS_LOG_FORMAT:-json}"
+log_file: "$LOG_DIR/datanode$n.log"
 EOF
 }
 
