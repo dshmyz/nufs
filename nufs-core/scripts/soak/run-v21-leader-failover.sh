@@ -91,6 +91,7 @@ log() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
 die() { printf '[%s] FATAL: %s\n' "$(date +%T)" "$*" >&2; exit 1; }
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+MODULE_ROOT="$(dirname "$REPO_ROOT")"   # 单模块合并后 go.mod 在仓库根
 BIN_DIR="$REPO_ROOT/bin"
 [ -n "${NUFS_BIN_DIR:-}" ] && BIN_DIR="$NUFS_BIN_DIR"
 METAD_BIN="$BIN_DIR/metad"
@@ -115,9 +116,9 @@ port_owner() { # port
 build_bins() {
   log "building binaries -> $BIN_DIR"
   mkdir -p "$BIN_DIR"
-  go build -o "$BIN_DIR/metad" ./cmd/metad
-  go build -o "$BIN_DIR/datanode" ./cmd/datanode
-  go build -o "$BIN_DIR/nufs-s3" ./cmd/nufs-s3
+  ( cd "$MODULE_ROOT" && go build -o "$BIN_DIR/metad" ./nufs-core/cmd/metad )
+  ( cd "$MODULE_ROOT" && go build -o "$BIN_DIR/datanode" ./nufs-core/cmd/datanode )
+  ( cd "$MODULE_ROOT" && go build -o "$BIN_DIR/nufs-s3" ./nufs-core/cmd/nufs-s3 )
 }
 
 # metad 矩阵路径

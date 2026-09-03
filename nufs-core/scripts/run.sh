@@ -24,7 +24,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$CORE_DIR"
+MODULE_ROOT="$(dirname "$CORE_DIR")"   # 单模块合并后 go.mod 在仓库根
+cd "$MODULE_ROOT"
 
 export NUFS_RUN_SMOKE=1
 
@@ -41,19 +42,19 @@ run_smoke() {
     go test -v -count=1 \
         -run "TestFullStack|TestRepair" \
         -timeout=90s \
-        ./tests/smoke/
+        ./nufs-core/tests/smoke/
 }
 
 run_regression() {
     echo "=== 全量回归测试 (~3min) ==="
     echo "--- datanode ---"
     # datanode/storage/segment 单包即需 ~150s（隔离跑实测），预算给足避免
-    # ./datanode/... 并行时被 120s 误杀。
-    go test -count=1 -timeout=300s ./datanode/... && echo "  ✅ datanode"
+    # ./nufs-core/datanode/... 并行时被 120s 误杀。
+    go test -count=1 -timeout=300s ./nufs-core/datanode/... && echo "  ✅ datanode"
     echo "--- chunkstore ---"
-    go test -count=1 -timeout=30s ./chunkstore/... && echo "  ✅ chunkstore"
+    go test -count=1 -timeout=30s ./nufs-core/chunkstore/... && echo "  ✅ chunkstore"
     echo "--- gateway/s3 ---"
-    go test -count=1 -timeout=30s ./gateway/s3/... && echo "  ✅ gateway/s3"
+    go test -count=1 -timeout=30s ./nufs-core/gateway/s3/... && echo "  ✅ gateway/s3"
 }
 
 run_load() {
@@ -64,7 +65,7 @@ run_load() {
     go test -v -count=1 \
         -run "TestLoad_SustainedS3Ops" \
         -timeout=$(( ${LOAD_DURATION%s} + 120 ))s \
-        ./tests/smoke/
+        ./nufs-core/tests/smoke/
 }
 
 run_benchmark() {
@@ -74,7 +75,7 @@ run_benchmark() {
     go test -v -count=1 \
         -run "TestBenchmark_S3Workload" \
         -timeout=$(( ${LOAD_DURATION%s} + 120 ))s \
-        ./tests/smoke/
+        ./nufs-core/tests/smoke/
 }
 
 run_chaos() {
@@ -82,7 +83,7 @@ run_chaos() {
     go test -v -count=1 \
         -run "TestChaos_RandomDiskNodeKill" \
         -timeout=120s \
-        ./tests/smoke/
+        ./nufs-core/tests/smoke/
 }
 
 run_ops_flow() {
@@ -90,19 +91,19 @@ run_ops_flow() {
     go test -v -count=1 \
         -run "TestOpsFlow_AdoptMigrateDecommissionRestart" \
         -timeout=150s \
-        ./tests/smoke/
+        ./nufs-core/tests/smoke/
 }
 
 run_ec() {
     echo "=== 纠删码集成测试 ==="
-    go test -count=1 -v -run "TestEC" -timeout=30s ./chunkstore/... 2>&1 | grep -E "^(=== RUN|--- PASS|--- FAIL|PASS|ok)"
+    go test -count=1 -v -run "TestEC" -timeout=30s ./nufs-core/chunkstore/... 2>&1 | grep -E "^(=== RUN|--- PASS|--- FAIL|PASS|ok)"
 }
 
 run_multidisk() {
     echo "=== 多盘测试 (V2.1 JBOD) ==="
     # V1 的 TestMultiDisk 已随 V1 引擎退役；V2.1 多盘端到端覆盖在 smoke 的
     # TestFullStack_MultiDiskJBOD（单节点双盘，S3 PUT/GET + 逐盘计数）。
-    go test -count=1 -v -run "TestFullStack_MultiDiskJBOD" -timeout=60s ./tests/smoke/ 2>&1 | grep -E "^(=== RUN|--- PASS|--- FAIL|PASS|ok)"
+    go test -count=1 -v -run "TestFullStack_MultiDiskJBOD" -timeout=60s ./nufs-core/tests/smoke/ 2>&1 | grep -E "^(=== RUN|--- PASS|--- FAIL|PASS|ok)"
 }
 
 run_full() {

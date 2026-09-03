@@ -79,6 +79,7 @@ log() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
 die() { printf '[%s] FATAL: %s\n' "$(date +%T)" "$*" >&2; exit 1; }
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+MODULE_ROOT="$(dirname "$REPO_ROOT")"   # 单模块合并后 go.mod 在仓库根
 BIN_DIR="$REPO_ROOT/bin"
 [ -n "${NUFS_BIN_DIR:-}" ] && BIN_DIR="$NUFS_BIN_DIR"
 METAD_BIN="$BIN_DIR/metad"
@@ -113,9 +114,9 @@ raft_peer_ops_desc() { local s=""; for i in $(seq 1 "$METAD_NODES"); do [ -n "$s
 build_bins() {
   log "building binaries -> $BIN_DIR"
   mkdir -p "$BIN_DIR"
-  go build -o "$BIN_DIR/metad" ./cmd/metad
-  go build -o "$BIN_DIR/datanode" ./cmd/datanode
-  go build -o "$BIN_DIR/nufs-s3" ./cmd/nufs-s3
+  ( cd "$MODULE_ROOT" && go build -o "$BIN_DIR/metad" ./nufs-core/cmd/metad )
+  ( cd "$MODULE_ROOT" && go build -o "$BIN_DIR/datanode" ./nufs-core/cmd/datanode )
+  ( cd "$MODULE_ROOT" && go build -o "$BIN_DIR/nufs-s3" ./nufs-core/cmd/nufs-s3 )
 }
 
 kill_all() {
@@ -350,19 +351,19 @@ run_layer1_baddisk() {
 run_layer2_restore() {
   log "=== LAYER 2: full-cluster loss -> backup restore (DR/restore/snapshot gate) ==="
   # 1) 端到端 DR: 源集群->备份->销毁->还原到新 cluster id->chunk 完好->未就绪前 ServiceUnavailable->RTO 门禁
-  if ! go test ./tests/metadata_dr/ -run 'TestLocalRestoreRecoveryFixturePreservesMetadataAndGatesReadiness' -count=1 > "$LOG_ROOT/log/layer2-dr.log" 2>&1; then
+  if ! ( cd "$MODULE_ROOT" && go test ./nufs-core/tests/metadata_dr/ -run 'TestLocalRestoreRecoveryFixturePreservesMetadataAndGatesReadiness' -count=1 > "$LOG_ROOT/log/layer2-dr.log" 2>&1 ); then
     log "LAYER2 FAIL: DR restore gate failed — see $LOG_ROOT/log/layer2-dr.log"
     tail -5 "$LOG_ROOT/log/layer2-dr.log" | sed 's/^/    /'
     return 1
   fi
   # 2) restore 原子性/非空目标/损坏产物拒绝等安全性
-  if ! go test ./metadata/ -run 'TestRestore' -count=1 > "$LOG_ROOT/log/layer2-restore.log" 2>&1; then
+  if ! ( cd "$MODULE_ROOT" && go test ./nufs-core/metadata/ -run 'TestRestore' -count=1 > "$LOG_ROOT/log/layer2-restore.log" 2>&1 ); then
     log "LAYER2 FAIL: restore safety gate failed — see $LOG_ROOT/log/layer2-restore.log"
     tail -5 "$LOG_ROOT/log/layer2-restore.log" | sed 's/^/    /'
     return 1
   fi
   # 3) 快照压缩 + checkpoint 备份语义（PBL1/PBL3、immutable、非 leader 拒绝）
-  if ! go test ./metadata/ -run 'TestPebbleSnapshot|TestPebbleFSM|TestCreateStandaloneCheckpoint|TestCreateBackupCheckpoint|TestCheckpointTerm' -count=1 > "$LOG_ROOT/log/layer2-snap.log" 2>&1; then
+  if ! ( cd "$MODULE_ROOT" && go test ./nufs-core/metadata/ -run 'TestPebbleSnapshot|TestPebbleFSM|TestCreateStandaloneCheckpoint|TestCreateBackupCheckpoint|TestCheckpointTerm' -count=1 > "$LOG_ROOT/log/layer2-snap.log" 2>&1 ); then
     log "LAYER2 FAIL: snapshot/checkpoint gate failed — see $LOG_ROOT/log/layer2-snap.log"
     tail -5 "$LOG_ROOT/log/layer2-snap.log" | sed 's/^/    /'
     return 1
