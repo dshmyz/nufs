@@ -78,7 +78,7 @@ export async function login(username: string, password: string): Promise<string>
 }
 
 // Clusters
-export async function listClusters(): Promise<ClusterInfo[]> {
+export async function listClusters(): Promise<ClusterView[]> {
   const resp = await api.get('/clusters')
   return resp.data
 }
@@ -222,10 +222,11 @@ export async function getAuditLogs(clusterId: string, params?: { limit?: number;
 }
 
 // Types
-export interface ClusterInfo {
+export interface ClusterView {
   name: string
   region: string
   description: string
+  metad_ops_url: string
   health: 'healthy' | 'unhealthy' | 'unknown'
   lastCheck: string
   source: 'static' | 'dynamic'

@@ -5,4 +5,4 @@
 #   bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
 
 - username: admin
-  password_hash: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+  password_hash: "$2a$10$C1fIBvuhyyKfjm6OLXlBO.qaV./ApqD3SSMpfpjssvknjjhsF6NnS"  # admin / password

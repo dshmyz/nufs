@@ -18,6 +18,7 @@ type Client struct {
 	baseURL         string
 	region          string
 	description     string
+	token           string
 	http            *http.Client
 	lastHealthCheck time.Time
 	maxRedirectHops int
@@ -48,6 +49,12 @@ func WithMaxRedirectHops(n int) ClientOption {
 // WithHTTPTimeout sets the HTTP client timeout.
 func WithHTTPTimeout(d time.Duration) ClientOption {
 	return func(c *Client) { c.http.Timeout = d }
+}
+
+// WithMetadToken sets the Bearer token presented to the metad ops API.
+// Empty (default) leaves requests unauthenticated (dev-mode metad).
+func WithMetadToken(t string) ClientOption {
+	return func(c *Client) { c.token = t }
 }
 
 // UpstreamHTTPError preserves a metad HTTP failure for API-layer translation.
@@ -211,6 +218,9 @@ func (c *Client) doWithRedirects(ctx context.Context, method, url string, bodyBy
 		if bodyBytes != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
 
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -244,6 +254,9 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
 	resp, err := c.http.Do(req)

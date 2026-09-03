@@ -35,5 +35,28 @@
   <script src="/admin/static/js/app/pages/ops.js"></script>
   <script src="/admin/static/js/app/pages/backups.js"></script>
   <script src="/admin/static/js/app/app.js"></script>
+
+  <!-- ops token input: production metad requires Bearer on /api/v1/*; the
+       shell stays public (no data), so the operator enters the token here and
+       every data fetch carries it. -->
+  <div style="position:fixed;right:12px;bottom:12px;z-index:9999;display:flex;gap:6px;align-items:center;background:#111827ee;border:1px solid #374151;border-radius:8px;padding:6px 8px;font-size:11px">
+    <input id="mTok" type="password" placeholder="Bearer token" spellcheck="false"
+      style="width:150px;font-size:11px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px 6px"
+      title="production ops token (AUTH_TOKEN)；回车保存，所有请求带 Bearer">
+    <button onclick="saveMTok()" style="font-size:11px;background:#1f6feb;color:#fff;border:none;border-radius:4px;padding:3px 8px;cursor:pointer">存</button>
+  </div>
+  <script>
+    function saveMTok() {
+      var v = (document.getElementById('mTok').value || '').trim();
+      try { if (v) localStorage.setItem('nufs_metad_ops_token', v); else localStorage.removeItem('nufs_metad_ops_token'); } catch (e) {}
+      location.reload();
+    }
+    (function () {
+      var el = document.getElementById('mTok');
+      if (!el) return;
+      try { var t = localStorage.getItem('nufs_metad_ops_token'); if (t) el.value = t; } catch (e) {}
+      el.addEventListener('keydown', function (e) { if (e.key === 'Enter') saveMTok(); });
+    })();
+  </script>
 </body>
 </html>

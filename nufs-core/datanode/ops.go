@@ -151,6 +151,10 @@ func NewOpsServerWithRepair(cfg Config, store OpsStore, meta OpsMetadata, repair
 			"/healthz":       {},
 			"/ready":         {},
 			"/version":       {},
+			// Admin shell is a static page with no data; the page itself asks the
+			// operator for the Bearer token and sends it on every data fetch, so
+			// the shell can stay public while /api/v1/* remains auth-gated.
+			"/admin/": {},
 		}
 		s.listener = &http.Server{
 			Addr:    cfg.OpsListenAddr,

@@ -90,7 +90,7 @@ func main() {
 		traceEndpoint        = flag.String("trace-endpoint", "", "OTLP gRPC endpoint")
 		traceInsecure        = flag.Bool("trace-insecure", true, "Use insecure OTLP connection")
 		logLevel             = flag.String("log-level", "info", "Log level (debug/info/warn/error)")
-		logJSON              = flag.Bool("log-json", false, "JSON log output")
+		logFormat            = flag.String("log-format", "text", "Log output format (text|json)")
 		logFile              = flag.String("log-file", "", "Log file path (empty = stderr)")
 		logMaxSize           = flag.Int("log-max-size", 100, "Max log file size in MB before rotation")
 		logMaxBackups        = flag.Int("log-max-backups", 7, "Max number of rotated log files to keep")
@@ -144,7 +144,7 @@ func main() {
 
 	logging.Init(logging.Config{
 		Level:      *logLevel,
-		JSON:       *logJSON,
+		JSON:       *logFormat == "json",
 		AddSource:  true,
 		LogFile:    *logFile,
 		MaxSize:    int64(*logMaxSize) * 1024 * 1024, // flag is MB, Config takes bytes
@@ -387,9 +387,21 @@ func main() {
 		store.SetRaftNode(raftNode)
 		log.Info("Raft node started", "addr", *raftAddr, "bootstrap", *raftBootstrap)
 
+		// Wait (bounded) for this node's leadership to settle before serving the
+		// ops API. Break early on either: we won the election, OR a leader is
+		// already known — meaning leadership is settled and we are a follower.
+		// Previously a follower that never won waited the full 30s, leaving its
+		// ops API dark for 30s on every cold start; followers serve fine earlier
+		// because consistency-critical ops endpoints are leader-forwarded (mut()).
+		// The only case that still waits the full budget is "no leader yet" (fresh
+		// cluster's first node, or no quorum), which is unchanged.
 		for i := 0; i < 30; i++ {
 			if store.IsLeader() {
 				log.Info("this node is the Raft leader")
+				break
+			}
+			if addr := store.LeaderAddr(); addr != "" {
+				log.Info("raft leadership settled on another node; opening ops as follower", "leader", addr)
 				break
 			}
 			time.Sleep(time.Second)
@@ -541,6 +553,13 @@ func main() {
 		"/api/v1/health":     {},
 		"/version":           {},
 		"/api/v1/auth/token": {}, // self-authenticating: accessKey/secretKey in body
+		// Admin shell + its static assets carry no data; the console asks the
+		// operator for the ops token and sends it on every data fetch, so these
+		// stay public while /api/v1/* remains auth-gated. (Exact-path matches:
+		// BearerAuth does not prefix-match, so the /admin/static/ tree must be
+		// listed explicitly.)
+		"/admin/":        {},
+		"/admin/static/": {},
 	}
 	var handler http.Handler = rejectEmptyBucketQuotaPath(drain.Middleware(public, mux))
 	// Body size limit: cap POST/PUT/DELETE/PATCH request bodies to prevent

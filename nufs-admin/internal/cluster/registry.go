@@ -20,11 +20,13 @@ const (
 	HealthUnknown   HealthStatus = "unknown"
 )
 
-// ClusterInfo combines configuration with runtime health status.
-type ClusterInfo struct {
+// ClusterView combines configuration with runtime health status. It is the
+// per-cluster summary the admin console renders.
+type ClusterView struct {
 	Name        string       `json:"name"`
 	Region      string       `json:"region"`
 	Description string       `json:"description"`
+	MetadOpsURL string       `json:"metad_ops_url"` // metad ops API base, for console deep-link
 	Health      HealthStatus `json:"health"`
 	LastCheck   time.Time    `json:"lastCheck"`
 	Source      string       `json:"source"` // "static" or "dynamic"
@@ -140,7 +142,7 @@ func (r *Registry) reload() error {
 	r.entries = make(map[string]*entry)
 	for _, cc := range cfg.Clusters {
 		r.entries[cc.Name] = &entry{
-			client:      NewClient(cc.Name, cc.MetadOpsURL),
+			client:      NewClient(cc.Name, cc.MetadOpsURL, WithMetadToken(cc.MetadToken)),
 			region:      cc.Region,
 			description: cc.Description,
 			source:      string(store.SourceStatic),
@@ -241,16 +243,17 @@ func (r *Registry) GetClient(name string) (*Client, bool) {
 }
 
 // List returns all clusters with their health status.
-func (r *Registry) List() []ClusterInfo {
+func (r *Registry) List() []ClusterView {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var list []ClusterInfo
+	var list []ClusterView
 	for name, e := range r.entries {
-		list = append(list, ClusterInfo{
+		list = append(list, ClusterView{
 			Name:        name,
 			Region:      e.region,
 			Description: e.description,
+			MetadOpsURL: e.client.baseURL,
 			Health:      e.health,
 			LastCheck:   e.lastCheck,
 			Source:      e.source,

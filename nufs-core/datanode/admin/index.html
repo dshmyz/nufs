@@ -349,6 +349,10 @@
       <span class="pill off" id="healthPill"><span class="led off"></span><span id="healthText">…</span></span>
       <span class="ver" id="verText"></span>
       <button class="opbtn" id="langToggle" style="font-size:11px">中 / EN</button>
+      <input id="tokInput" type="password" placeholder="Bearer token" spellcheck="false"
+        style="width:170px;font-size:11px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px 6px"
+        title="production ops token (AUTH_TOKEN)；回车保存，所有请求带 Bearer">
+      <button class="opbtn" id="btnTok" style="font-size:11px" title="save token">存</button>
     </div>
 
     <!-- ============ OVERVIEW ============ -->
@@ -454,6 +458,14 @@
           <span class="spacer" style="flex:1"></span>
           <button class="opbtn warnb" id="btnDrain"><span data-i18n="d.drain">Drain writes (pre-restart)</span></button>
         </div>
+        <div class="node-ops" style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d">
+          <h3 style="font-size:12px;opacity:.75"><span class="h-key">＋</span> <span data-i18n="n.title">Node / GC ops</span></h3>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="opbtn warnb" id="btnGcScan"><span data-i18n="n.gc">Trigger GC scan</span></button>
+            <input id="decomNodeId" data-i18n-ph="n.decom_ph" placeholder="node id (e.g. 1)" spellcheck="false" style="width:110px;font-size:11px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px 6px"/>
+            <button class="opbtn danger" id="btnNodeDecom"><span data-i18n="n.decom">Decommission node</span></button>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -540,6 +552,9 @@ const __I18N = {
     'op.failed': '磁盘操作失败',
     'cf.decommission': '下线会将该磁盘的分块迁移至其他磁盘后移除。是否继续？',
     'cf.retire': '报废将立即从节点移除该磁盘且不迁移分块（仅用于故障盘 —— 存在数据丢失风险）。是否继续？',
+    'n.title': '节点 / GC 运维', 'n.gc': '触发 GC 扫描', 'n.decom': '下线节点', 'n.decom_ph': '节点 id（如 1）',
+    'op.gc_ok': 'GC 扫描已触发', 'op.decom_ok': '节点 {id} 下线已触发', 'op.decom_needs_id': '请输入要下线的节点 id',
+    'cf.decom_node': '下线节点 {id} 为一次性不可逆操作。是否继续？',
     'st.online': '在线', 'st.draining': '排空中', 'st.maint': '维护', 'st.offline': '离线', 'st.failed': '故障',
     'st.degraded': '降级', 'st.pending': '等待中', 'st.ready': '就绪', 'st.syncing': '同步中', 'st.stale': '过期',
     'u.b': 'B', 'u.kb': 'KB', 'u.mb': 'MB', 'u.gb': 'GB', 'u.tb': 'TB',
@@ -595,6 +610,9 @@ const __I18N = {
     'op.failed': 'Disk action failed',
     'cf.decommission': "Decommissioning drains this disk's chunks onto others, then removes it. Continue?",
     'cf.retire': "Retiring removes this disk from the node immediately without migrating chunks (for failed disks only — data loss risk). Continue?",
+    'n.title': 'Node / GC ops', 'n.gc': 'Trigger GC scan', 'n.decom': 'Decommission node', 'n.decom_ph': 'node id (e.g. 1)',
+    'op.gc_ok': 'GC scan triggered', 'op.decom_ok': 'Node {id} decommission triggered', 'op.decom_needs_id': 'Enter a node id to decommission',
+    'cf.decom_node': 'Decommissioning node {id} is one-way and irreversible. Continue?',
     'st.online': 'online', 'st.draining': 'draining', 'st.maint': 'maint', 'st.offline': 'offline', 'st.failed': 'failed',
     'st.degraded': 'degraded', 'st.pending': 'pending', 'st.ready': 'ready', 'st.syncing': 'syncing', 'st.stale': 'stale',
     'u.b': 'B', 'u.kb': 'KB', 'u.mb': 'MB', 'u.gb': 'GB', 'u.tb': 'TB',
@@ -639,6 +657,50 @@ function applyStatic(){
 
 const $ = id => document.getElementById(id);
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ---------- ops auth token (production datanode requires Bearer) ---------- */
+const __tokKey = "nufs_dn_ops_token";
+let __tok = (()=>{ try{ return localStorage.getItem(__tokKey)||""; }catch(e){ return ""; } })();
+const __origFetch = window.fetch;
+window.fetch = (url, opts={}) => {
+  if (__tok) {
+    const h = new Headers(opts.headers || {});
+    if (!h.has("Authorization")) h.set("Authorization", "Bearer "+__tok);
+    opts.headers = h;
+  }
+  return __origFetch(url, opts);
+};
+function saveOpsToken(){
+  const el = document.getElementById("tokInput");
+  if(!el) return;
+  __tok = (el.value||"").trim();
+  try{ if(__tok) localStorage.setItem(__tokKey, __tok); else localStorage.removeItem(__tokKey); }catch(e){}
+  location.reload();
+}
+/* ---------- node / GC ops ---------- */
+async function postOpsAction(url, okMsg){
+  try{
+    const r = await fetch(url, {method:"POST"});
+    if(!r.ok){ const t = await r.text().catch(()=>""); alert("HTTP "+r.status+": "+(t||"").slice(0,300)); return; }
+    const t = await r.text().catch(()=>"");
+    alert(okMsg + (t && t!=="ok" ? " — "+(t||"").slice(0,200) : ""));
+  }catch(e){ alert("请求失败: "+e); }
+}
+window.addEventListener("DOMContentLoaded", ()=>{
+  const ti = document.getElementById("tokInput");
+  if(ti){ if(__tok) ti.value = __tok; ti.addEventListener("keydown", e=>{ if(e.key==="Enter") saveOpsToken(); }); }
+  const tb = document.getElementById("btnTok");
+  if(tb) tb.addEventListener("click", saveOpsToken);
+  const gc = document.getElementById("btnGcScan");
+  if(gc) gc.addEventListener("click", ()=>postOpsAction("/api/v1/gc/scan", T("op.gc_ok")));
+  const nd = document.getElementById("btnNodeDecom");
+  if(nd) nd.addEventListener("click", ()=>{
+    const id = (document.getElementById("decomNodeId").value||"").trim();
+    if(!id) return alert(T("op.decom_needs_id"));
+    if(!confirm(T("cf.decom_node",{id}))) return;
+    postOpsAction("/api/v1/nodes/"+encodeURIComponent(id)+"/decommission", T("op.decom_ok",{id}));
+  });
+});
 
 /* ---------- formatting ---------- */
 const fmtBytes = b => {

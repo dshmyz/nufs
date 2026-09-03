@@ -4,7 +4,8 @@
 clusters:
   - name: bj-prod
     region: beijing
-    metad_ops_url: "http://10.0.1.3:8091"
+    metad_ops_url: "http://10.0.1.3:18091"
+    metad_token: ""   # 可选：生产 metad 的 ops Bearer token（AUTH_TOKEN）。留空=连无认证的 dev metad
     description: "北京生产集群"
 
   - name: sh-prod

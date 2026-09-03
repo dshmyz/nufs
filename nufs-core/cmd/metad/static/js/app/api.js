@@ -5,6 +5,13 @@
   'use strict';
   var A = window.NUFS.API = {};
 
+  // ops auth token (production metad requires Bearer on /api/v1/*): read once
+  // from localStorage; the shell's token input sets it and reloads.
+  var opsToken = (function () {
+    try { return localStorage.getItem('nufs_metad_ops_token') || ''; } catch (e) { return ''; }
+  })();
+  function authHeaders() { return opsToken ? { 'Authorization': 'Bearer ' + opsToken } : {}; }
+
   function parseError(res, body) {
     if (body && body.error) return new Error(body.error);
     return new Error('HTTP ' + res.status);
@@ -15,7 +22,7 @@
     opts = opts || {};
     return fetch(path, {
       method: opts.method || 'GET',
-      headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
+      headers: Object.assign({}, authHeaders(), opts.body ? { 'Content-Type': 'application/json' } : undefined),
       body: opts.body ? JSON.stringify(opts.body) : undefined
     }).then(function (res) {
       return res.text().then(function (txt) {
@@ -30,7 +37,7 @@
   // jsonGet(path): GET, tolerate 404/503 by returning null (callers show
   // placeholder rather than erroring on uninitialized subsystems).
   A.get = function (path) {
-    return fetch(path).then(function (res) {
+    return fetch(path, { headers: authHeaders() }).then(function (res) {
       if (res.status === 404 || res.status === 503) return null;
       return res.text().then(function (txt) {
         var body = null;

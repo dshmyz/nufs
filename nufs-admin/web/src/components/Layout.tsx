@@ -1,13 +1,13 @@
 import { Outlet, Link, useParams, useNavigate } from 'react-router-dom'
 import { useState, useEffect } from 'react'
-import { listClusters, ClusterInfo } from '../api/client'
+import { listClusters, ClusterView } from '../api/client'
 
 interface LayoutProps {
   onLogout: () => void
 }
 
 export default function Layout({ onLogout }: LayoutProps) {
-  const [clusters, setClusters] = useState<ClusterInfo[]>([])
+  const [clusters, setClusters] = useState<ClusterView[]>([])
   const [selectedCluster, setSelectedCluster] = useState<string | null>(null)
   const params = useParams()
   const navigate = useNavigate()

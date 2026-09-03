@@ -5,13 +5,13 @@ import {
   removeCluster,
   getClusterAuditLogs,
   getWriteOpsStatus,
-  ClusterInfo,
+  ClusterView,
   ClusterAuditLog,
   WriteOpsStatus,
 } from '../../api/client'
 
 export default function Clusters() {
-  const [clusters, setClusters] = useState<ClusterInfo[]>([])
+  const [clusters, setClusters] = useState<ClusterView[]>([])
   const [logs, setLogs] = useState<ClusterAuditLog[]>([])
   const [writeOps, setWriteOps] = useState<Record<string, WriteOpsStatus | { error: string }>>({})
   const [loading, setLoading] = useState(true)
@@ -241,6 +241,24 @@ export default function Clusters() {
                     }}>
                       {isError ? '不可用' : hasBacklog ? '有积压' : '正常'}
                     </span>
+                    {cluster.metad_ops_url && (
+                      <a
+                        href={`${cluster.metad_ops_url.replace(/\/+$/, '')}/admin/`}
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{
+                          flex: '0 0 auto',
+                          fontSize: '12px',
+                          color: '#2563eb',
+                          textDecoration: 'none',
+                          border: '1px solid #bfdbfe',
+                          padding: '2px 8px',
+                          borderRadius: '4px',
+                        }}
+                      >
+                        metad 控制台 ↗
+                      </a>
+                    )}
                   </div>
 
                   {isError ? (

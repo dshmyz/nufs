@@ -75,10 +75,26 @@ func extractBearer(header string) string {
 // make this a confused deputy: "/api/v1/namespace/../auth/creds/x" looks like a
 // permitted namespace route to a raw-prefix check but routes to the credential
 // registry.
+// isPublicPath reports whether a cleaned request path is exempt from auth.
+// Exact match wins; a public entry ending in "/" also exempts its subtree
+// (used for static asset trees like /admin/static/, whose individual files are
+// not worth enumerating).
+func isPublicPath(publicPaths map[string]struct{}, p string) bool {
+	if _, ok := publicPaths[p]; ok {
+		return true
+	}
+	for k := range publicPaths {
+		if len(k) > 1 && k[len(k)-1] == '/' && strings.HasPrefix(p, k) {
+			return true
+		}
+	}
+	return false
+}
+
 func BearerAuth(token string, signingKeys []string, publicPaths map[string]struct{}, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		routedPath := cleanPath(r.URL.Path)
-		if _, ok := publicPaths[routedPath]; ok {
+		if isPublicPath(publicPaths, routedPath) {
 			next.ServeHTTP(w, r)
 			return
 		}
