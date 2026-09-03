@@ -71,6 +71,7 @@
               region: "{{ cluster_region | default('default') }}"
               metad_ops_url: "http://{{ metad1_ip }}:{{ metad_ops_port }}"
               metad_token: "{{ auth_token }}"
+              datanode_ops_port: {{ datanode_ops_port | default(18096) }}
               description: "NUFS cluster (deployed by ansible)"
           server:
             listen: ":{{ admin_port | default(8090) }}"

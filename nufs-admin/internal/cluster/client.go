@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -19,6 +21,7 @@ type Client struct {
 	region          string
 	description     string
 	token           string
+	datanodeOpsPort int
 	http            *http.Client
 	lastHealthCheck time.Time
 	maxRedirectHops int
@@ -55,6 +58,57 @@ func WithHTTPTimeout(d time.Duration) ClientOption {
 // Empty (default) leaves requests unauthenticated (dev-mode metad).
 func WithMetadToken(t string) ClientOption {
 	return func(c *Client) { c.token = t }
+}
+
+// WithDatanodeOpsPort sets the port used to reach each datanode's ops HTTP
+// API for disk/GC lifecycle actions proxied from the console. 0 = default 18096.
+func WithDatanodeOpsPort(p int) ClientOption {
+	return func(c *Client) {
+		if p == 0 {
+			p = 18096
+		}
+		c.datanodeOpsPort = p
+	}
+}
+
+// DoDatanodeOps proxies an ops call to a single datanode: nodeAddr is the
+// node's chunk host:port as reported by metad; the ops port is the cluster's
+// configured datanode_ops_port. Used by the console to drive disk lifecycle,
+// GC and node decommission from the management plane (server-side, so it works
+// even when control-plane ports are not reachable from the operator browser).
+func (c *Client) DoDatanodeOps(ctx context.Context, nodeAddr, opPath, method string, body io.Reader, result interface{}) error {
+	host, _, err := net.SplitHostPort(nodeAddr)
+	if err != nil || host == "" {
+		host = nodeAddr
+	}
+	port := c.datanodeOpsPort
+	if port == 0 {
+		port = 18096
+	}
+	url := fmt.Sprintf("http://%s:%d/api/v1/%s", host, port, strings.TrimPrefix(opPath, "/"))
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return fmt.Errorf("datanode ops request: %w", err)
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("datanode ops %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return &UpstreamHTTPError{StatusCode: resp.StatusCode, Body: b, ContentType: resp.Header.Get("Content-Type")}
+	}
+	if result == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(result)
 }
 
 // UpstreamHTTPError preserves a metad HTTP failure for API-layer translation.

@@ -12,11 +12,12 @@ import (
 
 // ClusterConfig represents a single NUFS cluster configuration.
 type ClusterConfig struct {
-	Name        string `yaml:"name"`          // Cluster identifier, e.g., "bj-prod"
-	Region      string `yaml:"region"`        // Geographic region, e.g., "beijing"
-	MetadOpsURL string `yaml:"metad_ops_url"` // metad ops API endpoint, e.g., "http://10.0.1.3:8091"
-	MetadToken  string `yaml:"metad_token"`   // Optional Bearer token for metad ops API (production auth, AUTH_TOKEN)
-	Description string `yaml:"description"`   // Human-readable description
+	Name            string `yaml:"name"`              // Cluster identifier, e.g., "bj-prod"
+	Region          string `yaml:"region"`            // Geographic region, e.g., "beijing"
+	MetadOpsURL     string `yaml:"metad_ops_url"`     // metad ops API endpoint, e.g., "http://10.0.1.3:8091"
+	MetadToken      string `yaml:"metad_token"`       // Optional Bearer token for metad ops API (production auth, AUTH_TOKEN)
+	DatanodeOpsPort int    `yaml:"datanode_ops_port"` // datanode ops HTTP port (default 18096); used to proxy disk/GC ops from the console
+	Description     string `yaml:"description"`       // Human-readable description
 }
 
 // ServerConfig holds admin-server specific settings.

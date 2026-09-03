@@ -142,7 +142,7 @@ func (r *Registry) reload() error {
 	r.entries = make(map[string]*entry)
 	for _, cc := range cfg.Clusters {
 		r.entries[cc.Name] = &entry{
-			client:      NewClient(cc.Name, cc.MetadOpsURL, WithMetadToken(cc.MetadToken)),
+			client:      NewClient(cc.Name, cc.MetadOpsURL, WithMetadToken(cc.MetadToken), WithDatanodeOpsPort(cc.DatanodeOpsPort)),
 			region:      cc.Region,
 			description: cc.Description,
 			source:      string(store.SourceStatic),

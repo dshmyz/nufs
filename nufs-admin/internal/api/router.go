@@ -90,6 +90,8 @@ func (r *Router) handleClusterRoutes(w http.ResponseWriter, req *http.Request) {
 	switch resource {
 	case "nodes":
 		r.handleNodes(w, req, clusterID, parts[5:])
+	case "datanode":
+		r.handleDatanodeOps(w, req, clusterID, parts[5:])
 	case "buckets":
 		r.handleBuckets(w, req, clusterID, parts[5:])
 	case "chunks":

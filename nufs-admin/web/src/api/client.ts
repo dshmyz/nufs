@@ -147,6 +147,31 @@ export async function decommissionNode(clusterId: string, nodeId: string): Promi
   await api.post(`/clusters/${clusterId}/nodes/${nodeId}/decommission`)
 }
 
+// Datanode ops (proxied server-side by nufs-admin; disk lifecycle / GC)
+export interface NodeDisk {
+  index?: number
+  dir?: string
+  state?: string
+  chunks?: number
+  bytes?: number
+  failed?: boolean
+}
+
+export async function getNodeDisks(clusterId: string, nodeId: string): Promise<NodeDisk[]> {
+  const resp = await api.get(`/clusters/${encodePathSegment(clusterId)}/datanode/${encodeURIComponent(nodeId)}/disks`)
+  const data = resp.data?.disks ?? resp.data
+  return Array.isArray(data) ? data : []
+}
+
+export async function nodeDiskAction(clusterId: string, nodeId: string, action: string, dir?: string): Promise<void> {
+  const q = dir ? `?dir=${encodeURIComponent(dir)}` : ''
+  await api.post(`/clusters/${encodePathSegment(clusterId)}/datanode/${encodeURIComponent(nodeId)}/disks/${action}${q}`)
+}
+
+export async function nodeGcScan(clusterId: string, nodeId: string): Promise<void> {
+  await api.post(`/clusters/${encodePathSegment(clusterId)}/datanode/${encodeURIComponent(nodeId)}/gc/scan`)
+}
+
 // Buckets
 export async function getBuckets(clusterId: string): Promise<BucketInfo[]> {
   const resp = await api.get(`/clusters/${encodePathSegment(clusterId)}/buckets`)
