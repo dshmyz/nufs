@@ -94,8 +94,8 @@ export default function Clusters() {
           onClick={() => setShowAdd(!showAdd)}
           style={{
             padding: '8px 16px',
-            background: '#2563eb',
-            color: '#fff',
+            background: 'var(--accent)',
+            color: 'var(--bg-elev)',
             border: 'none',
             borderRadius: '6px',
             cursor: 'pointer',
@@ -109,7 +109,7 @@ export default function Clusters() {
         <div style={{
           padding: '12px',
           background: '#fee2e2',
-          color: '#dc2626',
+          color: 'var(--danger)',
           borderRadius: '8px',
           marginBottom: '16px',
           fontSize: '13px',
@@ -120,7 +120,7 @@ export default function Clusters() {
 
       {showAdd && (
         <div style={{
-          background: '#fff',
+          background: 'var(--bg-elev)',
           border: '1px solid #e2e6ec',
           borderRadius: '10px',
           padding: '20px',
@@ -129,7 +129,7 @@ export default function Clusters() {
           <h3 style={{ fontSize: '14px', fontWeight: 700, marginBottom: '16px' }}>添加新集群</h3>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '12px' }}>
             <div>
-              <label style={{ fontSize: '12px', color: '#5a6478', display: 'block', marginBottom: '4px' }}>集群名称 *</label>
+              <label style={{ fontSize: '12px', color: 'var(--text-dim)', display: 'block', marginBottom: '4px' }}>集群名称 *</label>
               <input
                 value={form.id}
                 onChange={(e) => setForm({ ...form, id: e.target.value })}
@@ -138,7 +138,7 @@ export default function Clusters() {
               />
             </div>
             <div>
-              <label style={{ fontSize: '12px', color: '#5a6478', display: 'block', marginBottom: '4px' }}>区域</label>
+              <label style={{ fontSize: '12px', color: 'var(--text-dim)', display: 'block', marginBottom: '4px' }}>区域</label>
               <input
                 value={form.region}
                 onChange={(e) => setForm({ ...form, region: e.target.value })}
@@ -147,7 +147,7 @@ export default function Clusters() {
               />
             </div>
             <div style={{ gridColumn: 'span 2' }}>
-              <label style={{ fontSize: '12px', color: '#5a6478', display: 'block', marginBottom: '4px' }}>metad Ops URL *</label>
+              <label style={{ fontSize: '12px', color: 'var(--text-dim)', display: 'block', marginBottom: '4px' }}>metad Ops URL *</label>
               <input
                 value={form.metad_ops_url}
                 onChange={(e) => setForm({ ...form, metad_ops_url: e.target.value })}
@@ -156,7 +156,7 @@ export default function Clusters() {
               />
             </div>
             <div style={{ gridColumn: 'span 2' }}>
-              <label style={{ fontSize: '12px', color: '#5a6478', display: 'block', marginBottom: '4px' }}>描述</label>
+              <label style={{ fontSize: '12px', color: 'var(--text-dim)', display: 'block', marginBottom: '4px' }}>描述</label>
               <input
                 value={form.description}
                 onChange={(e) => setForm({ ...form, description: e.target.value })}
@@ -169,8 +169,8 @@ export default function Clusters() {
             onClick={handleAdd}
             style={{
               padding: '10px 20px',
-              background: '#16a34a',
-              color: '#fff',
+              background: 'var(--ok)',
+              color: 'var(--bg-elev)',
               border: 'none',
               borderRadius: '6px',
               cursor: 'pointer',
@@ -184,7 +184,7 @@ export default function Clusters() {
 
       {clusters.length > 0 && (
         <div style={{
-          background: '#fff',
+          background: 'var(--bg-elev)',
           border: '1px solid #e2e6ec',
           borderRadius: '10px',
           padding: '20px',
@@ -193,13 +193,13 @@ export default function Clusters() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', marginBottom: '16px', flexWrap: 'wrap' }}>
             <div>
               <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '4px' }}>对象写入闭环</h3>
-              <div style={{ fontSize: '12px', color: '#6b7280' }}>recovery / GC worker</div>
+              <div style={{ fontSize: '12px', color: 'var(--text-dim)' }}>recovery / GC worker</div>
             </div>
             <button
               onClick={loadData}
               style={{
                 padding: '7px 12px',
-                background: '#f8fafc',
+                background: 'var(--bg-hover)',
                 color: '#334155',
                 border: '1px solid #cbd5e1',
                 borderRadius: '6px',
@@ -235,7 +235,7 @@ export default function Clusters() {
                       padding: '2px 8px',
                       borderRadius: '4px',
                       background: isError ? '#fee2e2' : hasBacklog ? '#fef3c7' : '#d1fae5',
-                      color: isError ? '#b91c1c' : hasBacklog ? '#92400e' : '#047857',
+                      color: isError ? 'var(--danger)' : hasBacklog ? '#92400e' : 'var(--ok)',
                       fontSize: '12px',
                       fontWeight: 600,
                     }}>
@@ -249,7 +249,7 @@ export default function Clusters() {
                         style={{
                           flex: '0 0 auto',
                           fontSize: '12px',
-                          color: '#2563eb',
+                          color: 'var(--accent)',
                           textDecoration: 'none',
                           border: '1px solid #bfdbfe',
                           padding: '2px 8px',
@@ -262,7 +262,7 @@ export default function Clusters() {
                   </div>
 
                   {isError ? (
-                    <div style={{ color: '#b91c1c', background: '#fef2f2', borderRadius: '6px', padding: '10px', fontSize: '12px', wordBreak: 'break-word' }}>
+                    <div style={{ color: 'var(--danger)', background: '#fef2f2', borderRadius: '6px', padding: '10px', fontSize: '12px', wordBreak: 'break-word' }}>
                       {status?.error || '状态不可用'}
                     </div>
                   ) : (
@@ -285,10 +285,10 @@ export default function Clusters() {
         </div>
       )}
 
-      <div style={{ background: '#fff', border: '1px solid #e2e6ec', borderRadius: '10px', marginBottom: '24px', overflow: 'hidden' }}>
+      <div style={{ background: 'var(--bg-elev)', border: '1px solid #e2e6ec', borderRadius: '10px', marginBottom: '24px', overflow: 'hidden' }}>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
-            <tr style={{ background: '#f5f6f8' }}>
+            <tr style={{ background: 'var(--bg-hover)' }}>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>名称</th>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>区域</th>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>描述</th>
@@ -311,8 +311,8 @@ export default function Clusters() {
                     borderRadius: '4px',
                     background: cluster.health === 'healthy' ? '#d1fae5' :
                                 cluster.health === 'unhealthy' ? '#fee2e2' : '#f3f4f6',
-                    color: cluster.health === 'healthy' ? '#047857' :
-                           cluster.health === 'unhealthy' ? '#b91c1c' : '#6b7280',
+                    color: cluster.health === 'healthy' ? 'var(--ok)' :
+                           cluster.health === 'unhealthy' ? 'var(--danger)' : 'var(--text-dim)',
                   }}>
                     {cluster.health}
                   </span>
@@ -334,7 +334,7 @@ export default function Clusters() {
                       style={{
                         padding: '4px 12px',
                         background: '#fee2e2',
-                        color: '#dc2626',
+                        color: 'var(--danger)',
                         border: 'none',
                         borderRadius: '4px',
                         cursor: 'pointer',
@@ -343,7 +343,7 @@ export default function Clusters() {
                       删除
                     </button>
                   ) : (
-                    <span style={{ color: '#9ca3af', fontSize: '12px' }}>基线不可删</span>
+                    <span style={{ color: 'var(--text-faint)', fontSize: '12px' }}>基线不可删</span>
                   )}
                 </td>
               </tr>
@@ -352,14 +352,14 @@ export default function Clusters() {
         </table>
       </div>
 
-      <div style={{ background: '#fff', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px' }}>
+      <div style={{ background: 'var(--bg-elev)', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px' }}>
         <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '16px' }}>变更审计日志</h3>
         {logs.length === 0 ? (
-          <p style={{ color: '#9ca3af', fontSize: '13px' }}>暂无变更记录</p>
+          <p style={{ color: 'var(--text-faint)', fontSize: '13px' }}>暂无变更记录</p>
         ) : (
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
-              <tr style={{ background: '#f5f6f8' }}>
+              <tr style={{ background: 'var(--bg-hover)' }}>
                 <th style={{ padding: '10px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>时间</th>
                 <th style={{ padding: '10px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>集群</th>
                 <th style={{ padding: '10px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>操作</th>
@@ -378,14 +378,14 @@ export default function Clusters() {
                       borderRadius: '4px',
                       background: log.action === 'add' ? '#d1fae5' :
                                   log.action === 'remove' ? '#fee2e2' : '#dbeafe',
-                      color: log.action === 'add' ? '#047857' :
-                             log.action === 'remove' ? '#b91c1c' : '#1d4ed8',
+                      color: log.action === 'add' ? 'var(--ok)' :
+                             log.action === 'remove' ? 'var(--danger)' : '#1d4ed8',
                     }}>
                       {log.action}
                     </span>
                   </td>
                   <td style={{ padding: '10px', borderBottom: '1px solid #e2e6ec' }}>{log.operator}</td>
-                  <td style={{ padding: '10px', borderBottom: '1px solid #e2e6ec', fontSize: '12px', color: '#5a6478' }}>{log.detail}</td>
+                  <td style={{ padding: '10px', borderBottom: '1px solid #e2e6ec', fontSize: '12px', color: 'var(--text-dim)' }}>{log.detail}</td>
                 </tr>
               ))}
             </tbody>
@@ -398,9 +398,9 @@ export default function Clusters() {
 
 function WriteOpsMetric({ label, value, tone }: { label: string; value: number; tone: 'ok' | 'warn' | 'bad' }) {
   const colors = {
-    ok: { background: '#f0fdf4', color: '#047857' },
-    warn: { background: '#fffbeb', color: '#92400e' },
-    bad: { background: '#fef2f2', color: '#b91c1c' },
+    ok: { background: '#f0fdf4', color: 'var(--ok)' },
+    warn: { background: 'var(--warn-dim)', color: 'var(--warn)' },
+    bad: { background: '#fef2f2', color: 'var(--danger)' },
   }[tone]
 
   return (
@@ -421,7 +421,7 @@ function WorkerState({ label, state, error }: { label: string; state: string; er
           padding: '1px 6px',
           borderRadius: '4px',
           background: isHealthy ? '#eef2ff' : '#fef2f2',
-          color: isHealthy ? '#3730a3' : '#b91c1c',
+          color: isHealthy ? '#3730a3' : 'var(--danger)',
           fontSize: '11px',
           fontWeight: 600,
           maxWidth: '110px',
@@ -433,7 +433,7 @@ function WorkerState({ label, state, error }: { label: string; state: string; er
         </span>
       </div>
       {error && (
-        <div style={{ color: '#b91c1c', fontSize: '11px', wordBreak: 'break-word' }}>{error}</div>
+        <div style={{ color: 'var(--danger)', fontSize: '11px', wordBreak: 'break-word' }}>{error}</div>
       )}
     </div>
   )

@@ -418,3 +418,51 @@ main:has(.buckets-page) {
     grid-column: 1;
   }
 }
+
+/* ---- 深色主题覆盖（对齐 styles.css token）---- */
+.buckets-page { color: var(--text); }
+
+.button { background: var(--bg-hover); border-color: var(--line-strong); color: var(--text); }
+.button:hover:not(:disabled) { background: #243049; }
+.button--primary { background: var(--accent); border-color: transparent; color: #06221f; }
+.button--danger { border-color: rgba(248,113,113,.4); color: var(--danger); }
+
+.bucket-create { background: var(--bg-elev); border-color: var(--line); }
+.bucket-create label,
+.quota-editor label { color: var(--text-dim); }
+.bucket-create input,
+.quota-editor input { background: var(--bg-input); border-color: var(--line-strong); color: var(--text); }
+
+.page-message,
+.page-state { background: var(--danger-dim); border-color: rgba(248,113,113,.4); color: var(--danger); }
+
+.bucket-table-wrap { background: var(--bg-elev); border-color: var(--line); }
+.bucket-table th { background: var(--bg-hover); color: var(--text-faint); }
+.bucket-table th,
+.bucket-table td { border-bottom-color: var(--line); color: var(--text-dim); }
+.bucket-table__name { color: var(--text); }
+.bucket-table__empty { color: var(--text-faint); }
+
+.metric-subvalue { color: var(--text-faint); }
+
+.quota-summary { color: var(--text-dim); }
+.quota-summary--healthy { color: var(--ok); }
+.quota-summary--warning { color: var(--warn); }
+.quota-summary--critical { color: var(--danger); }
+
+.quota-rail__text { color: var(--text-faint); }
+.quota-rail__track { background: var(--line); }
+.quota-rail__fill { background: var(--ok); }
+.quota-rail--warning .quota-rail__fill { background: var(--warn); }
+.quota-rail--critical .quota-rail__fill { background: var(--danger); }
+
+.quota-loading { color: var(--text-faint); }
+.quota-error { color: var(--danger); }
+
+.text-button { color: var(--accent); }
+.text-button--danger { color: var(--danger); }
+
+.quota-editor-row td { background: var(--bg-input); }
+.quota-editor { border-left-color: var(--accent-line); }
+.quota-editor__heading span { color: var(--text-faint); }
+.quota-editor__error { color: var(--danger); }

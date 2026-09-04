@@ -12,7 +12,7 @@ import {
   AuditLog,
 } from '../../api/client'
 
-const card: React.CSSProperties = { background: '#fff', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px', marginBottom: '24px' }
+const card: React.CSSProperties = { background: 'var(--bg-elev)', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px', marginBottom: '24px' }
 
 export default function Governance() {
   const { clusterId } = useParams()
@@ -76,7 +76,7 @@ export default function Governance() {
       <div style={card}>
         <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '16px' }}>Raft 状态</h3>
         {raft && (
-          <div style={{ fontSize: '13px', color: '#5a6478', lineHeight: 1.8 }}>
+          <div style={{ fontSize: '13px', color: 'var(--text-dim)', lineHeight: 1.8 }}>
             <div>Leader: {raft.leader}</div>
             <div>Term: {raft.term}</div>
             <div>Commit: {raft.commit}</div>
@@ -89,24 +89,24 @@ export default function Governance() {
       <div style={card}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
           <h3 style={{ fontSize: '16px', fontWeight: 700, margin: 0 }}>元数据运维</h3>
-          <button onClick={loadOps} style={{ padding: '4px 10px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: '4px', cursor: 'pointer' }}>刷新</button>
+          <button onClick={loadOps} style={{ padding: '4px 10px', background: '#eff6ff', color: 'var(--accent)', border: '1px solid #bfdbfe', borderRadius: '4px', cursor: 'pointer' }}>刷新</button>
         </div>
 
         {/* 备份 */}
-        <div style={{ padding: '10px 12px', background: '#f8fafc', borderRadius: '8px', marginBottom: '12px' }}>
+        <div style={{ padding: '10px 12px', background: 'var(--bg-hover)', borderRadius: '8px', marginBottom: '12px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
             <div>
-              <div style={{ color: '#5a6478', fontSize: '12px' }}>元数据备份</div>
+              <div style={{ color: 'var(--text-dim)', fontSize: '12px' }}>元数据备份</div>
               {backupErr ? (
-                <span style={{ color: '#b91c1c', fontSize: '13px' }}>{backupErr}</span>
+                <span style={{ color: 'var(--danger)', fontSize: '13px' }}>{backupErr}</span>
               ) : (
                 <span style={{ fontSize: '13px' }}>
                   <b>{backupStatus || '—'}</b>
-                  {lastTask && <span style={{ color: '#5a6478', marginLeft: '8px' }}>{new Date(lastTask.ts ?? lastTask.completed_at ?? lastTask.created_at).toLocaleString()}</span>}
+                  {lastTask && <span style={{ color: 'var(--text-dim)', marginLeft: '8px' }}>{new Date(lastTask.ts ?? lastTask.completed_at ?? lastTask.created_at).toLocaleString()}</span>}
                 </span>
               )}
             </div>
-            <button onClick={handleTriggerBackup} disabled={!!backupErr} style={{ padding: '4px 12px', background: '#1f6feb', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
+            <button onClick={handleTriggerBackup} disabled={!!backupErr} style={{ padding: '4px 12px', background: 'var(--accent)', color: 'var(--bg-elev)', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
               立即备份
             </button>
           </div>
@@ -115,16 +115,16 @@ export default function Governance() {
         {/* 容量均衡 */}
         {nodes.length > 0 && (
           <div style={{ marginBottom: '12px' }}>
-            <div style={{ color: '#5a6478', fontSize: '12px', marginBottom: '6px' }}>
+            <div style={{ color: 'var(--text-dim)', fontSize: '12px', marginBottom: '6px' }}>
               容量均衡{typeof imbalance === 'number' && <span> · 不均衡度 <b>{imbalance.toFixed(2)}</b></span>}
             </div>
             {nodes.map((n: any, i: number) => (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', padding: '2px 0' }}>
                 <span style={{ width: '40px' }}>{n.id}</span>
-                <div style={{ width: '120px', height: '6px', background: '#e2e6ec', borderRadius: '3px', overflow: 'hidden' }}>
-                  <div style={{ width: `${Math.min(100, n.used_pct ?? 0)}%`, height: '100%', background: (n.used_pct ?? 0) > 85 ? '#dc2626' : '#1f6feb' }} />
+                <div style={{ width: '120px', height: '6px', background: 'var(--line)', borderRadius: '3px', overflow: 'hidden' }}>
+                  <div style={{ width: `${Math.min(100, n.used_pct ?? 0)}%`, height: '100%', background: (n.used_pct ?? 0) > 85 ? 'var(--danger)' : 'var(--accent)' }} />
                 </div>
-                <span style={{ color: '#5a6478' }}>{(n.used_pct ?? 0).toFixed(1)}%</span>
+                <span style={{ color: 'var(--text-dim)' }}>{(n.used_pct ?? 0).toFixed(1)}%</span>
               </div>
             ))}
           </div>
@@ -133,14 +133,14 @@ export default function Governance() {
         {/* 后台任务 */}
         {tasks.length > 0 && (
           <div style={{ marginBottom: '12px' }}>
-            <div style={{ color: '#5a6478', fontSize: '12px', marginBottom: '6px' }}>后台任务</div>
+            <div style={{ color: 'var(--text-dim)', fontSize: '12px', marginBottom: '6px' }}>后台任务</div>
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <tbody>
                 {tasks.map((t: any, i: number) => (
                   <tr key={i}>
                     <td style={{ padding: '6px 8px', borderBottom: '1px solid #eef1f5', fontSize: '12px' }}>{t.type ?? t.id}</td>
                     <td style={{ padding: '6px 8px', borderBottom: '1px solid #eef1f5', fontSize: '12px' }}>{t.state ?? t.status}</td>
-                    <td style={{ padding: '6px 8px', borderBottom: '1px solid #eef1f5', fontSize: '12px', color: '#5a6478' }}>{t.owner ?? ''}</td>
+                    <td style={{ padding: '6px 8px', borderBottom: '1px solid #eef1f5', fontSize: '12px', color: 'var(--text-dim)' }}>{t.owner ?? ''}</td>
                   </tr>
                 ))}
               </tbody>
@@ -151,7 +151,7 @@ export default function Governance() {
         {/* EC 转换队列 */}
         {ecQueue.length > 0 && (
           <div>
-            <div style={{ color: '#5a6478', fontSize: '12px', marginBottom: '6px' }}>EC 转换队列（{ecQueue.length}）</div>
+            <div style={{ color: 'var(--text-dim)', fontSize: '12px', marginBottom: '6px' }}>EC 转换队列（{ecQueue.length}）</div>
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <tbody>
                 {ecQueue.map((t: any, i: number) => (
@@ -166,7 +166,7 @@ export default function Governance() {
         )}
 
         {backupErr && tasks.length === 0 && ecQueue.length === 0 && nodes.length === 0 && (
-          <div style={{ color: '#5a6478', fontSize: '13px' }}>（无元数据运维数据）</div>
+          <div style={{ color: 'var(--text-dim)', fontSize: '13px' }}>（无元数据运维数据）</div>
         )}
       </div>
 
@@ -174,7 +174,7 @@ export default function Governance() {
         <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '16px' }}>审计日志</h3>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
-            <tr style={{ background: '#f5f6f8' }}>
+            <tr style={{ background: 'var(--bg-hover)' }}>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>时间</th>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>用户</th>
               <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>操作</th>

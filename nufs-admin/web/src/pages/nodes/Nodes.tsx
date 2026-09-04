@@ -36,17 +36,11 @@ export default function Nodes() {
   const loadNodes = () => {
     if (!clusterId) return
     setLoading(true)
-    getNodes(clusterId)
-      .then(setNodes)
-      .catch(console.error)
-      .finally(() => setLoading(false))
+    getNodes(clusterId).then(setNodes).catch(console.error).finally(() => setLoading(false))
   }
 
-  useEffect(() => {
-    loadNodes()
-  }, [clusterId])
+  useEffect(() => { loadNodes() }, [clusterId])
 
-  // 展开节点后轮询指标 + 拉告警（可视化数据）
   useEffect(() => {
     if (!clusterId) return
     const expandedIds = Object.keys(expanded).filter(k => expanded[k])
@@ -62,7 +56,7 @@ export default function Nodes() {
             const w = [...cur.w, m?.disk?.write_iops ?? 0].slice(-30)
             return { ...prev, [id]: { r, w } }
           })
-        } catch { /* 网络/暂不可达，忽略 */ }
+        } catch { /* ignore */ }
       }
     }
     poll()
@@ -70,7 +64,6 @@ export default function Nodes() {
     return () => clearInterval(timer)
   }, [clusterId, expanded])
 
-  // 展开时拉一次告警
   useEffect(() => {
     if (!clusterId) return
     Object.keys(expanded).filter(k => expanded[k]).forEach(async (id) => {
@@ -91,9 +84,7 @@ export default function Nodes() {
       try {
         const list = await getNodeDisks(clusterId, nodeId)
         setDisks(d => ({ ...d, [nodeId]: list }))
-      } catch (err) {
-        console.error(err)
-      }
+      } catch (err) { console.error(err) }
     }
   }
 
@@ -102,9 +93,7 @@ export default function Nodes() {
     try {
       const list = await getNodeDisks(clusterId, nodeId)
       setDisks(d => ({ ...d, [nodeId]: list }))
-    } catch (err) {
-      console.error(err)
-    }
+    } catch (err) { console.error(err) }
   }
 
   const handleDiskAction = async (nodeId: string, action: string, dir: string) => {
@@ -175,252 +164,182 @@ export default function Nodes() {
     try {
       await decommissionNode(clusterId, nodeId)
       setNodes(nodes.filter(n => n.id !== nodeId))
-    } catch (err) {
-      console.error(err)
-    }
+    } catch (err) { console.error(err) }
   }
 
-  if (loading) return <div>加载中...</div>
+  if (loading) return <div style={{ padding: '24px', color: 'var(--text-dim)' }}>加载中...</div>
 
   return (
     <div>
-      <h1 style={{ fontSize: '24px', fontWeight: 700, marginBottom: '24px' }}>节点列表</h1>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Nodes</div>
+          <h1>节点列表</h1>
+        </div>
+      </div>
 
-      <table style={{
-        width: '100%',
-        background: '#fff',
-        border: '1px solid #e2e6ec',
-        borderRadius: '10px',
-        borderCollapse: 'collapse',
-      }}>
-        <thead>
-          <tr style={{ background: '#f5f6f8' }}>
-            <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>ID</th>
-            <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>地址</th>
-            <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>状态</th>
-            <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>容量</th>
-            <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          {nodes.map(node => (
-            <tr key={node.id}>
-              <td style={{ padding: '12px', borderBottom: '1px solid #e2e6ec' }}>
-                {node.id}
-                <button
-                  onClick={() => toggleDisks(node.id)}
-                  style={{
-                    marginLeft: '8px',
-                    padding: '2px 8px',
-                    fontSize: '12px',
-                    background: '#eff6ff',
-                    color: '#2563eb',
-                    border: '1px solid #bfdbfe',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                  }}
-                >
-                  {expanded[node.id] ? '收起磁盘' : '磁盘'}
-                </button>
-              </td>
-              <td style={{ padding: '12px', borderBottom: '1px solid #e2e6ec' }}>{node.address}</td>
-              <td style={{ padding: '12px', borderBottom: '1px solid #e2e6ec' }}>
-                <span style={{
-                  padding: '2px 8px',
-                  borderRadius: '4px',
-                  background: node.status === 'online' ? '#d1fae5' : '#fee2e2',
-                  color: node.status === 'online' ? '#047857' : '#b91c1c',
-                }}>
-                  {node.status}
-                </span>
-              </td>
-              <td style={{ padding: '12px', borderBottom: '1px solid #e2e6ec' }}>
-                {node.used} / {node.capacity} GB
-              </td>
-              <td style={{ padding: '12px', borderBottom: '1px solid #e2e6ec' }}>
-                <button
-                  onClick={() => handleDecommission(node.id)}
-                  style={{
-                    padding: '4px 12px',
-                    background: '#fee2e2',
-                    color: '#dc2626',
-                    border: 'none',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                  }}
-                >
-                  下线
-                </button>
-              </td>
+      <div className="panel" style={{ overflowX: 'auto' }}>
+        <table className="dt">
+          <thead>
+            <tr>
+              <th>ID</th><th>地址</th><th>状态</th><th>容量</th><th>操作</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {nodes.map(node => (
+              <tr key={node.id}>
+                <td className="strong">
+                  {node.id}
+                  <button className="btn btn-sm" style={{ marginLeft: 8 }} onClick={() => toggleDisks(node.id)}>
+                    {expanded[node.id] ? '收起磁盘' : '磁盘'}
+                  </button>
+                </td>
+                <td>{node.address}</td>
+                <td>
+                  <span className={`badge ${node.status === 'online' ? 'badge-ok' : 'badge-danger'}`}>
+                    <span className={`led led-${node.status === 'online' ? 'ok' : 'danger'}`} />
+                    {node.status}
+                  </span>
+                </td>
+                <td className="mono">{node.used} / {node.capacity} GB</td>
+                <td>
+                  <button className="btn btn-sm btn-danger" onClick={() => handleDecommission(node.id)}>下线</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
 
       {Object.keys(expanded).filter(k => expanded[k]).map(nodeId => (
-        <div key={nodeId} style={{
-          background: '#fff',
-          border: '1px solid #e2e6ec',
-          borderRadius: '10px',
-          padding: '16px',
-          marginTop: '12px',
-        }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-                <h3 style={{ fontSize: '15px', fontWeight: 700, margin: 0 }}>节点 {nodeId} · 磁盘运维</h3>
-                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <button
-                    onClick={() => handleGc(nodeId)}
-                    disabled={busy[`${nodeId}:gc`]}
-                    style={{ padding: '4px 10px', background: '#fef3c7', color: '#92400e', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
-                  >
-                    {busy[`${nodeId}:gc`] ? '触发中...' : 'GC 扫描'}
-                  </button>
-                  <button
-                    onClick={() => handleDrain(nodeId)}
-                    disabled={busy[`${nodeId}:drain`]}
-                    style={{ padding: '4px 10px', background: '#fef3c7', color: '#92400e', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
-                  >
-                    排空写入
-                  </button>
+        <div key={nodeId} className="panel panel-pad" style={{ marginTop: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+            <h3>节点 {nodeId} · 磁盘运维</h3>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-sm btn-warn" onClick={() => handleGc(nodeId)} disabled={busy[`${nodeId}:gc`]}>
+                {busy[`${nodeId}:gc`] ? '触发中...' : 'GC 扫描'}
+              </button>
+              <button className="btn btn-sm btn-warn" onClick={() => handleDrain(nodeId)} disabled={busy[`${nodeId}:drain`]}>
+                排空写入
+              </button>
+            </div>
+          </div>
+
+          {/* 指标条 */}
+          {metrics[nodeId]?.disk && (
+            <div style={{ display: 'flex', gap: 22, flexWrap: 'wrap', marginBottom: 12, padding: '10px 12px', background: 'var(--bg-hover)', borderRadius: 8, fontSize: 13 }}>
+              <div>
+                <div className="faint" style={{ fontSize: 12 }}>容量使用率</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <div style={{ width: 110, height: 8, background: 'var(--line)', borderRadius: 4, overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.min(100, metrics[nodeId].disk!.usage_pct ?? 0)}%`, height: '100%', background: (metrics[nodeId].disk!.usage_pct ?? 0) > 85 ? 'var(--danger)' : 'var(--accent)' }} />
+                  </div>
+                  <b className="mono">{(metrics[nodeId].disk!.usage_pct ?? 0).toFixed(1)}%</b>
                 </div>
               </div>
+              <div>
+                <div className="faint" style={{ fontSize: 12 }}>读</div>
+                <b className="mono">{metrics[nodeId].disk!.read_iops ?? 0} IOPS</b>
+                <Sparkline data={rateHist[nodeId]?.r} />
+              </div>
+              <div>
+                <div className="faint" style={{ fontSize: 12 }}>写</div>
+                <b className="mono">{metrics[nodeId].disk!.write_iops ?? 0} IOPS</b>
+                <Sparkline data={rateHist[nodeId]?.w} />
+              </div>
+              <div><div className="faint" style={{ fontSize: 12 }}>IO 错误</div><b className="mono" style={{ color: (metrics[nodeId].disk!.io_errors ?? 0) > 0 ? 'var(--danger)' : 'var(--text)' }}>{metrics[nodeId].disk!.io_errors ?? 0}</b></div>
+              <div><div className="faint" style={{ fontSize: 12 }}>chunk</div><b className="mono">{metrics[nodeId].disk!.chunk_count ?? 0}</b></div>
+            </div>
+          )}
 
-              {/* 指标条：容量/读写/IO 错误（轮询 /metrics） */}
-              {metrics[nodeId]?.disk && (
-                <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', marginBottom: '12px', padding: '10px 12px', background: '#f8fafc', borderRadius: '8px', fontSize: '13px' }}>
-                  <div>
-                    <div style={{ color: '#5a6478', fontSize: '12px' }}>容量使用率</div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <div style={{ width: '110px', height: '8px', background: '#e2e6ec', borderRadius: '4px', overflow: 'hidden' }}>
-                        <div style={{ width: `${Math.min(100, metrics[nodeId].disk!.usage_pct ?? 0)}%`, height: '100%', background: (metrics[nodeId].disk!.usage_pct ?? 0) > 85 ? '#dc2626' : '#1f6feb' }} />
-                      </div>
-                      <b>{(metrics[nodeId].disk!.usage_pct ?? 0).toFixed(1)}%</b>
-                    </div>
-                  </div>
-                  <div>
-                    <div style={{ color: '#5a6478', fontSize: '12px' }}>读</div>
-                    <b>{metrics[nodeId].disk!.read_iops ?? 0} IOPS</b>
-                    <Sparkline data={rateHist[nodeId]?.r} />
-                  </div>
-                  <div>
-                    <div style={{ color: '#5a6478', fontSize: '12px' }}>写</div>
-                    <b>{metrics[nodeId].disk!.write_iops ?? 0} IOPS</b>
-                    <Sparkline data={rateHist[nodeId]?.w} />
-                  </div>
-                  <div><div style={{ color: '#5a6478', fontSize: '12px' }}>IO 错误</div><b style={{ color: (metrics[nodeId].disk!.io_errors ?? 0) > 0 ? '#dc2626' : '#5a6478' }}>{metrics[nodeId].disk!.io_errors ?? 0}</b></div>
-                  <div><div style={{ color: '#5a6478', fontSize: '12px' }}>chunk</div><b>{metrics[nodeId].disk!.chunk_count ?? 0}</b></div>
-                </div>
-              )}
-
-              {!disks[nodeId] || disks[nodeId].length === 0 ? (
-                <div style={{ color: '#5a6478', fontSize: '13px', padding: '12px' }}>无磁盘</div>
-              ) : (
-                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                  <thead>
-                    <tr style={{ background: '#f5f6f8' }}>
-                      <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>槽位</th>
-                      <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>目录</th>
-                      <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>状态</th>
-                      <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>chunk</th>
-                      <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}>使用</th>
-                      <th style={{ padding: '8px', textAlign: 'left', borderBottom: '1px solid #e2e6ec' }}></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(disks[nodeId] || []).map((disk, i) => (
-                      <tr key={i}>
-                        <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec' }}>bay {disk.index ?? '?'}</td>
-                        <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec', fontFamily: 'monospace', fontSize: '12px' }}>{disk.dir}</td>
-                        <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec' }}>{disk.state}</td>
-                        <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec' }}>{disk.chunks ?? 0}</td>
-                        <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec' }}>
-                          {disk.total_bytes ? (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                              <div style={{ width: '80px', height: '6px', background: '#e2e6ec', borderRadius: '3px', overflow: 'hidden' }}>
-                                <div style={{ width: `${Math.min(100, (disk.bytes! / disk.total_bytes) * 100)}%`, height: '100%', background: '#1f6feb' }} />
-                              </div>
-                              <span style={{ fontSize: '11px', color: '#5a6478' }}>{(disk.bytes! / disk.total_bytes * 100).toFixed(1)}%</span>
+          {!disks[nodeId] || disks[nodeId].length === 0 ? (
+            <div className="muted" style={{ fontSize: 13, padding: 12 }}>无磁盘</div>
+          ) : (
+            <div style={{ overflowX: 'auto' }}>
+              <table className="dt">
+                <thead>
+                  <tr><th>槽位</th><th>目录</th><th>状态</th><th>chunk</th><th>使用</th><th></th></tr>
+                </thead>
+                <tbody>
+                  {(disks[nodeId] || []).map((disk, i) => (
+                    <tr key={i}>
+                      <td className="mono">bay {disk.index ?? '?'}</td>
+                      <td className="mono" style={{ fontSize: 12 }}>{disk.dir}</td>
+                      <td><span className={`badge ${disk.failed ? 'badge-danger' : 'badge-ok'}`}>{disk.state}</span></td>
+                      <td className="mono">{disk.chunks ?? 0}</td>
+                      <td className="mono" style={{ fontSize: 12 }}>
+                        {disk.total_bytes ? (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <div style={{ width: 80, height: 6, background: 'var(--line)', borderRadius: 3, overflow: 'hidden' }}>
+                              <div style={{ width: `${Math.min(100, (disk.bytes! / disk.total_bytes) * 100)}%`, height: '100%', background: 'var(--accent)' }} />
                             </div>
-                          ) : (
-                            <span style={{ color: '#5a6478' }}>—</span>
-                          )}
-                        </td>
-                        <td style={{ padding: '8px', borderBottom: '1px solid #e2e6ec' }}>
-                          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                            {DISK_ACTIONS.map(a => (
+                            <span className="faint">{(disk.bytes! / disk.total_bytes * 100).toFixed(1)}%</span>
+                          </div>
+                        ) : <span className="faint">—</span>}
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                          {DISK_ACTIONS.map(a => {
+                            const danger = a.action === 'decommission' || a.action === 'retire'
+                            return (
                               <button
                                 key={a.action}
+                                className={`btn btn-sm ${danger ? 'btn-danger' : ''}`}
                                 onClick={() => handleDiskAction(nodeId, a.action, disk.dir!)}
                                 disabled={busy[`${nodeId}:${a.action}:${disk.dir}`]}
-                                style={{
-                                  padding: '3px 10px',
-                                  fontSize: '12px',
-                                  background: a.action === 'decommission' || a.action === 'retire' ? '#fee2e2' : '#eff6ff',
-                                  color: a.action === 'decommission' || a.action === 'retire' ? '#dc2626' : '#2563eb',
-                                  border: '1px solid ' + (a.action === 'decommission' || a.action === 'retire' ? '#fecaca' : '#bfdbfe'),
-                                  borderRadius: '4px',
-                                  cursor: 'pointer',
-                                }}
                               >
                                 {a.label}
                               </button>
-                            ))}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '12px', paddingTop: '12px', borderTop: '1px solid #e2e6ec' }}>
-                <input
-                  value={adoptDir[nodeId] || ''}
-                  onChange={e => setAdoptDir(d => ({ ...d, [nodeId]: e.target.value }))}
-                  placeholder="/mnt/disk3   (挂载为新磁盘的路径)"
-                  style={{ flex: 1, padding: '6px 8px', border: '1px solid #e2e6ec', borderRadius: '6px', fontSize: '12px' }}
-                />
-                <button
-                  onClick={() => handleAdopt(nodeId)}
-                  disabled={busy[`${nodeId}:adopt`]}
-                  style={{ padding: '6px 14px', background: '#1f6feb', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
-                >
-                  {busy[`${nodeId}:adopt`] ? '采纳中...' : '采纳新磁盘'}
-                </button>
-              </div>
-
-              {/* 告警流 */}
-              {alerts[nodeId] && alerts[nodeId].length > 0 && (
-                <div style={{ marginTop: '12px', paddingTop: '10px', borderTop: '1px solid #e2e6ec' }}>
-                  <div style={{ fontSize: '13px', fontWeight: 700, marginBottom: '6px', color: '#5a6478' }}>最近告警</div>
-                  {alerts[nodeId].slice(-6).reverse().map((a, i) => (
-                    <div key={i} style={{ display: 'flex', gap: '10px', alignItems: 'center', fontSize: '12px', padding: '3px 0' }}>
-                      <span style={{
-                        padding: '1px 8px', borderRadius: '3px', fontSize: '11px',
-                        background: a.level === 'critical' ? '#fee2e2' : a.level === 'warning' ? '#fef3c7' : '#e0f2fe',
-                        color: a.level === 'critical' ? '#b91c1c' : a.level === 'warning' ? '#92400e' : '#0369a1',
-                      }}>{a.level}</span>
-                      <span>使用率 {(a.usage_pct ?? 0).toFixed(1)}%</span>
-                      {a.ts && <span style={{ color: '#5a6478' }}>{new Date(a.ts).toLocaleString()}</span>}
-                    </div>
+                            )
+                          })}
+                        </div>
+                      </td>
+                    </tr>
                   ))}
-                </div>
-              )}
+                </tbody>
+              </table>
             </div>
-          ))}
+          )}
+
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--line)' }}>
+            <input
+              value={adoptDir[nodeId] || ''}
+              onChange={e => setAdoptDir(d => ({ ...d, [nodeId]: e.target.value }))}
+              placeholder="/mnt/disk3   挂载为新磁盘的路径"
+              style={{ flex: 1 }}
+            />
+            <button className="btn btn-primary" onClick={() => handleAdopt(nodeId)} disabled={busy[`${nodeId}:adopt`]}>
+              {busy[`${nodeId}:adopt`] ? '采纳中...' : '采纳新磁盘'}
+            </button>
+          </div>
+
+          {alerts[nodeId] && alerts[nodeId].length > 0 && (
+            <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--line)' }}>
+              <div className="faint" style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>最近告警</div>
+              {alerts[nodeId].slice(-6).reverse().map((a, i) => (
+                <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 12, padding: '3px 0' }}>
+                  <span className={`badge ${a.level === 'critical' ? 'badge-danger' : a.level === 'warning' ? 'badge-warn' : 'badge-accent'}`}>{a.level}</span>
+                  <span className="mono">使用率 {(a.usage_pct ?? 0).toFixed(1)}%</span>
+                  {a.ts && <span className="faint">{new Date(a.ts).toLocaleString()}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
     </div>
   )
 }
 
 // 迷你读写速率趋势线（最近 30 个采样，2s 一个点 → 约 1 分钟）
 function Sparkline({ data }: { data?: number[] }) {
-  if (!data || data.length < 2) return <div style={{ height: '18px' }} />
+  if (!data || data.length < 2) return <div style={{ height: 18 }} />
   const W = 64, H = 18
   const max = Math.max(...data, 1)
   const pts = data.map((v, i) => `${(i / (data.length - 1)) * W},${H - (v / max) * (H - 2) - 1}`).join(' ')
   return (
-    <svg width={W} height={H} style={{ display: 'block', marginTop: '2px' }}>
-      <polyline points={pts} fill="none" stroke="#1f6feb" strokeWidth="1.5" />
+    <svg width={W} height={H} style={{ display: 'block', marginTop: 2 }}>
+      <polyline points={pts} fill="none" stroke="var(--accent)" strokeWidth="1.5" />
     </svg>
   )
 }
