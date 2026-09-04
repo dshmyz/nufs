@@ -336,8 +336,8 @@ export default function Buckets() {
 
   // 聚合 KPI：总用量 / 对象 / 配额告警数
   let totalUsedBytes = 0, totalObjects = 0, quotaAlert = 0
-  for (const name of visibleBuckets) {
-    const st = quotas[name]?.status
+  for (const b of visibleBuckets) {
+    const st = quotas[b.name]?.status
     if (!st) continue
     if (st.usage) { totalUsedBytes += st.usage.used_bytes; totalObjects += st.usage.objects }
     const q = st.quota
