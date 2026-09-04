@@ -36,6 +36,10 @@
   --radius: 10px;
   --radius-sm: 6px;
   --shadow: 0 2px 4px rgba(0, 0, 0, 0.35), 0 8px 28px rgba(0, 0, 0, 0.3);
+
+  /* 顶栏/侧栏表面（渐变科技感，随主题切换） */
+  --bg-topbar: linear-gradient(180deg, #131b31, #121a2e);
+  --bg-sidebar: linear-gradient(180deg, #131b31, #111827);
 }
 
 /* ---- 浅色主题（html[data-theme="light"]，顶栏切换） ---- */
@@ -64,6 +68,10 @@
   --danger-dim: rgba(220, 38, 38, 0.1);
 
   --shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 4px 16px rgba(15, 23, 42, 0.05);
+
+  /* 顶栏/侧栏表面（渐变科技感，随主题切换） */
+  --bg-topbar: linear-gradient(180deg, #f8fafc, #eef1f6);
+  --bg-sidebar: linear-gradient(180deg, #ffffff, #f1f4f8);
 }
 
 * { box-sizing: border-box; }
@@ -312,8 +320,8 @@ table.dt tr:hover td { background: linear-gradient(90deg, rgba(34,211,238,.06), 
 .stat .value { text-shadow: 0 0 18px rgba(34,211,238,.18); }
 
 /* 顶部渐变氛围条 */
-.topbar { background: linear-gradient(180deg, #131b31, #121a2e); }
-.sidebar { background: linear-gradient(180deg, #131b31, #111827); }
+.topbar { background: var(--bg-topbar); }
+.sidebar { background: var(--bg-sidebar); }
 
 /* 页签激活：青色发光底线 */
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); text-shadow: 0 0 10px rgba(34,211,238,.5); }
