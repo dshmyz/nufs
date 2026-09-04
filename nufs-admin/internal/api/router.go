@@ -88,6 +88,8 @@ func (r *Router) handleClusterRoutes(w http.ResponseWriter, req *http.Request) {
 
 	resource := parts[4]
 	switch resource {
+	case "overview":
+		r.handleClusterOverview(w, req, clusterID)
 	case "nodes":
 		r.handleNodes(w, req, clusterID, parts[5:])
 	case "datanode":
