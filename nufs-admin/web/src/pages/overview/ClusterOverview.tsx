@@ -72,20 +72,29 @@ export default function ClusterOverview() {
           <span className="muted" style={{ fontSize: 12 }}>{data.capacityUsed} / {data.capacityTotal} GB</span>
         </div>
         {nodes.length > 0 ? (
-          <div className="spectrum">
-            {nodes.map(n => {
-              const pct = n.capacity > 0 ? (n.used / n.capacity) * 100 : 0
-              return (
-                <div className="spectrum-cell" key={n.id}>
-                  <div className={`spectrum-fill ${fillClass(pct)}`} style={{ transform: `scaleX(${Math.min(100, pct) / 100})` }} />
-                  <div className="spectrum-meta">
-                    <span className="id">{n.id}</span>
-                    <span className="pct">{pct.toFixed(1)}%</span>
+          <>
+            <div className="spectrum">
+              {nodes.map(n => {
+                const pct = n.capacity > 0 ? (n.used / n.capacity) * 100 : 0
+                return (
+                  <div className="spectrum-cell" key={n.id}>
+                    <div className={`spectrum-fill ${fillClass(pct)}`} style={{ transform: `scaleX(${Math.min(100, pct) / 100})` }} />
+                    <div className="spectrum-meta">
+                      <span className="id">node-{n.id}</span>
+                      <span className="pct">{pct.toFixed(1)}%</span>
+                    </div>
                   </div>
-                </div>
-              )
-            })}
-          </div>
+                )
+              })}
+            </div>
+            {/* 节点容量环（视觉密度） */}
+            <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginTop: 16 }}>
+              {nodes.map(n => {
+                const pct = n.capacity > 0 ? (n.used / n.capacity) * 100 : 0
+                return <CapacityRing key={n.id} id={n.id} pct={pct} used={n.used} cap={n.capacity} online={n.status === 'online'} />
+              })}
+            </div>
+          </>
         ) : (
           <div className="muted" style={{ fontSize: 13 }}>无节点数据</div>
         )}
@@ -148,6 +157,29 @@ export default function ClusterOverview() {
           <div>· 集群治理：Raft 状态、元数据备份、后台任务、审计日志</div>
         </div>
       </div>
+    </div>
+  )
+}
+
+// 节点容量环（SVG donut）：stroke=使用率，中心显示百分比
+function CapacityRing({ id, pct, used, cap, online }: { id: string; pct: number; used: number; cap: number; online: boolean }) {
+  const R = 26, C = 2 * Math.PI * R
+  const clamped = Math.min(100, Math.max(0, pct))
+  const color = clamped > 85 ? 'var(--danger)' : clamped > 70 ? 'var(--warn)' : 'var(--accent)'
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, minWidth: 88 }}>
+      <svg width={72} height={72} style={{ transform: 'rotate(-90deg)' }}>
+        <circle cx={36} cy={36} r={R} fill="none" stroke="var(--line-strong)" strokeWidth={6} />
+        <circle
+          cx={36} cy={36} r={R} fill="none"
+          stroke={color} strokeWidth={6} strokeLinecap="round"
+          strokeDasharray={`${(clamped / 100) * C} ${C}`}
+          style={{ filter: `drop-shadow(0 0 4px ${color})`, transition: 'stroke-dasharray .6s ease' }}
+        />
+      </svg>
+      <span className="mono" style={{ fontSize: 13, fontWeight: 700, color }}>{clamped.toFixed(1)}%</span>
+      <span className="mono faint" style={{ fontSize: 11 }}>node-{id} · {used}/{cap} GB</span>
+      <span className={`badge ${online ? 'badge-ok' : 'badge-danger'}`}>{online ? '在线' : '离线'}</span>
     </div>
   )
 }

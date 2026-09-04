@@ -1,31 +1,31 @@
 /* ============================================================
    NUFS Admin — design system
-   浅色高对比存储控制台：暖白底 + teal 强调 + 等宽数据字体
+   深色科技风存储控制台：深海军蓝 + 青色发光 + 高对比 + 数据密度
    ============================================================ */
 
 :root {
-  /* palette（浅色，高对比） */
-  --bg: #f4f6fa;
-  --bg-elev: #ffffff;
-  --bg-hover: #eef1f6;
-  --bg-input: #ffffff;
-  --line: #e2e8f0;
-  --line-strong: #cbd5e1;
+  /* palette（深蓝底，高对比——正文足够亮，不是上次那种黑糊糊） */
+  --bg: #0b1020;
+  --bg-elev: #121a2e;
+  --bg-hover: #19223a;
+  --bg-input: #0a0f1e;
+  --line: #232d47;
+  --line-strong: #2f3c5e;
 
-  --text: #0f172a;
-  --text-dim: #475569;
-  --text-faint: #94a3b8;
+  --text: #e8eef9;
+  --text-dim: #9aa8c7;
+  --text-faint: #64728f;
 
-  --accent: #0d9488;
-  --accent-dim: rgba(13, 148, 136, 0.1);
-  --accent-line: rgba(13, 148, 136, 0.4);
+  --accent: #22d3ee;
+  --accent-dim: rgba(34, 211, 238, 0.14);
+  --accent-line: rgba(34, 211, 238, 0.45);
 
-  --ok: #059669;
-  --ok-dim: rgba(5, 150, 105, 0.12);
-  --warn: #d97706;
-  --warn-dim: rgba(217, 119, 6, 0.12);
-  --danger: #dc2626;
-  --danger-dim: rgba(220, 38, 38, 0.1);
+  --ok: #34d399;
+  --ok-dim: rgba(52, 211, 153, 0.16);
+  --warn: #fbbf24;
+  --warn-dim: rgba(251, 191, 36, 0.15);
+  --danger: #f87171;
+  --danger-dim: rgba(248, 113, 113, 0.16);
 
   /* type */
   --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -34,7 +34,7 @@
   /* shape */
   --radius: 10px;
   --radius-sm: 6px;
-  --shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 4px 16px rgba(15, 23, 42, 0.05);
+  --shadow: 0 2px 4px rgba(0, 0, 0, 0.35), 0 8px 28px rgba(0, 0, 0, 0.3);
 }
 
 * { box-sizing: border-box; }
@@ -237,3 +237,54 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent-line); }
   * { transition: none !important; animation: none !important; }
   .spectrum-fill { transition: none; }
 }
+
+/* ============================================================
+   科技感增强：辉光 / 渐变 / 面板深度 / 密度
+   ============================================================ */
+
+/* 主按钮：青色渐变 + 微辉光 */
+.btn-primary {
+  background: linear-gradient(135deg, #2dd4bf, #22d3ee);
+  border: 1px solid rgba(34, 211, 238, 0.4);
+  color: #03120f;
+  box-shadow: 0 0 14px rgba(34, 211, 238, 0.25);
+}
+.btn-primary:hover { background: linear-gradient(135deg, #3ce0cc, #38d8f5); box-shadow: 0 0 20px rgba(34,211,238,.4); }
+
+/* 品牌：渐变色标 + 发光 */
+.brand .mark { color: transparent; background: linear-gradient(135deg, #2dd4bf, #22d3ee, #818cf8); -webkit-background-clip: text; background-clip: text; filter: drop-shadow(0 0 6px rgba(34,211,238,.5)); font-weight: 800; }
+.brand h2 { letter-spacing: 0.06em; }
+.brand .sub { color: var(--accent); opacity: .8; }
+
+/* 侧栏激活项：青色描边 + 辉光 */
+.nav-item.active { background: linear-gradient(90deg, rgba(34,211,238,.16), rgba(34,211,238,.04)); border-left: 2px solid var(--accent); color: var(--accent); }
+
+/* 面板：顶部细高光 + 深投影，制造层次 */
+.panel { position: relative; box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.04); }
+.panel::before { content: ""; position: absolute; top: 0; left: 14px; right: 14px; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,.35), transparent); }
+
+/* 状态 LED：更强辉光 */
+.led-ok     { box-shadow: 0 0 8px rgba(52,211,153,.7), 0 0 2px rgba(52,211,153,.9); }
+.led-warn   { box-shadow: 0 0 8px rgba(251,191,36,.7), 0 0 2px rgba(251,191,36,.9); }
+.led-danger { box-shadow: 0 0 8px rgba(248,113,113,.7), 0 0 2px rgba(248,113,113,.9); }
+
+/* 容量光谱：辉光填充 + 悬停浮起 */
+.spectrum-cell { transition: transform .15s ease, border-color .15s ease; }
+.spectrum-cell:hover { transform: translateY(-2px); border-color: var(--accent-line); }
+.spectrum-fill { background: linear-gradient(90deg, rgba(34,211,238,.5), var(--accent)); box-shadow: 0 0 12px rgba(34,211,238,.35) inset; }
+.spectrum-fill.hot { background: linear-gradient(90deg, rgba(251,191,36,.55), var(--warn)); box-shadow: 0 0 12px rgba(251,191,36,.35) inset; }
+.spectrum-fill.crit { background: linear-gradient(90deg, rgba(248,113,113,.6), var(--danger)); box-shadow: 0 0 12px rgba(248,113,113,.4) inset; }
+.spectrum-meta .pct { text-shadow: 0 0 8px rgba(34,211,238,.4); }
+
+/* 表格行 hover：青色微光 */
+table.dt tr:hover td { background: linear-gradient(90deg, rgba(34,211,238,.06), rgba(34,211,238,.02)); }
+
+/* 指标大数：辉光 */
+.stat .value { text-shadow: 0 0 18px rgba(34,211,238,.18); }
+
+/* 顶部渐变氛围条 */
+.topbar { background: linear-gradient(180deg, #131b31, #121a2e); }
+.sidebar { background: linear-gradient(180deg, #131b31, #111827); }
+
+/* 页签激活：青色发光底线 */
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); text-shadow: 0 0 10px rgba(34,211,238,.5); }
