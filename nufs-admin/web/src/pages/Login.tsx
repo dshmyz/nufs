@@ -24,7 +24,7 @@ export default function Login({ onLogin }: LoginProps) {
   return (
     <div style={{
       minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'radial-gradient(1200px 500px at 50% -10%, #1a2740 0%, var(--bg) 55%)',
+      background: 'radial-gradient(1200px 500px at 50% -10%, rgba(13,148,136,0.12) 0%, var(--bg) 55%)',
     }}>
       <form onSubmit={handleSubmit} className="panel panel-pad" style={{ width: 320 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 6 }}>
