@@ -29,6 +29,7 @@ export default function Nodes() {
   const [disks, setDisks] = useState<Record<string, NodeDisk[]>>({})
   const [metrics, setMetrics] = useState<Record<string, NodeMetrics>>({})
   const [alerts, setAlerts] = useState<Record<string, NodeAlert[]>>({})
+  const [rateHist, setRateHist] = useState<Record<string, { r: number[]; w: number[] }>>({})
   const [adoptDir, setAdoptDir] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState<Record<string, boolean>>({})
 
@@ -55,6 +56,12 @@ export default function Nodes() {
         try {
           const m = await getNodeMetrics(clusterId, id)
           setMetrics(prev => ({ ...prev, [id]: m }))
+          setRateHist(prev => {
+            const cur = prev[id] || { r: [], w: [] }
+            const r = [...cur.r, m?.disk?.read_iops ?? 0].slice(-30)
+            const w = [...cur.w, m?.disk?.write_iops ?? 0].slice(-30)
+            return { ...prev, [id]: { r, w } }
+          })
         } catch { /* 网络/暂不可达，忽略 */ }
       }
     }
@@ -290,8 +297,16 @@ export default function Nodes() {
                       <b>{(metrics[nodeId].disk!.usage_pct ?? 0).toFixed(1)}%</b>
                     </div>
                   </div>
-                  <div><div style={{ color: '#5a6478', fontSize: '12px' }}>读</div><b>{metrics[nodeId].disk!.read_iops ?? 0} IOPS</b></div>
-                  <div><div style={{ color: '#5a6478', fontSize: '12px' }}>写</div><b>{metrics[nodeId].disk!.write_iops ?? 0} IOPS</b></div>
+                  <div>
+                    <div style={{ color: '#5a6478', fontSize: '12px' }}>读</div>
+                    <b>{metrics[nodeId].disk!.read_iops ?? 0} IOPS</b>
+                    <Sparkline data={rateHist[nodeId]?.r} />
+                  </div>
+                  <div>
+                    <div style={{ color: '#5a6478', fontSize: '12px' }}>写</div>
+                    <b>{metrics[nodeId].disk!.write_iops ?? 0} IOPS</b>
+                    <Sparkline data={rateHist[nodeId]?.w} />
+                  </div>
                   <div><div style={{ color: '#5a6478', fontSize: '12px' }}>IO 错误</div><b style={{ color: (metrics[nodeId].disk!.io_errors ?? 0) > 0 ? '#dc2626' : '#5a6478' }}>{metrics[nodeId].disk!.io_errors ?? 0}</b></div>
                   <div><div style={{ color: '#5a6478', fontSize: '12px' }}>chunk</div><b>{metrics[nodeId].disk!.chunk_count ?? 0}</b></div>
                 </div>
@@ -394,5 +409,18 @@ export default function Nodes() {
             </div>
           ))}
     </div>
+  )
+}
+
+// 迷你读写速率趋势线（最近 30 个采样，2s 一个点 → 约 1 分钟）
+function Sparkline({ data }: { data?: number[] }) {
+  if (!data || data.length < 2) return <div style={{ height: '18px' }} />
+  const W = 64, H = 18
+  const max = Math.max(...data, 1)
+  const pts = data.map((v, i) => `${(i / (data.length - 1)) * W},${H - (v / max) * (H - 2) - 1}`).join(' ')
+  return (
+    <svg width={W} height={H} style={{ display: 'block', marginTop: '2px' }}>
+      <polyline points={pts} fill="none" stroke="#1f6feb" strokeWidth="1.5" />
+    </svg>
   )
 }

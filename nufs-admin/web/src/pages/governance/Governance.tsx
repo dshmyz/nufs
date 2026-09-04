@@ -1,12 +1,39 @@
 import { useState, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
-import { getRaftStatus, getAuditLogs, RaftStatus, AuditLog } from '../../api/client'
+import {
+  getRaftStatus,
+  getAuditLogs,
+  getBackupStatus,
+  triggerBackup,
+  getClusterBalance,
+  getBackgroundTasks,
+  getECQueue,
+  RaftStatus,
+  AuditLog,
+} from '../../api/client'
+
+const card: React.CSSProperties = { background: '#fff', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px', marginBottom: '24px' }
 
 export default function Governance() {
   const { clusterId } = useParams()
   const [raft, setRaft] = useState<RaftStatus | null>(null)
   const [logs, setLogs] = useState<AuditLog[]>([])
+  const [backup, setBackup] = useState<any>(null)
+  const [backupErr, setBackupErr] = useState('')
+  const [tasks, setTasks] = useState<any[]>([])
+  const [ecQueue, setEcQueue] = useState<any[]>([])
+  const [balance, setBalance] = useState<any>(null)
   const [loading, setLoading] = useState(true)
+
+  const loadOps = () => {
+    if (!clusterId) return
+    getBackupStatus(clusterId)
+      .then(d => { setBackup(d); setBackupErr('') })
+      .catch(() => setBackupErr('未启用元数据备份（metad 未配置 --backup-enabled）'))
+    getBackgroundTasks(clusterId).then(setTasks).catch(() => setTasks([]))
+    getECQueue(clusterId).then(setEcQueue).catch(() => setEcQueue([]))
+    getClusterBalance(clusterId).then(setBalance).catch(() => setBalance(null))
+  }
 
   useEffect(() => {
     if (!clusterId) return
@@ -20,15 +47,33 @@ export default function Governance() {
       })
       .catch(console.error)
       .finally(() => setLoading(false))
+    loadOps()
   }, [clusterId])
 
+  const handleTriggerBackup = async () => {
+    if (!clusterId) return
+    if (!window.confirm('立即触发一次元数据备份？')) return
+    try {
+      await triggerBackup(clusterId)
+      window.alert('备份已触发')
+      setTimeout(loadOps, 3000)
+    } catch (err) {
+      window.alert('触发失败：' + (err as any)?.response?.data?.error || String(err))
+    }
+  }
+
   if (loading) return <div>加载中...</div>
+
+  const backupStatus: string = backup?.Status?.status || backup?.status || ''
+  const lastTask = backup?.Catalog?.tasks?.[0] || backup?.Catalog?.last_task
+  const nodes = balance?.nodes || []
+  const imbalance = balance?.imbalance
 
   return (
     <div>
       <h1 style={{ fontSize: '24px', fontWeight: 700, marginBottom: '24px' }}>集群治理</h1>
 
-      <div style={{ background: '#fff', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px', marginBottom: '24px' }}>
+      <div style={card}>
         <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '16px' }}>Raft 状态</h3>
         {raft && (
           <div style={{ fontSize: '13px', color: '#5a6478', lineHeight: 1.8 }}>
@@ -40,7 +85,92 @@ export default function Governance() {
         )}
       </div>
 
-      <div style={{ background: '#fff', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px' }}>
+      {/* 元数据运维：备份 / 后台任务 / EC 队列 / 容量均衡 */}
+      <div style={card}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+          <h3 style={{ fontSize: '16px', fontWeight: 700, margin: 0 }}>元数据运维</h3>
+          <button onClick={loadOps} style={{ padding: '4px 10px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: '4px', cursor: 'pointer' }}>刷新</button>
+        </div>
+
+        {/* 备份 */}
+        <div style={{ padding: '10px 12px', background: '#f8fafc', borderRadius: '8px', marginBottom: '12px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
+            <div>
+              <div style={{ color: '#5a6478', fontSize: '12px' }}>元数据备份</div>
+              {backupErr ? (
+                <span style={{ color: '#b91c1c', fontSize: '13px' }}>{backupErr}</span>
+              ) : (
+                <span style={{ fontSize: '13px' }}>
+                  <b>{backupStatus || '—'}</b>
+                  {lastTask && <span style={{ color: '#5a6478', marginLeft: '8px' }}>{new Date(lastTask.ts ?? lastTask.completed_at ?? lastTask.created_at).toLocaleString()}</span>}
+                </span>
+              )}
+            </div>
+            <button onClick={handleTriggerBackup} disabled={!!backupErr} style={{ padding: '4px 12px', background: '#1f6feb', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
+              立即备份
+            </button>
+          </div>
+        </div>
+
+        {/* 容量均衡 */}
+        {nodes.length > 0 && (
+          <div style={{ marginBottom: '12px' }}>
+            <div style={{ color: '#5a6478', fontSize: '12px', marginBottom: '6px' }}>
+              容量均衡{typeof imbalance === 'number' && <span> · 不均衡度 <b>{imbalance.toFixed(2)}</b></span>}
+            </div>
+            {nodes.map((n: any, i: number) => (
+              <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', padding: '2px 0' }}>
+                <span style={{ width: '40px' }}>{n.id}</span>
+                <div style={{ width: '120px', height: '6px', background: '#e2e6ec', borderRadius: '3px', overflow: 'hidden' }}>
+                  <div style={{ width: `${Math.min(100, n.used_pct ?? 0)}%`, height: '100%', background: (n.used_pct ?? 0) > 85 ? '#dc2626' : '#1f6feb' }} />
+                </div>
+                <span style={{ color: '#5a6478' }}>{(n.used_pct ?? 0).toFixed(1)}%</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* 后台任务 */}
+        {tasks.length > 0 && (
+          <div style={{ marginBottom: '12px' }}>
+            <div style={{ color: '#5a6478', fontSize: '12px', marginBottom: '6px' }}>后台任务</div>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <tbody>
+                {tasks.map((t: any, i: number) => (
+                  <tr key={i}>
+                    <td style={{ padding: '6px 8px', borderBottom: '1px solid #eef1f5', fontSize: '12px' }}>{t.type ?? t.id}</td>
+                    <td style={{ padding: '6px 8px', borderBottom: '1px solid #eef1f5', fontSize: '12px' }}>{t.state ?? t.status}</td>
+                    <td style={{ padding: '6px 8px', borderBottom: '1px solid #eef1f5', fontSize: '12px', color: '#5a6478' }}>{t.owner ?? ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* EC 转换队列 */}
+        {ecQueue.length > 0 && (
+          <div>
+            <div style={{ color: '#5a6478', fontSize: '12px', marginBottom: '6px' }}>EC 转换队列（{ecQueue.length}）</div>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <tbody>
+                {ecQueue.map((t: any, i: number) => (
+                  <tr key={i}>
+                    <td style={{ padding: '6px 8px', borderBottom: '1px solid #eef1f5', fontSize: '12px' }}>{t.bucket ?? t.name}</td>
+                    <td style={{ padding: '6px 8px', borderBottom: '1px solid #eef1f5', fontSize: '12px' }}>{t.state ?? t.status}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {backupErr && tasks.length === 0 && ecQueue.length === 0 && nodes.length === 0 && (
+          <div style={{ color: '#5a6478', fontSize: '13px' }}>（无元数据运维数据）</div>
+        )}
+      </div>
+
+      <div style={card}>
         <h3 style={{ fontSize: '16px', fontWeight: 700, marginBottom: '16px' }}>审计日志</h3>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>

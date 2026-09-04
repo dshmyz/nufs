@@ -92,6 +92,14 @@ func (r *Router) handleClusterRoutes(w http.ResponseWriter, req *http.Request) {
 		r.handleNodes(w, req, clusterID, parts[5:])
 	case "datanode":
 		r.handleDatanodeOps(w, req, clusterID, parts[5:])
+	case "backups":
+		r.handleMetadPassthrough(w, req, clusterID, "/api/v1/backups", parts[5:])
+	case "balance":
+		r.handleMetadPassthrough(w, req, clusterID, "/api/v1/cluster/balance", parts[5:])
+	case "background-tasks":
+		r.handleMetadPassthrough(w, req, clusterID, "/api/v1/background-tasks", parts[5:])
+	case "ec":
+		r.handleMetadPassthrough(w, req, clusterID, "/api/v1/ec/convert/queue", parts[5:])
 	case "buckets":
 		r.handleBuckets(w, req, clusterID, parts[5:])
 	case "chunks":

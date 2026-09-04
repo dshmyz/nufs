@@ -208,6 +208,27 @@ export async function getNodeAlerts(clusterId: string, nodeId: string): Promise<
   return Array.isArray(resp.data?.alerts) ? resp.data.alerts : []
 }
 
+// 元数据运维（经 metad 透传）：备份 / 容量均衡 / 后台任务 / EC 队列
+export async function getBackupStatus(clusterId: string): Promise<any> {
+  const resp = await api.get(`/clusters/${encodePathSegment(clusterId)}/backups/status`)
+  return resp.data ?? {}
+}
+export async function triggerBackup(clusterId: string): Promise<void> {
+  await api.post(`/clusters/${encodePathSegment(clusterId)}/backups`)
+}
+export async function getClusterBalance(clusterId: string): Promise<any> {
+  const resp = await api.get(`/clusters/${encodePathSegment(clusterId)}/balance`)
+  return resp.data ?? {}
+}
+export async function getBackgroundTasks(clusterId: string): Promise<any[]> {
+  const resp = await api.get(`/clusters/${encodePathSegment(clusterId)}/background-tasks`)
+  return Array.isArray(resp.data) ? resp.data : []
+}
+export async function getECQueue(clusterId: string): Promise<any[]> {
+  const resp = await api.get(`/clusters/${encodePathSegment(clusterId)}/ec`)
+  return Array.isArray(resp.data) ? resp.data : []
+}
+
 // Buckets
 export async function getBuckets(clusterId: string): Promise<BucketInfo[]> {
   const resp = await api.get(`/clusters/${encodePathSegment(clusterId)}/buckets`)
