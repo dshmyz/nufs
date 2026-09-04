@@ -334,6 +334,22 @@ export default function Buckets() {
     }
   }
 
+  // 聚合 KPI：总用量 / 对象 / 配额告警数
+  let totalUsedBytes = 0, totalObjects = 0, quotaAlert = 0
+  for (const name of visibleBuckets) {
+    const st = quotas[name]?.status
+    if (!st) continue
+    if (st.usage) { totalUsedBytes += st.usage.used_bytes; totalObjects += st.usage.objects }
+    const q = st.quota
+    const ratio = q && st.usage
+      ? Math.max(
+          q.max_bytes > 0 ? st.usage.used_bytes / q.max_bytes : 0,
+          q.max_objects > 0 ? st.usage.objects / q.max_objects : 0,
+        )
+      : null
+    if (ratio !== null && ratio >= 0.8) quotaAlert++
+  }
+
   return (
     <section className="buckets-page" aria-labelledby="buckets-title">
       <div className="buckets-page__header">
@@ -345,6 +361,16 @@ export default function Buckets() {
           创建 Bucket
         </button>
       </div>
+
+      {/* 聚合 KPI */}
+      {visibleBuckets.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 12, marginBottom: 14 }}>
+          <div className="stat"><div className="label">Bucket 总数</div><div className="value" style={{ fontSize: 20 }}>{visibleBuckets.length}</div></div>
+          <div className="stat"><div className="label">总已用</div><div className="value" style={{ fontSize: 20, color: 'var(--accent)' }}>{formatBytes(totalUsedBytes)}</div></div>
+          <div className="stat"><div className="label">对象总数</div><div className="value" style={{ fontSize: 20 }}>{numberFormatter.format(totalObjects)}</div></div>
+          <div className="stat"><div className="label">配额告警</div><div className="value" style={{ fontSize: 20, color: quotaAlert > 0 ? 'var(--warn)' : 'var(--ok)' }}>{quotaAlert}</div></div>
+        </div>
+      )}
 
       {showCreate && (
         <form

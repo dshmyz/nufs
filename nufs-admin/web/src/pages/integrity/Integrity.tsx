@@ -53,104 +53,52 @@ export default function Integrity() {
 
   return (
     <div>
-      <h1 style={{ fontSize: '24px', fontWeight: 700, marginBottom: '24px' }}>数据完整性</h1>
-
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '16px', marginBottom: '32px' }}>
-        <div style={{ background: 'var(--bg-elev)', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px' }}>
-          <h3 style={{ fontSize: '14px', fontWeight: 700, marginBottom: '12px' }}>修复队列</h3>
-          {queue && (
-            <div style={{ fontSize: '13px', color: 'var(--text-dim)' }}>
-              <div>待修复: {queue.pending}</div>
-              <div>进行中: {queue.inProgress}</div>
-              <div>已完成: {queue.completed}</div>
-            </div>
-          )}
-          <button
-            onClick={handleRepair}
-            disabled={loading}
-            style={{
-              marginTop: '12px',
-              padding: '8px 16px',
-              background: 'var(--accent)',
-              color: 'var(--bg-elev)',
-              border: 'none',
-              borderRadius: '6px',
-              cursor: loading ? 'wait' : 'pointer',
-            }}
-          >
-            触发修复
-          </button>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Integrity</div>
+          <h1>数据完整性</h1>
         </div>
+        <button className="btn" onClick={() => getRepairQueue(clusterId!).then(setQueue)}>刷新</button>
+      </div>
 
-        <div style={{ background: 'var(--bg-elev)', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px' }}>
-          <h3 style={{ fontSize: '14px', fontWeight: 700, marginBottom: '12px' }}>GC 扫描</h3>
-          <p style={{ fontSize: '13px', color: 'var(--text-dim)', marginBottom: '12px' }}>
-            扫描孤儿块并回收磁盘空间
-          </p>
-          <button
-            onClick={handleGC}
-            disabled={loading}
-            style={{
-              padding: '8px 16px',
-              background: '#7c3aed',
-              color: 'var(--bg-elev)',
-              border: 'none',
-              borderRadius: '6px',
-              cursor: loading ? 'wait' : 'pointer',
-            }}
-          >
-            触发 GC
-          </button>
+      {/* 修复队列 KPI */}
+      {queue && (
+        <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', marginBottom: 18 }}>
+          <div className="stat"><div className="label">待修复</div><div className="value" style={{ fontSize: 20, color: queue.pending > 0 ? 'var(--warn)' : 'var(--ok)' }}>{queue.pending}</div></div>
+          <div className="stat"><div className="label">进行中</div><div className="value" style={{ fontSize: 20, color: 'var(--accent)' }}>{queue.inProgress}</div></div>
+          <div className="stat"><div className="label">已完成</div><div className="value" style={{ fontSize: 20 }}>{queue.completed}</div></div>
+          <div className="stat"><div className="label">队列总量</div><div className="value" style={{ fontSize: 20 }}>{queue.pending + queue.inProgress + queue.completed}</div></div>
         </div>
+      )}
 
-        <div style={{ background: 'var(--bg-elev)', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px' }}>
-          <h3 style={{ fontSize: '14px', fontWeight: 700, marginBottom: '12px' }}>再平衡</h3>
-          <p style={{ fontSize: '13px', color: 'var(--text-dim)', marginBottom: '12px' }}>
-            重新分布数据以均衡节点负载
-          </p>
-          <button
-            onClick={handleRebalance}
-            disabled={loading}
-            style={{
-              padding: '8px 16px',
-              background: '#d97706',
-              color: 'var(--bg-elev)',
-              border: 'none',
-              borderRadius: '6px',
-              cursor: loading ? 'wait' : 'pointer',
-            }}
-          >
-            触发再平衡
-          </button>
+      {/* 操作卡 */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14, marginBottom: 18 }}>
+        <div className="panel panel-pad">
+          <h3 style={{ marginBottom: 8 }}>修复</h3>
+          <p className="muted" style={{ fontSize: 13, marginBottom: 12 }}>重新补齐副本不足的 chunk（读修复）</p>
+          <button className="btn btn-primary" onClick={handleRepair} disabled={loading}>{loading ? '触发中...' : '触发修复'}</button>
+        </div>
+        <div className="panel panel-pad">
+          <h3 style={{ marginBottom: 8 }}>GC 扫描</h3>
+          <p className="muted" style={{ fontSize: 13, marginBottom: 12 }}>扫描孤儿块并回收磁盘空间</p>
+          <button className="btn btn-primary" onClick={handleGC} disabled={loading}>{loading ? '触发中...' : '触发 GC'}</button>
+        </div>
+        <div className="panel panel-pad">
+          <h3 style={{ marginBottom: 8 }}>再平衡</h3>
+          <p className="muted" style={{ fontSize: 13, marginBottom: 12 }}>重新分布数据以均衡节点负载</p>
+          <button className="btn btn-primary" onClick={handleRebalance} disabled={loading}>{loading ? '触发中...' : '触发再平衡'}</button>
         </div>
       </div>
 
-      <div style={{ background: 'var(--bg-elev)', border: '1px solid #e2e6ec', borderRadius: '10px', padding: '20px' }}>
-        <h3 style={{ fontSize: '14px', fontWeight: 700, marginBottom: '12px' }}>Chunk 查询</h3>
-        <input
-          value={chunkId}
-          onChange={(e) => setChunkId(e.target.value)}
-          placeholder="输入 Chunk ID"
-          style={{
-            padding: '10px',
-            border: '1px solid #e2e6ec',
-            borderRadius: '6px',
-            marginRight: '12px',
-            width: '300px',
-          }}
-        />
-        <button
-          style={{
-            padding: '10px 16px',
-            background: 'var(--accent)',
-            color: 'var(--bg-elev)',
-            border: 'none',
-            borderRadius: '6px',
-            cursor: 'pointer',
-          }}
-        >
-          查询
-        </button>
+      {/* Chunk 查询 */}
+      <div className="panel panel-pad">
+        <h3 style={{ marginBottom: 12 }}>Chunk 查询</h3>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <input value={chunkId} onChange={(e) => setChunkId(e.target.value)} placeholder="输入 Chunk ID" style={{ width: 300 }} />
+          <button className="btn btn-primary" onClick={() => { if (chunkId.trim()) window.open(`/clusters/${clusterId}/chunks/${encodeURIComponent(chunkId.trim())}`, '_blank') }}>
+            查询
+          </button>
+        </div>
       </div>
     </div>
   )

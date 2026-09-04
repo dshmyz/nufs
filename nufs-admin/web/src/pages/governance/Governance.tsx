@@ -89,7 +89,31 @@ export default function Governance() {
       <div style={card}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
           <h3 style={{ fontSize: '16px', fontWeight: 700, margin: 0 }}>元数据运维</h3>
-          <button onClick={loadOps} style={{ padding: '4px 10px', background: '#eff6ff', color: 'var(--accent)', border: '1px solid #bfdbfe', borderRadius: '4px', cursor: 'pointer' }}>刷新</button>
+          <button className="btn btn-sm" onClick={loadOps}>刷新</button>
+        </div>
+
+        {/* 元数据健康 KPI */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 12 }}>
+          <div className="stat">
+            <div className="label">备份状态</div>
+            <div className="value" style={{ fontSize: 18, color: backupErr ? 'var(--danger)' : backupStatus === 'ready' || backupStatus === 'healthy' ? 'var(--ok)' : 'var(--warn)' }}>
+              {backupErr ? '未启用' : (backupStatus || '—')}
+            </div>
+          </div>
+          <div className="stat">
+            <div className="label">后台任务</div>
+            <div className="value" style={{ fontSize: 18 }}>{tasks.length}</div>
+          </div>
+          <div className="stat">
+            <div className="label">EC 队列</div>
+            <div className="value" style={{ fontSize: 18, color: ecQueue.length > 0 ? 'var(--warn)' : 'var(--ok)' }}>{ecQueue.length}</div>
+          </div>
+          <div className="stat">
+            <div className="label">容量不均衡度</div>
+            <div className="value" style={{ fontSize: 18, color: typeof imbalance === 'number' && imbalance > 0.15 ? 'var(--warn)' : 'var(--ok)' }}>
+              {typeof imbalance === 'number' ? imbalance.toFixed(2) : '—'}
+            </div>
+          </div>
         </div>
 
         {/* 备份 */}
