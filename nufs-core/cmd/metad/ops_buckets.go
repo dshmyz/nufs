@@ -17,6 +17,9 @@ func (h *opsHandlers) handleBuckets(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if buckets == nil {
+			buckets = make([]metadata.BucketInfo, 0) // 空桶返回 [] 而非 null（列表 API 契约）
+		}
 		writeJSON(w, buckets)
 	case http.MethodPost:
 		var req struct {

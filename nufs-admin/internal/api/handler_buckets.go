@@ -26,6 +26,9 @@ func (r *Router) handleBuckets(w http.ResponseWriter, req *http.Request, cluster
 				http.Error(w, err.Error(), http.StatusServiceUnavailable)
 				return
 			}
+			if buckets == nil {
+				buckets = make([]map[string]interface{}, 0) // 空桶给 []，前端 .map 依赖
+			}
 
 			for _, bucket := range buckets {
 				bucket["cluster"] = clusterID

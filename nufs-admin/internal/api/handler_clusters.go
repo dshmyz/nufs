@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -62,25 +63,31 @@ func (r *Router) handleGlobalOverview(w http.ResponseWriter, req *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	result := r.aggregator.FetchAll(req.Context(), "/api/v1/overview")
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	ctx := req.Context()
+	results := map[string]interface{}{}
+	failures := map[string]string{}
+	for _, c := range r.proxy.Registry.List() {
+		o, err := r.clusterOverviewData(ctx, c.Name)
+		if err != nil {
+			failures[c.Name] = err.Error()
+			continue
+		}
+		results[c.Name] = o
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"results":  results,
+		"failures": failures,
+	})
 }
 
-// handleClusterOverview returns overview for a single cluster, aggregated from
-// real metad endpoints (nodes/buckets/repair queue) — the metad has no
-// /api/v1/overview endpoint, so this no longer proxies a nonexistent path.
-func (r *Router) handleClusterOverview(w http.ResponseWriter, req *http.Request, clusterID string) {
-	if req.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	ctx := req.Context()
+// clusterOverviewData aggregates a single cluster's overview from real metad
+// endpoints (nodes/buckets/repair queue). Used by both single-cluster and
+// global overview; the metad has no /api/v1/overview endpoint.
+func (r *Router) clusterOverviewData(ctx context.Context, clusterID string) (map[string]interface{}, error) {
 	out := map[string]interface{}{
 		"cluster":       clusterID,
 		"nodes":         0,
+		"capacity":      0,
 		"capacityTotal": 0,
 		"capacityUsed":  0,
 		"buckets":       0,
@@ -89,8 +96,7 @@ func (r *Router) handleClusterOverview(w http.ResponseWriter, req *http.Request,
 
 	var nodes []map[string]interface{}
 	if err := r.proxy.Get(ctx, clusterID, "/api/v1/nodes", &nodes); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
+		return nil, err
 	}
 	var capTotal, capUsed float64
 	for _, n := range nodes {
@@ -98,13 +104,13 @@ func (r *Router) handleClusterOverview(w http.ResponseWriter, req *http.Request,
 		capUsed += asFloat(n["used_gb"])
 	}
 	out["nodes"] = len(nodes)
+	out["capacity"] = int(capTotal)
 	out["capacityTotal"] = int(capTotal)
 	out["capacityUsed"] = int(capUsed)
 
 	var buckets []interface{}
 	if err := r.proxy.Get(ctx, clusterID, "/api/v1/buckets", &buckets); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
+		return nil, err
 	}
 	out["buckets"] = len(buckets)
 
@@ -115,7 +121,22 @@ func (r *Router) handleClusterOverview(w http.ResponseWriter, req *http.Request,
 			out["repairQueue"] = len(arr)
 		}
 	}
+	return out, nil
+}
 
+// handleClusterOverview returns overview for a single cluster, aggregated from
+// real metad endpoints (nodes/buckets/repair queue) — the metad has no
+// /api/v1/overview endpoint, so this no longer proxies a nonexistent path.
+func (r *Router) handleClusterOverview(w http.ResponseWriter, req *http.Request, clusterID string) {
+	if req.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	out, err := r.clusterOverviewData(req.Context(), clusterID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
 }
