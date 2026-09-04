@@ -335,6 +335,8 @@ export interface NodeInfo {
   status: 'online' | 'offline'
   capacity: number
   used: number
+  rack?: string
+  zone?: string
 }
 
 export interface BucketInfo {

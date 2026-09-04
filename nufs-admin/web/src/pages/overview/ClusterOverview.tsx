@@ -97,43 +97,91 @@ export default function ClusterOverview() {
         <KPI label="修复队列" value={String(readiness?.repair_queue_depth ?? data.repairQueue ?? 0)} tone={ioErrors > 0 ? 'danger' : undefined} />
       </div>
 
-      {/* 节点实时卡网格（视觉 + 信息密度） */}
+      {/* 节点实时卡网格（按 rack/zone 分组 + 磁盘热力） */}
       <div className="panel panel-pad" style={{ marginBottom: 18 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
           <h3>节点实时状态</h3>
           <span className="faint" style={{ fontSize: 12 }}>2s 刷新</span>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))', gap: 14 }}>
-          {nodes.map(n => {
-            const m = metrics[n.id]?.disk
-            const pct = n.capacity > 0 ? (n.used / n.capacity) * 100 : 0
-            const diskCount = disks[n.id]?.length ?? 0
-            return (
-              <div key={n.id} style={{ background: 'var(--bg-hover)', border: '1px solid var(--line)', borderRadius: 'var(--radius)', padding: 14 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
-                  <span className={`led led-${n.status === 'online' ? 'ok' : 'danger'}`} />
-                  <b className="mono">node-{n.id}</b>
-                  <span className="faint" style={{ fontSize: 11 }}>{n.address}</span>
-                </div>
-                <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
-                  <CapacityRing pct={pct} used={n.used} cap={n.capacity} online={n.status === 'online'} small />
-                  <div style={{ flex: 1, fontSize: 12, color: 'var(--text-dim)' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>读</span><b className="mono" style={{ color: 'var(--accent)' }}>{m?.read_iops ?? 0} IOPS</b></div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>写</span><b className="mono">{m?.write_iops ?? 0} IOPS</b></div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>IO 错误</span><b className="mono" style={{ color: (m?.io_errors ?? 0) > 0 ? 'var(--danger)' : 'var(--text)' }}>{m?.io_errors ?? 0}</b></div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>chunk</span><b className="mono">{m?.chunk_count ?? 0}</b></div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>磁盘</span><b className="mono">{diskCount}</b></div>
+        {Object.entries(groupByRack(nodes)).map(([rack, list]) => (
+          <div key={rack} style={{ marginBottom: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <span className="badge badge-accent">{rack}</span>
+              <span className="faint" style={{ fontSize: 11 }}>{list.length} 节点</span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))', gap: 12 }}>
+              {list.map(n => {
+                const m = metrics[n.id]?.disk
+                const pct = n.capacity > 0 ? (n.used / n.capacity) * 100 : 0
+                const diskCount = disks[n.id]?.length ?? 0
+                return (
+                  <div key={n.id} style={{ background: 'var(--bg-hover)', border: '1px solid var(--line)', borderRadius: 'var(--radius)', padding: 14 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+                      <span className={`led led-${n.status === 'online' ? 'ok' : 'danger'}`} />
+                      <b className="mono">node-{n.id}</b>
+                      <span className="faint" style={{ fontSize: 11 }}>{n.address}</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
+                      <CapacityRing pct={pct} used={n.used} cap={n.capacity} online={n.status === 'online'} small />
+                      <div style={{ flex: 1, fontSize: 12, color: 'var(--text-dim)' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>读</span><b className="mono" style={{ color: 'var(--accent)' }}>{m?.read_iops ?? 0} IOPS</b></div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>写</span><b className="mono">{m?.write_iops ?? 0} IOPS</b></div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>IO 错误</span><b className="mono" style={{ color: (m?.io_errors ?? 0) > 0 ? 'var(--danger)' : 'var(--text)' }}>{m?.io_errors ?? 0}</b></div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>chunk</span><b className="mono">{m?.chunk_count ?? 0}</b></div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>磁盘</span><b className="mono">{diskCount}</b></div>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: 12, marginTop: 10, borderTop: '1px solid var(--line)', paddingTop: 8 }}>
+                      <Sparkline label="读" data={rateHist[n.id]?.r} />
+                      <Sparkline label="写" data={rateHist[n.id]?.w} />
+                    </div>
                   </div>
-                </div>
-                <div style={{ display: 'flex', gap: 12, marginTop: 10, borderTop: '1px solid var(--line)', paddingTop: 8 }}>
-                  <Sparkline label="读" data={rateHist[n.id]?.r} />
-                  <Sparkline label="写" data={rateHist[n.id]?.w} />
-                </div>
-              </div>
-            )
-          })}
-        </div>
+                )
+              })}
+            </div>
+          </div>
+        ))}
       </div>
+
+      {/* 磁盘热力（整集群磁盘使用率 heatmap） */}
+      {Object.values(disks).some(d => d.length > 0) && (
+        <div className="panel panel-pad" style={{ marginBottom: 18 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <h3>磁盘热力</h3>
+            <span className="faint" style={{ fontSize: 12 }}>色块=磁盘使用率</span>
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
+            {nodes.map(n => {
+              const ds = disks[n.id] || []
+              if (ds.length === 0) return null
+              return (
+                <div key={n.id} style={{ minWidth: 180 }}>
+                  <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span className={`led led-${n.status === 'online' ? 'ok' : 'danger'}`} />
+                    <span className="mono">node-{n.id}</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                    {ds.map((d, i) => {
+                      const usedPct = d.total_bytes ? (d.bytes! / d.total_bytes) * 100 : 0
+                      const color = usedPct > 85 ? 'var(--danger)' : usedPct > 70 ? 'var(--warn)' : 'var(--accent)'
+                      return (
+                        <div key={i} title={`bay ${d.index} · ${d.dir}\n${usedPct.toFixed(1)}% 已用`} style={{
+                          width: 22, height: 22, borderRadius: 4,
+                          background: `linear-gradient(180deg, ${color} ${Math.min(100, usedPct)}%, var(--bg-input) ${Math.min(100, usedPct)}%)`,
+                          border: '1px solid var(--line-strong)',
+                          opacity: d.failed ? 0.5 : 1,
+                          cursor: 'default',
+                        }} />
+                      )
+                    })}
+                  </div>
+                  <div className="faint" style={{ fontSize: 10, marginTop: 4 }}>{ds.length} 块盘</div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
       {/* 系统健康 */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 16 }}>
@@ -186,6 +234,16 @@ function KPI({ label, value, unit, tone }: { label: string; value: string; unit?
       <div className="value" style={{ fontSize: 20, color }}>{value}</div>
     </div>
   )
+}
+
+// 按 rack/zone 分组节点（rack 优先，缺省用 zone，再缺省 "未分组"）
+function groupByRack(nodes: NodeInfo[]): Record<string, NodeInfo[]> {
+  const groups: Record<string, NodeInfo[]> = {}
+  for (const n of nodes) {
+    const key = n.rack || n.zone || '未分组'
+    ;(groups[key] ||= []).push(n)
+  }
+  return groups
 }
 
 // 节点容量环（SVG donut）：stroke=使用率，中心显示百分比

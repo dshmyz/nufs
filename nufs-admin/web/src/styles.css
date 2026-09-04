@@ -17,6 +17,7 @@
   --text-faint: #64728f;
 
   --accent: #22d3ee;
+  --accent-ink: #06222e; /* accent 底上的文字色（深色主题：cyan 上深字） */
   --accent-dim: rgba(34, 211, 238, 0.14);
   --accent-line: rgba(34, 211, 238, 0.45);
 
@@ -35,6 +36,34 @@
   --radius: 10px;
   --radius-sm: 6px;
   --shadow: 0 2px 4px rgba(0, 0, 0, 0.35), 0 8px 28px rgba(0, 0, 0, 0.3);
+}
+
+/* ---- 浅色主题（html[data-theme="light"]，顶栏切换） ---- */
+:root[data-theme="light"] {
+  --bg: #f4f6fa;
+  --bg-elev: #ffffff;
+  --bg-hover: #eef1f6;
+  --bg-input: #ffffff;
+  --line: #e2e8f0;
+  --line-strong: #cbd5e1;
+
+  --text: #0f172a;
+  --text-dim: #475569;
+  --text-faint: #94a3b8;
+
+  --accent: #0d9488;
+  --accent-ink: #ffffff; /* 浅色主题：teal-700 上白字 */
+  --accent-dim: rgba(13, 148, 136, 0.1);
+  --accent-line: rgba(13, 148, 136, 0.4);
+
+  --ok: #059669;
+  --ok-dim: rgba(5, 150, 105, 0.12);
+  --warn: #d97706;
+  --warn-dim: rgba(217, 119, 6, 0.12);
+  --danger: #dc2626;
+  --danger-dim: rgba(220, 38, 38, 0.1);
+
+  --shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 4px 16px rgba(15, 23, 42, 0.05);
 }
 
 * { box-sizing: border-box; }
@@ -89,7 +118,7 @@ a:hover { text-decoration: underline; }
 .btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.btn-primary { background: var(--accent); border-color: transparent; color: #fff; font-weight: 600; }
+.btn-primary { background: var(--accent); border-color: transparent; color: var(--accent-ink); font-weight: 600; }
 .btn-primary:hover { background: #0b8378; }
 
 .btn-danger { background: transparent; border-color: rgba(248, 113, 113, 0.4); color: var(--danger); }

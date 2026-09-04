@@ -1,6 +1,7 @@
 import { Outlet, Link, useParams, useNavigate } from 'react-router-dom'
 import { useState, useEffect } from 'react'
 import { listClusters, ClusterView } from '../api/client'
+import { toggleTheme, initTheme } from '../theme'
 
 interface LayoutProps {
   onLogout: () => void
@@ -9,8 +10,11 @@ interface LayoutProps {
 export default function Layout({ onLogout }: LayoutProps) {
   const [clusters, setClusters] = useState<ClusterView[]>([])
   const [selectedCluster, setSelectedCluster] = useState<string | null>(null)
+  const [theme, setTheme] = useState<'light' | 'dark'>(initTheme())
   const params = useParams()
   const navigate = useNavigate()
+
+  const handleTheme = () => setTheme(toggleTheme())
 
   useEffect(() => {
     listClusters().then(setClusters).catch(console.error)
@@ -71,7 +75,12 @@ export default function Layout({ onLogout }: LayoutProps) {
           <div className="ctx">
             {selectedCluster ? <><span className="crumb">集群</span> / {selectedCluster}</> : '多集群总览'}
           </div>
-          <button className="btn btn-ghost" onClick={onLogout}>退出登录</button>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button className="btn btn-ghost" onClick={handleTheme} title="切换浅色/深色主题">
+              {theme === 'dark' ? '☀ 浅色' : '☾ 深色'}
+            </button>
+            <button className="btn btn-ghost" onClick={onLogout}>退出登录</button>
+          </div>
         </header>
 
         {selectedCluster && !isManage && (
