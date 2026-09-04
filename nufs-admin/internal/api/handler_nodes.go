@@ -22,9 +22,18 @@ func (r *Router) handleNodes(w http.ResponseWriter, req *http.Request, clusterID
 			return
 		}
 
-		// Add cluster field to each node
+		// Add cluster field + normalize state → status (metad returns numeric
+		// NodeState: 0=online, 1=offline; the console reads a string status).
 		for _, node := range nodes {
 			node["cluster"] = clusterID
+			switch st, _ := node["state"].(float64); st {
+			case 0:
+				node["status"] = "online"
+			case 1:
+				node["status"] = "offline"
+			default:
+				node["status"] = "unknown"
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
