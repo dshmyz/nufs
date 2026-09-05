@@ -93,7 +93,7 @@ func (gw *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucke
 	}
 
 	// Lookup inode
-	inode, err := gw.meta.Lookup(ctx, b.RootInode, key)
+	inode, err := resolveObjectForRead(ctx, gw.meta, b.RootInode, key)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
 			WriteXMLError(w, http.StatusNotFound, ErrCodeNoSuchKey,
@@ -214,7 +214,7 @@ func (gw *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	inode, err := gw.meta.Lookup(ctx, b.RootInode, key)
+	inode, err := resolveObjectForRead(ctx, gw.meta, b.RootInode, key)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
 			w.WriteHeader(http.StatusNoContent)
@@ -237,7 +237,7 @@ func (gw *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, bu
 		}
 	}()
 
-	lockedInode, err := gw.meta.Lookup(ctx, b.RootInode, key)
+	lockedInode, err := resolveObjectForRead(ctx, gw.meta, b.RootInode, key)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
 			w.WriteHeader(http.StatusNoContent)
@@ -282,7 +282,7 @@ func (gw *Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	inode, err := gw.meta.Lookup(ctx, b.RootInode, key)
+	inode, err := resolveObjectForRead(ctx, gw.meta, b.RootInode, key)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
 			w.WriteHeader(http.StatusNotFound)
@@ -328,7 +328,7 @@ func (gw *Gateway) handleCopyObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	srcInode, err := gw.meta.Lookup(ctx, srcB.RootInode, srcKey)
+	srcInode, err := resolveObjectForRead(ctx, gw.meta, srcB.RootInode, srcKey)
 	if err != nil {
 		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
 			WriteXMLError(w, http.StatusNotFound, ErrCodeNoSuchKey,
@@ -352,7 +352,7 @@ func (gw *Gateway) handleCopyObject(w http.ResponseWriter, r *http.Request, buck
 		}
 	}()
 
-	lockedSource, err := gw.meta.Lookup(ctx, srcB.RootInode, srcKey)
+	lockedSource, err := resolveObjectForRead(ctx, gw.meta, srcB.RootInode, srcKey)
 	if err != nil {
 		WriteXMLError(w, http.StatusServiceUnavailable, ErrCodeSlowDown,
 			"Copy source changed while waiting for lock", resource, requestID)

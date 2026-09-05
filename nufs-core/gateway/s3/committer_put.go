@@ -95,6 +95,30 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 		return PutObjectResult{}, fmt.Errorf("%w: %v", ErrObjectMetadataFailed, err)
 	}
 
+	// Resolve the key to (parent inode, file name) inside the bucket namespace,
+	// creating intermediate directories for "/"-separated keys so S3 writes and
+	// FUSE writes converge on the same real directory layout.
+	parentInode, fileName, isDir, keyErr := resolveObjectKey(ctx, c.meta, b.RootInode, req.Key)
+	if keyErr != nil {
+		c.recordAttempt(ctx, &metadata.ObjectWriteAttempt{
+			ID:        attemptID,
+			Bucket:    req.Bucket,
+			Key:       req.Key,
+			State:     metadata.WriteAttemptFailed,
+			LastError: keyErr.Error(),
+		})
+		return PutObjectResult{}, fmt.Errorf("%w: %v", ErrObjectMetadataFailed, keyErr)
+	}
+	if isDir {
+		// Key ends in "/" — a zero-byte directory-marker object. The directory
+		// was created by resolveObjectKey (idempotent); no chunks to write.
+		c.recordAttempt(ctx, &metadata.ObjectWriteAttempt{
+			ID: attemptID, Bucket: req.Bucket, Key: req.Key,
+			State: metadata.WriteAttemptCommitted,
+		})
+		return PutObjectResult{}, nil
+	}
+
 	var (
 		inode            *metadata.InodeMeta
 		oldInodeSnapshot *metadata.InodeMeta
@@ -103,7 +127,7 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 		newObject        = true
 		knownLength      = req.ContentLength >= 0
 	)
-	if inode, err = c.meta.Lookup(ctx, b.RootInode, req.Key); err == nil {
+	if inode, err = resolveObjectForRead(ctx, c.meta, b.RootInode, req.Key); err == nil {
 		oldInodeSnapshot = cloneInodeMeta(inode)
 		oldChunks, _ = resolveCommittedChunks(ctx, c.meta, inode)
 		oldSize = inode.Size
@@ -145,11 +169,11 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 	}
 
 	if newObject {
-		inode, err = c.meta.CreateFile(ctx, b.RootInode, req.Key, 0644)
+		inode, err = c.meta.CreateFile(ctx, parentInode, fileName, 0644)
 		if errors.Is(err, metadata.ErrEntryExists) {
 			// Another writer created the key after the initial lookup.
 			// Continue as an overwrite, matching the pre-existing behavior.
-			inode, err = c.meta.Lookup(ctx, b.RootInode, req.Key)
+			inode, err = c.meta.Lookup(ctx, parentInode, fileName)
 			if err == nil {
 				oldInodeSnapshot = cloneInodeMeta(inode)
 				oldChunks, _ = resolveCommittedChunks(ctx, c.meta, inode)
@@ -198,7 +222,7 @@ func (c *metadataObjectCommitter) Put(ctx context.Context, req PutObjectRequest)
 	}()
 	tLock = time.Now() // after AdvisoryLock succeeds
 
-	currentInode, err := c.meta.Lookup(ctx, b.RootInode, req.Key)
+	currentInode, err := resolveObjectForRead(ctx, c.meta, b.RootInode, req.Key)
 	if err != nil {
 		var refreshErr error
 		if errors.Is(err, metadata.ErrEntryNotFound) || errors.Is(err, metadata.ErrInodeNotFound) {
