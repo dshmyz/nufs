@@ -3,8 +3,10 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -79,6 +81,14 @@ func (r *Router) handleBuckets(w http.ResponseWriter, req *http.Request, cluster
 			return
 		}
 		r.handleBucketQuota(w, req, clusterID, bucketName)
+
+	case len(subpath) == 2 && subpath[1] == "objects":
+		bucketName, err := decodeBucketPathSegment(req, subpath[0])
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		r.handleBucketObjects(w, req, clusterID, bucketName)
 
 	case len(subpath) == 2:
 		http.Error(w, "unknown bucket resource", http.StatusNotFound)
@@ -192,4 +202,89 @@ func writeBucketQuotaProxyError(w http.ResponseWriter, err error) {
 	}
 
 	http.Error(w, http.StatusText(upstreamError.StatusCode), upstreamError.StatusCode)
+}
+
+// handleBucketObjects lists a bucket's contents by walking the metadata
+// namespace (metad readdir on the bucket root inode) — no S3 protocol, no
+// SigV4, just the metad ops token. path is a "/"-joined directory path
+// inside the bucket; each level is resolved to its inode via readdir.
+// GET /clusters/{id}/buckets/{bucket}/objects?path=a/b
+func (r *Router) handleBucketObjects(w http.ResponseWriter, req *http.Request, clusterID, bucket string) {
+	if req.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx := req.Context()
+	path := strings.Trim(req.URL.Query().Get("path"), "/")
+
+	// 找桶 root inode
+	var buckets []map[string]interface{}
+	if err := r.proxy.Get(ctx, clusterID, "/api/v1/buckets", &buckets); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	var rootInode int64 = -1
+	for _, b := range buckets {
+		if b["name"] == bucket {
+			if v, ok := b["root_inode"].(float64); ok {
+				rootInode = int64(v)
+			}
+			break
+		}
+	}
+	if rootInode < 0 {
+		http.Error(w, "bucket not found", http.StatusNotFound)
+		return
+	}
+
+	// 按 path 逐段解析 inode
+	parent := rootInode
+	if path != "" {
+		for _, seg := range strings.Split(path, "/") {
+			entries, err := r.metadReadDir(ctx, clusterID, parent)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			var found bool
+			for _, e := range entries {
+				if e["name"] == seg {
+					if v, ok := e["inode"].(float64); ok {
+						parent = int64(v)
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				http.Error(w, "path not found: "+path, http.StatusNotFound)
+				return
+			}
+		}
+	}
+
+	entries, err := r.metadReadDir(ctx, clusterID, parent)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	for _, e := range entries {
+		name, _ := e["name"].(string)
+		if path == "" {
+			e["path"] = name
+		} else {
+			e["path"] = path + "/" + name
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"path": path, "entries": entries})
+}
+
+func (r *Router) metadReadDir(ctx context.Context, clusterID string, parent int64) ([]map[string]interface{}, error) {
+	var entries []map[string]interface{}
+	p := fmt.Sprintf("/api/v1/namespace/readdir?parent=%d&offset=0&limit=1000", parent)
+	if err := r.proxy.GetUncached(ctx, clusterID, p, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }

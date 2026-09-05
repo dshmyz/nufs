@@ -7,9 +7,11 @@ import {
   deleteBucket,
   deleteBucketQuota,
   getAPIErrorMessage,
+  getBucketObjects,
   getBucketQuota,
   getBuckets,
   setBucketQuota,
+  ObjectEntry,
 } from '../../api/client'
 import './Buckets.css'
 
@@ -118,6 +120,9 @@ export default function Buckets() {
   const [editingBucket, setEditingBucket] = useState<string | null>(null)
   const [quotaDraft, setQuotaDraft] = useState<QuotaDraft>({ maxBytes: '0', maxObjects: '0' })
   const [editError, setEditError] = useState('')
+  const [browseOpen, setBrowseOpen] = useState<Record<string, boolean>>({})
+  const [browsePath, setBrowsePath] = useState<Record<string, string>>({})
+  const [browseEntries, setBrowseEntries] = useState<Record<string, ObjectEntry[]>>({})
   const [busyAction, setBusyAction] = useState('')
   const [dataCluster, setDataCluster] = useState<string>()
   const pageRequest = useRef(0)
@@ -334,6 +339,32 @@ export default function Buckets() {
     }
   }
 
+  const toggleBrowse = async (name: string) => {
+    if (!clusterId || dataCluster !== clusterId || mutationBusy) return
+    const next = { ...browseOpen, [name]: !browseOpen[name] }
+    setBrowseOpen(next)
+    if (next[name]) {
+      try {
+        const r = await getBucketObjects(clusterId, name, browsePath[name] || '')
+        setBrowsePath(p => ({ ...p, [name]: r.path }))
+        setBrowseEntries(e => ({ ...e, [name]: r.entries }))
+      } catch (err) {
+        console.error(err)
+      }
+    }
+  }
+
+  const browseInto = async (name: string, path: string) => {
+    if (!clusterId) return
+    try {
+      const r = await getBucketObjects(clusterId, name, path)
+      setBrowsePath(p => ({ ...p, [name]: r.path }))
+      setBrowseEntries(e => ({ ...e, [name]: r.entries }))
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
   // 聚合 KPI：总用量 / 对象 / 配额告警数
   let totalUsedBytes = 0, totalObjects = 0, quotaAlert = 0
   for (const b of visibleBuckets) {
@@ -507,6 +538,15 @@ export default function Buckets() {
                           <button
                             className="text-button"
                             type="button"
+                            onClick={() => void toggleBrowse(bucket.name)}
+                            aria-expanded={browseOpen[bucket.name]}
+                            disabled={mutationBusy}
+                          >
+                            {browseOpen[bucket.name] ? '收起浏览' : '浏览'}
+                          </button>
+                          <button
+                            className="text-button"
+                            type="button"
                             onClick={() => openQuotaEditor(bucket.name)}
                             aria-label={`编辑 ${bucket.name} 的配额`}
                             aria-expanded={editingBucket === bucket.name}
@@ -586,6 +626,62 @@ export default function Buckets() {
                             </div>
                             {editError && <p className="quota-editor__error" role="alert">{editError}</p>}
                           </form>
+                        </td>
+                      </tr>
+                    )}
+                    {browseOpen[bucket.name] && (
+                      <tr>
+                        <td colSpan={7} style={{ padding: 0, background: 'var(--bg-input)' }}>
+                          <div style={{ padding: '12px 16px' }}>
+                            {/* 面包屑 */}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 8, fontSize: 13 }}>
+                              <button type="button" className="text-button" onClick={() => void browseInto(bucket.name, '')} disabled={mutationBusy}>📦 {bucket.name}</button>
+                              {(browsePath[bucket.name] || '').split('/').filter(Boolean).map((seg, idx, arr) => {
+                                const target = arr.slice(0, idx + 1).join('/')
+                                const isLast = idx === arr.length - 1
+                                return (
+                                  <Fragment key={idx}>
+                                    <span className="faint">/</span>
+                                    {isLast ? (
+                                      <span className="mono">{seg}</span>
+                                    ) : (
+                                      <button type="button" className="text-button" onClick={() => void browseInto(bucket.name, target)} disabled={mutationBusy}>{seg}</button>
+                                    )}
+                                  </Fragment>
+                                )
+                              })}
+                              <span className="faint" style={{ marginLeft: 'auto', fontSize: 11 }}>
+                                {(browseEntries[bucket.name] || []).length} 项
+                              </span>
+                            </div>
+                            {/* 条目列表 */}
+                            {(browseEntries[bucket.name] || []).length === 0 ? (
+                              <div style={{ padding: '14px', color: 'var(--text-faint)', fontSize: 13, textAlign: 'center' }}>（空目录）</div>
+                            ) : (
+                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 6 }}>
+                                {[...(browseEntries[bucket.name] || [])]
+                                  .sort((a, b) => (a.type === 1 ? 0 : 1) - (b.type === 1 ? 0 : 1) || a.name.localeCompare(b.name))
+                                  .map((e, i) => (
+                                    <button
+                                      key={i}
+                                      type="button"
+                                      className="browse-item"
+                                      style={{
+                                        display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px',
+                                        background: 'var(--bg-hover)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)',
+                                        fontSize: 12, cursor: e.type === 1 ? 'pointer' : 'default', textAlign: 'left',
+                                        color: 'var(--text)',
+                                      }}
+                                      disabled={mutationBusy}
+                                      onClick={() => { if (e.type === 1) void browseInto(bucket.name, e.path) }}
+                                    >
+                                      <span>{e.type === 1 ? '📁' : '📄'}</span>
+                                      <span className="mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.name}</span>
+                                    </button>
+                                  ))}
+                              </div>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     )}

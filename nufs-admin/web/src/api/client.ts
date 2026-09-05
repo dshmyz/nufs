@@ -248,6 +248,18 @@ export async function getBucketQuota(clusterId: string, bucketName: string): Pro
   return resp.data
 }
 
+// Bucket 对象浏览（走元数据命名空间 readdir，非 S3 协议）
+export interface ObjectEntry {
+  name: string
+  inode: number
+  type: number  // FileType: 0=file, 1=dir, 2=symlink
+  path: string
+}
+export async function getBucketObjects(clusterId: string, bucketName: string, path: string): Promise<{ path: string; entries: ObjectEntry[] }> {
+  const resp = await api.get(bucketResourcePath(clusterId, bucketName, '/objects'), { params: { path } })
+  return resp.data ?? { path: '', entries: [] }
+}
+
 export async function setBucketQuota(
   clusterId: string,
   bucketName: string,
