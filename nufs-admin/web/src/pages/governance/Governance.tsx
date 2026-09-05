@@ -136,21 +136,45 @@ export default function Governance() {
           </div>
         </div>
 
-        {/* 容量均衡 */}
+        {/* 容量均衡（图表） */}
         {nodes.length > 0 && (
           <div style={{ marginBottom: '12px' }}>
-            <div style={{ color: 'var(--text-dim)', fontSize: '12px', marginBottom: '6px' }}>
-              容量均衡{typeof imbalance === 'number' && <span> · 不均衡度 <b>{imbalance.toFixed(2)}</b></span>}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+              <span style={{ color: 'var(--text-dim)', fontSize: '12px' }}>容量均衡</span>
+              {typeof imbalance === 'number' && (
+                <span className={`badge ${imbalance > 0.2 ? 'badge-warn' : 'badge-ok'}`}>不均衡度 {imbalance.toFixed(2)}</span>
+              )}
             </div>
-            {nodes.map((n: any, i: number) => (
-              <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', padding: '2px 0' }}>
-                <span style={{ width: '40px' }}>{n.id}</span>
-                <div style={{ width: '120px', height: '6px', background: 'var(--line)', borderRadius: '3px', overflow: 'hidden' }}>
-                  <div style={{ width: `${Math.min(100, n.used_pct ?? 0)}%`, height: '100%', background: (n.used_pct ?? 0) > 85 ? 'var(--danger)' : 'var(--accent)' }} />
-                </div>
-                <span style={{ color: 'var(--text-dim)' }}>{(n.used_pct ?? 0).toFixed(1)}%</span>
-              </div>
-            ))}
+            {(() => {
+              const pcts: number[] = nodes.map((n: any) => n.used_pct ?? 0)
+              const avg = pcts.reduce((a, b) => a + b, 0) / pcts.length
+              const max = Math.max(...pcts)
+              const min = Math.min(...pcts)
+              const sorted = [...nodes].sort((a: any, b: any) => (b.used_pct ?? 0) - (a.used_pct ?? 0))
+              const maxBar = Math.max(max, 1)
+              return (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(90px, 1fr))', gap: 8, marginBottom: 10 }}>
+                    <MiniStat label="最大" value={`${max.toFixed(1)}%`} tone={max > 85 ? 'danger' : max > 70 ? 'warn' : 'ok'} />
+                    <MiniStat label="平均" value={`${avg.toFixed(1)}%`} />
+                    <MiniStat label="最小" value={`${min.toFixed(1)}%`} tone="accent" />
+                  </div>
+                  {sorted.map((n: any, i: number) => {
+                    const p = n.used_pct ?? 0
+                    const color = p > 85 ? 'var(--danger)' : p > 70 ? 'var(--warn)' : 'var(--accent)'
+                    return (
+                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, padding: '2px 0' }}>
+                        <span style={{ width: 40, color: 'var(--text-dim)' }}>node-{n.id}</span>
+                        <div style={{ flex: 1, height: 10, background: 'var(--line)', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
+                          <div style={{ width: `${(p / maxBar) * 100}%`, height: '100%', background: `linear-gradient(90deg, ${color}66, ${color})`, borderRadius: 4, transition: 'width .4s ease' }} />
+                        </div>
+                        <span className="mono" style={{ width: 52, textAlign: 'right', color: 'var(--text)' }}>{p.toFixed(1)}%</span>
+                      </div>
+                    )
+                  })}
+                </>
+              )
+            })()}
           </div>
         )}
 
@@ -219,6 +243,16 @@ export default function Governance() {
           </tbody>
         </table>
       </div>
+    </div>
+  )
+}
+
+function MiniStat({ label, value, tone }: { label: string; value: string; tone?: 'ok' | 'warn' | 'danger' | 'accent' }) {
+  const color = tone === 'ok' ? 'var(--ok)' : tone === 'warn' ? 'var(--warn)' : tone === 'danger' ? 'var(--danger)' : tone === 'accent' ? 'var(--accent)' : 'var(--text)'
+  return (
+    <div style={{ background: 'var(--bg-hover)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)', padding: '8px 10px' }}>
+      <div className="faint" style={{ fontSize: 11 }}>{label}</div>
+      <div className="mono" style={{ fontSize: 15, fontWeight: 700, color }}>{value}</div>
     </div>
   )
 }
